@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import sys
 from pathlib import Path
 
 import typer
@@ -9,9 +10,22 @@ from src.publish.playwright_steps import run_save_draft_sync
 from src.storage.files import list_executions, list_posts, load_post, save_post
 from src.storage.models import Execution, PostStatus, PostType, now_iso
 from src.validation import validate_post
-from src.workflow.create_post import create_post_with_draft
+from src.workflow.create_post import create_daily_news_posts, create_post_with_draft
 
 app = typer.Typer(help="小红书自动发帖（生成并保存草稿）CLI")
+
+
+def _ensure_utf8_output() -> None:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+@app.callback()
+def _main_callback() -> None:
+    _ensure_utf8_output()
 
 
 def _resolve_asset_paths(post, assets_glob: str) -> list[str]:
@@ -47,7 +61,7 @@ def _emit_validation(result) -> None:
 @app.command()
 def create(
     title: str = typer.Option(..., help="初始标题/题目"),
-    prompt: str = typer.Option(..., help="提示词/要点"),
+    prompt: str = typer.Option("", help="提示词/要点（可选）"),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
 ):
@@ -57,15 +71,29 @@ def create(
         typer.echo("未找到素材文件，请检查 assets_glob")
         raise typer.Exit(code=1)
 
-    post = create_post_with_draft(
-        title_hint=title,
-        prompt_hint=prompt,
-        asset_paths=asset_paths,
-        copy_assets=not no_copy,
-    )
-    typer.echo(f"创建完成：post_id={post.id}")
-    typer.echo(f"标题：{post.title}")
-    typer.echo(f"正文（前60字）：{post.body[:60]}{'...' if len(post.body) > 60 else ''}")
+    title_norm = (title or "").strip()
+    prompt_norm = (prompt or "").strip()
+
+    if title_norm == "每日新闻" and not prompt_norm:
+        posts = create_daily_news_posts(
+            prompt_hint="",
+            asset_paths=asset_paths,
+            copy_assets=not no_copy,
+            count=3,
+        )
+        typer.echo(f"创建完成：posts={len(posts)}")
+        for p in posts:
+            typer.echo(f"- post_id={p.id} | 标题：{p.title}")
+    else:
+        post = create_post_with_draft(
+            title_hint=title,
+            prompt_hint=prompt,
+            asset_paths=asset_paths,
+            copy_assets=not no_copy,
+        )
+        typer.echo(f"创建完成：post_id={post.id}")
+        typer.echo(f"标题：{post.title}")
+        typer.echo(f"正文（前60字）：{post.body[:60]}{'...' if len(post.body) > 60 else ''}")
 
 
 @app.command("list")
@@ -193,7 +221,7 @@ def run(
 @app.command()
 def auto(
     title: str = typer.Option(..., help="初始标题/题目"),
-    prompt: str = typer.Option(..., help="提示词要点"),
+    prompt: str = typer.Option("", help="提示词要点（可选）"),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
     dry_run: bool = typer.Option(
@@ -209,45 +237,62 @@ def auto(
         typer.echo("未找到素材文件，请检查 assets_glob")
         raise typer.Exit(code=1)
 
-    post = create_post_with_draft(
-        title_hint=title,
-        prompt_hint=prompt,
-        asset_paths=asset_paths,
-        copy_assets=not no_copy,
-    )
-    typer.echo(f"创建完成：post_id={post.id}")
+    title_norm = (title or "").strip()
+    prompt_norm = (prompt or "").strip()
 
-    result = validate_post(post)
-    _emit_validation(result)
-    if result.errors and not force:
-        raise typer.Exit(code=1)
+    if title_norm == "每日新闻" and not prompt_norm:
+        posts = create_daily_news_posts(
+            prompt_hint="",
+            asset_paths=asset_paths,
+            copy_assets=not no_copy,
+            count=3,
+        )
+    else:
+        posts = [
+            create_post_with_draft(
+                title_hint=title,
+                prompt_hint=prompt,
+                asset_paths=asset_paths,
+                copy_assets=not no_copy,
+            )
+        ]
 
-    post.status = PostStatus.approved
-    post.updated_at = now_iso()
-    save_post(post)
+    typer.echo(f"创建完成：posts={len(posts)}")
+    for p in posts:
+        typer.echo(f"- post_id={p.id} | 标题：{p.title}")
 
-    asset_paths = _resolve_asset_paths(post, "")
-    attempt = _next_attempt(post.id)
-    exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
-    exec_rec = run_save_draft_sync(
-        post,
-        assets=asset_paths,
-        dry_run=dry_run,
-        login_hold=login_hold,
-        wait_timeout_ms=wait_timeout * 1000,
-        execution=exec_rec,
-    )
+    for post in posts:
+        result = validate_post(post)
+        _emit_validation(result)
+        if result.errors and not force:
+            raise typer.Exit(code=1)
 
-    post.status = _apply_execution_status(post.status, exec_rec.result)
-    post.updated_at = now_iso()
-    save_post(post)
+        post.status = PostStatus.approved
+        post.updated_at = now_iso()
+        save_post(post)
 
-    typer.echo(f"result: {exec_rec.result}")
-    for s in exec_rec.steps:
-        detail = f" | {s.detail}" if s.detail else ""
-        typer.echo(f"- {s.name}: {s.status}{detail}")
-    if exec_rec.error:
-        typer.echo(f"error: {exec_rec.error}")
+        resolved_assets = _resolve_asset_paths(post, "")
+        attempt = _next_attempt(post.id)
+        exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
+        exec_rec = run_save_draft_sync(
+            post,
+            assets=resolved_assets,
+            dry_run=dry_run,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout * 1000,
+            execution=exec_rec,
+        )
+
+        post.status = _apply_execution_status(post.status, exec_rec.result)
+        post.updated_at = now_iso()
+        save_post(post)
+
+        typer.echo(f"post_id={post.id} result: {exec_rec.result}")
+        for s in exec_rec.steps:
+            detail = f" | {s.detail}" if s.detail else ""
+            typer.echo(f"- {s.name}: {s.status}{detail}")
+        if exec_rec.error:
+            typer.echo(f"error: {exec_rec.error}")
 
 
 @app.command()
@@ -286,4 +331,4 @@ def retry(
 
 
 if __name__ == "__main__":
-    app()
+    app(windows_expand_args=False)

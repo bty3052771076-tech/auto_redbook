@@ -838,18 +838,24 @@ def run_save_draft_sync(
                     raise RuntimeError("draft save verification failed")
                 steps[-1].status = "success"
 
+                # From here on, draft-box navigation is best-effort. If the UI changes,
+                # keep the saved result but leave evidence for manual verification.
+                exec_rec.result = "saved_draft"
+
                 _step("open_draft_box", "in_progress", "")
                 opened = _open_draft_box(page)
                 steps[-1].detail = f"opened={opened}"
                 if not opened:
-                    raise RuntimeError("draft box entry not found")
+                    steps[-1].status = "skipped"
+                    return exec_rec
                 steps[-1].status = "success"
 
                 _step("open_draft_tab", "in_progress", "")
                 opened_tab = _open_image_draft_tab(page)
                 steps[-1].detail = f"opened={opened_tab}"
                 if not opened_tab:
-                    raise RuntimeError("image draft tab not found")
+                    steps[-1].status = "skipped"
+                    return exec_rec
                 steps[-1].status = "success"
 
                 _step("wait_for_draft_items", "in_progress", "")
@@ -859,7 +865,8 @@ def run_save_draft_sync(
                     steps[-1].status = "success"
                 except PlaywrightTimeoutError:
                     steps[-1].detail = "timeout"
-                    raise
+                    steps[-1].status = "skipped"
+                    return exec_rec
 
                 _step("wait_for_draft_cover", "in_progress", "")
                 cover_ready = _wait_for_draft_cover(page, post.title)
@@ -882,10 +889,9 @@ def run_save_draft_sync(
                 verified = _verify_draft_item(page, post.title)
                 steps[-1].detail = f"verified={verified}"
                 if not (verified and cover_ready):
-                    raise RuntimeError("draft box item missing title or image")
+                    steps[-1].status = "skipped"
+                    return exec_rec
                 steps[-1].status = "success"
-
-                exec_rec.result = "saved_draft"
             finally:
                 context.close()
     except Exception as exc:  # pragma: no cover

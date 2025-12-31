@@ -71,4 +71,4 @@ def run(
 
 
 if __name__ == "__main__":
-    app()
+    app(windows_expand_args=False)

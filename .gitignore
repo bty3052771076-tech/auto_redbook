@@ -2,11 +2,23 @@
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
+.mypy_cache/
 
 # Local data
 data/
 logs/
 exports/
+
+# Secrets (local-only)
+.env
+.env.*
+*.env
+docs/*api-key.md
+*.pem
+*.p12
+*.pfx
+*.key
 
 # OS
 .DS_Store

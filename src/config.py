@@ -50,6 +50,9 @@ def load_llm_config(
     base_url = env_base or file_cfg.get("base_url")
 
     if not api_key:
-        raise RuntimeError("LLM api_key missing: set LLM_API_KEY env or docs/llm_api-key")
+        raise RuntimeError(
+            "LLM api_key missing: set LLM_API_KEY env or create docs/llm_api-key.md "
+            "(see docs/llm_api-key.example.md)"
+        )
 
     return LLMConfig(model=model, api_key=api_key, base_url=base_url)
