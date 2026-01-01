@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Iterable, List
 
 from src.config import load_llm_config
+from src.images.auto_image import fetch_and_download_related_image, is_auto_image_enabled
 from src.llm.generate import generate_draft
 from src.news.daily_news import (
     fetch_and_pick_daily_news,
     fetch_daily_news_candidates,
     pick_news_items,
 )
-from src.storage.files import copy_assets_into_post, save_post, save_revision
+from src.storage.files import copy_assets_into_post, post_dir, save_post, save_revision
 from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSource
 
 
@@ -47,6 +48,7 @@ def create_post_with_draft(
     prompt_hint: str,
     asset_paths: list[str],
     copy_assets: bool = True,
+    auto_image: bool = True,
 ) -> Post:
     """
     Generate a draft with LLM and persist post + revision.
@@ -114,8 +116,25 @@ def create_post_with_draft(
     if platform_meta:
         post.platform = platform_meta
 
+    auto_image_enabled = auto_image and is_auto_image_enabled()
     assets_paths = [Path(p) for p in asset_paths]
-    if copy_assets:
+    effective_copy_assets = copy_assets
+
+    if not assets_paths and auto_image_enabled:
+        dest_dir = post_dir(post.id) / "assets"
+        image_path, image_meta = fetch_and_download_related_image(
+            title=post.title,
+            body=post.body,
+            topics=post.topics,
+            prompt_hint=prompt_hint,
+            dest_dir=dest_dir,
+        )
+        post.platform.setdefault("image", image_meta)
+        assets_paths = [image_path]
+        # The downloaded file is already under data/posts/<id>/assets.
+        effective_copy_assets = False
+
+    if effective_copy_assets:
         copied = copy_assets_into_post(post.id, assets_paths)
         asset_infos = _build_asset_infos(copied)
     else:
@@ -140,6 +159,7 @@ def create_daily_news_posts(
     asset_paths: list[str],
     copy_assets: bool = True,
     count: int = 3,
+    auto_image: bool = True,
 ) -> list[Post]:
     """
     Special workflow for title="每日新闻".
@@ -149,6 +169,7 @@ def create_daily_news_posts(
     """
     cfg = load_llm_config()
     prompt_norm = (prompt_hint or "").strip()
+    auto_image_enabled = auto_image and is_auto_image_enabled()
 
     try:
         candidates, base_meta = fetch_daily_news_candidates(prompt_norm)
@@ -176,7 +197,22 @@ def create_daily_news_posts(
             },
         )
         assets_paths = [Path(p) for p in asset_paths]
-        if copy_assets:
+        effective_copy_assets = copy_assets
+
+        if not assets_paths and auto_image_enabled:
+            dest_dir = post_dir(post.id) / "assets"
+            image_path, image_meta = fetch_and_download_related_image(
+                title=post.title,
+                body=post.body,
+                topics=post.topics,
+                prompt_hint=prompt_norm,
+                dest_dir=dest_dir,
+            )
+            post.platform.setdefault("image", image_meta)
+            assets_paths = [image_path]
+            effective_copy_assets = False
+
+        if effective_copy_assets:
             copied = copy_assets_into_post(post.id, assets_paths)
             post.assets = _build_asset_infos(copied)
         else:
@@ -235,7 +271,22 @@ def create_daily_news_posts(
         )
 
         assets_paths = [Path(p) for p in asset_paths]
-        if copy_assets:
+        effective_copy_assets = copy_assets
+
+        if not assets_paths and auto_image_enabled:
+            dest_dir = post_dir(post.id) / "assets"
+            image_path, image_meta = fetch_and_download_related_image(
+                title=post.title,
+                body=post.body,
+                topics=post.topics,
+                prompt_hint=prompt_norm,
+                dest_dir=dest_dir,
+            )
+            post.platform.setdefault("image", image_meta)
+            assets_paths = [image_path]
+            effective_copy_assets = False
+
+        if effective_copy_assets:
             copied = copy_assets_into_post(post.id, assets_paths)
             post.assets = _build_asset_infos(copied)
         else:

@@ -68,8 +68,7 @@ def create(
     """生成草稿并落盘（post.json + revision）。"""
     asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
     if not asset_paths:
-        typer.echo("未找到素材文件，请检查 assets_glob")
-        raise typer.Exit(code=1)
+        typer.echo("未找到素材文件，将自动查找配图（如已启用 AUTO_IMAGE 且配置了图片 API）。")
 
     title_norm = (title or "").strip()
     prompt_norm = (prompt or "").strip()
@@ -80,6 +79,7 @@ def create(
             asset_paths=asset_paths,
             copy_assets=not no_copy,
             count=3,
+            auto_image=True,
         )
         typer.echo(f"创建完成：posts={len(posts)}")
         for p in posts:
@@ -90,6 +90,7 @@ def create(
             prompt_hint=prompt,
             asset_paths=asset_paths,
             copy_assets=not no_copy,
+            auto_image=True,
         )
         typer.echo(f"创建完成：post_id={post.id}")
         typer.echo(f"标题：{post.title}")
@@ -234,8 +235,7 @@ def auto(
     """Generate content then save draft in one command."""
     asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
     if not asset_paths and not dry_run:
-        typer.echo("未找到素材文件，请检查 assets_glob")
-        raise typer.Exit(code=1)
+        typer.echo("未找到素材文件，将自动查找配图（如已启用 AUTO_IMAGE 且配置了图片 API）。")
 
     title_norm = (title or "").strip()
     prompt_norm = (prompt or "").strip()
@@ -246,6 +246,7 @@ def auto(
             asset_paths=asset_paths,
             copy_assets=not no_copy,
             count=3,
+            auto_image=True,
         )
     else:
         posts = [
@@ -254,6 +255,7 @@ def auto(
                 prompt_hint=prompt,
                 asset_paths=asset_paths,
                 copy_assets=not no_copy,
+                auto_image=True,
             )
         ]
 

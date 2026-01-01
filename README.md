@@ -39,6 +39,10 @@ NewsAPI（“每日新闻”）：
 - 环境变量：`NEWS_API_KEY`（或 `NEWSAPI_API_KEY`），可选 `NEWS_BASE_URL`
 - 或本机文件：复制 `docs/news_api-key.example.md` 为 `docs/news_api-key.md` 并填写
 
+Pexels（自动配图：当未提供图片素材时）：
+- 环境变量：`PEXELS_API_KEY`，可选 `PEXELS_BASE_URL`；`AUTO_IMAGE=0` 可关闭自动配图
+- 或本机文件：复制 `docs/pexels_api-key.example.md` 为 `docs/pexels_api-key.md` 并填写
+
 如曾泄露密钥：请立即在对应平台轮换/作废旧 key。
 
 ## 常见问题
