@@ -27,7 +27,7 @@ python -m playwright install chromium
 #   $env:PEXELS_API_KEY="..."
 #
 # 3) 一键：生成 -> 校验/审批 -> 保存草稿（首次建议给更长登录时间）
-python -m apps.cli auto --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*" --login-hold 600
+.\.venv\Scripts\python -m apps.cli auto --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*" --login-hold 600
 ```
 
 ## 草稿与浏览器 Profile
@@ -83,26 +83,28 @@ Pexels（自动配图：当未提供图片素材时）：
 3) 执行一键保存草稿：
 
 ```powershell
-python -m apps.cli auto --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*" --login-hold 600
+.\.venv\Scripts\python -m apps.cli auto --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*" --login-hold 600
 ```
 
 ## 使用顺序（手动分步）
 需要更可控/便于排查时按以下顺序：
 ```powershell
-# 1) 生成内容并落盘（输出 post_id）
-python -m apps.cli create --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*"
+# 1) 生成内容并落盘（捕获 post_id）
+$out = .\.venv\Scripts\python -m apps.cli create --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*" 2>&1
+$out
+$post_id = ($out | Select-String -Pattern "post_id=([0-9a-f]{32})" | Select-Object -First 1).Matches[0].Groups[1].Value
 
 # 2) 校验（可选）
-python -m apps.cli validate <post_id>
+.\.venv\Scripts\python -m apps.cli validate $post_id
 
 # 3) 审批（标记为 approved）
-python -m apps.cli approve <post_id>
+.\.venv\Scripts\python -m apps.cli approve $post_id
 
 # 4) 保存草稿（首次建议加长 login_hold）
-python -m apps.cli run <post_id> --login-hold 600
+.\.venv\Scripts\python -m apps.cli run $post_id --login-hold 600
 
 # 5) 失败后重试
-python -m apps.cli retry <post_id>
+.\.venv\Scripts\python -m apps.cli retry $post_id --force
 ```
 
 ## CLI 命令一览
@@ -116,61 +118,32 @@ python -m apps.cli retry <post_id>
 - `retry <post_id>`：对失败的 run 进行重试
 
 ## 功能示例
-### 1) 普通图文（有图）
+### 1) 标题 + 简略提示词 + 图片齐全 → LLM 文案 → 保存草稿
 ```powershell
-python -m apps.cli auto --title "冬日穿搭" --prompt "通勤简约风，给我3套搭配思路" --assets-glob "assets/pics/*" --login-hold 60
+$env:LLM_API_KEY="YOUR_LLM_API_KEY"
+.\.venv\Scripts\python -m apps.cli auto --title "冬日穿搭" --prompt "通勤简约风，给我3套搭配思路" --assets-glob "assets/pics/*" --login-hold 600
 ```
 
-### 2) 普通图文（无图 → 自动配图）
+### 2) 标题为“每日新闻” → NewsAPI 获取当日新闻并按提示词挑选 → 保存草稿
+```powershell
+$env:LLM_API_KEY="YOUR_LLM_API_KEY"
+$env:NEWS_API_KEY="YOUR_NEWS_API_KEY"
+$env:NEWS_PROVIDER="newsapi"
+
+# 有提示词：挑选最匹配 1 条新闻
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "assets/pics/*" --login-hold 600
+
+# 无提示词：随机挑选 3 条新闻并保存 3 条草稿
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --assets-glob "assets/pics/*" --login-hold 600
+```
+
+### 3) 无图片上传 → Pexels 自动配图 → 保存草稿
 前提：已配置 `PEXELS_API_KEY`（或本机 `docs/pexels_api-key.md`）。
 ```powershell
+$env:LLM_API_KEY="YOUR_LLM_API_KEY"
 $env:PEXELS_API_KEY="YOUR_PEXELS_API_KEY"
-python -m apps.cli auto --title "上海周末咖啡馆推荐" --prompt "安静、适合学习办公" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
-```
-关闭自动配图（此时必须手动提供至少 1 张图片，否则校验失败）：
-```powershell
-$env:AUTO_IMAGE="0"
-python -m apps.cli auto --title "标题" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
-```
-
-### 3) 每日新闻（有提示词 → 选 1 条新闻）
-```powershell
-python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
-```
-可选：强制使用指定新闻源（默认自动；有 `NEWS_API_KEY` 时优先 `newsapi`）：
-```powershell
-$env:NEWS_PROVIDER="gdelt"   # 或 newsapi
-python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
-```
-
-### 4) 每日新闻（无提示词 → 生成 3 条草稿）
-```powershell
-python -m apps.cli auto --title "每日新闻" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
-```
-
-### 5) 手动分步（更可控，便于排查）
-```powershell
-# 1) 生成内容并落盘（输出 post_id）
-python -m apps.cli create --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*"
-
-# 2) 查看列表/详情
-python -m apps.cli list
-python -m apps.cli show <post_id>
-
-# 3) 校验/审批/保存草稿
-python -m apps.cli validate <post_id>
-python -m apps.cli approve <post_id>
-python -m apps.cli run <post_id> --login-hold 600
-```
-
-### 6) 只打开发布页（保持登录/抓证据，不上传不保存）
-```powershell
-python -m apps.cli run <post_id> --login-hold 600 --dry-run --force
-```
-
-### 7) 在浏览器中查看草稿箱（确保 profile 一致）
-```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default"
+$env:IMAGE_PROVIDER="pexels"
+.\.venv\Scripts\python -m apps.cli auto --title "上海周末咖啡馆推荐" --prompt "安静、适合学习办公" --assets-glob "assets/empty/*" --login-hold 600
 ```
 
 ## auto 参数说明
@@ -210,7 +183,9 @@ python -m apps.cli run <post_id> --login-hold 600 --dry-run --force
 ## 调试（可选）
 仅用于打开发布页/保持登录（不上传/不保存）：
 ```powershell
-python -m apps.cli run <post_id> --login-hold 600 --dry-run --force
+$out = .\.venv\Scripts\python -m apps.cli create --title "登录测试" --prompt "" --assets-glob "assets/pics/*" 2>&1
+$post_id = ($out | Select-String -Pattern "post_id=([0-9a-f]{32})" | Select-Object -First 1).Matches[0].Groups[1].Value
+.\.venv\Scripts\python -m apps.cli run $post_id --login-hold 600 --dry-run --force
 ```
 
 ## 常见问题
