@@ -1,4 +1,10 @@
-from src.images.auto_image import ImageItem, build_image_query, is_auto_image_enabled, pick_best_image
+from src.images.auto_image import (
+    ImageItem,
+    _pexels_query_hint,
+    build_image_query,
+    is_auto_image_enabled,
+    pick_best_image,
+)
 
 
 def test_is_auto_image_enabled_defaults_true(monkeypatch):
@@ -34,6 +40,12 @@ def test_build_image_query_includes_topics():
     assert "AI" in q
     assert "芯片" in q
     assert "科技" in q
+
+
+def test_pexels_query_hint_maps_us_politics():
+    q = _pexels_query_hint("美国时政")
+    assert "USA" in q
+    assert "politics" in q
 
 
 def test_pick_best_image_prefers_alt_match():

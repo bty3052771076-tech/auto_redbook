@@ -42,6 +42,59 @@ def _build_asset_infos(paths: Iterable[Path]) -> List[AssetInfo]:
     return infos
 
 
+def _shorten_daily_news_title(news_title: str, *, max_len: int = 20) -> str:
+    title = (news_title or "").strip()
+    if not title:
+        return "每日新闻"
+    # Prefer the first segment before long detail separators.
+    for sep in ("：", ":", " - ", "—", "（", "("):
+        if sep in title:
+            head = title.split(sep, 1)[0].strip()
+            if head:
+                title = head
+                break
+    prefix = "每日新闻｜"
+    if len(prefix) + len(title) <= max_len:
+        return f"{prefix}{title}"
+    # Trim title to fit.
+    room = max(0, max_len - len(prefix))
+    return f"{prefix}{title[:room]}".rstrip("｜").rstrip()
+
+
+def _daily_news_prompt(picked, prompt_norm: str) -> str:
+    """
+    Prompt for LLM to write publishable body ONLY (no metadata/requirements echoed).
+    """
+    return (
+        "你正在为小红书图文笔记写「每日新闻」栏目。\n"
+        "请根据下面的新闻信息写一篇可直接发布的正文（通俗中文）。\n"
+        "注意：正文里不要包含“来源/时间/链接/提示词/要求”等元信息，也不要复述下面的提示文本。\n\n"
+        f"新闻标题：{picked.title}\n"
+        f"用户关注点（可选）：{prompt_norm or '无'}\n\n"
+        "写作要求：\n"
+        "- 1-2 句概括新闻主题（不要杜撰未提供的具体细节/数字）\n"
+        "- 2-3 条你的解读/影响/建议（可结合用户关注点）\n"
+        "- 结尾给一个互动问题，引导评论\n"
+        "- topics 输出 3-8 个话题词，包含「每日新闻」\n"
+    )
+
+
+def _daily_news_offline_body(picked, prompt_norm: str) -> str:
+    """
+    Offline fallback body: keep it publishable and avoid echoing prompt/requirements.
+    """
+    focus = prompt_norm.strip()
+    focus_line = f"从「{focus}」角度" if focus else "从大众关心的角度"
+    return (
+        f"今日要闻：{picked.title}\n\n"
+        f"{focus_line}，这条新闻值得关注的原因是：\n"
+        "1）它释放了一个重要信号，后续可能还会有更多细节披露；\n"
+        "2）对相关人群/行业的影响，需要结合权威信息持续观察；\n"
+        "3）如果你也在关注这个话题，建议留意官方/主流媒体的进一步更新。\n\n"
+        "你觉得这条新闻接下来会怎么发展？"
+    )
+
+
 def create_post_with_draft(
     *,
     title_hint: str,
@@ -65,27 +118,19 @@ def create_post_with_draft(
                 "mode": "daily_news",
                 "prompt_hint": (prompt_hint or "").strip(),
             }
-            news_prompt = (
-                "你正在为小红书图文笔记写「每日新闻」栏目。\n"
-                "以下是今天挑选出的新闻（仅供参考，不要杜撰未提供的具体细节/数字）：\n"
-                f"- 标题：{picked.title}\n"
-                f"- 来源：{picked.domain or 'unknown'}\n"
-                f"- 时间：{picked.seendate or 'unknown'}\n"
-                f"- 链接：{picked.url}\n\n"
-                f"用户偏好（可选）：{(prompt_hint or '').strip() or '无'}\n\n"
-                "要求：\n"
-                "1) 先用 1-2 句话概括新闻；\n"
-                "2) 给出 2-3 条你的解读/影响/建议（通俗中文）；\n"
-                "3) 结尾给一个互动问题，引导评论；\n"
-                "4) topics 输出 3-8 个话题词，包含「每日新闻」。\n"
-            )
-            seed_title = f"每日新闻｜{picked.title}"
+            prompt_norm = (prompt_hint or "").strip()
+            news_prompt = _daily_news_prompt(picked, prompt_norm)
+            seed_title = "每日新闻"
             draft = generate_draft(
                 cfg,
                 title_hint=seed_title,
                 prompt_hint=news_prompt,
                 asset_paths=asset_paths,
             )
+            if draft.get("_fallback_error"):
+                draft["title"] = _shorten_daily_news_title(picked.title)
+                draft["body"] = _daily_news_offline_body(picked, prompt_norm)
+                draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
         except Exception as exc:
             platform_meta["news"] = {
                 "mode": "daily_news",
@@ -227,30 +272,21 @@ def create_daily_news_posts(
     posts: list[Post] = []
 
     for idx, picked in enumerate(picks, start=1):
-        news_prompt = (
-            "你正在为小红书图文笔记写「每日新闻」栏目。\n"
-            "以下是今天挑选出的新闻（仅供参考，不要杜撰未提供的具体细节/数字）：\n"
-            f"- 标题：{picked.title}\n"
-            f"- 来源：{picked.domain or 'unknown'}\n"
-            f"- 时间：{picked.seendate or 'unknown'}\n"
-            f"- 链接：{picked.url}\n\n"
-            f"用户偏好（可选）：{prompt_norm or '无'}\n\n"
-            "要求：\n"
-            "1) 先用 1-2 句话概括新闻；\n"
-            "2) 给出 2-3 条你的解读/影响/建议（通俗中文）；\n"
-            "3) 结尾给一个互动问题，引导评论；\n"
-            "4) topics 输出 3-8 个话题词，包含「每日新闻」。\n"
-        )
+        news_prompt = _daily_news_prompt(picked, prompt_norm)
         if total > 1:
             news_prompt = f"（第 {idx}/{total} 条）\n{news_prompt}"
 
-        seed_title = f"每日新闻｜{picked.title}"
+        seed_title = "每日新闻"
         draft = generate_draft(
             cfg,
             title_hint=seed_title,
             prompt_hint=news_prompt,
             asset_paths=asset_paths,
         )
+        if draft.get("_fallback_error"):
+            draft["title"] = _shorten_daily_news_title(picked.title)
+            draft["body"] = _daily_news_offline_body(picked, prompt_norm)
+            draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
 
         post = Post(
             type="image",

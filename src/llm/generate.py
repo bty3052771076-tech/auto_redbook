@@ -74,6 +74,56 @@ def _normalize_topics(value: Any) -> List[str]:
     return []
 
 
+def _sanitize_body(body: str) -> str:
+    body = (body or "").strip()
+    if not body:
+        return body
+
+    markers = (
+        "Prompt:",
+        "Prompt：",
+        "Initial title:",
+        "Initial title：",
+        "Assets",
+        "要求",
+        "写作要求",
+        "新闻标题",
+        "用户偏好",
+        "用户关注点",
+        "offline fallback",
+        "news_fetch_failed",
+        "http://",
+        "https://",
+    )
+    if not any(m in body for m in markers):
+        return body
+
+    lines = [ln.strip() for ln in body.splitlines()]
+    kept: list[str] = []
+    for ln in lines:
+        if not ln:
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        if ln.startswith(("Prompt:", "Prompt：", "Initial title:", "Initial title：")):
+            continue
+        if ln.startswith(("Assets", "Assets:")):
+            continue
+        if ln.startswith(("写作要求", "写作要求：", "要求", "要求：")):
+            continue
+        if re.match(r"^[-*]\s*(标题|来源|时间|链接)[:：]", ln):
+            continue
+        if "news_fetch_failed" in ln or "offline fallback" in ln:
+            continue
+        if re.search(r"https?://", ln):
+            continue
+        kept.append(ln)
+
+    text = "\n".join(kept).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
 def _parse_json_text(text: str) -> Dict[str, Any] | None:
     json_text = _extract_json_block(text)
     if json_text:
@@ -121,7 +171,9 @@ def generate_draft(
                 (
                     "You are a Xiaohongshu image-post assistant. Write in Chinese. "
                     "Generate a short title and body. Title <= 20 chars. Body <= 1000 chars. "
+                    "If the initial title is long, rewrite it into <= 20 chars (do NOT just truncate with '...'). "
                     "Body may include hashtags (e.g. #topic) but do not spam. "
+                    "Only output the final publishable article body. Do NOT include any prompt text, requirements, metadata, or links. "
                     "Return strict JSON only: no Markdown, no code fences, no extra text. "
                     "JSON keys: title, body, topics (array of strings). "
                     "The body must be plain text, not JSON or a list."
@@ -141,7 +193,7 @@ def generate_draft(
 
     messages = prompt.format_messages(
         prompt_hint=prompt_hint,
-        title_hint=_truncate(title_hint, max_title),
+        title_hint=(title_hint or "").strip(),
         assets=", ".join(asset_paths) if asset_paths else "none",
     )
 
@@ -151,8 +203,8 @@ def generate_draft(
     except Exception as exc:
         text = json.dumps(
             {
-                "title": _truncate(title_hint or "Title", max_title),
-                "body": _truncate(f"{prompt_hint}\n(offline fallback)", max_body),
+                "title": _truncate((title_hint or "标题").strip(), max_title),
+                "body": "（生成失败，请稍后重试）",
                 "topics": [],
                 "_fallback_error": str(exc),
             },
@@ -169,6 +221,8 @@ def generate_draft(
         parsed_body = _parse_json_text(raw_body)
         if parsed_body and isinstance(parsed_body, dict):
             raw_body = _coerce_text(parsed_body.get("body") or parsed_body.get("text") or raw_body)
+
+    raw_body = _sanitize_body(raw_body)
 
     if not raw_title:
         raw_title = title_hint

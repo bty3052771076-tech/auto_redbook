@@ -159,6 +159,41 @@ def build_image_query(
     return query if len(query) <= max_len else query[:max_len]
 
 
+def _pexels_query_hint(query: str) -> str:
+    """
+    Pexels search tends to work better with English keywords. Do a tiny mapping for common
+    Chinese hints to improve relevance without external translation.
+    """
+    q = (query or "").strip()
+    if not q:
+        return ""
+    if re.search(r"[a-zA-Z]", q):
+        return q
+    tokens: list[str] = []
+    if "美国" in q or "美國" in q:
+        tokens.append("USA")
+    if "时政" in q or "時政" in q or "政治" in q:
+        tokens.append("politics")
+    if "大选" in q or "大選" in q or "选举" in q or "選舉" in q:
+        tokens.append("election")
+    if "国会" in q or "國會" in q:
+        tokens.append("congress")
+    if "外交" in q:
+        tokens.append("diplomacy")
+    if "经济" in q or "經濟" in q or "财经" in q or "財經" in q:
+        tokens.append("economy")
+    if "科技" in q or "AI" in q.upper() or "人工智能" in q:
+        tokens.append("technology")
+    if "国际" in q or "國際" in q:
+        tokens.append("international")
+    if "新闻" in q:
+        tokens.append("news")
+    if "金融" in q:
+        tokens.append("finance")
+
+    return " ".join(tokens).strip()
+
+
 def _relevance_score(item: ImageItem, query: str) -> float:
     q_tokens = _tokens(query)
     if not q_tokens:
@@ -335,10 +370,15 @@ def fetch_and_download_related_image(
     orientation = (os.getenv("IMAGE_ORIENTATION") or DEFAULT_ORIENTATION).strip().lower()
     default_query = (os.getenv("IMAGE_QUERY_DEFAULT") or DEFAULT_QUERY).strip() or DEFAULT_QUERY
 
-    query = build_image_query(title, body, topics, prompt_hint)
-    queries = [q for q in (query, default_query) if q]
+    query_original = build_image_query(title, body, topics, prompt_hint)
+    query_used = query_original
+    if provider_name == "pexels":
+        hint = _pexels_query_hint(query_original)
+        if hint:
+            query_used = hint
+    queries = [q for q in (query_used, default_query) if q]
 
-    chosen_query = query
+    chosen_query = query_used
     candidates: list[ImageItem] = []
     last_err: Optional[str] = None
 
@@ -382,6 +422,8 @@ def fetch_and_download_related_image(
         "mode": "auto_image",
         "provider": provider_name,
         "query": chosen_query,
+        "query_original": query_original,
+        "query_used": query_used,
         "picked": asdict(picked),
         "downloaded_path": str(dest_path),
         "downloaded_at": datetime.now(timezone.utc).isoformat(),

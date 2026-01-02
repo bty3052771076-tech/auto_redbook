@@ -126,6 +126,47 @@ def _relevance_score(item: NewsItem, prompt_hint: str) -> float:
     return score
 
 
+def _best_relevance(items: list[NewsItem], hint: str) -> float:
+    hint = (hint or "").strip()
+    if not hint or not items:
+        return 0.0
+    return max(_relevance_score(i, hint) for i in items)
+
+
+def _maybe_translate_hint_to_en(hint: str) -> str:
+    """
+    Best-effort mapping for common Chinese hints to English keywords for NewsAPI.
+    This is intentionally lightweight (no external translation dependency).
+    """
+    hint = (hint or "").strip()
+    if not hint:
+        return ""
+    # If it already contains enough ASCII, keep it as-is.
+    if re.search(r"[a-zA-Z]", hint):
+        return hint
+    tokens: list[str] = []
+    if "美国" in hint or "美國" in hint:
+        tokens.append("US")
+    if "时政" in hint or "時政" in hint or "政治" in hint:
+        tokens.append("politics")
+    if "大选" in hint or "大選" in hint or "选举" in hint or "選舉" in hint:
+        tokens.append("election")
+    if "国会" in hint or "國會" in hint:
+        tokens.append("congress")
+    if "外交" in hint:
+        tokens.append("diplomacy")
+    if "经济" in hint or "經濟" in hint or "财经" in hint or "財經" in hint:
+        tokens.append("economy")
+    if "科技" in hint or "AI" in hint.upper() or "人工智能" in hint:
+        tokens.append("technology")
+    if "战争" in hint or "戰爭" in hint:
+        tokens.append("war")
+    if "国际" in hint or "國際" in hint:
+        tokens.append("international")
+
+    return " ".join(tokens).strip()
+
+
 def pick_best_news(items: list[NewsItem], prompt_hint: str) -> NewsItem:
     if not items:
         raise ValueError("no news candidates")
@@ -271,13 +312,14 @@ def _newsapi_fetch_articles(
     query: str,
     from_iso: Optional[str] = None,
     to_iso: Optional[str] = None,
+    sort_by: str = "publishedAt",
     page_size: int,
     timeout_s: float,
 ) -> list[NewsItem]:
     page_size = max(1, min(int(page_size), 100))
     params = {
         "q": query,
-        "sortBy": "publishedAt",
+        "sortBy": sort_by,
         "pageSize": str(page_size),
         "apiKey": api_key,
     }
@@ -338,6 +380,10 @@ def fetch_daily_news_candidates(
     timeout_s = float(os.getenv("NEWS_TIMEOUT_S") or (timeout_s or DEFAULT_TIMEOUT_S))
 
     startdatetime, enddatetime = _today_range_utc(tz_name)
+    start_dt = datetime.strptime(startdatetime, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    end_dt = datetime.strptime(enddatetime, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    from_iso = start_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+    to_iso = end_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
 
     provider = provider_env
     if not provider:
@@ -355,35 +401,52 @@ def fetch_daily_news_candidates(
 
     default_query = (os.getenv("NEWS_QUERY_DEFAULT") or DEFAULT_QUERY).strip()
     hint_query = (prompt_hint or "").strip()
-    queries = [q for q in (hint_query, default_query) if q]
+    hint_en = _maybe_translate_hint_to_en(hint_query) if hint_query else ""
+    queries = [q for q in (hint_query, hint_en, default_query) if q]
 
     last_err: Optional[str] = None
     chosen_query = default_query
     candidates: list[NewsItem] = []
+    used_time_range = False
     for q in queries:
         chosen_query = q
         try:
             if provider == "newsapi":
                 api_key, base_url = _load_newsapi_config()
-                start_dt = datetime.strptime(startdatetime, "%Y%m%d%H%M%S").replace(
-                    tzinfo=timezone.utc
-                )
-                end_dt = datetime.strptime(enddatetime, "%Y%m%d%H%M%S").replace(
-                    tzinfo=timezone.utc
-                )
+                sort_by = "relevancy" if q in (hint_query, hint_en) and q else "publishedAt"
                 raw = _newsapi_fetch_articles(
                     api_key=api_key,
                     base_url=base_url,
                     query=q,
+                    from_iso=from_iso,
+                    to_iso=to_iso,
+                    sort_by=sort_by,
                     page_size=max_records,
                     timeout_s=timeout_s,
                 )
+                if not raw:
+                    # If today's time window yields no results (common in early hours),
+                    # fall back to an unbounded search and filter locally.
+                    raw = _newsapi_fetch_articles(
+                        api_key=api_key,
+                        base_url=base_url,
+                        query=q,
+                        from_iso=None,
+                        to_iso=None,
+                        sort_by=sort_by,
+                        page_size=max_records,
+                        timeout_s=timeout_s,
+                    )
                 in_today = []
                 for item in raw:
                     seen = _parse_seendate_utc(item.seendate)
                     if seen and start_dt <= seen <= end_dt:
                         in_today.append(item)
                 candidates = in_today or raw
+                used_time_range = bool(in_today)
+                # If user provided a hint and nothing matches it, try the next query variant.
+                if hint_query and q != default_query and _best_relevance(candidates, q) <= 0.0:
+                    candidates = []
             else:
                 candidates = _gdelt_fetch_articles(
                     query=q,
@@ -407,8 +470,10 @@ def fetch_daily_news_candidates(
         "provider": provider,
         "tz": tz_name,
         "query": chosen_query,
+        "query_variants": queries,
         "startdatetime": startdatetime,
         "enddatetime": enddatetime,
+        "used_today_range": used_time_range,
         "candidates": [asdict(c) for c in candidates[:10]],
     }
     return candidates, meta
@@ -434,6 +499,7 @@ def fetch_and_pick_daily_news(
         max_records=max_records,
         timeout_s=timeout_s,
     )
-    picked = pick_best_news(candidates, prompt_hint)
+    score_hint = (base_meta.get("query") or "").strip()
+    picked = pick_best_news(candidates, score_hint if score_hint else prompt_hint)
     meta = {**base_meta, "picked": asdict(picked)}
     return picked, meta
