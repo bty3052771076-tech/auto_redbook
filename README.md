@@ -115,6 +115,64 @@ python -m apps.cli retry <post_id>
 - `auto`：一键完成 `create -> approve -> run`
 - `retry <post_id>`：对失败的 run 进行重试
 
+## 功能示例
+### 1) 普通图文（有图）
+```powershell
+python -m apps.cli auto --title "冬日穿搭" --prompt "通勤简约风，给我3套搭配思路" --assets-glob "assets/pics/*" --login-hold 60
+```
+
+### 2) 普通图文（无图 → 自动配图）
+前提：已配置 `PEXELS_API_KEY`（或本机 `docs/pexels_api-key.md`）。
+```powershell
+$env:PEXELS_API_KEY="YOUR_PEXELS_API_KEY"
+python -m apps.cli auto --title "上海周末咖啡馆推荐" --prompt "安静、适合学习办公" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
+```
+关闭自动配图（此时必须手动提供至少 1 张图片，否则校验失败）：
+```powershell
+$env:AUTO_IMAGE="0"
+python -m apps.cli auto --title "标题" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
+```
+
+### 3) 每日新闻（有提示词 → 选 1 条新闻）
+```powershell
+python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
+```
+可选：强制使用指定新闻源（默认自动；有 `NEWS_API_KEY` 时优先 `newsapi`）：
+```powershell
+$env:NEWS_PROVIDER="gdelt"   # 或 newsapi
+python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
+```
+
+### 4) 每日新闻（无提示词 → 生成 3 条草稿）
+```powershell
+python -m apps.cli auto --title "每日新闻" --assets-glob "assets/__no_such_dir__/*" --login-hold 60
+```
+
+### 5) 手动分步（更可控，便于排查）
+```powershell
+# 1) 生成内容并落盘（输出 post_id）
+python -m apps.cli create --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*"
+
+# 2) 查看列表/详情
+python -m apps.cli list
+python -m apps.cli show <post_id>
+
+# 3) 校验/审批/保存草稿
+python -m apps.cli validate <post_id>
+python -m apps.cli approve <post_id>
+python -m apps.cli run <post_id> --login-hold 600
+```
+
+### 6) 只打开发布页（保持登录/抓证据，不上传不保存）
+```powershell
+python -m apps.cli run <post_id> --login-hold 600 --dry-run --force
+```
+
+### 7) 在浏览器中查看草稿箱（确保 profile 一致）
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default"
+```
+
 ## auto 参数说明
 - `--title`：标题（必填）
 - `--prompt`：提示词（可选）
