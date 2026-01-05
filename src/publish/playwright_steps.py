@@ -415,14 +415,20 @@ def _click_draft(page) -> tuple[bool, str]:
     return False, "draft button not found"
 
 
-def _click_first(locator, *, force: bool = False) -> bool:
+def _click_first(locator, *, force: bool = False, timeout_ms: int | None = None) -> bool:
     if locator is None or locator.count() == 0:
         return False
     target = _first_visible(locator)
     if target is None:
         return False
-    target.click(force=force)
-    return True
+    try:
+        if timeout_ms is None:
+            target.click(force=force)
+        else:
+            target.click(force=force, timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
 
 
 def _open_draft_box(page) -> bool:
@@ -558,6 +564,23 @@ def _draft_item_has_cover(page, title: str) -> bool:
                 return bgImage && bgImage !== 'none' && bgImage.includes('http');
               };
               return candidates.some(hasCover);
+            }
+            """,
+            snippet,
+        )
+    )
+
+
+def _draft_item_exists(page, title: str) -> bool:
+    snippet = (title or "").strip()[:6]
+    return bool(
+        page.evaluate(
+            """
+            (snippet) => {
+              const items = Array.from(document.querySelectorAll('.draft-item'));
+              if (!items.length) return false;
+              if (!snippet) return true;
+              return items.some(item => (item.textContent || '').includes(snippet));
             }
             """,
             snippet,
@@ -796,10 +819,10 @@ def run_save_draft_sync(
                 _step("confirm_leave", "in_progress", "")
                 leave_clicked = False
                 for text in ("\u6682\u5b58\u79bb\u5f00", "\u786e\u5b9a", "\u7ee7\u7eed\u79bb\u5f00"):
-                    if _click_first(page.get_by_role("button", name=text)):
+                    if _click_first(page.get_by_role("button", name=text), timeout_ms=2000):
                         leave_clicked = True
                         break
-                    if _click_first(page.locator(f"button:has-text('{text}')")):
+                    if _click_first(page.locator(f"button:has-text('{text}')"), timeout_ms=2000):
                         leave_clicked = True
                         break
                 steps[-1].detail = f"clicked={leave_clicked}"
@@ -821,7 +844,7 @@ def run_save_draft_sync(
                 except PlaywrightTimeoutError:
                     pass
                 after_count = before_count
-                for _ in range(10):
+                for _ in range(30):
                     after_count = _extract_draft_count(page)
                     if (
                         before_count is not None
@@ -831,8 +854,21 @@ def run_save_draft_sync(
                         ok = True
                         break
                     time.sleep(1)
+                fallback_opened = False
+                fallback_exists = False
+                if not ok:
+                    try:
+                        fallback_opened = _open_draft_box(page)
+                        if fallback_opened:
+                            _open_image_draft_tab(page)
+                            page.locator(DRAFT_ITEM_SELECTOR).first.wait_for(timeout=30000)
+                            fallback_exists = _draft_item_exists(page, post.title)
+                            ok = fallback_exists
+                    except Exception:
+                        fallback_exists = False
                 steps[-1].detail = (
-                    f"toast={toast or 'none'} before={before_count} after={after_count}"
+                    f"toast={toast or 'none'} before={before_count} after={after_count} "
+                    f"fallback_opened={fallback_opened} fallback_exists={fallback_exists}"
                 )
                 if not ok:
                     raise RuntimeError("draft save verification failed")

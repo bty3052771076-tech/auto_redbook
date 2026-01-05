@@ -13,10 +13,14 @@ class LLMConfig:
     base_url: Optional[str] = None
 
 
+DEFAULT_LLM_BASE_URL = "https://api.ppinfra.com/openai"
+
+
 def _parse_llm_key_file(path: Path) -> dict[str, str]:
     """
     Parse docs/llm_api-key file with lines like:
     base_url="https://..."
+    model="deepseek/deepseek-v3-0324"
     api_key="sk-..."
     """
     data: dict[str, str] = {}
@@ -41,13 +45,24 @@ def load_llm_config(
 ) -> LLMConfig:
     env_model = os.getenv("LLM_MODEL")
     env_key = os.getenv("LLM_API_KEY")
-    env_base = os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    env_base_llm = os.getenv("LLM_BASE_URL")
+    env_base_openai = os.getenv("OPENAI_BASE_URL")
+    if (
+        env_base_llm
+        and env_base_openai
+        and env_base_llm.strip() != env_base_openai.strip()
+    ):
+        raise RuntimeError(
+            "Conflicting base URLs: LLM_BASE_URL != OPENAI_BASE_URL. "
+            "Set only one of them, or set them to the same value."
+        )
+    env_base = env_base_llm or env_base_openai
 
     file_cfg = _parse_llm_key_file(Path(llm_file))
 
-    model = env_model or file_cfg.get("model") or "deepseek/deepseek-v3.2"
+    model = env_model or file_cfg.get("model") or "deepseek/deepseek-v3-0324"
     api_key = env_key or file_cfg.get("api_key")
-    base_url = env_base or file_cfg.get("base_url")
+    base_url = env_base or file_cfg.get("base_url") or DEFAULT_LLM_BASE_URL
 
     if not api_key:
         raise RuntimeError(
