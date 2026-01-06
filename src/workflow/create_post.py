@@ -140,6 +140,40 @@ def _daily_news_offline_body(picked, prompt_norm: str) -> str:
     )
 
 
+def _fake_news_prompt(prompt_norm: str) -> str:
+    """
+    Prompt for humorous, clearly fictional fake news.
+    """
+    topic = prompt_norm or "日常离谱小事"
+    return (
+        "你正在为小红书图文笔记写《每日假新闻》栏目。\n"
+        "请根据给定主题编写一条**明显虚构、幽默夸张**的新闻，语气轻松有趣。\n"
+        "必须让读者一眼看出是娱乐内容，避免与现实新闻混淆。\n"
+        "不要引用真实媒体/来源/链接，不要提供可核验的具体事实或真实数据。\n"
+        "避免对真实人物/机构做恶意指控或诽谤，内容保持善意搞笑。\n"
+        "正文只输出可直接发布的文章，不要复述提示词或规则。\n\n"
+        f"主题提示（可自由发挥但要贴合）：{topic}\n\n"
+        "正文要求：\n"
+        "1) 只输出一段完整正文，不要列点或小标题；\n"
+        "2) 字数约 200-400 字；\n"
+        "3) 末尾必须加一句：本文纯属虚构，仅供娱乐。\n"
+        "4) topics 输出 3-8 个话题词，包含“每日假新闻”。\n"
+    )
+
+
+def _fake_news_offline_body(prompt_norm: str) -> str:
+    topic = prompt_norm or "离谱日常"
+    return (
+        f"【假新闻播报】今日最离谱的主角是「{topic}」。\n"
+        "据不可靠但十分认真（的想象）消息称，相关事件在短短几小时内引发了全民围观，"
+        "围观群众纷纷表示：这是我今天最开心的笑点。更夸张的是，现场还出现了神秘“反转”，"
+        "让事情从“不可思议”直接升级为“笑到肚子疼”。\n\n"
+        "专家（其实是路过的瓜友）点评：这类剧情虽然离谱，但快乐是真的。"
+        "如果明天还能看到同款离谱升级，请记得第一时间来围观。\n"
+        "本文纯属虚构，仅供娱乐。"
+    )
+
+
 def create_post_with_draft(
     *,
     title_hint: str,
@@ -188,6 +222,32 @@ def create_post_with_draft(
                 prompt_hint=f"{prompt_hint}\n(news_fetch_failed: {exc})",
                 asset_paths=asset_paths,
             )
+    elif title_norm == "每日假新闻":
+        prompt_norm = (prompt_hint or "").strip()
+        fake_prompt = _fake_news_prompt(prompt_norm)
+        draft = generate_draft(
+            cfg,
+            title_hint="每日假新闻",
+            prompt_hint=fake_prompt,
+            asset_paths=asset_paths,
+        )
+        if draft.get("_fallback_error"):
+            draft["title"] = "每日假新闻"
+            draft["body"] = _fake_news_offline_body(prompt_norm)
+        body_text = (draft.get("body") or "").strip()
+        if "本文纯属虚构" not in body_text:
+            joiner = "\n" if body_text else ""
+            draft["body"] = f"{body_text}{joiner}本文纯属虚构，仅供娱乐。"
+        topics = draft.get("topics", [])
+        if "每日假新闻" not in topics:
+            topics = ["每日假新闻"] + [t for t in topics if t and t != "每日假新闻"]
+        draft["topics"] = topics
+        platform_meta["fake_news"] = {
+            "mode": "daily_fake_news",
+            "prompt_hint": prompt_norm,
+            "is_fiction": True,
+            "tone": "humor",
+        }
     else:
         draft = generate_draft(
             cfg,

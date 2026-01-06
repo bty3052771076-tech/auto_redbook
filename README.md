@@ -5,6 +5,7 @@
 ## 功能一览
 - 普通图文：`标题 + 提示词（可选） + 图片（可选）` → 生成草稿并保存到草稿箱
 - 特殊标题「每日新闻」：自动抓取新闻 → 生成草稿并保存
+- 特殊标题「每日假新闻」：LLM 生成幽默虚构新闻 → 生成草稿并保存
 - 自动配图：当未提供图片时，使用图片 API 搜索并下载 1 张相关图片用于上传
 - 落盘与可追溯：`data/posts/<post_id>/` 保存 post / revision / execution / evidence
 
@@ -146,6 +147,12 @@ $env:IMAGE_PROVIDER="pexels"
 .\.venv\Scripts\python -m apps.cli auto --title "上海周末咖啡馆推荐" --prompt "安静、适合学习办公" --assets-glob "assets/empty/*" --login-hold 600
 ```
 
+### 4) 标题为“每日假新闻” → LLM 生成幽默虚构新闻 → 保存草稿
+```powershell
+$env:LLM_API_KEY="YOUR_LLM_API_KEY"
+.\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递、外卖延迟" --assets-glob "assets/pics/*" --login-hold 600
+```
+
 ## auto 参数说明
 - `--title`：标题（必填）
 - `--prompt`：提示词（可选）
@@ -169,6 +176,10 @@ $env:IMAGE_PROVIDER="pexels"
 - `NEWS_PROVIDER`：`newsapi` / `gdelt`（默认自动；有 `NEWS_API_KEY` 时优先 `newsapi`）
 - `NEWS_TZ`：默认 `Asia/Shanghai`
 - `NEWS_QUERY_DEFAULT`：提示词无结果时的回退 query（默认 `china`）
+
+## 每日假新闻（特殊标题）
+- 当 `--title "每日假新闻"`：使用 LLM 生成一条幽默、明显虚构的娱乐新闻，并保存草稿。
+- 建议提供 `--prompt` 作为主题提示；正文会强制包含“本文纯属虚构，仅供娱乐。”。
 
 ## 自动配图（无图片时）
 - 当 `--assets-glob` 未命中任何图片：会自动从 Pexels 搜索并下载 1 张图片到 `data/posts/<post_id>/assets/`，然后继续上传并保存草稿。

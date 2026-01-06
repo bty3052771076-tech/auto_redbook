@@ -301,6 +301,23 @@
 **Notes**
 - No tests run (small query change).
 
+### 2026-01-06 10:25
+**Task:** Add fake news tests, update README example, and prepare release.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added fake-news prompt branch and disclaimer fallback. | None. |
+| `tests/test_fake_news.py` | DONE | Added fake-news unit tests (topics, disclaimer, metadata). | None. |
+| `README.md` | DONE | Added “每日假新闻” feature notes and example command. | None. |
+| `docs/假新闻任务书.md` | DONE | Marked tests complete and logged recent runs. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | None. |
+
+**Notes**
+- Tests/Lint: `pytest tests/test_fake_news.py` (2 passed).
+- Risks/Assumptions: None.
+- Next steps: Push to `main` and create/push `backup_2026-1-6-2`.
+
 ### 2026-01-05 20:35
 **Task:** Re-run daily news auto and inspect image outputs.
 **Git:** `main`
@@ -328,6 +345,83 @@
 - Command: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` (300s timeout) created 3 posts: `6ed60c5a...`, `f554b93d...`, `f66e70c7...`.
 - Draft save flow succeeded for `6ed60c5a...` per CLI log; no Python processes left after run.
 - `image_query_original` no longer includes “每日新闻”, but `image_url` is empty in all 3 post.json files.
+
+### 2026-01-06 09:30
+**Task:** Draft fake news workflow task doc.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/假新闻任务书.md` | DONE | Added requirements, flow, acceptance criteria, and task list for “每日假新闻”. | Await user confirmation before coding. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- No code changes requested yet; documentation only.
+
+### 2026-01-06 10:05
+**Task:** Implement fake news workflow for title "每日假新闻".
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added fake-news prompt, offline fallback, and branch handling with `platform.fake_news`. | Add tests for trigger/prompt/topics if needed. |
+| `docs/假新闻任务书.md` | DONE | Marked completed items and updated progress heading. | Consider README updates after review. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- No tests run.
+
+### 2026-01-06 10:20
+**Task:** Test fake news flow and enforce disclaimer.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Ensure body includes “本文纯属虚构，仅供娱乐。” if missing. | Re-run auto/create to confirm disclaimer appears. |
+| `docs/假新闻任务书.md` | DONE | Logged test run and added disclaimer fallback item. | Add README example later. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Ran: `apps.cli auto --title "每日假新闻" --prompt "吕布和董卓是一对苦命鸳鸯" --assets-glob "assets/pics/*"`.
+- Result: saved_draft, but body lacked disclaimer; added fallback enforcement.
+
+### 2026-01-06 10:40
+**Task:** Re-run fake news auto after disclaimer enforcement.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/假新闻任务书.md` | DONE | Logged regression test with disclaimer present. | Add README example later. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Ran: `apps.cli auto --title "每日假新闻" --prompt "吕布和董卓是一对苦命鸳鸯" --assets-glob "assets/pics/*"`.
+- Result: saved_draft; body tail includes “本文纯属虚构，仅供娱乐。”.
+
+### 2026-01-06 11:10
+**Task:** Add unit tests for fake news workflow.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `tests/test_fake_news.py` | DONE | Added tests for fake-news prompt branch, metadata, and disclaimer enforcement. | None. |
+| `docs/假新闻任务书.md` | DONE | Marked unit test task as complete. | Update README example when ready. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: `pytest tests/test_fake_news.py` (2 passed).
+
+### 2026-01-06 11:35
+**Task:** Update README with fake news examples and re-run unit tests.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `README.md` | DONE | Added “每日假新闻” feature notes and example command. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: `pytest tests/test_fake_news.py` (2 passed).
 
 ### 2026-01-05 14:45
 **Task:** Re-run daily news auto after filtering topic "每日新闻"; inspect image queries.
