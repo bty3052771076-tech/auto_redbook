@@ -161,7 +161,7 @@ def generate_draft(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
         temperature=0.4,
-        max_tokens=800,
+        max_tokens=1200,
     )
 
     prompt = ChatPromptTemplate.from_messages(
@@ -171,9 +171,14 @@ def generate_draft(
                 (
                     "You are a Xiaohongshu image-post assistant. Write in Chinese. "
                     "Generate a short title and body. Title <= 20 chars. Body <= 1000 chars. "
+                    "Body must be at least 200 Chinese characters (count punctuation). "
+                    "If the body is shorter, expand it with more explanation or commentary. "
                     "If the initial title is long, rewrite it into <= 20 chars (do NOT just truncate with '...'). "
                     "Body may include hashtags (e.g. #topic) but do not spam. "
                     "Only output the final publishable article body. Do NOT include any prompt text, requirements, metadata, or links. "
+                    "If the prompt includes news details (e.g. title/source/time/url or mentions 每日新闻), "
+                    "do NOT fabricate facts; only use the provided news information. "
+                    "When information is limited, stay conservative and avoid adding specifics. "
                     "Return strict JSON only: no Markdown, no code fences, no extra text. "
                     "JSON keys: title, body, topics (array of strings). "
                     "The body must be plain text, not JSON or a list."

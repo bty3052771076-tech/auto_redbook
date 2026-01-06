@@ -61,21 +61,66 @@ def _shorten_daily_news_title(news_title: str, *, max_len: int = 20) -> str:
     return f"{prefix}{title[:room]}".rstrip("｜").rstrip()
 
 
+def _clip_text(value: str | None, *, limit: int = 400) -> str:
+    text = (value or "").strip()
+    if not text:
+        return "无"
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…"
+
+
+def _preferred_image_title(post: Post, fallback: str) -> str:
+    news_meta = (post.platform or {}).get("news") or {}
+    picked = news_meta.get("picked")
+    if isinstance(picked, dict):
+        picked_title = (picked.get("title") or "").strip()
+        if picked_title:
+            return picked_title
+    return fallback
+
+
+def _preferred_image_hint(post: Post, fallback: str) -> str:
+    news_meta = (post.platform or {}).get("news") or {}
+    picked = news_meta.get("picked")
+    if isinstance(picked, dict):
+        picked_title = (picked.get("title") or "").strip()
+        if picked_title:
+            return picked_title
+        picked_desc = (picked.get("description") or "").strip()
+        if picked_desc:
+            return picked_desc
+    return fallback
+
+
 def _daily_news_prompt(picked, prompt_norm: str) -> str:
     """
     Prompt for LLM to write publishable body ONLY (no metadata/requirements echoed).
     """
     return (
-        "你正在为小红书图文笔记写「每日新闻」栏目。\n"
-        "请根据下面的新闻信息写一篇可直接发布的正文（通俗中文）。\n"
-        "注意：正文里不要包含“来源/时间/链接/提示词/要求”等元信息，也不要复述下面的提示文本。\n\n"
-        f"新闻标题：{picked.title}\n"
-        f"用户关注点（可选）：{prompt_norm or '无'}\n\n"
-        "写作要求：\n"
-        "- 1-2 句概括新闻主题（不要杜撰未提供的具体细节/数字）\n"
-        "- 2-3 条你的解读/影响/建议（可结合用户关注点）\n"
-        "- 结尾给一个互动问题，引导评论\n"
-        "- topics 输出 3-8 个话题词，包含「每日新闻」\n"
+        "你正在为小红书图文笔记写《每日新闻》栏目。\n"
+        "请依据下面提供的新闻信息写一篇可直接发布的正文（通俗中文）。\n"
+        "注意：正文里不要包含“来源/时间/链接/提示词/要求”等元信息，也不要复述下面的提示文本。\n"
+        "只允许使用下列已提供的新闻信息，不得新增事实或编造细节；信息不足时保持保守表述。\n\n"
+        "可用新闻信息（仅限以下字段，链接仅供参考不要输出）：\n"
+        f"- 标题：{picked.title}\n"
+        f"- 来源名称：{picked.source or '未知'}\n"
+        f"- 来源域名：{picked.domain or '未知'}\n"
+        f"- 发布时间：{picked.seendate or '未知'}\n"
+        f"- 摘要：{_clip_text(picked.description, limit=300)}\n"
+        f"- 正文片段：{_clip_text(picked.content, limit=500)}\n"
+        f"- 链接：{picked.url}\n"
+        f"- 用户关注点（可选）：{prompt_norm or '无'}\n\n"
+        "输出格式（必须逐行保留标题，不得更名或省略）：\n"
+        "新闻内容：\n"
+        "<不少于200字的完整段落>\n\n"
+        "我的点评：\n"
+        "<不少于100字的完整段落，末尾附带1个互动问题>\n\n"
+        "正文结构与字数要求：\n"
+        "1) 新闻内容（>=200字）：基于上面的信息，说明发生了什么、为何值得关注。\n"
+        "2) 我的点评（>=100字）：给出影响解读/建议/风险提示，可结合用户关注点，但不得新增事实。\n"
+        "3) 总正文 >= 200 字；不得输出列表或额外小标题。\n"
+        "4) topics 输出 3-8 个话题词，包含“每日新闻”。\n"
     )
 
 
@@ -167,11 +212,12 @@ def create_post_with_draft(
 
     if not assets_paths and auto_image_enabled:
         dest_dir = post_dir(post.id) / "assets"
+        image_title = _preferred_image_title(post, post.title)
         image_path, image_meta = fetch_and_download_related_image(
-            title=post.title,
+            title=image_title,
             body=post.body,
             topics=post.topics,
-            prompt_hint=prompt_hint,
+            prompt_hint=_preferred_image_hint(post, prompt_hint),
             dest_dir=dest_dir,
         )
         post.platform.setdefault("image", image_meta)
@@ -246,11 +292,12 @@ def create_daily_news_posts(
 
         if not assets_paths and auto_image_enabled:
             dest_dir = post_dir(post.id) / "assets"
+            image_title = picked.title or post.title
             image_path, image_meta = fetch_and_download_related_image(
-                title=post.title,
+                title=image_title,
                 body=post.body,
                 topics=post.topics,
-                prompt_hint=prompt_norm,
+                prompt_hint=picked.title or picked.description or prompt_norm,
                 dest_dir=dest_dir,
             )
             post.platform.setdefault("image", image_meta)

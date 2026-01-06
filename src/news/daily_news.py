@@ -28,6 +28,9 @@ _CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
 class NewsItem:
     title: str
     url: str
+    source: Optional[str] = None
+    description: Optional[str] = None
+    content: Optional[str] = None
     domain: Optional[str] = None
     seendate: Optional[str] = None
     language: Optional[str] = None
@@ -258,6 +261,9 @@ def _gdelt_fetch_articles(
             NewsItem(
                 title=title,
                 url=url_item,
+                source=None,
+                description=None,
+                content=None,
                 domain=(a.get("domain") or "").strip() or None,
                 seendate=(a.get("seendate") or "").strip() or None,
                 language=(a.get("language") or "").strip() or None,
@@ -348,10 +354,19 @@ def _newsapi_fetch_articles(
         if not title or not url_item:
             continue
         domain = urllib.parse.urlparse(url_item).netloc or None
+        source = None
+        source_raw = a.get("source")
+        if isinstance(source_raw, dict):
+            source = (source_raw.get("name") or "").strip() or None
+        description = (a.get("description") or "").strip() or None
+        content = (a.get("content") or "").strip() or None
         items.append(
             NewsItem(
                 title=title,
                 url=url_item,
+                source=source,
+                description=description,
+                content=content,
                 domain=domain,
                 seendate=(a.get("publishedAt") or "").strip() or None,
                 socialimage=(a.get("urlToImage") or "").strip() or None,

@@ -137,6 +137,8 @@ def build_image_query(
     topics_norm: list[str] = []
     for t in topics or []:
         t = _compact_spaces(t).lstrip("#")
+        if t == "每日新闻":
+            continue
         if not t or t in topics_norm:
             continue
         topics_norm.append(t)

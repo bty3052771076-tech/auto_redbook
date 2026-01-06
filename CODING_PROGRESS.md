@@ -108,3 +108,262 @@
 - LLM smoke test: `apps.cli create` now succeeds and generates a normal title/body (no “生成失败”).
 - End-to-end: `apps.cli run 785b978f5e5643e99257802f8a147606 --login-hold 0 --wait-timeout 600` → `saved_draft` (evidence under `data/posts/785b978f5e5643e99257802f8a147606/evidence/ca390eb65565442585a76c903c0b18b7/`).
 - Tests: `pytest -q` → 18 passed.
+
+### 2026-01-05 10:20
+**Task:** Draft taskbook for expanding body length requirements (wait for review before coding).
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/正文内容扩充任务书.md` | DONE | Added requirements/constraints/plan for: body >=300; daily news news>=200 + review>=100; no fabrication; prompt + token_max changes (optional fallback). | Await your review/approval; then implement changes in `src/llm/generate.py` and `src/workflow/create_post.py` (and possibly `src/news/daily_news.py`). |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+### 2026-01-05 10:32
+**Task:** Implement plan A: enforce body >= 300 and raise max_tokens; keep news non-fabrication guidance.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/llm/generate.py` | DONE | Updated system prompt to require body >= 300 chars and forbid news fabrication; raised `max_tokens` to 1200. | Proceed with plan B and NewsAPI field expansion after your approval. |
+| `docs/正文内容扩充任务书.md` | DONE | Updated task progress table to reflect plan A completion. | Keep updating as plan B/C/D progress. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run (prompt/token change only).
+
+### 2026-01-05 10:45
+**Task:** Implement plan B: daily news prompt enforces structure and length.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Updated `_daily_news_prompt()` to require “新闻内容>=200字 + 点评>=100字 + 总正文>=300字” and forbid fabrication; added explicit allowed fields. | Next: expand NewsAPI fields and pass description/content to LLM. |
+| `docs/正文内容扩充任务书.md` | DONE | Marked plan B as completed in progress table. | Continue tracking plan B/C/D items. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run (prompt-only change).
+
+### 2026-01-05 11:05
+**Task:** Expand NewsAPI fields and pass to daily news prompt.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/news/daily_news.py` | DONE | Added `source/description/content` to `NewsItem`; populated these fields in NewsAPI fetch. | Consider enriching GDELT if needed (optional). |
+| `src/workflow/create_post.py` | DONE | Added `_clip_text` and included source/description/content in `_daily_news_prompt()` allowed fields. | Add length validation/second-pass expansion if required. |
+| `docs/正文内容扩充任务书.md` | DONE | Marked NewsAPI field expansion as completed. | Keep tracking remaining TODO items. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Continue updating after further work. |
+
+**Notes**
+- Tests: Not run (news fields/prompt update only).
+
+### 2026-01-05 11:12
+**Task:** Run tests after daily news prompt/news field updates.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/正文内容扩充任务书.md` | DONE | Marked test status as in-progress (unit tests done, smoke pending). | Run a local smoke test for "每日新闻" when ready. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: `pytest -q` → 18 passed.
+
+### 2026-01-05 11:25
+**Task:** Daily news smoke test for length/structure.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/正文内容扩充任务书.md` | DONE | Updated test status: length OK, structure missing headings. | Tighten prompt to require explicit headings or add post-check/second pass. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Smoke test: `apps.cli create --title "每日新闻" --prompt "美国时政"` produced body_len=306, but no explicit “新闻内容/我的点评” sections.
+
+### 2026-01-05 11:45
+**Task:** Run full auto flow for "每日新闻" and verify draft content rules.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/正文内容扩充任务书.md` | DONE | Marked smoke test as blocked due to unmet length/structure rules. | Implement post-check + rewrite to enforce section headings and min lengths. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Command: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` created 3 posts and saved drafts.
+- Results: body_len = 288, 288, 309; none contained explicit “新闻内容/我的点评” sections.
+- Conclusion: rules not met; needs stronger prompt and/or validation fallback.
+
+### 2026-01-05 12:05
+**Task:** Strengthen daily news prompt with fixed section headings.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Enforced fixed headings “新闻内容/我的点评” and clarified format/length constraints. | Re-run full auto smoke test to verify headings + length. |
+| `docs/正文内容扩充任务书.md` | DONE | Added progress row for prompt strengthening; set test status to in-progress. | Update after smoke test results. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run (prompt-only change).
+
+### 2026-01-05 12:18
+**Task:** Re-run full auto flow after prompt strengthening and verify section lengths.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/正文内容扩充任务书.md` | DONE | Updated test status: headings present and body>=300, but news section <200 in all 3 drafts. | Add stronger constraint or post-check/second-pass rewrite for news section length. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Command: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` created 3 drafts and saved successfully.
+- Section lengths (news/review): 163/142, 161/145, 143/145; total body lengths 317, 318, 300.
+
+### 2026-01-05 12:40
+**Task:** Re-run auto flow; accept completeness over strict 200-char news section; report results.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/正文内容扩充任务书.md` | DONE | Relaxed news section length requirement when content is complete; updated test status summary. | Await your manual review of saved drafts for completeness. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Command: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` created 3 posts.
+- Results: 1 failed (`a0333d...` body not filled); 2 saved (`6d8df1...`, `9e3ff0...`).
+- Saved drafts include headings; news section lengths 152 and 196 chars (shorter than 200 but may be complete).
+
+### 2026-01-05 13:05
+**Task:** Re-run auto flow per request; validate length/structure.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/正文内容扩充任务书.md` | DONE | Updated test status: latest auto run produced 3 drafts under 300 chars; 2 missing section headings. | Decide whether to relax global 300-char rule or add post-check/second pass. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Command: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` created 3 drafts and saved successfully.
+- Results: body_len 277/261/258; section headings missing on 2 of 3; one draft had headings but still <300.
+
+### 2026-01-05 13:25
+**Task:** Relax global body minimum to >=200 and re-test.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/llm/generate.py` | DONE | Changed global minimum body length in system prompt from 300 to 200. | Re-run full auto smoke test to validate new threshold. |
+| `docs/正文内容扩充任务书.md` | DONE | Updated requirements to global >=200 and set test status to in-progress. | Update after smoke test results. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run yet (awaiting new auto run).
+
+### 2026-01-05 13:45
+**Task:** Re-run auto flow after relaxing global body length to >=200.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Adjusted daily news prompt total length requirement to >=200 to match global rule. | Consider enforcing headings via post-check/second pass. |
+| `docs/正文内容扩充任务书.md` | DONE | Updated test status with latest auto run results. | Await your review of whether missing headings are acceptable. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Command: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` created 3 drafts and saved successfully.
+- Results: body_len 270/432/284 (all >=200). Headings missing in 2 drafts; 1 draft contains only “我的点评” label.
+
+### 2026-01-05 14:05
+**Task:** Investigate daily news image mismatch; update taskbook with findings.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Added verification that image query uses post.title/topics; when title/topic is “每日新闻” it leads to generic news images. | If needed, change query builder to prefer picked news title or filter out “每日新闻”. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Evidence: `post.platform.image.query_original` includes “每日新闻” when title/topics contain it; example `data/posts/a0333d5285354ca8b946a9ff82704130/post.json`.
+
+### 2026-01-05 14:25
+**Task:** Filter topic "每日新闻" from auto image query.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/auto_image.py` | DONE | Skipped topic "每日新闻" when building image query, reducing generic news image bias. | Re-run auto flow to validate image relevance. |
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Updated taskbook checklist and progress note. | Keep tracking image relevance results. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- No tests run (small query change).
+
+### 2026-01-05 20:35
+**Task:** Re-run daily news auto and inspect image outputs.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Logged the latest auto run and that `image_url` is empty. | Investigate why Pexels results are not persisted in `image_url`. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Command: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` timed out in shell but reported 3 posts created: `f821fab5...`, `7fdceaf2...`, `36e0f249...`.
+- `image_query_original` no longer includes “每日新闻”, but `image_url` is empty in all 3 post.json files.
+- Two `apps.cli auto` Python processes still running due to timeout (PIDs 17232, 20848).
+
+### 2026-01-05 20:42
+**Task:** Re-run daily news auto with longer timeout.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Logged another auto run; image_url still empty. | Investigate why Pexels image URL is not persisted. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Command: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` (300s timeout) created 3 posts: `6ed60c5a...`, `f554b93d...`, `f66e70c7...`.
+- Draft save flow succeeded for `6ed60c5a...` per CLI log; no Python processes left after run.
+- `image_query_original` no longer includes “每日新闻”, but `image_url` is empty in all 3 post.json files.
+
+### 2026-01-05 14:45
+**Task:** Re-run daily news auto after filtering topic "每日新闻"; inspect image queries.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Noted auto re-run and that query_original no longer contains "每日新闻". | Evaluate image relevance and consider switching to picked news title for query. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Command: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` created 3 drafts.
+- Image queries: `query_original` no longer includes “每日新闻”; sample IDs `5c8796...`, `5abe1...`, `5e7a5...`.
+
+### 2026-01-05 15:10
+**Task:** Prefer picked news title for auto image queries.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | When auto-image is used, query title now prefers `post.platform.news.picked.title` (or current picked in multi flow). | Re-run auto to validate image relevance. |
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Marked "query aligns to picked news title" as completed. | Keep tracking image relevance outcomes. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- No tests run (small query change).
+
+### 2026-01-05 15:45
+**Task:** Use picked news title/description as image search hint.
+**Git:** `main`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Auto-image now passes picked news title/description as `prompt_hint` to reduce generic results. | Re-run auto to confirm image relevance improves. |
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Marked prompt_hint alignment with picked news as completed. | Keep tracking image relevance after tests. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- No tests run (small query change).
