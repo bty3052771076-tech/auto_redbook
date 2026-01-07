@@ -42,10 +42,52 @@ def test_build_image_query_includes_topics():
     assert "科技" in q
 
 
+def test_build_image_query_skips_news_topics():
+    q = build_image_query(
+        title="委内瑞拉石油危机",
+        body="",
+        topics=["国际新闻", "每日新闻", "能源", "经济"],
+        prompt_hint="",
+    )
+    assert "新闻" not in q
+    assert "能源" in q
+
+
+def test_build_image_query_compresses_long_english_title():
+    q = build_image_query(
+        title="Trump declares US in charge of Venezuela and Maduro goes to court",
+        body="",
+        topics=[],
+        prompt_hint="",
+    )
+    assert "trump" in q.lower()
+    assert "venezuela" in q.lower()
+    assert "court" not in q.lower()
+
+
 def test_pexels_query_hint_maps_us_politics():
     q = _pexels_query_hint("美国时政")
     assert "USA" in q
     assert "politics" in q
+
+
+def test_pexels_query_hint_includes_entities():
+    q = _pexels_query_hint("巴基斯坦 利比亚 军事协议")
+    assert "Pakistan" in q
+    assert "Libya" in q
+    assert "military" in q
+
+
+def test_pexels_query_hint_avoids_news_when_specific():
+    q = _pexels_query_hint("国际新闻 政治")
+    assert "international" in q
+    assert "politics" in q
+    assert "news" not in q
+
+
+def test_pexels_query_hint_uses_news_when_only_news():
+    q = _pexels_query_hint("新闻")
+    assert q == "news"
 
 
 def test_pick_best_image_prefers_alt_match():

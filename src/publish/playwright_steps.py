@@ -4,12 +4,14 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from src.storage.events import save_event
 from src.storage.files import evidence_dir, save_execution
 from src.storage.models import Execution, Post, StepResult
 
@@ -32,7 +34,10 @@ DRAFT_TEXTS = [
     "\u5b58\u4e3a\u8349\u7a3f",
 ]
 PROCESSING_TEXTS = ["\u6b63\u5728\u5904\u7406\u4e2d", "\u5904\u7406\u4e2d", "\u4e0a\u4f20\u4e2d"]
-DRAFT_TAB_TEXTS = ["\u56fe\u6587\u7b14\u8bb0", "\u56fe\u6587"]
+DRAFT_TAB_TEXTS_IMAGE = ["\u56fe\u6587\u7b14\u8bb0", "\u56fe\u6587"]
+DRAFT_TAB_TEXTS_VIDEO = ["\u89c6\u9891\u7b14\u8bb0", "\u89c6\u9891"]
+DRAFT_TAB_TEXTS_ARTICLE = ["\u957f\u6587\u7b14\u8bb0", "\u957f\u6587"]
+DRAFT_TAB_TEXTS = DRAFT_TAB_TEXTS_IMAGE
 COVER_HINT_TEXTS = ["\u83b7\u53d6\u5c01\u9762\u5efa\u8bae", "\u5c01\u9762\u5efa\u8bae", "\u9009\u62e9\u5c01\u9762", "\u8bbe\u7f6e\u5c01\u9762"]
 COVER_CONFIRM_TEXTS = ["\u5b8c\u6210", "\u786e\u5b9a", "\u4fdd\u5b58", "\u4f7f\u7528", "\u786e\u8ba4"]
 COVER_IMAGE_SELECTORS = [
@@ -485,6 +490,127 @@ def _open_image_draft_tab(page) -> bool:
     return False
 
 
+def _open_draft_tab(page, draft_type: str) -> bool:
+    draft_type = (draft_type or "image").strip().lower()
+    if draft_type == "image":
+        return _open_image_draft_tab(page)
+    texts = DRAFT_TAB_TEXTS_IMAGE
+    if draft_type == "video":
+        texts = DRAFT_TAB_TEXTS_VIDEO
+    elif draft_type in ("article", "long"):
+        texts = DRAFT_TAB_TEXTS_ARTICLE
+    for text in texts:
+        loc = page.get_by_text(text, exact=False)
+        if _click_first(loc, force=True):
+            return True
+    return False
+
+
+def _collect_draft_items(page, *, limit: Optional[int] = None) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    locator = page.locator(DRAFT_ITEM_SELECTOR)
+    count = locator.count()
+    if limit is not None:
+        count = min(count, max(0, int(limit)))
+    for i in range(count):
+        item = locator.nth(i)
+        title = ""
+        saved_at = ""
+        try:
+            title = (item.locator(".draft-title-text").first.text_content() or "").strip()
+        except Exception:
+            title = ""
+        try:
+            saved_at = (item.locator(".draft-time").first.text_content() or "").strip()
+        except Exception:
+            saved_at = ""
+        items.append({"title": title, "saved_at": saved_at})
+    return items
+
+
+def _confirm_delete_dialog(page, timeout_s: float = 3.0) -> bool:
+    selectors = [
+        ".el-popconfirm:visible button:has-text('删除')",
+        ".el-popconfirm:visible button:has-text('确定')",
+        ".el-popconfirm:visible button:has-text('确认')",
+        ".el-popover:visible button:has-text('删除')",
+        ".el-popover:visible button:has-text('确定')",
+        ".el-popover:visible button:has-text('确认')",
+        ".el-popper:visible button:has-text('删除')",
+        ".el-popper:visible button:has-text('确定')",
+        ".el-popper:visible button:has-text('确认')",
+        "[role='dialog'] button:has-text('删除')",
+        "[role='dialog'] button:has-text('确定')",
+        "[role='dialog'] button:has-text('确认')",
+        ".el-dialog__wrapper:visible button:has-text('删除')",
+        ".el-dialog__wrapper:visible button:has-text('确定')",
+        ".el-dialog__wrapper:visible button:has-text('确认')",
+        ".d-dialog:visible button:has-text('删除')",
+        ".d-dialog:visible button:has-text('确定')",
+        ".d-dialog:visible button:has-text('确认')",
+        ".modal:visible button:has-text('删除')",
+        ".modal:visible button:has-text('确定')",
+        ".modal:visible button:has-text('确认')",
+        "[aria-modal='true'] button:has-text('删除')",
+        "[aria-modal='true'] button:has-text('确定')",
+        "[aria-modal='true'] button:has-text('确认')",
+        "[role='dialog'] span:has-text('删除')",
+        ".el-popover:visible span:has-text('删除')",
+        ".el-popper:visible span:has-text('删除')",
+        ".modal:visible span:has-text('删除')",
+        "[aria-modal='true'] span:has-text('删除')",
+        ".d-popconfirm .btn-footer-confirm",
+        ".d-popover .btn-footer-confirm",
+        ".draft-delete-popconfirm .btn-footer-confirm",
+        ".d-popconfirm-footer .btn-footer-confirm",
+    ]
+    deadline = time.time() + max(0.0, timeout_s)
+    while time.time() < deadline:
+        for sel in selectors:
+            loc = page.locator(sel)
+            if loc.count() == 0:
+                continue
+            try:
+                loc.first.click(force=True)
+                return True
+            except Exception:
+                continue
+        try:
+            if page.evaluate(
+                """
+                () => {
+                  const containers = Array.from(document.querySelectorAll(
+                    '.el-popconfirm,.el-popover,.el-popper,.d-popconfirm,.d-popover,.draft-delete-popconfirm,[role="dialog"],[aria-modal="true"],.el-dialog__wrapper,.modal,.d-dialog,[class*="dialog"],[class*="modal"],[class*="popper"]'
+                  ));
+                  const scope = containers.find(el => {
+                    const style = window.getComputedStyle(el);
+                    if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  });
+                  if (!scope) return false;
+                  const btns = Array.from(scope.querySelectorAll('button, .btn, [role="button"], a, .btn-footer-confirm'));
+                  const target = btns.find(el => {
+                    if (!el.textContent) return false;
+                    const txt = el.textContent;
+                    if (txt.includes('删除') || txt.includes('确定') || txt.includes('确认')) {
+                      return !el.closest('.draft-actions');
+                    }
+                    return false;
+                  });
+                  if (!target) return false;
+                  target.click();
+                  return true;
+                }
+                """
+            ):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
 def _verify_draft_item(page, title: str) -> bool:
     return _draft_item_has_cover(page, title)
 
@@ -594,6 +720,134 @@ def _wait_for_draft_cover(page, title: str, timeout_ms: int = 120000) -> bool:
         if _draft_item_has_cover(page, title):
             return True
         time.sleep(1)
+    return False
+
+
+def _delete_first_draft_item(page) -> tuple[bool, str]:
+    locator = page.locator(DRAFT_ITEM_SELECTOR)
+    if locator.count() == 0:
+        return False, "no draft items"
+    item = locator.first
+    title = ""
+    try:
+        title = (item.locator(".draft-title-text").first.text_content() or "").strip()
+    except Exception:
+        title = ""
+    btn = item.locator(".draft-actions .btn", has_text="删除")
+    if btn.count() == 0:
+        btn = item.locator(".btn", has_text="删除")
+    if btn.count() == 0:
+        return False, "delete button not found"
+    click_error = None
+    clicked = False
+    try:
+        item.scroll_into_view_if_needed()
+        item.hover()
+        page.once("dialog", lambda dialog: dialog.accept())
+        btn.first.scroll_into_view_if_needed()
+        btn.first.click(force=True)
+        clicked = True
+    except Exception as exc:
+        click_error = exc
+
+    if not clicked:
+        try:
+            clicked = bool(
+                page.evaluate(
+                    """
+                    () => {
+                      const items = Array.from(document.querySelectorAll('.draft-item'));
+                      if (!items.length) return false;
+                      const item = items[0];
+                      const btns = Array.from(item.querySelectorAll('.draft-actions .btn, .draft-actions button, .draft-actions a'));
+                      const target = btns.find(btn => btn.textContent && btn.textContent.includes('删除'));
+                      if (!target) return false;
+                      target.click();
+                      return true;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            clicked = False
+        if not clicked:
+            return False, f"click delete failed: {click_error or 'unknown'}"
+
+    confirmed = _confirm_delete_dialog(page, timeout_s=5.0)
+    if not confirmed:
+        try:
+            confirm_clicked = page.evaluate(
+                """
+                () => {
+                  const selectors = [
+                    '[role="dialog"] button',
+                    '[role="dialog"] .btn',
+                    '[role="dialog"] [role="button"]',
+                    '[aria-modal="true"] button',
+                    '[aria-modal="true"] .btn',
+                    '[aria-modal="true"] [role="button"]',
+                    '.el-popover button',
+                    '.el-popover .btn',
+                    '.el-popper button',
+                    '.el-popper .btn',
+                    '.modal button',
+                    '.modal .btn',
+                    '.d-dialog button',
+                    '.d-dialog .btn',
+                    'div[role="dialog"] button',
+                  ];
+                  const btns = selectors.flatMap(sel => Array.from(document.querySelectorAll(sel)));
+                  const target = btns.find(el => {
+                    const txt = (el.textContent || '').trim();
+                    return txt.includes('删除') || txt.includes('确定') || txt.includes('确认');
+                  });
+                  if (!target) return false;
+                  target.click();
+                  return true;
+                }
+                """
+            )
+            if confirm_clicked:
+                confirmed = True
+        except Exception:
+            pass
+    if not confirmed:
+        return False, "delete confirm not found"
+    return True, title or "draft"
+
+
+def _wait_for_draft_list_change(
+    page,
+    *,
+    before_count: int,
+    before_title: str,
+    before_total: Optional[int] = None,
+    timeout_s: int = 10,
+) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            after_count = page.locator(DRAFT_ITEM_SELECTOR).count()
+        except Exception:
+            after_count = before_count
+        if after_count < before_count:
+            return True
+        if before_total is not None:
+            after_total = _extract_draft_count(page)
+            if after_total is not None and after_total < before_total:
+                return True
+        try:
+            first_title = (
+                page.locator(DRAFT_ITEM_SELECTOR)
+                .first.locator(".draft-title-text")
+                .first.text_content()
+                or ""
+            ).strip()
+        except Exception:
+            first_title = ""
+        if first_title and before_title and first_title != before_title:
+            return True
+        time.sleep(0.5)
     return False
 
 
@@ -938,3 +1192,184 @@ def run_save_draft_sync(
         save_execution(exec_rec)
 
     return exec_rec
+
+
+def run_delete_drafts_sync(
+    *,
+    draft_type: str = "image",
+    draft_location: str = "publish",
+    draft_url: str = "",
+    limit: int = 0,
+    dry_run: bool = False,
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+) -> dict:
+    result = {
+        "draft_type": draft_type,
+        "draft_location": draft_location,
+        "draft_url": draft_url or "",
+        "total": 0,
+        "deleted": 0,
+        "items": [],
+        "errors": [],
+    }
+    evidence_dir: Optional[Path] = None
+
+    profile_dir, channel, args = _resolve_profile_config()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with sync_playwright() as p:
+            launch_kwargs = {"headless": False}
+            if channel:
+                launch_kwargs["channel"] = channel
+            if args:
+                launch_kwargs["args"] = args
+            context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
+            context.set_default_timeout(30000)
+            page = context.pages[0] if context.pages else context.new_page()
+            location = (draft_location or "publish").strip().lower()
+            failure_count = 0
+
+            def _ensure_evidence_dir() -> Path:
+                nonlocal evidence_dir
+                if evidence_dir is None:
+                    evidence_dir = _repo_root() / "data" / "events" / f"delete_{uuid.uuid4().hex}"
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                return evidence_dir
+
+            def _capture_delete_failure(label: str) -> None:
+                nonlocal failure_count
+                failure_count += 1
+                ev_dir = _ensure_evidence_dir()
+                tag = f"{label}_{failure_count}"
+                try:
+                    page.screenshot(path=str(ev_dir / f"{tag}.png"), full_page=True)
+                except Exception:
+                    pass
+                try:
+                    (ev_dir / f"{tag}.html").write_text(page.content(), encoding="utf-8")
+                except Exception:
+                    pass
+
+            def _goto_draft_page(dtype: str) -> None:
+                if location == "publish":
+                    if dtype == "image":
+                        page.goto(TARGET_URL, wait_until="domcontentloaded")
+                    elif dtype == "video":
+                        page.goto(
+                            "https://creator.xiaohongshu.com/publish/publish?target=video",
+                            wait_until="domcontentloaded",
+                        )
+                    else:
+                        page.goto(
+                            "https://creator.xiaohongshu.com/publish/publish?target=article",
+                            wait_until="domcontentloaded",
+                        )
+                    return
+                if not draft_url:
+                    raise RuntimeError("draft_url is required when draft_location != publish")
+                page.goto(draft_url, wait_until="domcontentloaded")
+
+            def _collect_for_type(dtype: str) -> list[dict[str, str]]:
+                _goto_draft_page(dtype)
+
+                if login_hold > 0:
+                    time.sleep(login_hold)
+                if location == "publish":
+                    _wait_for_any_text(page, WAIT_TEXTS, wait_timeout_ms)
+                    if not _open_draft_box(page):
+                        raise RuntimeError("draft box not found")
+                    if not _open_draft_tab(page, dtype):
+                        raise RuntimeError(f"draft tab not found for type={dtype}")
+                else:
+                    try:
+                        _wait_for_any_text(page, WAIT_TEXTS, min(wait_timeout_ms, 15000))
+                    except PlaywrightTimeoutError:
+                        pass
+                    opened_box = _open_draft_box(page)
+                    opened_tab = _open_draft_tab(page, dtype)
+                    if not opened_tab and page.locator(DRAFT_ITEM_SELECTOR).count() == 0:
+                        if opened_box:
+                            raise RuntimeError(f"draft tab not found for type={dtype}")
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    if page.locator(DRAFT_ITEM_SELECTOR).count() > 0:
+                        break
+                    time.sleep(1)
+                return _collect_draft_items(page, limit=None)
+
+            if dry_run:
+                total_items = _collect_for_type(draft_type)
+                result["total"] = len(total_items)
+                if limit and limit > 0:
+                    result["items"] = total_items[:limit]
+                else:
+                    result["items"] = total_items
+                return result
+
+            def _delete_for_type(dtype: str) -> None:
+                total_items = _collect_for_type(dtype)
+                result["total"] = len(total_items)
+                if limit and limit > 0:
+                    result["items"] = total_items[:limit]
+                else:
+                    result["items"] = total_items
+
+                target = len(result["items"])
+                deleted_titles: list[str] = []
+                for _ in range(target):
+                    before = page.locator(DRAFT_ITEM_SELECTOR).count()
+                    if before == 0:
+                        break
+                    try:
+                        before_title = (
+                            page.locator(DRAFT_ITEM_SELECTOR)
+                            .first.locator(".draft-title-text")
+                            .first.text_content()
+                            or ""
+                        ).strip()
+                    except Exception:
+                        before_title = ""
+                    before_total = _extract_draft_count(page)
+                    ok, title = _delete_first_draft_item(page)
+                    if not ok:
+                        result["errors"].append(title)
+                        _capture_delete_failure("delete_error")
+                        break
+                    changed = _wait_for_draft_list_change(
+                        page,
+                        before_count=before,
+                        before_title=before_title,
+                        before_total=before_total,
+                        timeout_s=10,
+                    )
+                    if not changed and title:
+                        if not _draft_item_exists(page, title):
+                            changed = True
+                    if not changed:
+                        result["errors"].append(f"delete timeout: {title}")
+                        _capture_delete_failure("delete_timeout")
+                        break
+                    deleted_titles.append(title)
+                result["deleted"] = len(deleted_titles)
+                result["deleted_titles"] = deleted_titles
+
+            _delete_for_type(draft_type)
+            if evidence_dir is not None:
+                result["evidence_dir"] = str(evidence_dir)
+
+            event_path = save_event(
+                {
+                    "type": "delete_drafts",
+                    "draft_type": draft_type,
+                    "dry_run": dry_run,
+                    "profile_dir": str(profile_dir),
+                    "summary": result,
+                }
+            )
+            result["event_path"] = str(event_path)
+            return result
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        return result

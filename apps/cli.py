@@ -6,7 +6,7 @@ from pathlib import Path
 
 import typer
 
-from src.publish.playwright_steps import run_save_draft_sync
+from src.publish.playwright_steps import run_delete_drafts_sync, run_save_draft_sync
 from src.storage.files import list_executions, list_posts, load_post, save_post
 from src.storage.models import Execution, PostStatus, PostType, now_iso
 from src.validation import validate_post
@@ -295,6 +295,94 @@ def auto(
             typer.echo(f"- {s.name}: {s.status}{detail}")
         if exec_rec.error:
             typer.echo(f"error: {exec_rec.error}")
+
+
+@app.command("delete-drafts")
+def delete_drafts(
+    draft_type: str = typer.Option(
+        "image", help="草稿类型：image/video/article", show_default=True
+    ),
+    draft_location: str = typer.Option(
+        "publish", help="草稿位置：publish/url", show_default=True
+    ),
+    draft_url: str = typer.Option(
+        "", help="自定义草稿页面 URL（配合 --draft-location url）"
+    ),
+    all_types: bool = typer.Option(False, "--all", help="删除所有类型草稿"),
+    limit: int = typer.Option(0, help="最多删除 N 条（0 表示不限制）"),
+    dry_run: bool = typer.Option(False, help="只预览将删除的草稿"),
+    yes: bool = typer.Option(False, help="跳过确认"),
+    login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
+    wait_timeout: int = typer.Option(300, help="seconds to wait for publish UI"),
+):
+    """删除草稿箱草稿（默认图文）。"""
+    location = (draft_location or "publish").strip().lower()
+    if location not in ("publish", "url"):
+        typer.echo("draft_location 仅支持 publish 或 url")
+        raise typer.Exit(code=1)
+    if location == "url" and not draft_url:
+        typer.echo("使用 --draft-location url 时必须提供 --draft-url")
+        raise typer.Exit(code=1)
+
+    types = [draft_type]
+    if all_types:
+        types = ["image", "video", "article"]
+
+    def _print_preview(res: dict) -> None:
+        typer.echo(f"type={res.get('draft_type')} total={res.get('total')}")
+        for item in res.get("items", [])[:5]:
+            title = item.get("title") or "(无标题)"
+            saved_at = item.get("saved_at") or ""
+            typer.echo(f"- {title} {saved_at}".rstrip())
+        if res.get("total", 0) > 5:
+            typer.echo("... (仅显示前 5 条)")
+
+    previews: list[dict] = []
+    for t in types:
+        preview = run_delete_drafts_sync(
+            draft_type=t,
+            draft_location=location,
+            draft_url=draft_url,
+            limit=limit,
+            dry_run=True,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout * 1000,
+        )
+        previews.append(preview)
+        _print_preview(preview)
+
+    if dry_run:
+        return
+
+    total = sum(p.get("total", 0) for p in previews)
+    if total == 0:
+        typer.echo("未找到草稿")
+        return
+
+    if not yes:
+        confirm = typer.confirm(f"将删除草稿（最多 {limit or '全部'} 条），确认继续？")
+        if not confirm:
+            typer.echo("已取消")
+            return
+
+    for t in types:
+        res = run_delete_drafts_sync(
+            draft_type=t,
+            draft_location=location,
+            draft_url=draft_url,
+            limit=limit,
+            dry_run=False,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout * 1000,
+        )
+        typer.echo(
+            f"deleted {res.get('deleted', 0)}/{res.get('total', 0)} drafts "
+            f"({res.get('draft_type')})"
+        )
+        if res.get("event_path"):
+            typer.echo(f"event: {res['event_path']}")
+        if res.get("errors"):
+            typer.echo(f"errors: {res['errors']}")
 
 
 @app.command()

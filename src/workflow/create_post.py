@@ -116,11 +116,12 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
         "<不少于200字的完整段落>\n\n"
         "我的点评：\n"
         "<不少于100字的完整段落，末尾附带1个互动问题>\n\n"
-        "正文结构与字数要求：\n"
-        "1) 新闻内容（>=200字）：基于上面的信息，说明发生了什么、为何值得关注。\n"
-        "2) 我的点评（>=100字）：给出影响解读/建议/风险提示，可结合用户关注点，但不得新增事实。\n"
-        "3) 总正文 >= 200 字；不得输出列表或额外小标题。\n"
-        "4) topics 输出 3-8 个话题词，包含“每日新闻”。\n"
+        "硬性要求：\n"
+        "1) 必须包含且仅包含以上两个段落，段落之间空一行。\n"
+        "2) 不得输出列表或额外小标题，不得合并成一段。\n"
+        "3) 新闻内容（>=200字）：基于上面的信息，说明发生了什么、为何值得关注。\n"
+        "4) 我的点评（>=100字）：给出影响解读/建议/风险提示，可结合用户关注点，但不得新增事实。\n"
+        "5) topics 输出 3-8 个话题词，包含“每日新闻”。\n"
     )
 
 
@@ -129,15 +130,34 @@ def _daily_news_offline_body(picked, prompt_norm: str) -> str:
     Offline fallback body: keep it publishable and avoid echoing prompt/requirements.
     """
     focus = prompt_norm.strip()
-    focus_line = f"从「{focus}」角度" if focus else "从大众关心的角度"
+    focus_line = f"从「{focus}」角度" if focus else "从读者关注点"
     return (
-        f"今日要闻：{picked.title}\n\n"
-        f"{focus_line}，这条新闻值得关注的原因是：\n"
-        "1）它释放了一个重要信号，后续可能还会有更多细节披露；\n"
-        "2）对相关人群/行业的影响，需要结合权威信息持续观察；\n"
-        "3）如果你也在关注这个话题，建议留意官方/主流媒体的进一步更新。\n\n"
-        "你觉得这条新闻接下来会怎么发展？"
+        "新闻内容：\n"
+        f"{picked.title}。这条新闻反映出当前议题的最新进展，仍需关注后续权威信息披露。\n\n"
+        "我的点评：\n"
+        f"{focus_line}来看，它可能带来连锁影响，值得持续观察与跟进。"
+        "你认为接下来会如何发展？"
     )
+
+
+def _ensure_daily_news_sections(body: str, prompt_norm: str) -> str:
+    text = (body or "").strip()
+    if not text:
+        return text
+    if "新闻内容：" in text and "我的点评：" in text:
+        return text
+
+    cleaned = text.replace("新闻内容：", "").replace("我的点评：", "").strip()
+    paragraphs = [p.strip() for p in cleaned.splitlines() if p.strip()]
+    if len(paragraphs) >= 2:
+        news = paragraphs[0]
+        comment = " ".join(paragraphs[1:])
+    else:
+        news = paragraphs[0] if paragraphs else cleaned
+        focus_line = f"从「{prompt_norm}」角度" if prompt_norm else "从读者关注点"
+        comment = f"{focus_line}来看，这条新闻提示我们需要持续关注后续进展与影响。你怎么看？"
+
+    return f"新闻内容：\n{news}\n\n我的点评：\n{comment}"
 
 
 def _fake_news_prompt(prompt_norm: str) -> str:
@@ -205,6 +225,9 @@ def create_post_with_draft(
                 title_hint=seed_title,
                 prompt_hint=news_prompt,
                 asset_paths=asset_paths,
+            )
+            draft["body"] = _ensure_daily_news_sections(
+                draft.get("body", ""), prompt_norm
             )
             if draft.get("_fallback_error"):
                 draft["title"] = _shorten_daily_news_title(picked.title)
@@ -390,6 +413,7 @@ def create_daily_news_posts(
             prompt_hint=news_prompt,
             asset_paths=asset_paths,
         )
+        draft["body"] = _ensure_daily_news_sections(draft.get("body", ""), prompt_norm)
         if draft.get("_fallback_error"):
             draft["title"] = _shorten_daily_news_title(picked.title)
             draft["body"] = _daily_news_offline_body(picked, prompt_norm)
@@ -418,11 +442,13 @@ def create_daily_news_posts(
 
         if not assets_paths and auto_image_enabled:
             dest_dir = post_dir(post.id) / "assets"
+            image_title = _preferred_image_title(post, post.title)
+            image_prompt = _preferred_image_hint(post, prompt_norm)
             image_path, image_meta = fetch_and_download_related_image(
-                title=post.title,
+                title=image_title,
                 body=post.body,
                 topics=post.topics,
-                prompt_hint=prompt_norm,
+                prompt_hint=image_prompt,
                 dest_dir=dest_dir,
             )
             post.platform.setdefault("image", image_meta)

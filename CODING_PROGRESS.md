@@ -301,6 +301,244 @@
 **Notes**
 - No tests run (small query change).
 
+### 2026-01-07 14:40
+**Task:** Fix delete-drafts confirmation for d-popconfirm and verify deletion.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Added `d-popconfirm/d-popover` selectors for delete confirm, improved confirm click targeting, and removed premature “暂无” empty-state break to avoid false zero counts. | If UI changes again, re-capture evidence and update confirm selectors. |
+| `docs/删除草稿功能任务书.md` | DONE | Logged confirm dialog structure and successful deletion test. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Manual run: `apps.cli delete-drafts --draft-type image --limit 5 --yes --login-hold 120` deleted 5/50 drafts.
+- Tests/Lint: Not run (Playwright UI change).
+
+### 2026-01-07 15:10
+**Task:** Delete all drafts across all tabs.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/删除草稿功能任务书.md` | DONE | Logged full delete-drafts run results (image 45/45, video/long 0). | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Manual run: `apps.cli delete-drafts --all --yes --login-hold 120` deleted 45/45 image drafts; video/long both 0.
+
+### 2026-01-07 15:25
+**Task:** Add delete-drafts description and examples to README.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `README.md` | DONE | Added delete-drafts capability to feature list, added example commands, and clarified profile scope. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+### 2026-01-06 17:25
+**Task:** Improve delete-drafts reliability (confirm wait + list change detection).
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Added confirm-dialog wait loop and switched delete loop to fast list-change detection with fallback item-exists check. | Re-run `delete-drafts` to validate deletion speed and stability. |
+| `docs/删除草稿功能任务书.md` | DONE | Logged the new reliability improvements and pending re-test. | Update with real test outcome. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run (Playwright UI change).
+
+### 2026-01-07 13:20
+**Task:** Fix delete-drafts confirm handling after timeout.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Added popconfirm/popup selectors and avoided clicking list-level delete; now fails fast if confirm not found. | Re-run delete test to verify confirmation click and list change. |
+| `docs/删除草稿功能任务书.md` | DONE | Logged delete timeout and confirm-selector fix. | Update with test outcome. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run (Playwright UI change).
+
+### 2026-01-07 13:35
+**Task:** Handle native confirm dialog in delete-drafts flow.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Added a one-shot Playwright dialog accept handler before clicking delete. | Re-run delete test to confirm items are removed. |
+| `docs/删除草稿功能任务书.md` | DONE | Logged confirm-accept update. | Update with actual deletion outcome. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run (Playwright UI change).
+
+### 2026-01-07 13:50
+**Task:** Improve delete detection using draft box count.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Added `before_total` tracking and header count change detection when waiting for deletion. | Re-run delete test to verify count-based detection. |
+| `docs/删除草稿功能任务书.md` | DONE | Logged the count-based detection change. | Update with test result. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run (Playwright UI change).
+
+### 2026-01-07 14:05
+**Task:** Add delete failure evidence capture for debugging.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Added screenshot/HTML capture on delete errors and timeouts under `data/events/delete_<id>/`. | Re-run delete and inspect evidence to adjust selectors. |
+| `docs/删除草稿功能任务书.md` | DONE | Documented evidence capture path. | Update after inspection. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run (Playwright UI change).
+
+### 2026-01-06 17:50
+**Task:** Add draft-location parameter to target alternate draft pages.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/cli.py` | DONE | Added `--draft-location` and `--draft-url` options with validation; passed through to deletion flow. | Re-run delete test against the correct draft URL if needed. |
+| `src/publish/playwright_steps.py` | DONE | Added location-aware navigation and relaxed waits for non-publish pages. | Verify custom URL path and selectors if the page layout differs. |
+| `docs/删除草稿功能任务书.md` | DONE | Documented new parameters and test note. | Update with real deletion result. |
+| `README.md` | DONE | Added example showing custom draft URL usage. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- Tests: Not run (Playwright UI change).
+
+### 2026-01-06 14:36
+**Task:** Improve news image relevance by reducing generic “news” queries.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/auto_image.py` | DONE | Skip “新闻/每日假新闻” topics and only add “news” keyword when no other hints exist. | Consider live daily-news run to confirm image relevance. |
+| `src/workflow/create_post.py` | DONE | Daily news multi-flow now uses picked title/description for image query. | Consider live daily-news run to confirm image relevance. |
+| `tests/test_auto_image.py` | DONE | Added coverage for skipping news topics and refined query hint behavior. | None. |
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Logged the latest fix for query de-genericization. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | None. |
+
+**Notes**
+- Tests/Lint: `pytest tests/test_auto_image.py` (10 passed).
+- Risks/Assumptions: Image relevance still depends on Pexels coverage; if results remain generic, consider custom keyword mapping per news domain.
+- Next steps: Run `apps.cli auto --title "每日新闻"` to validate real-world image picks.
+
+### 2026-01-06 14:45
+**Task:** Add entity-aware keyword mapping for news image queries.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/auto_image.py` | DONE | Added country/region/entity mappings and industry keywords to strengthen specific image queries. | Consider expanding entity map as needed. |
+| `tests/test_auto_image.py` | DONE | Added coverage for entity keyword mapping. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | None. |
+
+**Notes**
+- Tests/Lint: `pytest tests/test_auto_image.py` (11 passed).
+- Risks/Assumptions: Pexels still may return generic results for low-signal topics; mapping can be expanded with more entities.
+- Next steps: Re-run `apps.cli auto --title "每日新闻"` and inspect `platform.image.query_used` vs. picked image.
+
+### 2026-01-06 14:57
+**Task:** Re-run daily news auto and tighten English query heuristics.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/auto_image.py` | DONE | Added English stopword compression for long titles; expanded entity/industry keyword mapping. | Monitor real-world relevance and extend mappings if needed. |
+| `tests/test_auto_image.py` | DONE | Added long-English compression coverage. | None. |
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Logged latest auto run outcomes and remaining mismatch. | Run another auto to verify the new compression behavior. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | None. |
+
+**Notes**
+- Tests/Lint: `pytest tests/test_auto_image.py` (12 passed).
+- Run: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` created 3 posts and saved drafts; command timed out after 300s but all 3 posts show `saved_as_draft`.
+- Image relevance: two picks aligned with topic (Vietnam town, humanoid robot), one still off-topic (stadium image for Venezuela/US politics).
+
+### 2026-01-06 15:13
+**Task:** Re-run daily news auto to validate image relevance.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/增加图片api后的错误修正任务书.md` | DONE | Logged latest auto run and remaining mismatches (oil hands, cemetery). | Further compress/clean English queries; consider stronger keyword extraction. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | None. |
+
+**Notes**
+- Run: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` created 3 posts; command timed out but drafts saved.
+- Image relevance: 1/3 aligned (hacker), 2/3 still off-topic due to noisy English titles.
+
+### 2026-01-06 15:18
+**Task:** Enforce daily news two-section body output.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Strengthened prompt and added post-processing to ensure “新闻内容/我的点评” two-section body. | None. |
+| `tests/test_daily_news.py` | DONE | Added tests for section enforcement helper. | None. |
+| `docs/正文内容扩充任务书.md` | DONE | Updated testing status with latest auto validation. | Continue sampling if needed. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | None. |
+
+**Notes**
+- Tests/Lint: `pytest tests/test_daily_news.py` (8 passed).
+- Run: `apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*"` created 3 posts; all show both “新闻内容/我的点评” sections.
+
+### 2026-01-06 15:57
+**Task:** Add delete-drafts CLI and Playwright flow.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/storage/events.py` | DONE | Added event logging helper for delete-drafts runs. | None. |
+| `src/publish/playwright_steps.py` | DONE | Implemented delete-drafts flow and helpers. | Validate selectors in live UI if needed. |
+| `apps/cli.py` | DONE | Added `delete-drafts` command with preview/confirm. | Add optional tests if desired. |
+| `README.md` | DONE | Documented delete-drafts usage. | None. |
+| `docs/删除草稿功能任务书.md` | DONE | Updated progress for implemented items. | Add tests if required. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | None. |
+
+**Notes**
+- Tests/Lint: Not run (Playwright UI feature).
+- Risks/Assumptions: UI selectors may change; delete confirmation dialog varies.
+- Next steps: Run `apps.cli delete-drafts --dry-run` then `--yes` to validate in UI.
+
+### 2026-01-06 16:08
+**Task:** Fix delete-drafts CLI runtime error and run dry-run.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Fixed indentation error in draft-tab helper. | Consider adding selector resilience tests. |
+| `docs/删除草稿功能任务书.md` | DONE | Logged dry-run result and cleaned heading. | Re-run dry-run after confirming login/profile. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | None. |
+
+**Notes**
+- Tests/Lint: `apps.cli delete-drafts --dry-run` ran (total=0).
+- Risks/Assumptions: Dry-run likely returned 0 due to login/profile mismatch; verify with `--login-hold`.
+- Next steps: Re-run `delete-drafts --dry-run --login-hold 60` and confirm drafts list before deletion.
+
+### 2026-01-06 15:47
+**Task:** Draft delete-drafts feature task doc.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/删除草稿功能任务书.md` | DONE | Added requirements, safety checks, and acceptance criteria for deleting drafts. | Await user review before coding. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | None. |
+
+**Notes**
+- Tests/Lint: Not run (documentation only).
+- Risks/Assumptions: None.
+- Next steps: Implement after user approval.
+
 ### 2026-01-06 10:25
 **Task:** Add fake news tests, update README example, and prepare release.
 **Git:** `main (dirty)`
@@ -448,6 +686,18 @@
 
 **Notes**
 - No tests run (small query change).
+
+### 2026-01-06 17:11
+**Task:** Investigate delete-drafts tab mismatch report; update taskbook.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/删除草稿功能任务书.md` | DONE | Documented that `draft_type=image` opens 图文 and only `--all` cycles to 视频/长文; long-tab view is not the root failure. | If deletion still stalls, improve post-delete list refresh wait/confirm dialog detection. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future work. |
+
+**Notes**
+- No runtime test executed in this step.
 
 ### 2026-01-05 15:45
 **Task:** Use picked news title/description as image search hint.

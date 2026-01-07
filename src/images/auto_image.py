@@ -20,6 +20,71 @@ DEFAULT_ORIENTATION = "portrait"
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
 _CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
 _HASHTAG_RE = re.compile(r"#\S+")
+_EN_TOKEN_RE = re.compile(r"[a-zA-Z]+")
+_EN_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "but",
+    "by",
+    "court",
+    "for",
+    "from",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "left",
+    "news",
+    "now",
+    "of",
+    "on",
+    "or",
+    "out",
+    "over",
+    "s",
+    "says",
+    "saying",
+    "that",
+    "the",
+    "this",
+    "to",
+    "under",
+    "was",
+    "were",
+    "with",
+    "what",
+    "why",
+}
+_ENTITY_MAP = {
+    "中国": "China",
+    "美国": "USA",
+    "俄罗斯": "Russia",
+    "乌克兰": "Ukraine",
+    "以色列": "Israel",
+    "加沙": "Gaza",
+    "伊朗": "Iran",
+    "伊拉克": "Iraq",
+    "叙利亚": "Syria",
+    "土耳其": "Turkey",
+    "欧盟": "EU",
+    "联合国": "United Nations",
+    "越南": "Vietnam",
+    "巴基斯坦": "Pakistan",
+    "利比亚": "Libya",
+    "委内瑞拉": "Venezuela",
+    "菲律宾": "Philippines",
+    "日本": "Japan",
+    "韩国": "South Korea",
+    "朝鲜": "North Korea",
+    "印度": "India",
+}
 
 
 @dataclass(frozen=True)
@@ -107,6 +172,29 @@ def _compact_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+def _english_tokens(text: str) -> list[str]:
+    return [t.lower() for t in _EN_TOKEN_RE.findall(text or "")]
+
+
+def _compress_english_query(text: str, *, max_words: int = 6) -> str:
+    tokens = _english_tokens(text)
+    if not tokens:
+        return ""
+    filtered = [t for t in tokens if t not in _EN_STOPWORDS and len(t) > 2]
+    if not filtered:
+        filtered = [t for t in tokens if len(t) > 2] or tokens
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in filtered:
+        if t in seen:
+            continue
+        out.append(t)
+        seen.add(t)
+        if len(out) >= max_words:
+            break
+    return " ".join(out).strip()
+
+
 def build_image_query(
     title: str,
     body: str,
@@ -131,13 +219,19 @@ def build_image_query(
         title_norm = _compact_spaces(title_norm.split("｜", 1)[1])
     if "|" in title_norm:
         title_norm = _compact_spaces(title_norm.split("|", 1)[1]) or title_norm
+    if re.search(r"[a-zA-Z]", title_norm):
+        word_count = len(_english_tokens(title_norm))
+        if len(title_norm) > 60 or word_count > 8:
+            title_norm = _compress_english_query(title_norm, max_words=6) or title_norm
     if title_norm:
         parts.append(title_norm)
 
     topics_norm: list[str] = []
     for t in topics or []:
         t = _compact_spaces(t).lstrip("#")
-        if t == "每日新闻":
+        if t in ("每日新闻", "每日假新闻"):
+            continue
+        if "新闻" in t or "news" in t.lower():
             continue
         if not t or t in topics_norm:
             continue
@@ -171,27 +265,46 @@ def _pexels_query_hint(query: str) -> str:
         return ""
     if re.search(r"[a-zA-Z]", q):
         return q
+    def _add_token(bucket: list[str], value: str) -> None:
+        if not value:
+            return
+        if value not in bucket:
+            bucket.append(value)
+
     tokens: list[str] = []
+    for cn, en in _ENTITY_MAP.items():
+        if cn in q:
+            _add_token(tokens, en)
     if "美国" in q or "美國" in q:
-        tokens.append("USA")
+        _add_token(tokens, "USA")
     if "时政" in q or "時政" in q or "政治" in q:
-        tokens.append("politics")
+        _add_token(tokens, "politics")
     if "大选" in q or "大選" in q or "选举" in q or "選舉" in q:
-        tokens.append("election")
+        _add_token(tokens, "election")
     if "国会" in q or "國會" in q:
-        tokens.append("congress")
+        _add_token(tokens, "congress")
     if "外交" in q:
-        tokens.append("diplomacy")
+        _add_token(tokens, "diplomacy")
     if "经济" in q or "經濟" in q or "财经" in q or "財經" in q:
-        tokens.append("economy")
+        _add_token(tokens, "economy")
     if "科技" in q or "AI" in q.upper() or "人工智能" in q:
-        tokens.append("technology")
+        _add_token(tokens, "technology")
     if "国际" in q or "國際" in q:
-        tokens.append("international")
-    if "新闻" in q:
-        tokens.append("news")
+        _add_token(tokens, "international")
+    has_news = "新闻" in q
+    if "军事" in q or "軍事" in q:
+        _add_token(tokens, "military")
+    if "能源" in q or "石油" in q or "油价" in q or "油價" in q:
+        _add_token(tokens, "oil")
+    if "工业" in q or "工業" in q:
+        _add_token(tokens, "industry")
+    if "制造" in q or "製造" in q:
+        _add_token(tokens, "manufacturing")
     if "金融" in q:
-        tokens.append("finance")
+        _add_token(tokens, "finance")
+
+    if not tokens and has_news:
+        tokens.append("news")
 
     return " ".join(tokens).strip()
 

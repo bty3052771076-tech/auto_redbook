@@ -1,4 +1,5 @@
 from src.news.daily_news import NewsItem, pick_best_news, pick_news_items
+from src.workflow.create_post import _ensure_daily_news_sections
 
 
 def test_pick_best_news_empty_hint_returns_first():
@@ -61,3 +62,18 @@ def test_pick_news_items_with_hint_returns_single_best():
     picked = pick_news_items(items, "新能源", count=3)
     assert len(picked) == 1
     assert "新能源" in picked[0].title
+
+
+def test_ensure_daily_news_sections_adds_headings():
+    body = "这是只有一段的正文。"
+    out = _ensure_daily_news_sections(body, "美国时政")
+    assert "新闻内容：" in out
+    assert "我的点评：" in out
+
+
+def test_ensure_daily_news_sections_preserves_two_paragraphs():
+    body = "第一段内容。\n\n第二段点评。"
+    out = _ensure_daily_news_sections(body, "")
+    assert out.splitlines()[0] == "新闻内容："
+    assert "第一段内容。" in out
+    assert "我的点评：" in out

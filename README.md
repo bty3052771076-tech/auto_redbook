@@ -7,6 +7,7 @@
 - 特殊标题「每日新闻」：自动抓取新闻 → 生成草稿并保存
 - 特殊标题「每日假新闻」：LLM 生成幽默虚构新闻 → 生成草稿并保存
 - 自动配图：当未提供图片时，使用图片 API 搜索并下载 1 张相关图片用于上传
+- 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
 - 落盘与可追溯：`data/posts/<post_id>/` 保存 post / revision / execution / evidence
 
 ## 快速开始（推荐顺序）
@@ -117,6 +118,7 @@ $post_id = ($out | Select-String -Pattern "post_id=([0-9a-f]{32})" | Select-Obje
 - `run <post_id>`：用 Playwright 上传图片/填写标题正文/保存草稿
 - `auto`：一键完成 `create -> approve -> run`
 - `retry <post_id>`：对失败的 run 进行重试
+- `delete-drafts`：删除草稿箱草稿（默认图文）
 
 ## 功能示例
 ### 1) 标题 + 简略提示词 + 图片齐全 → LLM 文案 → 保存草稿
@@ -153,6 +155,15 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递、外卖延迟" --assets-glob "assets/pics/*" --login-hold 600
 ```
 
+### 5) 删除草稿（预览/删除）
+```powershell
+# 预览将删除的草稿（不会实际删除）
+.\.venv\Scripts\python -m apps.cli delete-drafts --dry-run --login-hold 60
+
+# 删除图文草稿（最多 5 条，跳过确认）
+.\.venv\Scripts\python -m apps.cli delete-drafts --limit 5 --yes --login-hold 60
+```
+
 ## auto 参数说明
 - `--title`：标题（必填）
 - `--prompt`：提示词（可选）
@@ -184,6 +195,22 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 ## 自动配图（无图片时）
 - 当 `--assets-glob` 未命中任何图片：会自动从 Pexels 搜索并下载 1 张图片到 `data/posts/<post_id>/assets/`，然后继续上传并保存草稿。
 - 关闭自动配图：`AUTO_IMAGE=0`（注意：图文 post 仍需要至少 1 张图片，否则校验会失败）。
+
+## 删除草稿（危险操作）
+说明：删除操作发生在当前浏览器 profile 的草稿箱内；默认仅处理图文草稿，可用 `--all` 覆盖三类草稿。
+```powershell
+# 预览将删除的草稿（不会实际删除）
+.\.venv\Scripts\python -m apps.cli delete-drafts --dry-run
+
+# 删除图文草稿（最多 10 条），需要确认
+.\.venv\Scripts\python -m apps.cli delete-drafts --limit 10
+
+# 删除全部类型草稿（跳过确认）
+.\.venv\Scripts\python -m apps.cli delete-drafts --all --yes
+
+# 在自定义草稿位置删除（指定草稿页面 URL）
+.\.venv\Scripts\python -m apps.cli delete-drafts --draft-location url --draft-url "https://creator.xiaohongshu.com/..." --limit 5 --yes
+```
 
 ## 输出位置（落盘）
 - `data/posts/<post_id>/post.json`：草稿内容与元数据（含 `platform.news` / `platform.image`）
