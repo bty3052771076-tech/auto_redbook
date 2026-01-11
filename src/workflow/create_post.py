@@ -332,17 +332,19 @@ def create_daily_news_posts(
     prompt_hint: str = "",
     asset_paths: list[str],
     copy_assets: bool = True,
-    count: int = 3,
+    count: int = 1,
     auto_image: bool = True,
 ) -> list[Post]:
     """
     Special workflow for title="每日新闻".
 
-    - If `prompt_hint` is provided: pick the best matching news and create 1 post.
-    - If `prompt_hint` is empty: pick up to `count` news and create multiple posts.
+    - Use `prompt_hint` to rank candidates, then pick up to `count` items.
+    - When `count` is 1, behavior is equivalent to a single best match.
     """
     cfg = load_llm_config()
     prompt_norm = (prompt_hint or "").strip()
+    if count <= 0:
+        count = 1
     auto_image_enabled = auto_image and is_auto_image_enabled()
 
     try:
@@ -375,12 +377,12 @@ def create_daily_news_posts(
 
         if not assets_paths and auto_image_enabled:
             dest_dir = post_dir(post.id) / "assets"
-            image_title = picked.title or post.title
+            image_title = draft.get("title") or post.title or "每日新闻"
             image_path, image_meta = fetch_and_download_related_image(
                 title=image_title,
                 body=post.body,
                 topics=post.topics,
-                prompt_hint=picked.title or picked.description or prompt_norm,
+                prompt_hint=prompt_norm,
                 dest_dir=dest_dir,
             )
             post.platform.setdefault("image", image_meta)

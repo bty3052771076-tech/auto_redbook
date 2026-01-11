@@ -6,6 +6,7 @@
 - 普通图文：`标题 + 提示词（可选） + 图片（可选）` → 生成草稿并保存到草稿箱
 - 特殊标题「每日新闻」：自动抓取新闻 → 生成草稿并保存
 - 特殊标题「每日假新闻」：LLM 生成幽默虚构新闻 → 生成草稿并保存
+- 批量生成：使用 `--count` 控制单次生成条数（默认 1）
 - 自动配图：当未提供图片时，使用图片 API 搜索并下载 1 张相关图片用于上传
 - 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
 - 落盘与可追溯：`data/posts/<post_id>/` 保存 post / revision / execution / evidence
@@ -136,8 +137,9 @@ $env:NEWS_PROVIDER="newsapi"
 # 有提示词：挑选最匹配 1 条新闻
 .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "assets/pics/*" --login-hold 600
 
-# 无提示词：随机挑选 3 条新闻并保存 3 条草稿
+# 无提示词：默认生成 1 条，可用 --count 调整
 .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --assets-glob "assets/pics/*" --login-hold 600
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --assets-glob "assets/pics/*" --count 3 --login-hold 600
 ```
 
 ### 3) 无图片上传 → Pexels 自动配图 → 保存草稿
@@ -167,21 +169,23 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 ## auto 参数说明
 - `--title`：标题（必填）
 - `--prompt`：提示词（可选）
+- `--count`：生成草稿数量（默认 1）
 - `--assets-glob`：素材路径（glob），默认 `assets/pics/*`
 - `--no-copy`：不复制素材到 `data/posts/<id>/assets`（默认会复制，便于隔离）
-- `--login-hold`：等待登录秒数，默认 0
+- `--login-hold`：等待手动登录的秒数（仅用于登录，不用于等待上传），默认 0
 - `--wait-timeout`：等待发布页秒数，默认 300
 - `--dry-run`：只抓取证据，不上传/不保存
 - `--force`：忽略校验失败继续执行（仅排查用）
 
 ## create/run 常用参数
-- `create`：`--assets-glob` / `--no-copy`
+- `create`：`--assets-glob` / `--no-copy` / `--count`
 - `run`：`--assets-glob` / `--login-hold` / `--wait-timeout` / `--dry-run` / `--force`
 
 ## 每日新闻（特殊标题）
 - 当 `--title "每日新闻"`：会先拉取新闻候选，再生成草稿。
-  - 提供 `--prompt`：按提示词挑选最匹配的 1 条新闻生成 1 条草稿
-  - 不提供 `--prompt`：挑选 3 条新闻，生成并保存 3 条草稿
+  - 生成条数由 `--count` 控制（默认 1）
+  - 提供 `--prompt`：按提示词相关性排序后取前 N 条
+  - 不提供 `--prompt`：按候选顺序取前 N 条
 
 可选配置（环境变量）：
 - `NEWS_PROVIDER`：`newsapi` / `gdelt`（默认自动；有 `NEWS_API_KEY` 时优先 `newsapi`）

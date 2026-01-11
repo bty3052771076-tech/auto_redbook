@@ -197,7 +197,7 @@ def pick_news_items(
     """
     Pick one (best match) or multiple (first N) news items.
 
-    - If `prompt_hint` is provided: return a single best match.
+    - If `prompt_hint` is provided: return up to `count` items sorted by relevance.
     - If `prompt_hint` is empty: return up to `count` distinct items.
     """
     if count <= 0:
@@ -207,7 +207,20 @@ def pick_news_items(
 
     hint = (prompt_hint or "").strip()
     if hint:
-        return [pick_best_news(items, hint)]
+        scored: list[tuple[float, datetime, int, NewsItem]] = []
+        seen: set[str] = set()
+        for idx, item in enumerate(items):
+            key = item.url or item.title
+            if key in seen:
+                continue
+            seen.add(key)
+            score = _relevance_score(item, hint)
+            seen_at = _parse_seendate_utc(item.seendate) or datetime.min.replace(
+                tzinfo=timezone.utc
+            )
+            scored.append((score, seen_at, -idx, item))
+        scored.sort(reverse=True)
+        return [item for _, _, _, item in scored[:count]]
 
     picked: list[NewsItem] = []
     seen: set[str] = set()

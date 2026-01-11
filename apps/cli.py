@@ -63,6 +63,7 @@ def create(
     title: str = typer.Option(..., help="初始标题/题目"),
     prompt: str = typer.Option("", help="提示词/要点（可选）"),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
+    count: int = typer.Option(1, help="生成草稿数量（>=1）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
 ):
     """生成草稿并落盘（post.json + revision）。"""
@@ -73,28 +74,39 @@ def create(
     title_norm = (title or "").strip()
     prompt_norm = (prompt or "").strip()
 
-    if title_norm == "每日新闻" and not prompt_norm:
+    if count <= 0:
+        typer.echo("count 必须 >= 1")
+        raise typer.Exit(code=1)
+
+    if title_norm == "每日新闻":
         posts = create_daily_news_posts(
-            prompt_hint="",
+            prompt_hint=prompt_norm,
             asset_paths=asset_paths,
             copy_assets=not no_copy,
-            count=3,
+            count=count,
             auto_image=True,
         )
-        typer.echo(f"创建完成：posts={len(posts)}")
-        for p in posts:
-            typer.echo(f"- post_id={p.id} | 标题：{p.title}")
     else:
-        post = create_post_with_draft(
-            title_hint=title,
-            prompt_hint=prompt,
-            asset_paths=asset_paths,
-            copy_assets=not no_copy,
-            auto_image=True,
-        )
+        posts = [
+            create_post_with_draft(
+                title_hint=title,
+                prompt_hint=prompt,
+                asset_paths=asset_paths,
+                copy_assets=not no_copy,
+                auto_image=True,
+            )
+            for _ in range(count)
+        ]
+
+    if len(posts) == 1:
+        post = posts[0]
         typer.echo(f"创建完成：post_id={post.id}")
         typer.echo(f"标题：{post.title}")
         typer.echo(f"正文（前60字）：{post.body[:60]}{'...' if len(post.body) > 60 else ''}")
+    else:
+        typer.echo(f"创建完成：posts={len(posts)}")
+        for p in posts:
+            typer.echo(f"- post_id={p.id} | 标题：{p.title}")
 
 
 @app.command("list")
@@ -224,6 +236,7 @@ def auto(
     title: str = typer.Option(..., help="初始标题/题目"),
     prompt: str = typer.Option("", help="提示词要点（可选）"),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
+    count: int = typer.Option(1, help="生成草稿数量（>=1）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
     dry_run: bool = typer.Option(
         False, help="open page and capture evidence only; skip upload/fill/save"
@@ -240,12 +253,16 @@ def auto(
     title_norm = (title or "").strip()
     prompt_norm = (prompt or "").strip()
 
-    if title_norm == "每日新闻" and not prompt_norm:
+    if count <= 0:
+        typer.echo("count 必须 >= 1")
+        raise typer.Exit(code=1)
+
+    if title_norm == "每日新闻":
         posts = create_daily_news_posts(
-            prompt_hint="",
+            prompt_hint=prompt_norm,
             asset_paths=asset_paths,
             copy_assets=not no_copy,
-            count=3,
+            count=count,
             auto_image=True,
         )
     else:
@@ -257,6 +274,7 @@ def auto(
                 copy_assets=not no_copy,
                 auto_image=True,
             )
+            for _ in range(count)
         ]
 
     typer.echo(f"创建完成：posts={len(posts)}")

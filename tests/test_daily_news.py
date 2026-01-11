@@ -54,13 +54,14 @@ def test_pick_news_items_empty_hint_returns_first_n_distinct():
     ]
 
 
-def test_pick_news_items_with_hint_returns_single_best():
+def test_pick_news_items_with_hint_returns_top_n():
     items = [
         NewsItem(title="新能源车销量创新高", url="https://example.com/1"),
-        NewsItem(title="苹果发布新款Mac", url="https://example.com/2"),
+        NewsItem(title="新能源电池技术突破", url="https://example.com/2"),
+        NewsItem(title="苹果发布新款Mac", url="https://example.com/3"),
     ]
-    picked = pick_news_items(items, "新能源", count=3)
-    assert len(picked) == 1
+    picked = pick_news_items(items, "新能源", count=2)
+    assert len(picked) == 2
     assert "新能源" in picked[0].title
 
 
