@@ -87,16 +87,19 @@ def create(
             auto_image=True,
         )
     else:
-        posts = [
-            create_post_with_draft(
-                title_hint=title,
-                prompt_hint=prompt,
-                asset_paths=asset_paths,
-                copy_assets=not no_copy,
-                auto_image=True,
+        used_image_ids: set[str] = set()
+        posts = []
+        for _ in range(count):
+            posts.append(
+                create_post_with_draft(
+                    title_hint=title,
+                    prompt_hint=prompt,
+                    asset_paths=asset_paths,
+                    copy_assets=not no_copy,
+                    auto_image=True,
+                    image_exclude_ids=used_image_ids,
+                )
             )
-            for _ in range(count)
-        ]
 
     if len(posts) == 1:
         post = posts[0]
@@ -266,16 +269,19 @@ def auto(
             auto_image=True,
         )
     else:
-        posts = [
-            create_post_with_draft(
-                title_hint=title,
-                prompt_hint=prompt,
-                asset_paths=asset_paths,
-                copy_assets=not no_copy,
-                auto_image=True,
+        used_image_ids: set[str] = set()
+        posts = []
+        for _ in range(count):
+            posts.append(
+                create_post_with_draft(
+                    title_hint=title,
+                    prompt_hint=prompt,
+                    asset_paths=asset_paths,
+                    copy_assets=not no_copy,
+                    auto_image=True,
+                    image_exclude_ids=used_image_ids,
+                )
             )
-            for _ in range(count)
-        ]
 
     typer.echo(f"创建完成：posts={len(posts)}")
     for p in posts:

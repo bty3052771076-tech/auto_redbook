@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 from src.config import load_llm_config
-from src.images.auto_image import fetch_and_download_related_image, is_auto_image_enabled
+from src.images.auto_image import (
+    fetch_and_download_related_images,
+    is_auto_image_enabled,
+)
 from src.llm.generate import generate_draft
 from src.news.daily_news import (
     fetch_and_pick_daily_news,
@@ -40,6 +44,20 @@ def _build_asset_infos(paths: Iterable[Path]) -> List[AssetInfo]:
             )
         )
     return infos
+
+
+def _merge_image_ids(target: Optional[set[str]], metas: list[dict]) -> None:
+    if target is None:
+        return
+    for meta in metas:
+        if not isinstance(meta, dict):
+            continue
+        picked = meta.get("picked")
+        if not isinstance(picked, dict):
+            continue
+        image_id = picked.get("id")
+        if image_id:
+            target.add(str(image_id))
 
 
 def _shorten_daily_news_title(news_title: str, *, max_len: int = 20) -> str:
@@ -160,6 +178,24 @@ def _ensure_daily_news_sections(body: str, prompt_norm: str) -> str:
     return f"新闻内容：\n{news}\n\n我的点评：\n{comment}"
 
 
+def _news_source_line(picked) -> str:
+    source = (picked.source or picked.domain or "未知来源").strip()
+    url = (picked.url or "").strip()
+    if url:
+        return f"来源：{source} {url}"
+    return f"来源：{source}"
+
+
+def _append_news_source_line(body: str, picked) -> str:
+    text = (body or "").rstrip()
+    if not text:
+        return text
+    line = _news_source_line(picked)
+    if re.search(r"(?:\r?\n)*来源：.*\Z", text):
+        text = re.sub(r"(?:\r?\n)*来源：.*\Z", "", text).rstrip()
+    return f"{text}\n\n{line}".rstrip()
+
+
 def _fake_news_prompt(prompt_norm: str) -> str:
     """
     Prompt for humorous, clearly fictional fake news.
@@ -201,6 +237,7 @@ def create_post_with_draft(
     asset_paths: list[str],
     copy_assets: bool = True,
     auto_image: bool = True,
+    image_exclude_ids: Optional[set[str]] = None,
 ) -> Post:
     """
     Generate a draft with LLM and persist post + revision.
@@ -233,6 +270,7 @@ def create_post_with_draft(
                 draft["title"] = _shorten_daily_news_title(picked.title)
                 draft["body"] = _daily_news_offline_body(picked, prompt_norm)
                 draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
+            draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
         except Exception as exc:
             platform_meta["news"] = {
                 "mode": "daily_news",
@@ -296,15 +334,18 @@ def create_post_with_draft(
     if not assets_paths and auto_image_enabled:
         dest_dir = post_dir(post.id) / "assets"
         image_title = _preferred_image_title(post, post.title)
-        image_path, image_meta = fetch_and_download_related_image(
+        image_paths, image_metas = fetch_and_download_related_images(
             title=image_title,
             body=post.body,
             topics=post.topics,
             prompt_hint=_preferred_image_hint(post, prompt_hint),
             dest_dir=dest_dir,
+            exclude_ids=image_exclude_ids,
         )
-        post.platform.setdefault("image", image_meta)
-        assets_paths = [image_path]
+        post.platform.setdefault("image", image_metas[0])
+        post.platform["images"] = image_metas
+        _merge_image_ids(image_exclude_ids, image_metas)
+        assets_paths = image_paths
         # The downloaded file is already under data/posts/<id>/assets.
         effective_copy_assets = False
 
@@ -346,6 +387,7 @@ def create_daily_news_posts(
     if count <= 0:
         count = 1
     auto_image_enabled = auto_image and is_auto_image_enabled()
+    used_image_ids: set[str] = set()
 
     try:
         candidates, base_meta = fetch_daily_news_candidates(prompt_norm)
@@ -378,15 +420,18 @@ def create_daily_news_posts(
         if not assets_paths and auto_image_enabled:
             dest_dir = post_dir(post.id) / "assets"
             image_title = draft.get("title") or post.title or "每日新闻"
-            image_path, image_meta = fetch_and_download_related_image(
+            image_paths, image_metas = fetch_and_download_related_images(
                 title=image_title,
                 body=post.body,
                 topics=post.topics,
                 prompt_hint=prompt_norm,
                 dest_dir=dest_dir,
+                exclude_ids=used_image_ids,
             )
-            post.platform.setdefault("image", image_meta)
-            assets_paths = [image_path]
+            post.platform.setdefault("image", image_metas[0])
+            post.platform["images"] = image_metas
+            _merge_image_ids(used_image_ids, image_metas)
+            assets_paths = image_paths
             effective_copy_assets = False
 
         if effective_copy_assets:
@@ -420,6 +465,7 @@ def create_daily_news_posts(
             draft["title"] = _shorten_daily_news_title(picked.title)
             draft["body"] = _daily_news_offline_body(picked, prompt_norm)
             draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
+        draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
 
         post = Post(
             type="image",
@@ -446,15 +492,18 @@ def create_daily_news_posts(
             dest_dir = post_dir(post.id) / "assets"
             image_title = _preferred_image_title(post, post.title)
             image_prompt = _preferred_image_hint(post, prompt_norm)
-            image_path, image_meta = fetch_and_download_related_image(
+            image_paths, image_metas = fetch_and_download_related_images(
                 title=image_title,
                 body=post.body,
                 topics=post.topics,
                 prompt_hint=image_prompt,
                 dest_dir=dest_dir,
+                exclude_ids=used_image_ids,
             )
-            post.platform.setdefault("image", image_meta)
-            assets_paths = [image_path]
+            post.platform.setdefault("image", image_metas[0])
+            post.platform["images"] = image_metas
+            _merge_image_ids(used_image_ids, image_metas)
+            assets_paths = image_paths
             effective_copy_assets = False
 
         if effective_copy_assets:

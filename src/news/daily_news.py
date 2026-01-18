@@ -16,6 +16,9 @@ DEFAULT_TZ = "Asia/Shanghai"
 DEFAULT_QUERY = "china"
 DEFAULT_MAX_RECORDS = 50
 DEFAULT_TIMEOUT_S = 20.0
+CROSS_DOMAIN_SIM_THRESHOLD = 0.75
+CROSS_DOMAIN_BONUS = 0.4
+NEWS_DEDUPE_SIM_THRESHOLD = 0.8
 
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 NEWSAPI_BASE_URL = "https://newsapi.org"
@@ -78,6 +81,66 @@ def _tokens(text: str) -> set[str]:
             for i in range(len(part) - 1):
                 out.add(part[i : i + 2])
     return out
+
+
+def _domain_for_item(item: NewsItem) -> str:
+    if item.domain:
+        return item.domain.strip().lower()
+    try:
+        return urllib.parse.urlparse(item.url or "").netloc.strip().lower()
+    except Exception:
+        return ""
+
+
+def _title_similar(
+    tokens_a: set[str],
+    tokens_b: set[str],
+    *,
+    threshold: float = CROSS_DOMAIN_SIM_THRESHOLD,
+) -> bool:
+    if not tokens_a or not tokens_b:
+        return False
+    min_len = min(len(tokens_a), len(tokens_b))
+    if min_len < 3:
+        return False
+    overlap = len(tokens_a & tokens_b) / min_len
+    return overlap >= threshold
+
+
+def _cross_domain_counts(items: list[NewsItem]) -> list[int]:
+    tokens_list = [_tokens(item.title) for item in items]
+    domains = [_domain_for_item(item) for item in items]
+    counts: list[int] = []
+    for i, tokens_i in enumerate(tokens_list):
+        domains_i: set[str] = set()
+        if domains[i]:
+            domains_i.add(domains[i])
+        for j, tokens_j in enumerate(tokens_list):
+            if i == j:
+                continue
+            if not domains[j] or domains[j] == domains[i]:
+                continue
+            if _title_similar(tokens_i, tokens_j):
+                domains_i.add(domains[j])
+        counts.append(len(domains_i))
+    return counts
+
+
+def _dedupe_by_title(items: list[NewsItem], *, max_count: int) -> list[NewsItem]:
+    picked: list[NewsItem] = []
+    picked_tokens: list[set[str]] = []
+    for item in items:
+        tokens = _tokens(item.title)
+        if any(
+            _title_similar(tokens, t, threshold=NEWS_DEDUPE_SIM_THRESHOLD)
+            for t in picked_tokens
+        ):
+            continue
+        picked.append(item)
+        picked_tokens.append(tokens)
+        if len(picked) >= max_count:
+            break
+    return picked
 
 
 def _parse_seendate_utc(seendate: Optional[str]) -> Optional[datetime]:
@@ -173,15 +236,31 @@ def _maybe_translate_hint_to_en(hint: str) -> str:
 def pick_best_news(items: list[NewsItem], prompt_hint: str) -> NewsItem:
     if not items:
         raise ValueError("no news candidates")
+    counts = _cross_domain_counts(items)
     if not (prompt_hint or "").strip():
-        return items[0]
+        if not any(c >= 2 for c in counts):
+            return items[0]
+        best = items[0]
+        best_key = (counts[0], datetime.min.replace(tzinfo=timezone.utc))
+        for idx, item in enumerate(items):
+            seen = _parse_seendate_utc(item.seendate) or datetime.min.replace(
+                tzinfo=timezone.utc
+            )
+            key = (counts[idx], seen)
+            if key > best_key:
+                best = item
+                best_key = key
+        return best
 
     best = items[0]
     best_key = (-1.0, datetime.min.replace(tzinfo=timezone.utc))
-    for item in items:
+    for idx, item in enumerate(items):
         score = _relevance_score(item, prompt_hint)
-        seen = _parse_seendate_utc(item.seendate) or datetime.min.replace(tzinfo=timezone.utc)
-        key = (score, seen)
+        score += max(0, counts[idx] - 1) * CROSS_DOMAIN_BONUS
+        seen = _parse_seendate_utc(item.seendate) or datetime.min.replace(
+            tzinfo=timezone.utc
+        )
+        key = (score, counts[idx], seen)
         if key > best_key:
             best = item
             best_key = key
@@ -206,6 +285,7 @@ def pick_news_items(
         raise ValueError("no news candidates")
 
     hint = (prompt_hint or "").strip()
+    counts = _cross_domain_counts(items)
     if hint:
         scored: list[tuple[float, datetime, int, NewsItem]] = []
         seen: set[str] = set()
@@ -215,24 +295,36 @@ def pick_news_items(
                 continue
             seen.add(key)
             score = _relevance_score(item, hint)
+            score += max(0, counts[idx] - 1) * CROSS_DOMAIN_BONUS
             seen_at = _parse_seendate_utc(item.seendate) or datetime.min.replace(
                 tzinfo=timezone.utc
             )
-            scored.append((score, seen_at, -idx, item))
+            scored.append((score, seen_at, counts[idx], -idx, item))
         scored.sort(reverse=True)
-        return [item for _, _, _, item in scored[:count]]
+        order = [item for _, _, _, _, item in scored]
+        return _dedupe_by_title(order, max_count=count)
 
-    picked: list[NewsItem] = []
     seen: set[str] = set()
-    for item in items:
+    if any(c >= 2 for c in counts):
+        scored: list[tuple[int, datetime, int, NewsItem]] = []
+        for idx, item in enumerate(items):
+            seen_at = _parse_seendate_utc(item.seendate) or datetime.min.replace(
+                tzinfo=timezone.utc
+            )
+            scored.append((counts[idx], seen_at, -idx, item))
+        scored.sort(reverse=True)
+        order = [item for _, _, _, item in scored]
+    else:
+        order = items
+
+    unique: list[NewsItem] = []
+    for item in order:
         key = item.url or item.title
         if key in seen:
             continue
         seen.add(key)
-        picked.append(item)
-        if len(picked) >= count:
-            break
-    return picked
+        unique.append(item)
+    return _dedupe_by_title(unique, max_count=count)
 
 
 def _gdelt_fetch_articles(

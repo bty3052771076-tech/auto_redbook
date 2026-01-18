@@ -16,6 +16,9 @@ DEFAULT_QUERY = "lifestyle"
 DEFAULT_TIMEOUT_S = 20.0
 DEFAULT_MAX_CANDIDATES = 30
 DEFAULT_ORIENTATION = "portrait"
+DEFAULT_IMAGE_COUNT = 3
+DEFAULT_MIN_SCORE = 0.12
+MAX_IMAGE_COUNT = 18
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
 _CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
@@ -195,6 +198,46 @@ def _compress_english_query(text: str, *, max_words: int = 6) -> str:
     return " ".join(out).strip()
 
 
+def _dedupe_tokens(tokens: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tokens:
+        if not t or t in seen:
+            continue
+        out.append(t)
+        seen.add(t)
+    return out
+
+
+def _resolve_image_count(count: Optional[int]) -> int:
+    env = (os.getenv("AUTO_IMAGE_COUNT") or "").strip()
+    if count is None and env:
+        try:
+            count = int(env)
+        except ValueError:
+            count = None
+    if count is None:
+        count = DEFAULT_IMAGE_COUNT
+    return max(1, min(int(count), MAX_IMAGE_COUNT))
+
+
+def _item_tokens(item: ImageItem) -> set[str]:
+    tokens = _tokens(item.alt or "")
+    if tokens:
+        return tokens
+    return _tokens(item.page_url or "")
+
+
+def _is_similar_tokens(a: set[str], b: set[str], *, threshold: float = 0.6) -> bool:
+    if not a or not b:
+        return False
+    min_len = min(len(a), len(b))
+    if min_len < 3:
+        return False
+    overlap = len(a & b) / min_len
+    return overlap >= threshold
+
+
 def build_image_query(
     title: str,
     body: str,
@@ -263,8 +306,6 @@ def _pexels_query_hint(query: str) -> str:
     q = (query or "").strip()
     if not q:
         return ""
-    if re.search(r"[a-zA-Z]", q):
-        return q
     def _add_token(bucket: list[str], value: str) -> None:
         if not value:
             return
@@ -272,6 +313,9 @@ def _pexels_query_hint(query: str) -> str:
             bucket.append(value)
 
     tokens: list[str] = []
+    english_hint = _compress_english_query(q, max_words=6)
+    if english_hint:
+        tokens.extend(english_hint.split())
     for cn, en in _ENTITY_MAP.items():
         if cn in q:
             _add_token(tokens, en)
@@ -306,18 +350,26 @@ def _pexels_query_hint(query: str) -> str:
     if not tokens and has_news:
         tokens.append("news")
 
-    return " ".join(tokens).strip()
+    if not tokens:
+        return q
+
+    tokens = _dedupe_tokens(tokens)
+    return " ".join(tokens[:8]).strip()
 
 
-def _relevance_score(item: ImageItem, query: str) -> float:
-    q_tokens = _tokens(query)
+def _relevance_score(
+    item: ImageItem, query: str, *, query_tokens: Optional[set[str]] = None
+) -> float:
+    q_tokens = query_tokens or _tokens(query)
     if not q_tokens:
         return 0.0
-    item_text = f"{item.alt or ''} {item.photographer or ''} {item.page_url or ''}".lower()
+    item_text = f"{item.alt or ''} {item.page_url or ''}".lower()
     i_tokens = _tokens(item_text)
     hit = len(q_tokens & i_tokens)
     denom = max(1, len(q_tokens))
     score = hit / denom
+    if not (item.alt or "").strip():
+        score *= 0.8
 
     # Prefer higher-resolution assets (soft weight).
     w = int(item.width or 0)
@@ -341,6 +393,61 @@ def pick_best_image(items: list[ImageItem], query: str) -> ImageItem:
             best = item
             best_key = key
     return best
+
+
+def pick_top_images(
+    items: list[ImageItem],
+    query: str,
+    count: int,
+    *,
+    exclude_ids: Optional[set[str]] = None,
+    min_score: Optional[float] = None,
+) -> list[ImageItem]:
+    if not items:
+        raise ValueError("no image candidates")
+    count = max(1, int(count))
+    exclude_ids = set(exclude_ids or [])
+    q_tokens = _tokens(query)
+
+    ranked: list[tuple[float, int, ImageItem]] = []
+    for item in items:
+        score = _relevance_score(item, query, query_tokens=q_tokens)
+        area = int(item.width or 0) * int(item.height or 0)
+        ranked.append((score, area, item))
+    ranked.sort(key=lambda r: (r[0], r[1]), reverse=True)
+
+    if min_score is None:
+        try:
+            min_score = float(os.getenv("IMAGE_MIN_SCORE") or DEFAULT_MIN_SCORE)
+        except ValueError:
+            min_score = DEFAULT_MIN_SCORE
+    if len(ranked) >= count:
+        filtered = [r for r in ranked if r[0] >= min_score]
+        if len(filtered) >= count:
+            ranked = filtered
+
+    selected: list[ImageItem] = []
+    selected_tokens: list[set[str]] = []
+    for _score, _area, item in ranked:
+        if item.id in exclude_ids:
+            continue
+        item_tokens = _item_tokens(item)
+        if any(_is_similar_tokens(item_tokens, t) for t in selected_tokens):
+            continue
+        selected.append(item)
+        selected_tokens.append(item_tokens)
+        if len(selected) >= count:
+            break
+
+    if len(selected) < count:
+        for _score, _area, item in ranked:
+            if item.id in exclude_ids or item in selected:
+                continue
+            selected.append(item)
+            if len(selected) >= count:
+                break
+
+    return selected
 
 
 def _guess_ext(url: str) -> str:
@@ -459,6 +566,118 @@ def _download_image(
     dest_path.write_bytes(data)
 
 
+def fetch_and_download_related_images(
+    *,
+    title: str,
+    body: str,
+    topics: list[str],
+    prompt_hint: str,
+    dest_dir: Path,
+    provider: Optional[str] = None,
+    count: Optional[int] = None,
+    exclude_ids: Optional[set[str]] = None,
+    max_candidates: Optional[int] = None,
+    timeout_s: Optional[float] = None,
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    """
+    Search related images and download them into `dest_dir`.
+
+    Returns:
+      - downloaded file paths
+      - meta dict list for persistence/audit (provider/query/picked/attribution)
+    """
+    provider_env = (provider or os.getenv("IMAGE_PROVIDER") or "").strip().lower()
+    provider_name = provider_env or DEFAULT_PROVIDER
+
+    timeout_s = float(os.getenv("IMAGE_TIMEOUT_S") or (timeout_s or DEFAULT_TIMEOUT_S))
+    max_candidates = int(os.getenv("IMAGE_MAX_CANDIDATES") or (max_candidates or DEFAULT_MAX_CANDIDATES))
+    orientation = (os.getenv("IMAGE_ORIENTATION") or DEFAULT_ORIENTATION).strip().lower()
+    default_query = (os.getenv("IMAGE_QUERY_DEFAULT") or DEFAULT_QUERY).strip() or DEFAULT_QUERY
+    count = _resolve_image_count(count)
+
+    query_original = build_image_query(title, body, topics, prompt_hint)
+    query_used = query_original
+    if provider_name == "pexels":
+        hint = _pexels_query_hint(query_original)
+        if hint:
+            query_used = hint
+
+    queries = _dedupe_tokens([q for q in (query_used, query_original, default_query) if q])
+    last_err: Optional[str] = None
+    used_ids = set(exclude_ids or [])
+    paths: list[Path] = []
+    metas: list[dict[str, Any]] = []
+
+    for q in queries:
+        try:
+            if provider_name == "pexels":
+                api_key, base_url = _load_pexels_config()
+                candidates = _pexels_search_photos(
+                    api_key=api_key,
+                    base_url=base_url,
+                    query=q,
+                    per_page=max_candidates,
+                    orientation=orientation,
+                    timeout_s=timeout_s,
+                )
+            else:
+                raise RuntimeError(
+                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels"
+                )
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+
+        if not candidates:
+            continue
+
+        picks = pick_top_images(
+            candidates, q, count - len(paths), exclude_ids=used_ids
+        )
+        if not picks:
+            continue
+
+        for picked in picks:
+            if len(paths) >= count:
+                break
+            if picked.id in used_ids:
+                continue
+            ext = _guess_ext(picked.download_url)
+            filename = f"auto_image_{provider_name}_{picked.id}{ext}"
+            dest_path = dest_dir / filename
+            try:
+                if not dest_path.exists():
+                    _download_image(
+                        url=picked.download_url, dest_path=dest_path, timeout_s=timeout_s
+                    )
+            except Exception as exc:
+                last_err = str(exc)
+                continue
+
+            meta: dict[str, Any] = {
+                "mode": "auto_image",
+                "provider": provider_name,
+                "query": q,
+                "query_original": query_original,
+                "query_used": q,
+                "picked": asdict(picked),
+                "downloaded_path": str(dest_path),
+                "downloaded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            paths.append(dest_path)
+            metas.append(meta)
+            used_ids.add(picked.id)
+
+        if len(paths) >= count:
+            break
+
+    if not paths:
+        raise RuntimeError(
+            f"no image returned (provider={provider_name}, query={query_used}, err={last_err})"
+        )
+    return paths, metas
+
+
 def fetch_and_download_related_image(
     *,
     title: str,
@@ -477,70 +696,15 @@ def fetch_and_download_related_image(
       - downloaded file path
       - meta dict for persistence/audit (provider/query/picked/attribution)
     """
-    provider_env = (provider or os.getenv("IMAGE_PROVIDER") or "").strip().lower()
-    provider_name = provider_env or DEFAULT_PROVIDER
-
-    timeout_s = float(os.getenv("IMAGE_TIMEOUT_S") or (timeout_s or DEFAULT_TIMEOUT_S))
-    max_candidates = int(os.getenv("IMAGE_MAX_CANDIDATES") or (max_candidates or DEFAULT_MAX_CANDIDATES))
-    orientation = (os.getenv("IMAGE_ORIENTATION") or DEFAULT_ORIENTATION).strip().lower()
-    default_query = (os.getenv("IMAGE_QUERY_DEFAULT") or DEFAULT_QUERY).strip() or DEFAULT_QUERY
-
-    query_original = build_image_query(title, body, topics, prompt_hint)
-    query_used = query_original
-    if provider_name == "pexels":
-        hint = _pexels_query_hint(query_original)
-        if hint:
-            query_used = hint
-    queries = [q for q in (query_used, default_query) if q]
-
-    chosen_query = query_used
-    candidates: list[ImageItem] = []
-    last_err: Optional[str] = None
-
-    for q in queries:
-        chosen_query = q
-        try:
-            if provider_name == "pexels":
-                api_key, base_url = _load_pexels_config()
-                candidates = _pexels_search_photos(
-                    api_key=api_key,
-                    base_url=base_url,
-                    query=q,
-                    per_page=max_candidates,
-                    orientation=orientation,
-                    timeout_s=timeout_s,
-                )
-            else:
-                raise RuntimeError(
-                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels"
-                )
-            if candidates:
-                break
-        except Exception as exc:
-            last_err = str(exc)
-            candidates = []
-
-    if not candidates:
-        raise RuntimeError(
-            f"no image returned (provider={provider_name}, query={chosen_query}, err={last_err})"
-        )
-
-    picked = pick_best_image(candidates, chosen_query)
-
-    ext = _guess_ext(picked.download_url)
-    filename = f"auto_image_{provider_name}_{picked.id}{ext}"
-    dest_path = dest_dir / filename
-    if not dest_path.exists():
-        _download_image(url=picked.download_url, dest_path=dest_path, timeout_s=timeout_s)
-
-    meta: dict[str, Any] = {
-        "mode": "auto_image",
-        "provider": provider_name,
-        "query": chosen_query,
-        "query_original": query_original,
-        "query_used": query_used,
-        "picked": asdict(picked),
-        "downloaded_path": str(dest_path),
-        "downloaded_at": datetime.now(timezone.utc).isoformat(),
-    }
-    return dest_path, meta
+    paths, metas = fetch_and_download_related_images(
+        title=title,
+        body=body,
+        topics=topics,
+        prompt_hint=prompt_hint,
+        dest_dir=dest_dir,
+        provider=provider,
+        count=1,
+        max_candidates=max_candidates,
+        timeout_s=timeout_s,
+    )
+    return paths[0], metas[0]

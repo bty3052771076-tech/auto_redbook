@@ -4,6 +4,7 @@ from src.images.auto_image import (
     build_image_query,
     is_auto_image_enabled,
     pick_best_image,
+    pick_top_images,
 )
 
 
@@ -138,3 +139,62 @@ def test_pick_best_image_tiebreaker_by_area():
     ]
     picked = pick_best_image(items, "abstract")
     assert picked.id == "2"
+
+
+def test_pick_top_images_prefers_diverse_results():
+    items = [
+        ImageItem(
+            provider="pexels",
+            id="1",
+            page_url="https://example.com/1",
+            download_url="https://example.com/1.jpg",
+            alt="venezuela oil industry",
+            width=1000,
+            height=1500,
+        ),
+        ImageItem(
+            provider="pexels",
+            id="2",
+            page_url="https://example.com/2",
+            download_url="https://example.com/2.jpg",
+            alt="venezuela oil industry",
+            width=1000,
+            height=1500,
+        ),
+        ImageItem(
+            provider="pexels",
+            id="3",
+            page_url="https://example.com/3",
+            download_url="https://example.com/3.jpg",
+            alt="venezuela election politics",
+            width=1000,
+            height=1500,
+        ),
+    ]
+    picked = pick_top_images(items, "venezuela oil", count=2)
+    assert [p.id for p in picked] == ["1", "3"]
+
+
+def test_pick_top_images_respects_exclude_ids():
+    items = [
+        ImageItem(
+            provider="pexels",
+            id="1",
+            page_url="https://example.com/1",
+            download_url="https://example.com/1.jpg",
+            alt="coffee shop interior",
+            width=1000,
+            height=1500,
+        ),
+        ImageItem(
+            provider="pexels",
+            id="2",
+            page_url="https://example.com/2",
+            download_url="https://example.com/2.jpg",
+            alt="coffee shop interior",
+            width=1000,
+            height=1500,
+        ),
+    ]
+    picked = pick_top_images(items, "coffee", count=1, exclude_ids={"1"})
+    assert picked[0].id == "2"

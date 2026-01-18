@@ -7,7 +7,7 @@
 - 特殊标题「每日新闻」：自动抓取新闻 → 生成草稿并保存
 - 特殊标题「每日假新闻」：LLM 生成幽默虚构新闻 → 生成草稿并保存
 - 批量生成：使用 `--count` 控制单次生成条数（默认 1）
-- 自动配图：当未提供图片时，使用图片 API 搜索并下载 1 张相关图片用于上传
+- 自动配图：当未提供图片时，使用图片 API 搜索并下载 3 张相关图片用于上传（默认）
 - 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
 - 落盘与可追溯：`data/posts/<post_id>/` 保存 post / revision / execution / evidence
 
@@ -43,7 +43,7 @@ python -m playwright install chromium
 
 查看草稿（默认 profile）：
 ```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default"
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1"
 ```
 
 ## 环境准备
@@ -74,7 +74,7 @@ NewsAPI（“每日新闻”）：
 - 或本机文件：复制 `docs/news_api-key.example.md` 为 `docs/news_api-key.md` 并填写
 
 Pexels（自动配图：当未提供图片素材时）：
-- 环境变量：`PEXELS_API_KEY`，可选 `PEXELS_BASE_URL`；`AUTO_IMAGE=0` 可关闭自动配图
+- 环境变量：`PEXELS_API_KEY`，可选 `PEXELS_BASE_URL` / `AUTO_IMAGE_COUNT` / `IMAGE_MIN_SCORE`；`AUTO_IMAGE=0` 可关闭自动配图
 - 或本机文件：复制 `docs/pexels_api-key.example.md` 为 `docs/pexels_api-key.md` 并填写
 
 如曾泄露密钥：请立即在对应平台轮换/作废旧 key。
@@ -197,7 +197,9 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 - 建议提供 `--prompt` 作为主题提示；正文会强制包含“本文纯属虚构，仅供娱乐。”。
 
 ## 自动配图（无图片时）
-- 当 `--assets-glob` 未命中任何图片：会自动从 Pexels 搜索并下载 1 张图片到 `data/posts/<post_id>/assets/`，然后继续上传并保存草稿。
+- 当 `--assets-glob` 未命中任何图片：会自动从 Pexels 搜索并下载 3 张图片到 `data/posts/<post_id>/assets/`，然后继续上传并保存草稿（默认）。
+- 调整张数：`AUTO_IMAGE_COUNT=3`（上限 18）。
+- 提高相关性：`IMAGE_MIN_SCORE=0.12`（分数越高越严格，图片数量可能减少）。
 - 关闭自动配图：`AUTO_IMAGE=0`（注意：图文 post 仍需要至少 1 张图片，否则校验会失败）。
 
 ## 删除草稿（危险操作）
@@ -217,7 +219,7 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 ```
 
 ## 输出位置（落盘）
-- `data/posts/<post_id>/post.json`：草稿内容与元数据（含 `platform.news` / `platform.image`）
+- `data/posts/<post_id>/post.json`：草稿内容与元数据（含 `platform.news` / `platform.image` / `platform.images`）
 - `data/posts/<post_id>/revisions/*.json`：每次生成的 revision
 - `data/posts/<post_id>/executions/*.json`：每次保存草稿 attempt 的执行记录
 - `data/posts/<post_id>/evidence/<execution_id>/`：截图/HTML 等证据文件
