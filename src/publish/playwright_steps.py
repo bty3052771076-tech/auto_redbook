@@ -95,6 +95,21 @@ def _resolve_profile_config() -> tuple[Path, Optional[str], list[str]]:
     return profile_dir, channel, args
 
 
+def _resolve_cdp_url() -> Optional[str]:
+    """
+    Optional: attach to an existing user-launched Chrome via CDP.
+
+    Env:
+      - XHS_CDP_URL: e.g. "http://127.0.0.1:9222" (or just "9222")
+    """
+    raw = (os.getenv("XHS_CDP_URL") or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return f"http://127.0.0.1:{raw}"
+    return raw
+
+
 def _wait_for_any_text(page, texts: List[str], timeout_ms: int) -> str:
     per = max(1000, timeout_ms // max(1, len(texts)))
     for text in texts:
@@ -917,6 +932,7 @@ def run_save_draft_sync(
 
     assets = [str(Path(p)) for p in (assets or []) if Path(p).is_file()]
     context = None
+    should_close_context = True
 
     try:
         profile_dir, channel, args = _resolve_profile_config()
@@ -924,16 +940,26 @@ def run_save_draft_sync(
 
         _step("launch", "in_progress", str(profile_dir))
         with sync_playwright() as p:
-            launch_kwargs = {"headless": False}
-            if channel:
-                launch_kwargs["channel"] = channel
-            if args:
-                launch_kwargs["args"] = args
-            context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
+            cdp_url = _resolve_cdp_url()
+            if cdp_url:
+                # Attach to an existing Chrome instance (recommended when the profile is already open).
+                context = None
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                should_close_context = False
+                steps[-1].detail = f"cdp={cdp_url}"
+            else:
+                launch_kwargs = {"headless": False}
+                if channel:
+                    launch_kwargs["channel"] = channel
+                if args:
+                    launch_kwargs["args"] = args
+                context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
             context.set_default_timeout(30000)
             steps[-1].status = "success"
             try:
-                page = context.pages[0] if context.pages else context.new_page()
+                # In CDP mode, avoid hijacking an existing tab (e.g. ChatGPT page); open a new one.
+                page = context.new_page() if not should_close_context else (context.pages[0] if context.pages else context.new_page())
                 _step("open_page", "in_progress", TARGET_URL)
                 page.goto(TARGET_URL, wait_until="domcontentloaded")
                 steps[-1].status = "success"
@@ -1183,7 +1209,8 @@ def run_save_draft_sync(
                     return exec_rec
                 steps[-1].status = "success"
             finally:
-                context.close()
+                if should_close_context:
+                    context.close()
     except Exception as exc:  # pragma: no cover
         exec_rec.result = "failed"
         exec_rec.error = {"message": str(exc)}

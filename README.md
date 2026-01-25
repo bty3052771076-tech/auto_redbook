@@ -197,10 +197,82 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 - 建议提供 `--prompt` 作为主题提示；正文会强制包含“本文纯属虚构，仅供娱乐。”。
 
 ## 自动配图（无图片时）
-- 当 `--assets-glob` 未命中任何图片：会自动从 Pexels 搜索并下载 3 张图片到 `data/posts/<post_id>/assets/`，然后继续上传并保存草稿（默认）。
-- 调整张数：`AUTO_IMAGE_COUNT=3`（上限 18）。
+- 当 `--assets-glob` 未命中任何图片：会自动生成/下载图片到 `data/posts/<post_id>/assets/`，然后继续上传并保存草稿。
+- 通过 `IMAGE_PROVIDER` 选择来源：
+  - `pexels`（默认）：图片检索下载（需要 `PEXELS_API_KEY`）
+  - `chatgpt_images`：进入 `https://chatgpt.com/images` 自动生图并落盘（优先下载原图字节，避免“截图截到模糊/生成中”）
+- 调整张数：`AUTO_IMAGE_COUNT=3`（上限 18；`pexels` 默认 3，`chatgpt_images` 默认 1）。
 - 提高相关性：`IMAGE_MIN_SCORE=0.12`（分数越高越严格，图片数量可能减少）。
 - 关闭自动配图：`AUTO_IMAGE=0`（注意：图文 post 仍需要至少 1 张图片，否则校验会失败）。
+
+### ChatGPT Images（自动生图）配置
+前提：你已经在下面这个 profile 中登录了 ChatGPT：
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1"
+```
+
+运行前建议关闭所有 Chrome 窗口（避免 profile 被占用）。
+
+注意：ChatGPT 站点可能触发 Cloudflare 人机校验，自动化无法绕过；如果自动化窗口一直卡在白屏/加载中，通常就是被拦截了。
+默认行为是在等待 `CHATGPT_CHALLENGE_TIMEOUT_S` 后，自动切换到【手动生图】模式：用“普通 Chrome 窗口”打开 `https://chatgpt.com/images`，你粘贴提示词生成并把下载图片放到 `data/posts/<post_id>/assets/`，脚本检测到新图片后继续保存草稿。
+
+如果你希望尽量“全自动”（避免重新启动浏览器触发校验），可以改用【连接到你已打开的 Chrome】模式：你先用普通 Chrome 打开并通过校验，然后脚本通过 CDP 连接并复用当前页面。
+
+```powershell
+$env:IMAGE_PROVIDER="chatgpt_images"
+$env:CHATGPT_CHROME_EXECUTABLE="C:\Program Files\Google\Chrome\Application\chrome.exe"
+$env:CHATGPT_CHROME_USER_DATA_DIR="D:\AI\codex\redbook_workflow\data\browser\chrome-profile"
+$env:CHATGPT_CHROME_PROFILE="Default1"
+$env:CHATGPT_IMAGE_TIMEOUT_S="180"             # 生成图片等待上限（秒）
+$env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"          # 等待原图可下载的最大时间（越大越稳，但更慢）
+$env:CHATGPT_CHALLENGE_TIMEOUT_S="30"          # 自动化被拦截后等待 N 秒再转手动
+$env:CHATGPT_MANUAL_TIMEOUT_S="1800"           # 手动模式等待你放入图片的时间
+$env:CHATGPT_FALLBACK_MANUAL_ON_CHALLENGE="1"  # 0=关闭手动降级（保持失败）
+
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
+```
+
+### 连接到已打开的 Chrome（可选，推荐）
+1) 先用下面命令启动 Chrome（会启用远程调试端口），并打开 ChatGPT Images：
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 `
+  --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" `
+  --profile-directory="Default1" `
+  "https://chatgpt.com/images"
+```
+如果你本机已经有其它 Chrome 在运行，上面的命令可能会“复用已有进程”而导致 `9222` 端口没有真的打开；建议先完全退出所有 `chrome.exe` 再运行。
+2) 在该窗口里手动通过 Cloudflare/确认页面正常后，不要关闭该窗口。
+3) 另开一个终端运行（脚本会连接到现有 Chrome）：
+```powershell
+$env:CHATGPT_CDP_URL="http://127.0.0.1:9222"
+$env:XHS_CDP_URL="http://127.0.0.1:9222"
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
+```
+
+**完整指令（GPT 生图 → 保存到小红书草稿）**
+```powershell
+# 1) 先启动已登录的 Chrome（复用你的 Default1 profile）
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 `
+  --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" `
+  --profile-directory="Default1" `
+  "https://chatgpt.com/images"
+
+# 2) 通过校验后保持窗口打开，再运行自动化（无本地图片 → ChatGPT 生图 → 保存草稿）
+$env:IMAGE_PROVIDER="chatgpt_images"
+$env:CHATGPT_CDP_URL="http://127.0.0.1:9222"
+$env:XHS_CDP_URL="http://127.0.0.1:9222"
+$env:CHATGPT_IMAGE_TIMEOUT_S="180"
+$env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"
+
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
+```
+
+**一行版（含人工回车等待）**
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1" "https://chatgpt.com/images"; Read-Host "完成校验后回车继续"; $env:IMAGE_PROVIDER="chatgpt_images"; $env:CHATGPT_CDP_URL="http://127.0.0.1:9222"; $env:XHS_CDP_URL="http://127.0.0.1:9222"; $env:CHATGPT_IMAGE_TIMEOUT_S="180"; $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
+```
 
 ## 删除草稿（危险操作）
 说明：删除操作发生在当前浏览器 profile 的草稿箱内；默认仅处理图文草稿，可用 `--all` 覆盖三类草稿。
@@ -230,6 +302,20 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 $out = .\.venv\Scripts\python -m apps.cli create --title "登录测试" --prompt "" --assets-glob "assets/pics/*" 2>&1
 $post_id = ($out | Select-String -Pattern "post_id=([0-9a-f]{32})" | Select-Object -First 1).Matches[0].Groups[1].Value
 .\.venv\Scripts\python -m apps.cli run $post_id --login-hold 600 --dry-run --force
+```
+
+探测 ChatGPT Images 登录态/输入框（会自动留证到 `data/posts/<post_id>/evidence/...`）：
+```powershell
+.\.venv\Scripts\python -m apps.inspect_chatgpt_images --hold 30
+```
+
+E2E 测试（推荐先用 CDP 模式打开并通过校验）：
+```powershell
+# 只测 ChatGPT Images 生图落盘（验证 method != screenshot*）
+.\.venv\Scripts\python -m apps.e2e_test_chatgpt_images --prompt "为一条科技类新闻生成竖版3:4新闻插画，干净无文字无logo，抽象象征元素，高清"
+
+# 全流程：每日新闻 -> ChatGPT 生图 -> 小红书保存草稿（会自动读取 post.json 校验 method/素材落盘）
+.\.venv\Scripts\python -m apps.e2e_test_auto_full --cdp "http://127.0.0.1:9222" --title "每日新闻" --prompt "美国时政" --count 1 --assets-glob "empty/pics/*"
 ```
 
 ## 常见问题

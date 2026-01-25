@@ -593,9 +593,44 @@ def fetch_and_download_related_images(
     max_candidates = int(os.getenv("IMAGE_MAX_CANDIDATES") or (max_candidates or DEFAULT_MAX_CANDIDATES))
     orientation = (os.getenv("IMAGE_ORIENTATION") or DEFAULT_ORIENTATION).strip().lower()
     default_query = (os.getenv("IMAGE_QUERY_DEFAULT") or DEFAULT_QUERY).strip() or DEFAULT_QUERY
+    requested_count = count
     count = _resolve_image_count(count)
 
     query_original = build_image_query(title, body, topics, prompt_hint)
+
+    if provider_name in ("chatgpt_images", "chatgpt"):
+        from src.images.chatgpt_images import build_chatgpt_image_prompt, generate_chatgpt_image
+
+        # ChatGPT Images is interactive and much slower than search-based providers.
+        # Default to 1 image unless the caller or env explicitly requests otherwise.
+        if requested_count is None and not (os.getenv("AUTO_IMAGE_COUNT") or "").strip():
+            count = 1
+
+        chatgpt_timeout_s = float(os.getenv("CHATGPT_IMAGE_TIMEOUT_S") or 180.0)
+        prompt = build_chatgpt_image_prompt(
+            title=title, body=body, topics=topics, prompt_hint=prompt_hint
+        )
+
+        # Best-effort derive post_id from dest_dir; we use it only for evidence folder naming.
+        post_id = dest_dir.parent.name if dest_dir.name == "assets" else dest_dir.name
+
+        paths: list[Path] = []
+        metas: list[dict[str, Any]] = []
+        for _ in range(count):
+            res = generate_chatgpt_image(
+                post_id=post_id,
+                prompt=prompt,
+                dest_dir=dest_dir,
+                timeout_s=chatgpt_timeout_s,
+            )
+            meta = {
+                **res.meta,
+                "query_original": query_original,
+            }
+            paths.append(res.path)
+            metas.append(meta)
+        return paths, metas
+
     query_used = query_original
     if provider_name == "pexels":
         hint = _pexels_query_hint(query_original)
@@ -622,7 +657,7 @@ def fetch_and_download_related_images(
                 )
             else:
                 raise RuntimeError(
-                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels"
+                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels, chatgpt_images"
                 )
         except Exception as exc:
             last_err = str(exc)
