@@ -545,6 +545,10 @@ def _collect_draft_items(page, *, limit: Optional[int] = None) -> list[dict[str,
 
 def _confirm_delete_dialog(page, timeout_s: float = 3.0) -> bool:
     selectors = [
+        ".draft-delete-popconfirm .btn-footer-confirm",
+        ".d-popconfirm .btn-footer-confirm",
+        ".d-popconfirm-footer .btn-footer-confirm",
+        ".d-popover .btn-footer-confirm",
         ".el-popconfirm:visible button:has-text('删除')",
         ".el-popconfirm:visible button:has-text('确定')",
         ".el-popconfirm:visible button:has-text('确认')",
@@ -574,10 +578,6 @@ def _confirm_delete_dialog(page, timeout_s: float = 3.0) -> bool:
         ".el-popper:visible span:has-text('删除')",
         ".modal:visible span:has-text('删除')",
         "[aria-modal='true'] span:has-text('删除')",
-        ".d-popconfirm .btn-footer-confirm",
-        ".d-popover .btn-footer-confirm",
-        ".draft-delete-popconfirm .btn-footer-confirm",
-        ".d-popconfirm-footer .btn-footer-confirm",
     ]
     deadline = time.time() + max(0.0, timeout_s)
     while time.time() < deadline:
@@ -585,8 +585,11 @@ def _confirm_delete_dialog(page, timeout_s: float = 3.0) -> bool:
             loc = page.locator(sel)
             if loc.count() == 0:
                 continue
+            target = _first_visible(loc)
+            if target is None:
+                continue
             try:
-                loc.first.click(force=True)
+                target.click(force=True)
                 return True
             except Exception:
                 continue
@@ -729,6 +732,30 @@ def _draft_item_exists(page, title: str) -> bool:
     )
 
 
+def _draft_item_key(page) -> str:
+    try:
+        title = (
+            page.locator(DRAFT_ITEM_SELECTOR)
+            .first.locator(".draft-title-text")
+            .first.text_content()
+            or ""
+        ).strip()
+    except Exception:
+        title = ""
+    try:
+        saved_at = (
+            page.locator(DRAFT_ITEM_SELECTOR)
+            .first.locator(".draft-time")
+            .first.text_content()
+            or ""
+        ).strip()
+    except Exception:
+        saved_at = ""
+    if not title and not saved_at:
+        return ""
+    return f"{title}|{saved_at}"
+
+
 def _wait_for_draft_cover(page, title: str, timeout_ms: int = 120000) -> bool:
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
@@ -836,6 +863,7 @@ def _wait_for_draft_list_change(
     *,
     before_count: int,
     before_title: str,
+    before_key: str = "",
     before_total: Optional[int] = None,
     timeout_s: int = 10,
 ) -> bool:
@@ -850,6 +878,10 @@ def _wait_for_draft_list_change(
         if before_total is not None:
             after_total = _extract_draft_count(page)
             if after_total is not None and after_total < before_total:
+                return True
+        if before_key:
+            after_key = _draft_item_key(page)
+            if after_key and after_key != before_key:
                 return True
         try:
             first_title = (
@@ -1358,6 +1390,16 @@ def run_delete_drafts_sync(
                         ).strip()
                     except Exception:
                         before_title = ""
+                    try:
+                        before_time = (
+                            page.locator(DRAFT_ITEM_SELECTOR)
+                            .first.locator(".draft-time")
+                            .first.text_content()
+                            or ""
+                        ).strip()
+                    except Exception:
+                        before_time = ""
+                    before_key = f"{before_title}|{before_time}" if before_title or before_time else ""
                     before_total = _extract_draft_count(page)
                     ok, title = _delete_first_draft_item(page)
                     if not ok:
@@ -1368,6 +1410,7 @@ def run_delete_drafts_sync(
                         page,
                         before_count=before,
                         before_title=before_title,
+                        before_key=before_key,
                         before_total=before_total,
                         timeout_s=10,
                     )

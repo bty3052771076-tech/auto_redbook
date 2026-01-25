@@ -2,6 +2,37 @@
 
 > 记录按时间倒序（最新在前）
 
+### 2026-01-25 16:57
+**Task:** Fix delete-drafts SyntaxError and run a real delete.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Fixed indentation around the delete list-change fallback so the delete loop runs. | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry and the delete run result. | Continue logging. |
+
+**Notes**
+- Run: `.\.venv\Scripts\python -m apps.cli delete-drafts --limit 5 --yes`
+- Result: deleted 5/92 image drafts; event `data/events/f283ccc98e724605a13febf4ad372335.json`.
+
+### 2026-01-25 16:50
+**Task:** Fix draft deletion flow (confirm click + list change detection).
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Confirm dialog click now targets visible confirm buttons first; deletion list change detection uses title+time key to avoid false timeouts on duplicate titles. | Run `apps.cli delete-drafts --dry-run` or a limited delete to validate. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+### 2026-01-25 16:21
+**Task:** Add GPT image commands for “每日假新闻”.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `README.md` | DONE | Added full and one-line commands to generate GPT images for “每日假新闻” and save drafts. | Run the new commands if you want a fresh verification. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
 ### 2026-01-25 12:46
 **Task:** Provide single-line GPT image → XHS draft command in README.
 **Git:** `main (dirty)`

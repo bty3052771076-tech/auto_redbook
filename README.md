@@ -274,6 +274,30 @@ $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"
 & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1" "https://chatgpt.com/images"; Read-Host "完成校验后回车继续"; $env:IMAGE_PROVIDER="chatgpt_images"; $env:CHATGPT_CDP_URL="http://127.0.0.1:9222"; $env:XHS_CDP_URL="http://127.0.0.1:9222"; $env:CHATGPT_IMAGE_TIMEOUT_S="180"; $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
 ```
 
+**每日假新闻（GPT 生图 → 保存到小红书草稿）**
+```powershell
+# 1) 先启动已登录的 Chrome（复用你的 Default1 profile）
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 `
+  --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" `
+  --profile-directory="Default1" `
+  "https://chatgpt.com/images"
+
+# 2) 通过校验后保持窗口打开，再运行自动化（无本地图片 → ChatGPT 生图 → 保存草稿）
+$env:IMAGE_PROVIDER="chatgpt_images"
+$env:CHATGPT_CDP_URL="http://127.0.0.1:9222"
+$env:XHS_CDP_URL="http://127.0.0.1:9222"
+$env:CHATGPT_IMAGE_TIMEOUT_S="180"
+$env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"
+
+.\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
+```
+
+**每日假新闻一行版（含人工回车等待）**
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1" "https://chatgpt.com/images"; Read-Host "完成校验后回车继续"; $env:IMAGE_PROVIDER="chatgpt_images"; $env:CHATGPT_CDP_URL="http://127.0.0.1:9222"; $env:XHS_CDP_URL="http://127.0.0.1:9222"; $env:CHATGPT_IMAGE_TIMEOUT_S="180"; $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
+```
+
 ## 删除草稿（危险操作）
 说明：删除操作发生在当前浏览器 profile 的草稿箱内；默认仅处理图文草稿，可用 `--all` 覆盖三类草稿。
 ```powershell
