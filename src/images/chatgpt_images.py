@@ -273,11 +273,12 @@ def _click_send_if_present(page) -> bool:
             loc = page.locator(sel)
             if loc.count() == 0:
                 continue
-            btn = loc.first
-            if not btn.is_visible() or not btn.is_enabled():
-                continue
-            btn.click()
-            return True
+            for i in range(min(loc.count(), 6)):
+                btn = loc.nth(i)
+                if not btn.is_visible() or not btn.is_enabled():
+                    continue
+                btn.click()
+                return True
         except Exception:
             continue
     return False
@@ -471,11 +472,10 @@ def _pick_new_image_locator(page, before_srcs: set[str]):
                 continue
             if not img.is_visible():
                 continue
-            loaded = False
             try:
                 loaded = bool(img.evaluate("el => !!el.complete && (el.naturalWidth || 0) > 0"))
             except Exception:
-                loaded = True
+                continue
             if not loaded:
                 continue
             try:
@@ -485,14 +485,14 @@ def _pick_new_image_locator(page, before_srcs: set[str]):
                 if w < 256 or h < 256:
                     continue
             except Exception:
-                pass
+                continue
             return img
         except Exception:
             continue
     return None
 
 
-def _collect_img_srcs(page, *, limit: int = 80) -> set[str]:
+def _collect_img_srcs(page, *, limit: int = 200) -> set[str]:
     out: set[str] = set()
     try:
         values = page.evaluate(
@@ -535,16 +535,17 @@ def _fill_prompt(page, box, prompt: str) -> bool:
 
     if not filled and is_contenteditable:
         try:
-            box.evaluate(
-                """(el, value) => {
-                  el.focus();
-                  el.innerHTML = '';
-                  el.dispatchEvent(new InputEvent('input', { bubbles: true }));
-                  el.textContent = value;
-                  el.dispatchEvent(new InputEvent('input', { bubbles: true }));
-                }""",
-                prompt,
-            )
+            # Prefer real typing for ChatGPT's ProseMirror editor; direct DOM assignment
+            # may not update the app state (the submit button can stay in "voice" mode).
+            box.click()
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+            try:
+                # Insert text like paste (doesn't press Enter). This avoids accidentally
+                # sending the prompt early when it contains newlines.
+                page.keyboard.insert_text(prompt)
+            except Exception:
+                page.keyboard.type(prompt, delay=5)
             filled = bool(_box_text(box))
         except Exception:
             filled = False
@@ -800,6 +801,10 @@ def _is_placeholder_src(src_url: str) -> bool:
     src = (src_url or "").strip()
     if not src:
         return True
+    if src.startswith("data:image/gif"):
+        return True
+    if src.startswith("data:image/svg"):
+        return True
     if "persistent.oaistatic.com/images-app/" in src:
         return True
     if "sugar-cookie" in src or "cookie.webp" in src:
@@ -856,12 +861,28 @@ def generate_chatgpt_image(
 
             # In CDP mode, prefer reusing an already opened images page to avoid re-triggering checks.
             if not cdp_url or not (page.url or "").startswith(CHATGPT_IMAGES_URL):
-                page.goto(CHATGPT_IMAGES_URL, wait_until="domcontentloaded")
+                try:
+                    page.goto(CHATGPT_IMAGES_URL, wait_until="domcontentloaded")
+                except Exception as exc:
+                    if not cdp_url:
+                        raise
+                    _snapshot(page, post_id=post_id, run_id=run_id, name="goto_failed")
+                    # Retry by reusing any existing images page or opening a fresh tab.
+                    fallback = _find_existing_images_page(context)
+                    if fallback is not None:
+                        page = fallback
+                    else:
+                        page = context.new_page()
+                        try:
+                            page.goto(CHATGPT_IMAGES_URL, wait_until="domcontentloaded")
+                        except Exception:
+                            _snapshot(page, post_id=post_id, run_id=run_id, name="goto_failed_retry")
+                            raise exc
             _snapshot(page, post_id=post_id, run_id=run_id, name="opened")
 
             if _is_cloudflare_challenge(page):
                 _snapshot(page, post_id=post_id, run_id=run_id, name="cf_challenge")
-                challenge_timeout_s = float(os.getenv("CHATGPT_CHALLENGE_TIMEOUT_S") or 600.0)
+                challenge_timeout_s = float(os.getenv("CHATGPT_CHALLENGE_TIMEOUT_S") or 180.0)
                 deadline = time.time() + challenge_timeout_s
                 while time.time() < deadline and _is_cloudflare_challenge(page):
                     time.sleep(2)
@@ -872,7 +893,7 @@ def generate_chatgpt_image(
                         run_id=run_id,
                         name="cf_challenge_timeout",
                     )
-                    manual_timeout_s = float(os.getenv("CHATGPT_MANUAL_TIMEOUT_S") or 1800.0)
+                    manual_timeout_s = float(os.getenv("CHATGPT_MANUAL_TIMEOUT_S") or 180.0)
                     if _truthy_env("CHATGPT_FALLBACK_MANUAL_ON_CHALLENGE", default=True):
                         # Close automation context first; then guide the user to generate the image manually.
                         if should_close_context:

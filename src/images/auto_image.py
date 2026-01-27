@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -102,6 +103,20 @@ class ImageItem:
     width: Optional[int] = None
     height: Optional[int] = None
     alt: Optional[str] = None
+
+
+class ImageGenerationAbandoned(RuntimeError):
+    """
+    Raised when an interactive image provider (e.g. ChatGPT Images) fails repeatedly
+    and we intentionally give up for this post/news item.
+    """
+
+    def __init__(self, *, provider: str, attempts: int, errors: list[str]):
+        msg = f"image generation abandoned (provider={provider}, attempts={attempts})"
+        super().__init__(msg)
+        self.provider = provider
+        self.attempts = attempts
+        self.errors = errors
 
 
 def is_auto_image_enabled() -> bool:
@@ -606,7 +621,25 @@ def fetch_and_download_related_images(
         if requested_count is None and not (os.getenv("AUTO_IMAGE_COUNT") or "").strip():
             count = 1
 
+        def _is_retryable_chatgpt_error(exc: Exception) -> bool:
+            msg = str(exc or "")
+            if not msg:
+                return False
+            msg_lower = msg.lower()
+            # Do not retry auth / challenge blocks; these need manual intervention.
+            if "cloudflare" in msg_lower:
+                return False
+            if "未登录" in msg or "login required" in msg_lower:
+                return False
+            # Everything else is treated as retryable; after max attempts we will
+            # raise ImageGenerationAbandoned so the caller can skip this item.
+            return True
+
         chatgpt_timeout_s = float(os.getenv("CHATGPT_IMAGE_TIMEOUT_S") or 180.0)
+        max_attempts = int(os.getenv("CHATGPT_IMAGE_MAX_ATTEMPTS") or 3)
+        retry_sleep_s = float(os.getenv("CHATGPT_IMAGE_RETRY_SLEEP_S") or 2.0)
+        if max_attempts <= 0:
+            max_attempts = 1
         prompt = build_chatgpt_image_prompt(
             title=title, body=body, topics=topics, prompt_hint=prompt_hint
         )
@@ -617,15 +650,35 @@ def fetch_and_download_related_images(
         paths: list[Path] = []
         metas: list[dict[str, Any]] = []
         for _ in range(count):
-            res = generate_chatgpt_image(
-                post_id=post_id,
-                prompt=prompt,
-                dest_dir=dest_dir,
-                timeout_s=chatgpt_timeout_s,
-            )
+            errors: list[str] = []
+            res = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    res = generate_chatgpt_image(
+                        post_id=post_id,
+                        prompt=prompt,
+                        dest_dir=dest_dir,
+                        timeout_s=chatgpt_timeout_s,
+                    )
+                    break
+                except Exception as exc:
+                    errors.append(str(exc))
+                    if attempt < max_attempts and _is_retryable_chatgpt_error(exc):
+                        time.sleep(max(0.0, retry_sleep_s))
+                        continue
+                    if attempt >= max_attempts and _is_retryable_chatgpt_error(exc):
+                        raise ImageGenerationAbandoned(
+                            provider=provider_name, attempts=attempt, errors=errors[-3:]
+                        ) from exc
+                    raise
+            if res is None:
+                raise ImageGenerationAbandoned(provider=provider_name, attempts=max_attempts, errors=errors[-3:])
             meta = {
                 **res.meta,
                 "query_original": query_original,
+                "attempt": len(errors) + 1,
+                "attempt_max": max_attempts,
+                "attempt_errors": errors[-3:],
             }
             paths.append(res.path)
             metas.append(meta)

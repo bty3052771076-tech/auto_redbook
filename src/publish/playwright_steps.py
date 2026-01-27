@@ -33,7 +33,15 @@ DRAFT_TEXTS = [
     "\u5b58\u8349\u7a3f",
     "\u5b58\u4e3a\u8349\u7a3f",
 ]
-PROCESSING_TEXTS = ["\u6b63\u5728\u5904\u7406\u4e2d", "\u5904\u7406\u4e2d", "\u4e0a\u4f20\u4e2d"]
+# Upload/processing hints shown around image thumbnails. Keep the more specific
+# ones first so we don't miss them when there are many partial matches.
+PROCESSING_TEXTS = [
+    "\u56fe\u7247\u4e0a\u4f20\u4e2d",  # 图片上传中，上传完成后可使用
+    "\u4e0a\u4f20\u5b8c\u6210\u540e\u53ef\u4f7f\u7528",
+    "\u6b63\u5728\u5904\u7406\u4e2d",
+    "\u5904\u7406\u4e2d",
+    "\u4e0a\u4f20\u4e2d",
+]
 DRAFT_TAB_TEXTS_IMAGE = ["\u56fe\u6587\u7b14\u8bb0", "\u56fe\u6587"]
 DRAFT_TAB_TEXTS_VIDEO = ["\u89c6\u9891\u7b14\u8bb0", "\u89c6\u9891"]
 DRAFT_TAB_TEXTS_ARTICLE = ["\u957f\u6587\u7b14\u8bb0", "\u957f\u6587"]
@@ -927,9 +935,19 @@ def _processing_visible(page) -> bool:
     for text in PROCESSING_TEXTS:
         try:
             loc = page.get_by_text(text, exact=False)
-            if loc.count() == 0:
+            count = loc.count()
+            if count == 0:
                 continue
-            for i in range(min(loc.count(), 5)):
+            # Some pages contain many hidden/template matches. Scan more than a
+            # handful and also check the tail where transient toasts often live.
+            head = min(count, 30)
+            for i in range(head):
+                if loc.nth(i).is_visible():
+                    return True
+            tail_start = max(0, count - 10)
+            for i in range(count - 1, tail_start - 1, -1):
+                if i < head:
+                    break
                 if loc.nth(i).is_visible():
                     return True
         except Exception:
@@ -937,11 +955,67 @@ def _processing_visible(page) -> bool:
     return False
 
 
+def _upload_in_progress(page) -> bool:
+    try:
+        return bool(
+            page.evaluate(
+                """
+                () => {
+                  const selectors = [
+                    '.upload-item .loading-box',
+                    '.upload-item .loading-container',
+                    '.upload-item .loading-spinner',
+                    '.upload-item .upload-layer',
+                    '.bg-loading',
+                    '.loading-box',
+                    '.loading-container',
+                    '.loading-spinner'
+                  ];
+                  const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                      return false;
+                    }
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  };
+                  for (const sel of selectors) {
+                    const nodes = Array.from(document.querySelectorAll(sel));
+                    if (nodes.some(isVisible)) return true;
+                  }
+                  return false;
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def _wait_for_processing_done(page, timeout_ms: int = 120000) -> bool:
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
-        if not _processing_visible(page):
+        if not _processing_visible(page) and not _upload_in_progress(page):
             return True
+        time.sleep(1)
+    return False
+
+
+def _wait_for_upload_settle(
+    page, *, settle_s: int = 5, timeout_ms: int = 180000
+) -> bool:
+    if settle_s <= 0:
+        return True
+    deadline = time.time() + timeout_ms / 1000
+    stable = 0
+    while time.time() < deadline:
+        if _upload_in_progress(page) or _processing_visible(page):
+            stable = 0
+        else:
+            stable += 1
+            if stable >= settle_s:
+                return True
         time.sleep(1)
     return False
 
@@ -1083,6 +1157,22 @@ def run_save_draft_sync(
                     if not processed:
                         raise RuntimeError("upload processing not finished")
                     steps[-1].status = "success"
+                    settle_s = int(os.getenv("XHS_UPLOAD_SETTLE_S") or 5)
+                    settle_timeout_s = float(os.getenv("XHS_UPLOAD_SETTLE_TIMEOUT_S") or 180.0)
+                    _step(
+                        "wait_for_upload_settle",
+                        "in_progress",
+                        f"{settle_s}s timeout={int(settle_timeout_s)}s",
+                    )
+                    settled = _wait_for_upload_settle(
+                        page,
+                        settle_s=settle_s,
+                        timeout_ms=int(max(1.0, settle_timeout_s) * 1000),
+                    )
+                    steps[-1].detail = f"settled={settled}"
+                    if not settled:
+                        raise RuntimeError("upload not settled")
+                    steps[-1].status = "success"
                     _step("select_cover", "in_progress", "")
                     cover_applied, cover_detail = _maybe_select_cover(page)
                     steps[-1].detail = cover_detail
@@ -1190,56 +1280,75 @@ def run_save_draft_sync(
                 # keep the saved result but leave evidence for manual verification.
                 exec_rec.result = "saved_draft"
 
-                _step("open_draft_box", "in_progress", "")
-                opened = _open_draft_box(page)
-                steps[-1].detail = f"opened={opened}"
-                if not opened:
-                    steps[-1].status = "skipped"
-                    return exec_rec
-                steps[-1].status = "success"
-
-                _step("open_draft_tab", "in_progress", "")
-                opened_tab = _open_image_draft_tab(page)
-                steps[-1].detail = f"opened={opened_tab}"
-                if not opened_tab:
-                    steps[-1].status = "skipped"
-                    return exec_rec
-                steps[-1].status = "success"
-
-                _step("wait_for_draft_items", "in_progress", "")
                 try:
-                    page.locator(DRAFT_ITEM_SELECTOR).first.wait_for(timeout=30000)
-                    steps[-1].detail = "ready"
+                    _step("open_draft_box", "in_progress", "")
+                    opened = _open_draft_box(page)
+                    steps[-1].detail = f"opened={opened}"
+                    if not opened:
+                        steps[-1].status = "skipped"
+                        return exec_rec
                     steps[-1].status = "success"
-                except PlaywrightTimeoutError:
-                    steps[-1].detail = "timeout"
-                    steps[-1].status = "skipped"
+
+                    _step("open_draft_tab", "in_progress", "")
+                    opened_tab = _open_image_draft_tab(page)
+                    steps[-1].detail = f"opened={opened_tab}"
+                    if not opened_tab:
+                        steps[-1].status = "skipped"
+                        return exec_rec
+                    steps[-1].status = "success"
+
+                    _step("wait_for_draft_items", "in_progress", "")
+                    try:
+                        page.locator(DRAFT_ITEM_SELECTOR).first.wait_for(timeout=30000)
+                        steps[-1].detail = "ready"
+                        steps[-1].status = "success"
+                    except PlaywrightTimeoutError:
+                        steps[-1].detail = "timeout"
+                        steps[-1].status = "skipped"
+                        return exec_rec
+
+                    _step("wait_for_draft_cover", "in_progress", "")
+                    cover_ready = False
+                    try:
+                        cover_ready = _wait_for_draft_cover(page, post.title)
+                        steps[-1].detail = f"ready={cover_ready}"
+                        steps[-1].status = "success"
+                    except Exception as exc:
+                        steps[-1].detail = f"error: {exc}"
+                        steps[-1].status = "skipped"
+
+                    _step("snapshot_draft_box", "in_progress", "")
+                    try:
+                        draft_shot = ev_dir / "draft_box.png"
+                        page.screenshot(path=str(draft_shot), full_page=True)
+                        steps[-1].detail = f"saved to {draft_shot}"
+                        steps[-1].status = "success"
+                    except Exception as exc:
+                        steps[-1].detail = f"error: {exc}"
+                        steps[-1].status = "skipped"
+
+                    _step("html_draft_box", "in_progress", "")
+                    try:
+                        draft_html = ev_dir / "draft_box.html"
+                        draft_html.write_text(page.content(), encoding="utf-8")
+                        steps[-1].detail = f"saved to {draft_html}"
+                        steps[-1].status = "success"
+                    except Exception as exc:
+                        steps[-1].detail = f"error: {exc}"
+                        steps[-1].status = "skipped"
+
+                    _step("verify_draft_box_item", "in_progress", "")
+                    try:
+                        verified = _verify_draft_item(page, post.title)
+                        steps[-1].detail = f"verified={verified} cover_ready={cover_ready}"
+                        steps[-1].status = "success" if (verified and cover_ready) else "skipped"
+                    except Exception as exc:
+                        steps[-1].detail = f"error: {exc}"
+                        steps[-1].status = "skipped"
+                except Exception as exc:
+                    # Do not fail the whole run after the draft has already been saved.
+                    _step("draft_box_optional", "skipped", f"error: {exc}")
                     return exec_rec
-
-                _step("wait_for_draft_cover", "in_progress", "")
-                cover_ready = _wait_for_draft_cover(page, post.title)
-                steps[-1].detail = f"ready={cover_ready}"
-                steps[-1].status = "success"
-
-                _step("snapshot_draft_box", "in_progress", "")
-                draft_shot = ev_dir / "draft_box.png"
-                page.screenshot(path=str(draft_shot), full_page=True)
-                steps[-1].detail = f"saved to {draft_shot}"
-                steps[-1].status = "success"
-
-                _step("html_draft_box", "in_progress", "")
-                draft_html = ev_dir / "draft_box.html"
-                draft_html.write_text(page.content(), encoding="utf-8")
-                steps[-1].detail = f"saved to {draft_html}"
-                steps[-1].status = "success"
-
-                _step("verify_draft_box_item", "in_progress", "")
-                verified = _verify_draft_item(page, post.title)
-                steps[-1].detail = f"verified={verified}"
-                if not (verified and cover_ready):
-                    steps[-1].status = "skipped"
-                    return exec_rec
-                steps[-1].status = "success"
             finally:
                 if should_close_context:
                     context.close()

@@ -2,6 +2,115 @@
 
 > 记录按时间倒序（最新在前）
 
+### 2026-01-27 13:44
+**Task:** Re-run `auto --count 3` three times with ChatGPT images.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `data/posts/498905ce5476495cb4d99fc4678ff72a/post.json` | DONE | Draft saved with image. | None. |
+| `data/posts/23499b32f9a24494a08f84b0ccc9df41/post.json` | DONE | Draft saved with image. | None. |
+| `data/posts/02492089aceb46cb84b4e983aee1300a/post.json` | DONE | Draft saved with image. | None. |
+| `data/posts/779f220f4d664ca69d3d1b54d20834df/post.json` | DONE | Draft saved with image. | None. |
+| `data/posts/92dda163aba14b938db489f8f903ec09/post.json` | DONE | Draft saved with image. | None. |
+| `data/posts/94ce8d3339ae42fa96a893d94cf6dca8/post.json` | DONE | Draft saved with image. | None. |
+| `data/posts/23d74a0f4b764d8a949851020ecadd02/post.json` | DONE | Draft saved with image. | None. |
+| `data/posts/f6c31bae7f614d53a3ab0bb1bfcc50cb/post.json` | DONE | Draft saved with image. | None. |
+| `data/posts/8276c364308d425ab649f9d99dc9be4e/post.json` | DONE | Draft saved with image. | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this batch. | Continue logging. |
+
+**Notes**
+- Each run used `auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*"` with ChatGPT images and CDP.
+- All 9 drafts saved (`saved_draft`).
+
+### 2026-01-27 12:35
+**Task:** Retry ChatGPT image generation when send trigger fails.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/auto_image.py` | DONE | Treat “未能触发生成（发送按钮/快捷键均失败）” as retryable so it won’t abort the batch early. | Re-run `auto --count 3` 3–4 times. |
+| `tests/test_chatgpt_image_retry.py` | DONE | Added retry test for send-trigger failure. | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+### 2026-01-27 12:27
+**Task:** Fix CDP ChatGPT Images navigation abort during `auto`.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/chatgpt_images.py` | DONE | Added CDP fallback when `page.goto` fails (reuse existing images tab or open a new tab) to avoid `net::ERR_ABORTED`. | Re-run `auto --count 3` multiple times to confirm stability. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+### 2026-01-27 12:22
+**Task:** Don’t mark saved drafts as failed when optional draft-box screenshots/timeouts happen.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | After `verify_draft_saved` succeeds, all draft-box navigation (open tab / cover wait / screenshot / html / verify) is now best-effort and won’t flip the execution to `failed`. | Re-run `apps.cli retry <post_id>` once to confirm result becomes `saved_draft`. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+### 2026-01-27 11:53
+**Task:** Run `auto` with ChatGPT images for 3 daily-news drafts.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `data/posts/9f8fd2943cf64364963d603ed66ba7c0/post.json` | DONE | Draft saved with uploaded image via ChatGPT images. | None. |
+| `data/posts/a8295d26470c4632a96947924563e10d/post.json` | DONE | Draft saved with uploaded image via ChatGPT images. | None. |
+| `data/posts/78834a70b4fb45ca9fc136846346d572/post.json` | DONE | Draft saved with uploaded image via ChatGPT images. | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this run. | Continue logging. |
+
+**Notes**
+- Command: `.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600`
+- Result: 3/3 drafts saved (`saved_draft`). Evidence saved under each post’s `evidence/` folder.
+
+### 2026-01-27 13:19
+**Task:** Fix ChatGPT Images prompt sending (multiline paste + reliable send button click) and verify `auto --count 3`.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/chatgpt_images.py` | DONE | Contenteditable input now uses `keyboard.insert_text()` (paste-style) to avoid early-send on newline; send button click scans multiple matches to avoid picking a hidden/disabled first match. | If ChatGPT UI changes again, re-check selectors in `_find_prompt_box` / `_click_send_if_present`. |
+| `tests/test_chatgpt_image_retry.py` | DONE | Still passes after the ChatGPT input/send changes. | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry with real run IDs. | Continue logging. |
+
+**Notes**
+- E2E ChatGPT Images: `apps.e2e_test_chatgpt_images` saved `data/posts/91c54288046f450dae1a9cfca04de7dc/assets/ai_chatgpt_20260127_041752.webp` via `method=request_download`.
+- Real run: `apps.cli auto --title \"每日新闻\" --count 3` → saved drafts for post_ids:
+  - `831f7804fb9348eebee3eb2ce54f144b`
+  - `73e528d838bc4a4c88d46c76183b6f0b`
+  - `c4c1e13760984aa78f0eab8019d1b7a4`
+- Tests: `pytest -q` → `41 passed`.
+
+### 2026-01-27 11:27
+**Task:** Retry ChatGPT image generation on timeout (max 3) and skip the news item after repeated failures.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/图片生成失败重试任务书.md` | DONE | Added spec for timeout-retry + give-up behavior and how we persist attempts/errors. | None. |
+| `src/images/auto_image.py` | DONE | Added `CHATGPT_IMAGE_MAX_ATTEMPTS` retry loop for `chatgpt_images`; after max attempts, raise `ImageGenerationAbandoned` with attempts/errors. | Consider also surfacing these env vars in README if you want end-user knobs. |
+| `src/workflow/create_post.py` | DONE | In daily-news batch mode, pick extra candidates and skip posts when image generation is abandoned; persist failed post with `platform.image_generate` metadata. | Observe a few real runs (`--count 3`) and confirm count can still be satisfied in practice. |
+| `tests/test_chatgpt_image_retry.py` | DONE | Added unit tests covering retry success, give-up after max attempts, and no-retry for non-timeout errors. | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+**Notes**
+- Env knobs: `CHATGPT_IMAGE_MAX_ATTEMPTS` (default 3), `CHATGPT_IMAGE_RETRY_SLEEP_S` (default 2s).
+
+### 2026-01-26 14:08
+**Task:** Avoid ChatGPT image placeholder selection that causes detached screenshot errors.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/chatgpt_images.py` | DONE | Skip placeholder/unstable images during fallback picking (treat evaluate errors as skip) and collect more baseline `img` srcs to reduce false positives. | Re-run `auto` with `--count 3` a few times to confirm images consistently save. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+**Notes**
+- Prior run failed with `Locator.screenshot: Element is not attached to the DOM` after selecting a `data:image/gif` placeholder; the picker now ignores those and requires stable loaded dimensions.
+
 ### 2026-01-25 16:57
 **Task:** Fix delete-drafts SyntaxError and run a real delete.
 **Git:** `main (dirty)`
@@ -14,6 +123,28 @@
 **Notes**
 - Run: `.\.venv\Scripts\python -m apps.cli delete-drafts --limit 5 --yes`
 - Result: deleted 5/92 image drafts; event `data/events/f283ccc98e724605a13febf4ad372335.json`.
+
+### 2026-01-25 18:44
+**Task:** Cap ChatGPT image timeouts to 3 minutes in the one-line commands.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `README.md` | DONE | Updated the one-line “GPT 生图 → 保存草稿” commands to set `CHATGPT_CHALLENGE_TIMEOUT_S=180` and `CHATGPT_MANUAL_TIMEOUT_S=180` (so ChatGPT-related waits don’t exceed ~3 minutes). | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+**Notes**
+- README 一行指令已整理为单行（避免重复行）。
+
+### 2026-01-26 11:47
+**Task:** Reduce missing draft images and cap ChatGPT challenge waits.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Added upload-in-progress detection and a short settle wait before saving drafts to avoid saving while uploads are still processing. | Re-run `auto` with `XHS_UPLOAD_SETTLE_S=5` (default) to confirm missing-image drafts no longer occur. |
+| `src/images/chatgpt_images.py` | DONE | Defaulted `CHATGPT_CHALLENGE_TIMEOUT_S`/`CHATGPT_MANUAL_TIMEOUT_S` to 180s to prevent long stalls when ChatGPT is blocked. | If you still see long gaps, consider lowering `CHATGPT_IMAGE_TIMEOUT_S` or checking LLM latency. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
 
 ### 2026-01-25 16:50
 **Task:** Fix draft deletion flow (confirm click + list change detection).

@@ -271,7 +271,7 @@ $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"
 
 **一行版（含人工回车等待）**
 ```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1" "https://chatgpt.com/images"; Read-Host "完成校验后回车继续"; $env:IMAGE_PROVIDER="chatgpt_images"; $env:CHATGPT_CDP_URL="http://127.0.0.1:9222"; $env:XHS_CDP_URL="http://127.0.0.1:9222"; $env:CHATGPT_IMAGE_TIMEOUT_S="180"; $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1" "https://chatgpt.com/images"; Read-Host "完成校验后回车继续"; $env:IMAGE_PROVIDER="chatgpt_images"; $env:CHATGPT_CDP_URL="http://127.0.0.1:9222"; $env:XHS_CDP_URL="http://127.0.0.1:9222"; $env:CHATGPT_IMAGE_TIMEOUT_S="180"; $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"; $env:CHATGPT_CHALLENGE_TIMEOUT_S="180"; $env:CHATGPT_MANUAL_TIMEOUT_S="180"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
 ```
 
 **每日假新闻（GPT 生图 → 保存到小红书草稿）**
@@ -295,7 +295,7 @@ $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"
 
 **每日假新闻一行版（含人工回车等待）**
 ```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1" "https://chatgpt.com/images"; Read-Host "完成校验后回车继续"; $env:IMAGE_PROVIDER="chatgpt_images"; $env:CHATGPT_CDP_URL="http://127.0.0.1:9222"; $env:XHS_CDP_URL="http://127.0.0.1:9222"; $env:CHATGPT_IMAGE_TIMEOUT_S="180"; $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1" "https://chatgpt.com/images"; Read-Host "完成校验后回车继续"; $env:IMAGE_PROVIDER="chatgpt_images"; $env:CHATGPT_CDP_URL="http://127.0.0.1:9222"; $env:XHS_CDP_URL="http://127.0.0.1:9222"; $env:CHATGPT_IMAGE_TIMEOUT_S="180"; $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"; $env:CHATGPT_CHALLENGE_TIMEOUT_S="180"; $env:CHATGPT_MANUAL_TIMEOUT_S="180"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
 ```
 
 ## 删除草稿（危险操作）

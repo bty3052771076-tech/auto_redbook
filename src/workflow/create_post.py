@@ -8,6 +8,7 @@ from typing import Iterable, List, Optional
 
 from src.config import load_llm_config
 from src.images.auto_image import (
+    ImageGenerationAbandoned,
     fetch_and_download_related_images,
     is_auto_image_enabled,
 )
@@ -391,7 +392,9 @@ def create_daily_news_posts(
 
     try:
         candidates, base_meta = fetch_daily_news_candidates(prompt_norm)
-        picks = pick_news_items(candidates, prompt_norm, count=count)
+        # Pick more than requested so we can skip items whose image generation fails.
+        pick_limit = min(len(candidates), max(count * 5, count + 10))
+        picks = pick_news_items(candidates, prompt_norm, count=pick_limit)
     except Exception as exc:
         # Degrade to normal generation if fetching fails.
         draft = generate_draft(
@@ -445,13 +448,16 @@ def create_daily_news_posts(
         save_revision(rev)
         return [post]
 
-    total = len(picks)
+    target_count = count
     posts: list[Post] = []
 
-    for idx, picked in enumerate(picks, start=1):
+    success_idx = 0
+    for candidate_idx, picked in enumerate(picks, start=1):
+        if len(posts) >= target_count:
+            break
         news_prompt = _daily_news_prompt(picked, prompt_norm)
-        if total > 1:
-            news_prompt = f"（第 {idx}/{total} 条）\n{news_prompt}"
+        if target_count > 1:
+            news_prompt = f"（第 {success_idx + 1}/{target_count} 条）\n{news_prompt}"
 
         seed_title = "每日新闻"
         draft = generate_draft(
@@ -477,10 +483,11 @@ def create_daily_news_posts(
                 "news": {
                     **base_meta,
                     "picked": asdict(picked),
-                    "mode": "daily_news_multi" if total > 1 else "daily_news",
+                    "mode": "daily_news_multi" if target_count > 1 else "daily_news",
                     "prompt_hint": prompt_norm,
-                    "pick_index": idx,
-                    "pick_total": total,
+                    "pick_index": success_idx + 1,
+                    "pick_total": target_count,
+                    "candidate_index": candidate_idx,
                 }
             },
         )
@@ -492,14 +499,27 @@ def create_daily_news_posts(
             dest_dir = post_dir(post.id) / "assets"
             image_title = _preferred_image_title(post, post.title)
             image_prompt = _preferred_image_hint(post, prompt_norm)
-            image_paths, image_metas = fetch_and_download_related_images(
-                title=image_title,
-                body=post.body,
-                topics=post.topics,
-                prompt_hint=image_prompt,
-                dest_dir=dest_dir,
-                exclude_ids=used_image_ids,
-            )
+            try:
+                image_paths, image_metas = fetch_and_download_related_images(
+                    title=image_title,
+                    body=post.body,
+                    topics=post.topics,
+                    prompt_hint=image_prompt,
+                    dest_dir=dest_dir,
+                    exclude_ids=used_image_ids,
+                )
+            except ImageGenerationAbandoned as exc:
+                post.status = PostStatus.failed
+                post.platform["image_generate"] = {
+                    "give_up": True,
+                    "provider": exc.provider,
+                    "attempts": exc.attempts,
+                    "errors": exc.errors,
+                }
+                rev = Revision(post_id=post.id, source=RevisionSource.llm, content=draft)
+                save_post(post)
+                save_revision(rev)
+                continue
             post.platform.setdefault("image", image_metas[0])
             post.platform["images"] = image_metas
             _merge_image_ids(used_image_ids, image_metas)
@@ -516,5 +536,6 @@ def create_daily_news_posts(
         save_post(post)
         save_revision(rev)
         posts.append(post)
+        success_idx += 1
 
     return posts
