@@ -24,6 +24,7 @@ MAX_IMAGE_COUNT = 18
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
 _CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
 _HASHTAG_RE = re.compile(r"#\S+")
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _EN_TOKEN_RE = re.compile(r"[a-zA-Z]+")
 _EN_STOPWORDS = {
     "a",
@@ -107,7 +108,7 @@ class ImageItem:
 
 class ImageGenerationAbandoned(RuntimeError):
     """
-    Raised when an interactive image provider (e.g. ChatGPT Images) fails repeatedly
+    Raised when an image-generation provider fails repeatedly
     and we intentionally give up for this post/news item.
     """
 
@@ -188,6 +189,78 @@ def _strip_hashtags(text: str) -> str:
 
 def _compact_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _strip_urls(text: str) -> str:
+    if not text:
+        return ""
+    return _URL_RE.sub("", text).strip()
+
+
+def _clip_text(text: str, *, limit: int) -> str:
+    value = _compact_spaces(text)
+    if not value:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "…"
+
+
+def _body_snippet_for_prompt(body: str, *, limit: int = 180) -> str:
+    """
+    Extract a short, clean snippet from the post body for image prompt grounding.
+    - Remove hashtags and URLs.
+    - Drop likely “source/link” lines.
+    """
+    if not body:
+        return ""
+    cleaned = _strip_urls(_strip_hashtags(body))
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    kept: list[str] = []
+    for ln in lines:
+        if ln.startswith("来源") or ln.lower().startswith("source"):
+            continue
+        if "http" in ln:
+            continue
+        kept.append(ln)
+        if len(" ".join(kept)) >= limit:
+            break
+    return _clip_text(" ".join(kept), limit=limit)
+
+
+def _build_aliyun_image_prompt(*, title: str, body: str, topics: list[str], prompt_hint: str) -> str:
+    """
+    Build a stable, policy-friendly prompt for DashScope image generation.
+
+    Notes:
+    - Prefer the news hint (daily-news picked title/desc) when provided.
+    - Avoid forcing specific numbers/names that may not be supported by the article.
+    - Hard forbid text/watermark/logo to reduce unusable outputs.
+    """
+    theme = _strip_urls(_strip_hashtags((prompt_hint or "").strip())) or _strip_urls(_strip_hashtags(title))
+    theme = _compact_spaces(theme)
+    snippet = _body_snippet_for_prompt(body, limit=180)
+    top_topics = [t for t in topics if (t or "").strip()]
+    topic_line = "、".join(top_topics[:5])
+
+    parts = [
+        f"为以下主题生成一张竖版3:4插画，画面内容需与主题本身直接相关：{theme or '主题'}。",
+    ]
+    if snippet:
+        parts.append(f"参考要点（可选）：{snippet}")
+    if topic_line:
+        parts.append(f"关键词：{topic_line}")
+    parts.extend(
+        [
+            "风格：现代 editorial illustration，画面干净，细节清晰，高清。",
+            "构图：主体清晰，突出主题要素，留白适中。",
+            "避免：新闻台/报纸/麦克风/记者/摄像机等“新闻媒体元素”，不要做成“新闻图片”。",
+            "要求：不要出现任何文字、字幕、水印、logo、品牌标识；不要出现可识别的真人肖像；避免血腥暴力。",
+        ]
+    )
+    prompt = "\n".join(parts).strip()
+    # Keep it within typical prompt limits (DashScope docs mention 800 chars).
+    return _clip_text(prompt, limit=780)
 
 
 def _english_tokens(text: str) -> list[str]:
@@ -613,38 +686,38 @@ def fetch_and_download_related_images(
 
     query_original = build_image_query(title, body, topics, prompt_hint)
 
-    if provider_name in ("chatgpt_images", "chatgpt"):
-        from src.images.chatgpt_images import build_chatgpt_image_prompt, generate_chatgpt_image
+    if provider_name in ("aliyun", "dashscope", "bailian", "qwen_image", "qwen-image"):
+        from src.images.aliyun_images import generate_aliyun_image
 
-        # ChatGPT Images is interactive and much slower than search-based providers.
+        # Image generation is slower/costlier than search-based providers.
         # Default to 1 image unless the caller or env explicitly requests otherwise.
         if requested_count is None and not (os.getenv("AUTO_IMAGE_COUNT") or "").strip():
             count = 1
 
-        def _is_retryable_chatgpt_error(exc: Exception) -> bool:
+        def _is_retryable_aliyun_error(exc: Exception) -> bool:
             msg = str(exc or "")
             if not msg:
                 return False
             msg_lower = msg.lower()
-            # Do not retry auth / challenge blocks; these need manual intervention.
-            if "cloudflare" in msg_lower:
+            # Auth/config errors should not be retried.
+            if "api_key missing" in msg_lower or "invalid" in msg_lower and "key" in msg_lower:
                 return False
-            if "未登录" in msg or "login required" in msg_lower:
+            if "401" in msg_lower or "forbidden" in msg_lower:
                 return False
-            # Everything else is treated as retryable; after max attempts we will
-            # raise ImageGenerationAbandoned so the caller can skip this item.
             return True
 
-        chatgpt_timeout_s = float(os.getenv("CHATGPT_IMAGE_TIMEOUT_S") or 180.0)
-        max_attempts = int(os.getenv("CHATGPT_IMAGE_MAX_ATTEMPTS") or 3)
-        retry_sleep_s = float(os.getenv("CHATGPT_IMAGE_RETRY_SLEEP_S") or 2.0)
+        aliyun_timeout_s = float(os.getenv("ALIYUN_IMAGE_TIMEOUT_S") or 180.0)
+        aliyun_download_timeout_s = float(os.getenv("ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S") or 60.0)
+        max_attempts = int(os.getenv("ALIYUN_IMAGE_MAX_ATTEMPTS") or 3)
+        retry_sleep_s = float(os.getenv("ALIYUN_IMAGE_RETRY_SLEEP_S") or 2.0)
         if max_attempts <= 0:
             max_attempts = 1
-        prompt = build_chatgpt_image_prompt(
+
+        prompt = _build_aliyun_image_prompt(
             title=title, body=body, topics=topics, prompt_hint=prompt_hint
         )
 
-        # Best-effort derive post_id from dest_dir; we use it only for evidence folder naming.
+        # Best-effort derive post_id from dest_dir.
         post_id = dest_dir.parent.name if dest_dir.name == "assets" else dest_dir.name
 
         paths: list[Path] = []
@@ -654,25 +727,28 @@ def fetch_and_download_related_images(
             res = None
             for attempt in range(1, max_attempts + 1):
                 try:
-                    res = generate_chatgpt_image(
+                    res = generate_aliyun_image(
                         post_id=post_id,
                         prompt=prompt,
                         dest_dir=dest_dir,
-                        timeout_s=chatgpt_timeout_s,
+                        timeout_s=aliyun_timeout_s,
+                        download_timeout_s=aliyun_download_timeout_s,
                     )
                     break
                 except Exception as exc:
                     errors.append(str(exc))
-                    if attempt < max_attempts and _is_retryable_chatgpt_error(exc):
+                    if attempt < max_attempts and _is_retryable_aliyun_error(exc):
                         time.sleep(max(0.0, retry_sleep_s))
                         continue
-                    if attempt >= max_attempts and _is_retryable_chatgpt_error(exc):
+                    if attempt >= max_attempts and _is_retryable_aliyun_error(exc):
                         raise ImageGenerationAbandoned(
                             provider=provider_name, attempts=attempt, errors=errors[-3:]
                         ) from exc
                     raise
             if res is None:
-                raise ImageGenerationAbandoned(provider=provider_name, attempts=max_attempts, errors=errors[-3:])
+                raise ImageGenerationAbandoned(
+                    provider=provider_name, attempts=max_attempts, errors=errors[-3:]
+                )
             meta = {
                 **res.meta,
                 "query_original": query_original,
@@ -710,7 +786,7 @@ def fetch_and_download_related_images(
                 )
             else:
                 raise RuntimeError(
-                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels, chatgpt_images"
+                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels, aliyun"
                 )
         except Exception as exc:
             last_err = str(exc)

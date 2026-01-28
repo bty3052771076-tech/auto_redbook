@@ -11,9 +11,13 @@ from pathlib import Path
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="E2E: apps.cli auto with chatgpt_images via CDP"
+        description="E2E: apps.cli auto with auto-image provider (e.g. aliyun/pexels)"
     )
-    parser.add_argument("--cdp", default="http://127.0.0.1:9222")
+    parser.add_argument(
+        "--cdp",
+        default="",
+        help="Optional: attach XHS automation to an existing Chrome via CDP, e.g. http://127.0.0.1:9222",
+    )
     parser.add_argument("--title", default="每日新闻")
     parser.add_argument("--prompt", default="")
     parser.add_argument("--count", type=int, default=1)
@@ -23,16 +27,21 @@ def main() -> int:
         help="Use an empty glob to force auto-image",
     )
     parser.add_argument("--wait-timeout", type=int, default=600)
-    parser.add_argument("--download-timeout", type=int, default=180)
-    parser.add_argument("--image-timeout", type=int, default=180)
+    parser.add_argument(
+        "--image-provider",
+        default=os.getenv("IMAGE_PROVIDER") or "aliyun",
+        help="auto-image provider, e.g. aliyun or pexels",
+    )
+    parser.add_argument("--aliyun-timeout", type=int, default=180)
+    parser.add_argument("--aliyun-download-timeout", type=int, default=60)
     args = parser.parse_args()
 
     env = os.environ.copy()
-    env["IMAGE_PROVIDER"] = "chatgpt_images"
-    env["CHATGPT_CDP_URL"] = args.cdp
-    env["XHS_CDP_URL"] = args.cdp
-    env["CHATGPT_DOWNLOAD_TIMEOUT_S"] = str(args.download_timeout)
-    env["CHATGPT_IMAGE_TIMEOUT_S"] = str(args.image_timeout)
+    env["IMAGE_PROVIDER"] = (args.image_provider or "").strip()
+    if args.cdp.strip():
+        env["XHS_CDP_URL"] = args.cdp.strip()
+    env["ALIYUN_IMAGE_TIMEOUT_S"] = str(args.aliyun_timeout)
+    env["ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S"] = str(args.aliyun_download_timeout)
 
     cmd = [
         sys.executable,

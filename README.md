@@ -77,6 +77,10 @@ Pexels（自动配图：当未提供图片素材时）：
 - 环境变量：`PEXELS_API_KEY`，可选 `PEXELS_BASE_URL` / `AUTO_IMAGE_COUNT` / `IMAGE_MIN_SCORE`；`AUTO_IMAGE=0` 可关闭自动配图
 - 或本机文件：复制 `docs/pexels_api-key.example.md` 为 `docs/pexels_api-key.md` 并填写
 
+阿里云百炼 / DashScope（API 生图：当未提供图片素材时）：
+- 环境变量：`ALIYUN_IMAGE_API_KEY`（或 `DASHSCOPE_API_KEY`），可选 `ALIYUN_IMAGE_BASE_URL` / `ALIYUN_IMAGE_MODEL` / `ALIYUN_IMAGE_SIZE`
+- 或本机文件：复制 `docs/aliyun_image_api-key.example.md` 为 `docs/aliyun_image_api-key.md` 并填写
+
 如曾泄露密钥：请立即在对应平台轮换/作废旧 key。
 
 ## 使用顺序（推荐）
@@ -196,106 +200,61 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 - 当 `--title "每日假新闻"`：使用 LLM 生成一条幽默、明显虚构的娱乐新闻，并保存草稿。
 - 建议提供 `--prompt` 作为主题提示；正文会强制包含“本文纯属虚构，仅供娱乐。”。
 
+## 提示词（Prompt）修改入口（代码位置）
+为了方便你快速改“生成文案/每日新闻/每日假新闻/生图”的提示词，本项目所有核心提示词都集中在以下位置：
+
+- 普通图文（标题/正文/topics 的 LLM 结构化输出）：`src/llm/generate.py` → `generate_draft()` → `ChatPromptTemplate.from_messages(...)`
+  - `system`：整体写作风格、字数要求、JSON 输出要求等
+  - `user`：把 `prompt_hint/title_hint/assets` 注入模型
+- 每日新闻（给 LLM 的“新闻写作提示词”）：`src/workflow/create_post.py` → `_daily_news_prompt(...)`
+  - 同文件：`_daily_news_offline_body(...)` / `_ensure_daily_news_sections(...)`（离线兜底与段落结构修正）
+- 每日假新闻（给 LLM 的“虚构新闻提示词”）：`src/workflow/create_post.py` → `_fake_news_prompt(...)`
+  - 同文件：`_fake_news_offline_body(...)`（离线兜底）
+- 阿里云百炼文生图（把主题/要点拼成生图提示词）：`src/images/auto_image.py` → `_build_aliyun_image_prompt(...)`
+  - 同文件：`build_image_query(...)`（用于检索/补图时的 query 生成；影响“相关性”）
+  - 可选负面提示词（negative prompt）与自动扩写：`src/images/aliyun_images.py`（读取环境变量 `ALIYUN_IMAGE_NEGATIVE_PROMPT` / `ALIYUN_IMAGE_PROMPT_EXTEND`）
+
 ## 自动配图（无图片时）
 - 当 `--assets-glob` 未命中任何图片：会自动生成/下载图片到 `data/posts/<post_id>/assets/`，然后继续上传并保存草稿。
 - 通过 `IMAGE_PROVIDER` 选择来源：
   - `pexels`（默认）：图片检索下载（需要 `PEXELS_API_KEY`）
-  - `chatgpt_images`：进入 `https://chatgpt.com/images` 自动生图并落盘（优先下载原图字节，避免“截图截到模糊/生成中”）
-- 调整张数：`AUTO_IMAGE_COUNT=3`（上限 18；`pexels` 默认 3，`chatgpt_images` 默认 1）。
+  - `aliyun`：阿里云百炼（DashScope）API 生图并落盘（支持 Qwen-Image / Z-Image / 通义万相 wan2.x/wanx 系列）
+- 调整张数：`AUTO_IMAGE_COUNT=3`（上限 18；`pexels` 默认 3，`aliyun` 默认 1）。
 - 提高相关性：`IMAGE_MIN_SCORE=0.12`（分数越高越严格，图片数量可能减少）。
 - 关闭自动配图：`AUTO_IMAGE=0`（注意：图文 post 仍需要至少 1 张图片，否则校验会失败）。
 
-### ChatGPT Images（自动生图）配置
-前提：你已经在下面这个 profile 中登录了 ChatGPT：
+### 阿里云百炼 / DashScope（API 生图，推荐）配置
+前提：你已在本机准备好阿里云百炼 API Key（本仓库不会提交密钥）。
+
+配置方式（二选一）：
+- 推荐：环境变量 `ALIYUN_IMAGE_API_KEY`
+- 或本机文件：复制 `docs/aliyun_image_api-key.example.md` 为 `docs/aliyun_image_api-key.md` 并填写（已被 `.gitignore` 忽略）
+
+支持模型（文生图，模型名以百炼控制台为准，均使用同一把 API Key）：
+- Qwen-Image：`qwen-image-max` / `qwen-image-plus` / `qwen-image`
+- Z-Image：`z-image-turbo`
+- 通义万相：`wan2.6-t2i` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等
+
+常用可选参数（环境变量）：
+- `ALIYUN_IMAGE_MODEL`：生图模型（默认 `qwen-image-plus`；可改为 `qwen-image-max` 等）
+- `ALIYUN_IMAGE_SIZE`：尺寸（默认 `1104*1472`，3:4 竖图）
+- `ALIYUN_IMAGE_TIMEOUT_S`：单次生图请求超时（默认 `180`）
+- `ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S`：下载生成图片超时（默认 `60`）
+- `ALIYUN_IMAGE_MAX_ATTEMPTS`：单条新闻图片失败最大重试次数（默认 `3`；超限会放弃该条图片）
+- `ALIYUN_IMAGE_RETRY_SLEEP_S`：两次重试间隔秒数（默认 `2`）
+- `ALIYUN_IMAGE_CALL_MODE`：`auto` / `sync` / `async` / `text2image`（默认 `auto`；wan2.5/wanx 走异步，其它优先同步，失败自动降级）
+
+注意：文生图 API 返回的是图片 URL（通常 24 小时有效），程序会自动下载保存为本地 PNG/JPG 以便上传。
+
+
+**每日新闻一行版（无本地图片 → 阿里云生图 → 保存草稿）**
 ```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1"
+$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODEL="qwen-image-plus"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
 
-运行前建议关闭所有 Chrome 窗口（避免 profile 被占用）。
-
-注意：ChatGPT 站点可能触发 Cloudflare 人机校验，自动化无法绕过；如果自动化窗口一直卡在白屏/加载中，通常就是被拦截了。
-默认行为是在等待 `CHATGPT_CHALLENGE_TIMEOUT_S` 后，自动切换到【手动生图】模式：用“普通 Chrome 窗口”打开 `https://chatgpt.com/images`，你粘贴提示词生成并把下载图片放到 `data/posts/<post_id>/assets/`，脚本检测到新图片后继续保存草稿。
-
-如果你希望尽量“全自动”（避免重新启动浏览器触发校验），可以改用【连接到你已打开的 Chrome】模式：你先用普通 Chrome 打开并通过校验，然后脚本通过 CDP 连接并复用当前页面。
-
+**每日假新闻一行版（无本地图片 → 阿里云生图 → 保存草稿）**
 ```powershell
-$env:IMAGE_PROVIDER="chatgpt_images"
-$env:CHATGPT_CHROME_EXECUTABLE="C:\Program Files\Google\Chrome\Application\chrome.exe"
-$env:CHATGPT_CHROME_USER_DATA_DIR="D:\AI\codex\redbook_workflow\data\browser\chrome-profile"
-$env:CHATGPT_CHROME_PROFILE="Default1"
-$env:CHATGPT_IMAGE_TIMEOUT_S="180"             # 生成图片等待上限（秒）
-$env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"          # 等待原图可下载的最大时间（越大越稳，但更慢）
-$env:CHATGPT_CHALLENGE_TIMEOUT_S="30"          # 自动化被拦截后等待 N 秒再转手动
-$env:CHATGPT_MANUAL_TIMEOUT_S="1800"           # 手动模式等待你放入图片的时间
-$env:CHATGPT_FALLBACK_MANUAL_ON_CHALLENGE="1"  # 0=关闭手动降级（保持失败）
-
-.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
-```
-
-### 连接到已打开的 Chrome（可选，推荐）
-1) 先用下面命令启动 Chrome（会启用远程调试端口），并打开 ChatGPT Images：
-```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
-  --remote-debugging-port=9222 `
-  --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" `
-  --profile-directory="Default1" `
-  "https://chatgpt.com/images"
-```
-如果你本机已经有其它 Chrome 在运行，上面的命令可能会“复用已有进程”而导致 `9222` 端口没有真的打开；建议先完全退出所有 `chrome.exe` 再运行。
-2) 在该窗口里手动通过 Cloudflare/确认页面正常后，不要关闭该窗口。
-3) 另开一个终端运行（脚本会连接到现有 Chrome）：
-```powershell
-$env:CHATGPT_CDP_URL="http://127.0.0.1:9222"
-$env:XHS_CDP_URL="http://127.0.0.1:9222"
-.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "美国时政" --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
-```
-
-**完整指令（GPT 生图 → 保存到小红书草稿）**
-```powershell
-# 1) 先启动已登录的 Chrome（复用你的 Default1 profile）
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
-  --remote-debugging-port=9222 `
-  --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" `
-  --profile-directory="Default1" `
-  "https://chatgpt.com/images"
-
-# 2) 通过校验后保持窗口打开，再运行自动化（无本地图片 → ChatGPT 生图 → 保存草稿）
-$env:IMAGE_PROVIDER="chatgpt_images"
-$env:CHATGPT_CDP_URL="http://127.0.0.1:9222"
-$env:XHS_CDP_URL="http://127.0.0.1:9222"
-$env:CHATGPT_IMAGE_TIMEOUT_S="180"
-$env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"
-
-.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
-```
-
-**一行版（含人工回车等待）**
-```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1" "https://chatgpt.com/images"; Read-Host "完成校验后回车继续"; $env:IMAGE_PROVIDER="chatgpt_images"; $env:CHATGPT_CDP_URL="http://127.0.0.1:9222"; $env:XHS_CDP_URL="http://127.0.0.1:9222"; $env:CHATGPT_IMAGE_TIMEOUT_S="180"; $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"; $env:CHATGPT_CHALLENGE_TIMEOUT_S="180"; $env:CHATGPT_MANUAL_TIMEOUT_S="180"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
-```
-
-**每日假新闻（GPT 生图 → 保存到小红书草稿）**
-```powershell
-# 1) 先启动已登录的 Chrome（复用你的 Default1 profile）
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
-  --remote-debugging-port=9222 `
-  --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" `
-  --profile-directory="Default1" `
-  "https://chatgpt.com/images"
-
-# 2) 通过校验后保持窗口打开，再运行自动化（无本地图片 → ChatGPT 生图 → 保存草稿）
-$env:IMAGE_PROVIDER="chatgpt_images"
-$env:CHATGPT_CDP_URL="http://127.0.0.1:9222"
-$env:XHS_CDP_URL="http://127.0.0.1:9222"
-$env:CHATGPT_IMAGE_TIMEOUT_S="180"
-$env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"
-
-.\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
-```
-
-**每日假新闻一行版（含人工回车等待）**
-```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1" "https://chatgpt.com/images"; Read-Host "完成校验后回车继续"; $env:IMAGE_PROVIDER="chatgpt_images"; $env:CHATGPT_CDP_URL="http://127.0.0.1:9222"; $env:XHS_CDP_URL="http://127.0.0.1:9222"; $env:CHATGPT_IMAGE_TIMEOUT_S="180"; $env:CHATGPT_DOWNLOAD_TIMEOUT_S="180"; $env:CHATGPT_CHALLENGE_TIMEOUT_S="180"; $env:CHATGPT_MANUAL_TIMEOUT_S="180"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 0 --wait-timeout 600
+$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODEL="qwen-image-plus"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
 
 ## 删除草稿（危险操作）
@@ -328,18 +287,10 @@ $post_id = ($out | Select-String -Pattern "post_id=([0-9a-f]{32})" | Select-Obje
 .\.venv\Scripts\python -m apps.cli run $post_id --login-hold 600 --dry-run --force
 ```
 
-探测 ChatGPT Images 登录态/输入框（会自动留证到 `data/posts/<post_id>/evidence/...`）：
+E2E 测试（需要已配置阿里云百炼 key；可选 `--cdp` 复用你已打开的 Chrome）：
 ```powershell
-.\.venv\Scripts\python -m apps.inspect_chatgpt_images --hold 30
-```
-
-E2E 测试（推荐先用 CDP 模式打开并通过校验）：
-```powershell
-# 只测 ChatGPT Images 生图落盘（验证 method != screenshot*）
-.\.venv\Scripts\python -m apps.e2e_test_chatgpt_images --prompt "为一条科技类新闻生成竖版3:4新闻插画，干净无文字无logo，抽象象征元素，高清"
-
-# 全流程：每日新闻 -> ChatGPT 生图 -> 小红书保存草稿（会自动读取 post.json 校验 method/素材落盘）
-.\.venv\Scripts\python -m apps.e2e_test_auto_full --cdp "http://127.0.0.1:9222" --title "每日新闻" --prompt "美国时政" --count 1 --assets-glob "empty/pics/*"
+# 全流程：每日新闻 -> 阿里云生图 -> 小红书保存草稿（会自动读取 post.json 校验素材落盘）
+.\.venv\Scripts\python -m apps.e2e_test_auto_full --image-provider aliyun --title "每日新闻" --prompt "美国时政" --count 1 --assets-glob "empty/pics/*"
 ```
 
 ## 常见问题

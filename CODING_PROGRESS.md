@@ -2,6 +2,53 @@
 
 > 记录按时间倒序（最新在前）
 
+### 2026-01-28
+**Task:** 测试：使用 Z-Image 生成每日新闻（count=10）。
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `data/posts/*/post.json` | DONE | 运行 `auto --title "每日新闻" --count 10`（Z-Image）后生成多条 post；其中 17 条有 Z-Image 配图，5 条保存为草稿，12 条停留在 `draft`，5 条失败。 | 如需“正好 10 条已保存草稿”，建议单独对 `draft` 状态的 post 执行 `apps.cli run <post_id>` 或延长 `--wait-timeout`/`--login-hold` 重新跑。 |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+**Notes**
+- 命令分两次执行，均在本地超时中断；Z-Image 配图仍已落盘（`data/posts/<id>/assets/ai_aliyun_*.png`）。
+
+### 2026-01-28
+**Task:** Document Aliyun Bailian text-to-image model support (Qwen-Image/Z-Image/Wanxiang) and URL-download behavior.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `README.md` | DONE | Documented supported model families, call mode, and URL download note. | None. |
+| `docs/AI生图任务书.md` | DONE | Added model list, call mode, URL download note, and progress entry. | None. |
+| `docs/aliyun_image_api-key.example.md` | DONE | Added model examples note. | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+**Notes**
+- Verified Bailian docs for Qwen-Image/Z-Image/Wan2.x endpoints and URL outputs.
+
+### 2026-01-28
+**Task:** Remove web-based ChatGPT Images generation and switch to Aliyun DashScope API image generation.
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/auto_image.py` | DONE | Removed `chatgpt_images` provider and added `aliyun` provider with retry/abandon logic. | Run `auto --count 3` a few times to confirm no stalls. |
+| `src/images/aliyun_images.py` | DONE | Added DashScope (百炼) text-to-image API call + download-to-assets implementation. | If model/size changes, update env vars in README. |
+| `README.md` | DONE | Removed ChatGPT Images workflow docs; documented Aliyun provider and one-line commands. | Keep examples in sync with preferred timeouts. |
+| `docs/AI生图任务书.md` | DONE | Rewrote task doc for Aliyun API; removed webpage automation approach. | None. |
+| `docs/图片生成失败重试任务书.md` | DONE | Updated retry spec to target Aliyun API generation. | None. |
+| `apps/inspect_chatgpt_images.py` | DONE | Deleted (no longer used). | — |
+| `apps/e2e_test_chatgpt_images.py` | DONE | Deleted (no longer used). | — |
+| `tests/test_chatgpt_images.py` | DONE | Deleted (no longer used). | — |
+| `tests/test_chatgpt_image_retry.py` | DONE | Deleted (no longer used). | — |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+**Notes**
+- The old ChatGPT Images implementation was removed because it was unstable (Cloudflare/网页 UI 变更/自动化登录问题).
+- The new Aliyun provider uses `docs/aliyun_image_api-key.md` (gitignored) or `ALIYUN_IMAGE_API_KEY` env var.
+
 ### 2026-01-27 13:44
 **Task:** Re-run `auto --count 3` three times with ChatGPT images.
 **Git:** `main (dirty)`
