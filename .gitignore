@@ -15,6 +15,7 @@ exports/
 .env.*
 *.env
 docs/*api-key.md
+docs/z-image_api-key.md
 *.pem
 *.p12
 *.pfx
