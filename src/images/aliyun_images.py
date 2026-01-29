@@ -21,10 +21,13 @@ DEFAULT_POLL_TIMEOUT_S = 240.0
 DEFAULT_TASK_QUERY_TIMEOUT_S = 30.0
 
 # Default negative prompt for models that support it (qwen-image / wan2.6 / wan2.x).
-# Keep it short and focused: prevent any text-like artifacts and poster/UI layouts.
+# Keep it focused: prevent any text-like artifacts and poster/UI layouts.
+#
+# Note: Use both Chinese + English keywords because prompts may be interpreted bilingually.
 DEFAULT_NEGATIVE_PROMPT = (
-    "text, watermark, logo, brand, caption, subtitle, typography, letters, words, numbers, "
-    "signage, banner, poster, flyer, infographic, label, UI, interface, screen, QR code"
+    "文字, 字母, 数字, 标题, 字幕, 标语, 路牌, 海报, 封面排版, 信息图, 标签, 水印, logo, 品牌标识, 二维码, UI界面, 屏幕内容, 书报标题, 包装标签, "
+    "text, watermark, logo, brand, caption, subtitle, typography, letters, words, numbers, signage, banner, poster, flyer, "
+    "infographic, label, UI, interface, screen, QR code"
 )
 
 _EXT_RE = re.compile(r"\.(png|jpg|jpeg|webp)(?:$|[?#])", re.IGNORECASE)
