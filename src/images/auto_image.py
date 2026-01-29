@@ -243,19 +243,31 @@ def _build_aliyun_image_prompt(*, title: str, body: str, topics: list[str], prom
     top_topics = [t for t in topics if (t or "").strip()]
     topic_line = "、".join(top_topics[:5])
 
+    # Keep this prompt:
+    # - strongly grounded to the *news content* (not a generic "news cover"),
+    # - safe for XHS upload (no text/watermark/logo),
+    # - long enough (>= ~300 Chinese chars) to steer style/composition reliably,
+    # - but still under the typical provider limits (we clip to 780 chars below).
     parts = [
-        f"为以下主题生成一张竖版3:4插画，画面内容需与主题本身直接相关：{theme or '主题'}。",
+        (
+            "你是一名插画导演。请为下面这条新闻生成一张“与内容强相关的插画/场景图”，"
+            "重点表现新闻主题中的具体对象、场景与动作氛围；不要把画面做成“新闻图片/新闻封面”，"
+            "不要出现新闻台、麦克风、记者、摄像机、报纸、屏幕字幕、滚动条等媒体元素。"
+            f"画面比例：竖版 3:4。主题：{theme or '主题'}。"
+        ),
     ]
     if snippet:
-        parts.append(f"参考要点（可选）：{snippet}")
+        parts.append(f"新闻要点（用于画面取材，不要照抄为文字）：{snippet}")
     if topic_line:
-        parts.append(f"关键词：{topic_line}")
+        parts.append(f"关键词（用于联想画面元素）：{topic_line}")
     parts.extend(
         [
-            "风格：现代 editorial illustration，画面干净，细节清晰，高清。",
-            "构图：主体清晰，突出主题要素，留白适中。",
-            "避免：新闻台/报纸/麦克风/记者/摄像机等“新闻媒体元素”，不要做成“新闻图片”。",
-            "要求：不要出现任何文字、字幕、水印、logo、品牌标识；不要出现可识别的真人肖像；避免血腥暴力。",
+            "风格：现代 editorial illustration，质感高级但不过度花哨，光影自然，细节清晰，高清。",
+            "构图：主体明确，围绕新闻的“关键物/关键动作/关键场景”组织画面；前景/中景/背景层次清楚，留白适中但不空。",
+            "人物处理：如果必须出现人物，使用背影、剪影、侧脸遮挡、远景小人等方式表达；不要出现可识别真人肖像或清晰面部特征。",
+            "文字要求：画面中不得出现任何可读文字（含标题、字幕、标语、路牌、UI 文本）、水印、logo、品牌标识、二维码。",
+            "内容要求：避免血腥暴力、色情、仇恨；避免夸张的灾难场景；不要添加新闻中未给出的具体细节（如精确数字、具体人名头像等）。",
+            "表现重点：请把“新闻的内容”画出来，而不是把“新闻报道的形式”画出来；让观众一眼看出这是该事件/主题相关的画面。",
         ]
     )
     prompt = "\n".join(parts).strip()
