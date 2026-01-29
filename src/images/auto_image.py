@@ -215,6 +215,14 @@ def _body_snippet_for_prompt(body: str, *, limit: int = 180) -> str:
     if not body:
         return ""
     cleaned = _strip_urls(_strip_hashtags(body))
+    # The post body often contains section headings like “新闻内容：/我的点评：”.
+    # Strip them so the image prompt doesn't accidentally steer towards a "news poster" style.
+    cleaned = (
+        cleaned.replace("新闻内容：", "")
+        .replace("新闻内容:", "")
+        .replace("我的点评：", "")
+        .replace("我的点评:", "")
+    )
     lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
     kept: list[str] = []
     for ln in lines:
@@ -239,8 +247,14 @@ def _build_aliyun_image_prompt(*, title: str, body: str, topics: list[str], prom
     """
     theme = _strip_urls(_strip_hashtags((prompt_hint or "").strip())) or _strip_urls(_strip_hashtags(title))
     theme = _compact_spaces(theme)
+    # Avoid leaking workflow meta like "每日新闻｜" into the prompt; keep the actual topic only.
+    theme = re.sub(r"^(?:每日新闻|每日假新闻)(?:[｜:：\\-—\\s]+)?", "", theme).strip() or theme
     snippet = _body_snippet_for_prompt(body, limit=180)
-    top_topics = [t for t in topics if (t or "").strip()]
+    top_topics = [
+        t
+        for t in topics
+        if (t or "").strip() and ("新闻" not in t) and ("news" not in (t or "").lower())
+    ]
     topic_line = "、".join(top_topics[:5])
 
     # Keep this prompt:
@@ -250,29 +264,30 @@ def _build_aliyun_image_prompt(*, title: str, body: str, topics: list[str], prom
     # - but still under the typical provider limits (we clip to 780 chars below).
     parts = [
         (
-            "你是一名插画导演。请为下面这条新闻生成一张“与内容强相关的插画/场景图”，"
-            "画面要聚焦事件本身（对象/场景/动作/氛围），不要把画面做成“新闻图片/新闻封面”。"
+            "你是一名插画导演。请根据下面的事件描述生成一张“与内容强相关的插画/场景图”，"
+            "画面只描绘事件本身（对象/场景/动作/氛围），不要做成海报/封面/宣传图/信息图。"
             f"画面比例：竖版 3:4。主题：{theme or '主题'}。"
         ),
     ]
     if snippet:
-        parts.append(f"新闻要点（用于画面取材，不要照抄为文字）：{snippet}")
+        parts.append(f"事件要点（用于画面取材，不要以可读符号出现在画面里）：{snippet}")
     if topic_line:
         parts.append(f"关键词（用于联想画面元素）：{topic_line}")
     parts.extend(
         [
             "风格：现代 editorial illustration，质感高级但不过度花哨，光影自然，细节清晰，高清。",
-            "构图：主体明确，围绕新闻的关键元素组织画面；前/中/后景层次清楚，留白适中但不空。",
+            "构图：主体明确，围绕该事件的关键元素组织画面；前/中/后景层次清楚，留白适中但不空。",
             "人物处理：如果必须出现人物，使用背影、剪影、侧脸遮挡、远景小人等方式表达；不要出现可识别真人肖像或清晰面部特征。",
             (
-                "严格禁止文字：画面中不得出现任何可读文字/字符/数字（任何语言都不行），包括标题/字幕/路牌/海报/UI 文本/"
-                "屏幕内容/包装标签/印章/水印/logo/品牌标识/二维码；所有可能出现文字的区域必须处理为纯色或抽象图形。"
+                "严格禁止可读内容：画面中不得出现任何可读字符/字母/数字/符号（任何语言都不行），包括标题条、字幕框、角标、"
+                "标签、路牌、海报排版、屏幕界面、书报标题、包装标签、印章、水印、logo、品牌标识、二维码；"
+                "所有可能出现可读内容的区域必须处理为纯色或抽象图形。"
             ),
             (
-                "严格禁止“新闻感”画面：不要出现新闻采访/发布会/记者/麦克风/摄像机/新闻台/演播室/报纸/海报/封面排版等元素。"
+                "严格禁止媒体报道感画面：不要出现采访/发布会/记者/麦克风/摄像机/演播台/演播室/报纸/海报/封面排版等元素。"
             ),
-            "内容要求：避免血腥暴力、色情、仇恨；避免夸张的灾难场景；不要添加新闻中未给出的具体细节（如精确数字、具体人名头像等）。",
-            "表现重点：只描绘新闻描述的事件本身（场景、关键物、动作关系、氛围），画面像“事件现场的插画”，而不是“报道这个事件的媒体画面”。",
+            "内容要求：避免血腥暴力、色情、仇恨；避免夸张的灾难场景；不要添加描述中未给出的具体细节（如精确数字、具体人名头像等）。",
+            "表现重点：只描绘描述中的事件本身（场景、关键物、动作关系、氛围），画面像“事件现场的插画”，而不是“媒体画面”。",
         ]
     )
     prompt = "\n".join(parts).strip()
