@@ -101,6 +101,10 @@ def _preferred_image_title(post: Post, fallback: str) -> str:
 
 def _preferred_image_hint(post: Post, fallback: str) -> str:
     news_meta = (post.platform or {}).get("news") or {}
+    if isinstance(news_meta, dict):
+        event = (news_meta.get("image_event") or "").strip()
+        if event:
+            return event
     picked = news_meta.get("picked")
     if isinstance(picked, dict):
         picked_title = (picked.get("title") or "").strip()
@@ -110,6 +114,43 @@ def _preferred_image_hint(post: Post, fallback: str) -> str:
         if picked_desc:
             return picked_desc
     return fallback
+
+
+_IMAGE_EVENT_DROP_WORDS = (
+    "每日新闻",
+    "新闻",
+    "报道",
+    "采访",
+    "记者",
+    "媒体",
+    "来源",
+    "链接",
+    "时间",
+)
+
+
+def _normalize_image_event(value: str, *, fallback: str = "", limit: int = 40) -> str:
+    """
+    Normalize the LLM-provided short event description for image generation.
+
+    Goals:
+    - Keep it short (~30 chars).
+    - Describe the *event* only (avoid "news/reporting" semantics).
+    - Remove URLs and obvious workflow prefixes.
+    """
+    text = (value or "").strip()
+    if not text:
+        text = (fallback or "").strip()
+    text = re.sub(r"https?://\S+", "", text).strip()
+    text = re.sub(r"^(?:每日新闻|每日假新闻)(?:[｜:：—\s-]+)?", "", text).strip() or text
+    for w in _IMAGE_EVENT_DROP_WORDS:
+        if w:
+            text = text.replace(w, "")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip("：:—-，,。.!！？?\"'“”‘’（）()[]【】 ")
+    if len(text) > limit:
+        text = text[:limit].rstrip()
+    return text
 
 
 def _daily_news_prompt(picked, prompt_norm: str) -> str:
@@ -141,6 +182,8 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
         "3) 新闻内容（>=200字）：基于上面的信息，说明发生了什么、为何值得关注。\n"
         "4) 我的点评（>=100字）：给出影响解读/建议/风险提示，可结合用户关注点，但不得新增事实。\n"
         "5) topics 输出 3-8 个话题词，包含“每日新闻”。\n"
+        "6) image_event 输出一条仅用于配图的事件描述（建议20-40个中文字符，约30字）：只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
+        "不要出现“新闻/报道/采访/记者/媒体/来源/链接/时间”等词。\n"
     )
 
 
@@ -272,6 +315,12 @@ def create_post_with_draft(
                 draft["body"] = _daily_news_offline_body(picked, prompt_norm)
                 draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
             draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
+            image_event = _normalize_image_event(
+                str(draft.get("image_event") or ""),
+                fallback=picked.title,
+            )
+            platform_meta["news"]["image_event"] = image_event
+            draft["image_event"] = image_event
         except Exception as exc:
             platform_meta["news"] = {
                 "mode": "daily_news",
@@ -472,6 +521,11 @@ def create_daily_news_posts(
             draft["body"] = _daily_news_offline_body(picked, prompt_norm)
             draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
         draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
+        image_event = _normalize_image_event(
+            str(draft.get("image_event") or ""),
+            fallback=picked.title,
+        )
+        draft["image_event"] = image_event
 
         post = Post(
             type="image",
@@ -488,6 +542,7 @@ def create_daily_news_posts(
                     "pick_index": success_idx + 1,
                     "pick_total": target_count,
                     "candidate_index": candidate_idx,
+                    "image_event": image_event,
                 }
             },
         )

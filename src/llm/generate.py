@@ -181,6 +181,7 @@ def generate_draft(
                     "When information is limited, stay conservative and avoid adding specifics. "
                     "Return strict JSON only: no Markdown, no code fences, no extra text. "
                     "JSON keys: title, body, topics (array of strings). "
+                    "Optional JSON key: image_event (a short event-only description for image generation). "
                     "The body must be plain text, not JSON or a list."
                 ),
             ),
@@ -190,7 +191,7 @@ def generate_draft(
                     "Prompt: {prompt_hint}\n"
                     "Initial title: {title_hint}\n"
                     "Assets (for reference only, do not output paths): {assets}\n"
-                    "Return a JSON object with title/body/topics."
+                    "Return a JSON object with title/body/topics (and optionally image_event)."
                 ),
             ),
         ]
@@ -211,6 +212,7 @@ def generate_draft(
                 "title": _truncate((title_hint or "标题").strip(), max_title),
                 "body": "（生成失败，请稍后重试）",
                 "topics": [],
+                "image_event": "",
                 "_fallback_error": str(exc),
             },
             ensure_ascii=False,
@@ -218,7 +220,7 @@ def generate_draft(
 
     data = _parse_json_text(text)
     if data is None:
-        data = {"title": title_hint, "body": text, "topics": []}
+        data = {"title": title_hint, "body": text, "topics": [], "image_event": ""}
 
     raw_title = _coerce_text(data.get("title", title_hint)).strip()
     raw_body = _coerce_text(data.get("body", "")).strip()
@@ -237,4 +239,5 @@ def generate_draft(
     data["title"] = _truncate(raw_title, max_title)
     data["body"] = _truncate(raw_body, max_body)
     data["topics"] = _normalize_topics(data.get("topics"))
+    data.setdefault("image_event", "")
     return data

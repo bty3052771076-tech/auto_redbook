@@ -245,11 +245,15 @@ def _build_aliyun_image_prompt(*, title: str, body: str, topics: list[str], prom
     - Avoid forcing specific numbers/names that may not be supported by the article.
     - Hard forbid text/watermark/logo to reduce unusable outputs.
     """
-    theme = _strip_urls(_strip_hashtags((prompt_hint or "").strip())) or _strip_urls(_strip_hashtags(title))
-    theme = _compact_spaces(theme)
+    hint = _compact_spaces(_strip_urls(_strip_hashtags((prompt_hint or "").strip())))
+    theme = hint or _compact_spaces(_strip_urls(_strip_hashtags(title)))
     # Avoid leaking workflow meta like "每日新闻｜" into the prompt; keep the actual topic only.
-    theme = re.sub(r"^(?:每日新闻|每日假新闻)(?:[｜:：\\-—\\s]+)?", "", theme).strip() or theme
-    snippet = _body_snippet_for_prompt(body, limit=180)
+    theme = re.sub(r"^(?:每日新闻|每日假新闻)(?:[｜:：—\s-]+)?", "", theme).strip() or theme
+    # If we have a short, event-only hint (typically ~30 chars from LLM), prefer using it alone and
+    # avoid feeding the full body which may contain “news/reporting” phrasing that biases the image.
+    snippet = ""
+    if not (hint and len(hint) <= 60):
+        snippet = _body_snippet_for_prompt(body, limit=180)
     top_topics = [
         t
         for t in topics
