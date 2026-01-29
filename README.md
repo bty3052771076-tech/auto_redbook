@@ -243,6 +243,7 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 - `ALIYUN_IMAGE_MAX_ATTEMPTS`：单条新闻图片失败最大重试次数（默认 `3`；超限会放弃该条图片）
 - `ALIYUN_IMAGE_RETRY_SLEEP_S`：两次重试间隔秒数（默认 `2`）
 - `ALIYUN_IMAGE_CALL_MODE`：`auto` / `sync` / `async` / `text2image`（默认 `auto`；wan2.5/wanx 走异步，其它优先同步，失败自动降级）
+- `ALIYUN_IMAGE_NEGATIVE_PROMPT`：负面提示词（用于降低“文字/水印/logo/海报排版”等不可用输出；未设置时会使用内置默认值；设置为空字符串可关闭默认值）
 
 注意：文生图 API 返回的是图片 URL（通常 24 小时有效），程序会自动下载保存为本地 PNG/JPG 以便上传。
 

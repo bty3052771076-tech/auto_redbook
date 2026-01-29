@@ -20,6 +20,13 @@ DEFAULT_POLL_INTERVAL_S = 2.0
 DEFAULT_POLL_TIMEOUT_S = 240.0
 DEFAULT_TASK_QUERY_TIMEOUT_S = 30.0
 
+# Default negative prompt for models that support it (qwen-image / wan2.6 / wan2.x).
+# Keep it short and focused: prevent any text-like artifacts and poster/UI layouts.
+DEFAULT_NEGATIVE_PROMPT = (
+    "text, watermark, logo, brand, caption, subtitle, typography, letters, words, numbers, "
+    "signage, banner, poster, flyer, infographic, label, UI, interface, screen, QR code"
+)
+
 _EXT_RE = re.compile(r"\.(png|jpg|jpeg|webp)(?:$|[?#])", re.IGNORECASE)
 
 
@@ -451,7 +458,11 @@ def generate_aliyun_image(
         watermark = raw in ("1", "true", "yes", "on") if raw else False
 
     if negative_prompt is None:
-        negative_prompt = (os.getenv("ALIYUN_IMAGE_NEGATIVE_PROMPT") or "").strip()
+        # Follow the DashScope docs pattern: negative_prompt is optional.
+        # If the env var is unset, use a sane default to reduce accidental text/watermark artifacts.
+        # If the env var is set to an empty string, it disables the default.
+        env_neg = os.getenv("ALIYUN_IMAGE_NEGATIVE_PROMPT")
+        negative_prompt = DEFAULT_NEGATIVE_PROMPT if env_neg is None else (env_neg or "").strip()
 
     call_mode = (os.getenv("ALIYUN_IMAGE_CALL_MODE") or "auto").strip().lower()
     poll_interval_s = float(os.getenv("ALIYUN_IMAGE_POLL_INTERVAL_S") or DEFAULT_POLL_INTERVAL_S)
@@ -594,4 +605,3 @@ def generate_aliyun_image(
         meta["task"] = {"status": _extract_task_status(task_resp)}
 
     return AliyunImageResult(path=out_path, meta=meta)
-
