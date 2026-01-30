@@ -5,6 +5,37 @@ from pathlib import Path
 from src.images import aliyun_images
 
 
+def test_qwen_image_does_not_send_negative_prompt_by_default(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("ALIYUN_IMAGE_API_KEY", "dummy")
+    monkeypatch.setenv("ALIYUN_IMAGE_BASE_URL", "https://example.com")
+    monkeypatch.setenv("ALIYUN_IMAGE_MODEL", "qwen-image-plus")
+    monkeypatch.delenv("ALIYUN_IMAGE_NEGATIVE_PROMPT", raising=False)
+
+    seen: dict[str, object] = {}
+
+    def fake_post_json(*, url, payload, headers, timeout_s):
+        seen["payload"] = payload
+        return {
+            "output": {
+                "choices": [
+                    {"message": {"content": [{"image": "https://example.com/out.png"}]}}
+                ]
+            }
+        }
+
+    def fake_download_bytes(*, url, timeout_s):
+        return b"\x89PNG\r\n\x1a\n" + b"x" * 64
+
+    monkeypatch.setattr(aliyun_images, "_http_post_json", fake_post_json)
+    monkeypatch.setattr(aliyun_images, "_download_bytes", fake_download_bytes)
+
+    aliyun_images.generate_aliyun_image(post_id="p", prompt="hi", dest_dir=tmp_path)
+
+    payload = seen["payload"]
+    assert isinstance(payload, dict)
+    assert "negative_prompt" not in payload["parameters"]
+
+
 def test_wan26_forces_n_to_1(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ALIYUN_IMAGE_API_KEY", "dummy")
     monkeypatch.setenv("ALIYUN_IMAGE_BASE_URL", "https://example.com")
@@ -103,4 +134,3 @@ def test_wan25_auto_uses_async_text2image_and_polls(monkeypatch, tmp_path: Path)
     assert int(seen["get_calls"]) >= 1
     assert res.meta["task_id"] == "task123"
     assert res.meta["method"].startswith("text2image_synthesis_async")
-

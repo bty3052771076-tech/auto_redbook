@@ -245,58 +245,16 @@ def _build_aliyun_image_prompt(*, title: str, body: str, topics: list[str], prom
     - Avoid forcing specific numbers/names that may not be supported by the article.
     - Hard forbid text/watermark/logo to reduce unusable outputs.
     """
+    # User preference: keep the image prompt minimal and event-only.
+    # We avoid adding extra constraints/allow-lists that can bias the model toward undesired artifacts.
     hint = _compact_spaces(_strip_urls(_strip_hashtags((prompt_hint or "").strip())))
     theme = hint or _compact_spaces(_strip_urls(_strip_hashtags(title)))
-    # Avoid leaking workflow meta like "每日新闻｜" into the prompt; keep the actual topic only.
     theme = re.sub(r"^(?:每日新闻|每日假新闻)(?:[｜:：—\s-]+)?", "", theme).strip() or theme
-    # If we have a short, event-only hint (typically ~30 chars from LLM), prefer using it alone and
-    # avoid feeding the full body which may contain “news/reporting” phrasing that biases the image.
-    snippet = ""
-    if not (hint and len(hint) <= 60):
-        snippet = _body_snippet_for_prompt(body, limit=180)
-    top_topics = [
-        t
-        for t in topics
-        if (t or "").strip() and ("新闻" not in t) and ("news" not in (t or "").lower())
-    ]
-    topic_line = "、".join(top_topics[:5])
 
-    # Keep this prompt:
-    # - strongly grounded to the *news content* (not a generic "news cover"),
-    # - safe for XHS upload (no text/watermark/logo),
-    # - long enough (>= ~300 Chinese chars) to steer style/composition reliably,
-    # - but still under the typical provider limits (we clip to 780 chars below).
-    parts = [
-        (
-            "你是一名插画导演。请根据下面的事件描述生成一张“与内容强相关的插画/场景图”，"
-            "画面只描绘事件本身（对象/场景/动作/氛围），不要做成海报/封面/宣传图/信息图。"
-            f"画面比例：竖版 3:4。主题：{theme or '主题'}。"
-        ),
-    ]
-    if snippet:
-        parts.append(f"事件要点（用于画面取材，不要以可读符号出现在画面里）：{snippet}")
-    if topic_line:
-        parts.append(f"关键词（用于联想画面元素）：{topic_line}")
-    parts.extend(
-        [
-            "风格：现代 editorial illustration，质感高级但不过度花哨，光影自然，细节清晰，高清。",
-            "构图：主体明确，围绕该事件的关键元素组织画面；前/中/后景层次清楚，留白适中但不空。",
-            "人物处理：如果必须出现人物，使用背影、剪影、侧脸遮挡、远景小人等方式表达；不要出现可识别真人肖像或清晰面部特征。",
-            (
-                "严格禁止可读内容：画面中不得出现任何可读字符/字母/数字/符号（任何语言都不行），包括标题条、字幕框、角标、"
-                "标签、路牌、海报排版、屏幕界面、书报标题、包装标签、印章、水印、logo、品牌标识、二维码；"
-                "所有可能出现可读内容的区域必须处理为纯色或抽象图形。"
-            ),
-            (
-                "严格禁止媒体报道感画面：不要出现采访/发布会/记者/麦克风/摄像机/演播台/演播室/报纸/海报/封面排版等元素。"
-            ),
-            "内容要求：避免血腥暴力、色情、仇恨；避免夸张的灾难场景；不要添加描述中未给出的具体细节（如精确数字、具体人名头像等）。",
-            "表现重点：只描绘描述中的事件本身（场景、关键物、动作关系、氛围），画面像“事件现场的插画”，而不是“媒体画面”。",
-        ]
-    )
-    prompt = "\n".join(parts).strip()
-    # Keep it within typical prompt limits (DashScope docs mention 800 chars).
-    return _clip_text(prompt, limit=780)
+    # Only use a short event summary (typically from LLM image_event) plus a tiny base instruction.
+    # If the hint is missing, fall back to title-derived theme (still event-like).
+    prompt = f"生成一张竖版3:4插画，描绘以下事件：{theme or '事件'}。"
+    return _clip_text(prompt, limit=220)
 
 
 def _english_tokens(text: str) -> list[str]:

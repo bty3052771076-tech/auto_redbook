@@ -20,15 +20,9 @@ DEFAULT_POLL_INTERVAL_S = 2.0
 DEFAULT_POLL_TIMEOUT_S = 240.0
 DEFAULT_TASK_QUERY_TIMEOUT_S = 30.0
 
-# Default negative prompt for models that support it (qwen-image / wan2.6 / wan2.x).
-# Keep it focused: prevent any text-like artifacts and poster/UI layouts.
-#
-# Note: Use both Chinese + English keywords because prompts may be interpreted bilingually.
-DEFAULT_NEGATIVE_PROMPT = (
-    "文字, 字母, 数字, 标题, 字幕, 标语, 路牌, 海报, 封面排版, 信息图, 标签, 水印, logo, 品牌标识, 二维码, UI界面, 屏幕内容, 书报标题, 包装标签, "
-    "text, watermark, logo, brand, caption, subtitle, typography, letters, words, numbers, signage, banner, poster, flyer, "
-    "infographic, label, UI, interface, screen, QR code"
-)
+# Negative prompt is optional and model-dependent.
+# Keep it opt-in via env var (ALIYUN_IMAGE_NEGATIVE_PROMPT) because extra constraints
+# can bias outputs in unexpected ways for some prompts/models.
 
 _EXT_RE = re.compile(r"\.(png|jpg|jpeg|webp)(?:$|[?#])", re.IGNORECASE)
 
@@ -461,11 +455,10 @@ def generate_aliyun_image(
         watermark = raw in ("1", "true", "yes", "on") if raw else False
 
     if negative_prompt is None:
-        # Follow the DashScope docs pattern: negative_prompt is optional.
-        # If the env var is unset, use a sane default to reduce accidental text/watermark artifacts.
-        # If the env var is set to an empty string, it disables the default.
+        # Follow the DashScope docs pattern: negative_prompt is optional and should be opt-in.
+        # If the env var is unset, do not send negative_prompt at all.
         env_neg = os.getenv("ALIYUN_IMAGE_NEGATIVE_PROMPT")
-        negative_prompt = DEFAULT_NEGATIVE_PROMPT if env_neg is None else (env_neg or "").strip()
+        negative_prompt = "" if env_neg is None else (env_neg or "").strip()
 
     call_mode = (os.getenv("ALIYUN_IMAGE_CALL_MODE") or "auto").strip().lower()
     poll_interval_s = float(os.getenv("ALIYUN_IMAGE_POLL_INTERVAL_S") or DEFAULT_POLL_INTERVAL_S)
