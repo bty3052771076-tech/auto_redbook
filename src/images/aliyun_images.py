@@ -482,6 +482,9 @@ def generate_aliyun_image(
         else:
             call_mode = "sync"
 
+    # Log the resolved model per generation for quick verification.
+    print(f"[aliyun-image] model={model_name} size={size_value} call_mode={call_mode}")
+
     if call_mode in ("async", "task", "text2image"):
         if _is_wan26_model(model_name):
             method = "wan26_generation_async"
