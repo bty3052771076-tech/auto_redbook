@@ -142,8 +142,40 @@ def _parse_json_text(text: str) -> Dict[str, Any] | None:
     return None
 
 
+def _should_try_next_llm(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    keywords = (
+        "quota",
+        "out of quota",
+        "insufficient",
+        "balance",
+        "limit",
+        "throttl",
+        "rate",
+        "exceeded",
+        "model not found",
+        "unsupported",
+        "not support",
+        "invalid model",
+        "no available",
+        "429",
+        "余额",
+        "配额",
+        "限流",
+        "不足",
+        "超限",
+    )
+    return any(k in msg for k in keywords)
+
+
+def _ensure_cfg_list(cfg: LLMConfig | list[LLMConfig]) -> list[LLMConfig]:
+    if isinstance(cfg, list):
+        return cfg
+    return [cfg]
+
+
 def generate_draft(
-    cfg: LLMConfig,
+    cfg: LLMConfig | list[LLMConfig],
     *,
     title_hint: str,
     prompt_hint: str,
@@ -155,14 +187,7 @@ def generate_draft(
     Generate a structured draft (title/body/topics) using the configured LLM.
     Fallback to offline template if the API call fails.
     """
-    model = init_chat_model(
-        cfg.model,
-        model_provider="openai",  # use OpenAI-compatible API
-        base_url=cfg.base_url,
-        api_key=cfg.api_key,
-        temperature=0.4,
-        max_tokens=1200,
-    )
+    cfg_list = _ensure_cfg_list(cfg)
 
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -203,20 +228,38 @@ def generate_draft(
         assets=", ".join(asset_paths) if asset_paths else "none",
     )
 
-    try:
-        resp = model.invoke(messages)
-        text = resp.content if hasattr(resp, "content") else str(resp)
-    except Exception as exc:
-        text = json.dumps(
-            {
-                "title": _truncate((title_hint or "标题").strip(), max_title),
-                "body": "（生成失败，请稍后重试）",
-                "topics": [],
-                "image_event": "",
-                "_fallback_error": str(exc),
-            },
-            ensure_ascii=False,
-        )
+    last_exc: Exception | None = None
+    for idx, llm_cfg in enumerate(cfg_list):
+        try:
+            model = init_chat_model(
+                llm_cfg.model,
+                model_provider="openai",  # use OpenAI-compatible API
+                base_url=llm_cfg.base_url,
+                api_key=llm_cfg.api_key,
+                temperature=0.4,
+                max_tokens=1200,
+            )
+            print(
+                f"[llm] provider={llm_cfg.provider} model={llm_cfg.model} base_url={llm_cfg.base_url}"
+            )
+            resp = model.invoke(messages)
+            text = resp.content if hasattr(resp, "content") else str(resp)
+            break
+        except Exception as exc:
+            last_exc = exc
+            if idx + 1 < len(cfg_list) and _should_try_next_llm(exc):
+                continue
+            text = json.dumps(
+                {
+                    "title": _truncate((title_hint or "标题").strip(), max_title),
+                    "body": "（生成失败，请稍后重试）",
+                    "topics": [],
+                    "image_event": "",
+                    "_fallback_error": str(exc),
+                },
+                ensure_ascii=False,
+            )
+            break
 
     data = _parse_json_text(text)
     if data is None:

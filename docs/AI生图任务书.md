@@ -57,7 +57,8 @@ Key 配置（二选一）：
 - 本机文件：`docs/aliyun_image_api-key.md`（参考 `docs/aliyun_image_api-key.example.md`；已被 `.gitignore` 忽略）
 
 可选参数（环境变量）：
-- `ALIYUN_IMAGE_MODEL`：默认 `qwen-image-plus`（可改 `qwen-image-max` 等）
+- `ALIYUN_IMAGE_MODELS`：生图模型候选列表（逗号/空格分隔，按顺序尝试；优先于 `ALIYUN_IMAGE_MODEL`）
+- `ALIYUN_IMAGE_MODEL`：默认 `qwen-image-plus-2026-01-09`（仅在未设置 `ALIYUN_IMAGE_MODELS` 时使用）
 - `ALIYUN_IMAGE_SIZE`：默认 `1104*1472`
 - `ALIYUN_IMAGE_TIMEOUT_S`：默认 `180`
 - `ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S`：默认 `60`
@@ -66,9 +67,10 @@ Key 配置（二选一）：
 - `ALIYUN_IMAGE_CALL_MODE`：`auto` / `sync` / `async` / `text2image`（默认 `auto`）
 
 支持模型（文生图，模型名以百炼控制台为准，均使用同一把 API Key）：
-- Qwen-Image：`qwen-image-max` / `qwen-image-plus` / `qwen-image`
+- Qwen-Image：`qwen-image-plus-2026-01-09` / `qwen-image-max` / `qwen-image`
 - Z-Image：`z-image-turbo`
-- 通义万相：`wan2.6-t2i` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等
+- 通义万相：`wan2.6-t2i` / `wan2.6-image` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等
+- 说明：本流程仅使用“文生图”模型；`i2v`/`t2v`/`edit`/`mt-image` 会被自动跳过
 
 备注：文生图接口返回的是图片 URL（通常 24 小时有效），必须下载后才能保存为本地 PNG/JPG 用于上传。
 

@@ -2,6 +2,12 @@
 
 本项目用于在本地生成小红书图文内容，并通过 Playwright 自动保存为草稿（不发布）。
 
+## 免费运行说明（默认配置即可）
+- 文案生成：优先使用阿里云百炼（DeepSeek-V3.2，OpenAI 兼容接口）
+- 图片生成：使用阿里云百炼文生图（Qwen-Image / 通义万相 / Z-Image）
+- 新闻来源：默认可使用 GDELT（无需 key 的免费新闻源）
+- 费用说明：上述能力在**免费额度内可运行**；若超出平台免费额度会产生计费，请自行关注控制台余额/配额
+
 ## 功能一览
 - 普通图文：`标题 + 提示词（可选） + 图片（可选）` → 生成草稿并保存到草稿箱
 - 特殊标题「每日新闻」：自动抓取新闻 → 生成草稿并保存
@@ -22,7 +28,9 @@ pip install -r requirements.txt
 python -m playwright install chromium
 
 # 2) 配置密钥（推荐用环境变量）
-#   - LLM_API_KEY：生成文案（必填）
+#   - ALIYUN_LLM_API_KEY：生成文案（推荐，Aliyun DeepSeek-V3.2）
+#   - LLM_API_KEY：生成文案（可选：作为阿里云无额度时的备用）
+#   - ALIYUN_IMAGE_API_KEY：生图（可与 LLM 共用同一把 DashScope Key）
 #   - NEWS_API_KEY：每日新闻（可选；不配则回退到无需 key 的新闻源）
 #   - PEXELS_API_KEY：自动配图（可选；不配则必须手动提供图片）
 # 例如（PowerShell）：
@@ -66,19 +74,25 @@ python -m playwright install chromium
 - 推荐使用环境变量（更安全），或仅在本机创建 `docs/*api-key.md`（不要提交）。
 
 LLM（生成文案）：
-- 环境变量：`LLM_API_KEY`（必填），可选 `LLM_MODEL` / `LLM_BASE_URL`
-- 或本机文件：复制 `docs/llm_api-key.example.md` 为 `docs/llm_api-key.md` 并填写
+- 主用（阿里云百炼 / DashScope，DeepSeek-V3.2）：
+  - 环境变量：`ALIYUN_LLM_API_KEY`（或 `ALIYUN_IMAGE_API_KEY` / `DASHSCOPE_API_KEY`）
+  - 可选：`ALIYUN_LLM_MODEL`（默认 `deepseek-v3.2`）/ `ALIYUN_LLM_BASE_URL`（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）
+- 备用（原 OpenAI 兼容提供商）：
+  - 环境变量：`LLM_API_KEY`，可选 `LLM_MODEL` / `LLM_BASE_URL`
+  - 或本机文件：复制 `docs/llm_api-key.example.md` 为 `docs/llm_api-key.md` 并填写
+- 说明：若同时配置主用与备用，阿里云优先；当出现额度/限流/模型不可用等错误时自动回退
 
 NewsAPI（“每日新闻”）：
 - 环境变量：`NEWS_API_KEY`（或 `NEWSAPI_API_KEY`），可选 `NEWS_BASE_URL`
 - 或本机文件：复制 `docs/news_api-key.example.md` 为 `docs/news_api-key.md` 并填写
+- 无需 key 的免费新闻源：`GDELT`（设置 `NEWS_PROVIDER=gdelt` 或不配置 key 时自动回退）
 
 Pexels（自动配图：当未提供图片素材时）：
 - 环境变量：`PEXELS_API_KEY`，可选 `PEXELS_BASE_URL` / `AUTO_IMAGE_COUNT` / `IMAGE_MIN_SCORE`；`AUTO_IMAGE=0` 可关闭自动配图
 - 或本机文件：复制 `docs/pexels_api-key.example.md` 为 `docs/pexels_api-key.md` 并填写
 
 阿里云百炼 / DashScope（API 生图：当未提供图片素材时）：
-- 环境变量：`ALIYUN_IMAGE_API_KEY`（或 `DASHSCOPE_API_KEY`），可选 `ALIYUN_IMAGE_BASE_URL` / `ALIYUN_IMAGE_MODEL` / `ALIYUN_IMAGE_SIZE`
+- 环境变量：`ALIYUN_IMAGE_API_KEY`（或 `DASHSCOPE_API_KEY`），可选 `ALIYUN_IMAGE_BASE_URL` / `ALIYUN_IMAGE_MODELS` / `ALIYUN_IMAGE_MODEL` / `ALIYUN_IMAGE_SIZE`
 - 或本机文件：复制 `docs/aliyun_image_api-key.example.md` 为 `docs/aliyun_image_api-key.md` 并填写
 
 如曾泄露密钥：请立即在对应平台轮换/作废旧 key。
@@ -231,31 +245,52 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 - 或本机文件：复制 `docs/aliyun_image_api-key.example.md` 为 `docs/aliyun_image_api-key.md` 并填写（已被 `.gitignore` 忽略）
 
 支持模型（文生图，模型名以百炼控制台为准，均使用同一把 API Key）：
-- Qwen-Image：`qwen-image-max` / `qwen-image-plus` / `qwen-image`
+- Qwen-Image：`qwen-image-plus-2026-01-09` / `qwen-image-max` / `qwen-image`
 - Z-Image：`z-image-turbo`
-- 通义万相：`wan2.6-t2i` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等
+- 通义万相：`wan2.6-t2i` / `wan2.6-image` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等
+- 说明：本流程仅使用“文生图”模型；`i2v`/`t2v`/`edit`/`mt-image` 会被自动跳过
 
 常用可选参数（环境变量）：
-- `ALIYUN_IMAGE_MODEL`：生图模型（默认 `qwen-image-plus`；可改为 `qwen-image-max` 等）
+- `ALIYUN_IMAGE_MODELS`：生图模型候选列表（逗号/空格分隔，按顺序尝试；优先于 `ALIYUN_IMAGE_MODEL`）
+- `ALIYUN_IMAGE_MODEL`：生图模型（默认 `qwen-image-plus-2026-01-09`；仅在未设置 `ALIYUN_IMAGE_MODELS` 时使用）
 - `ALIYUN_IMAGE_SIZE`：尺寸（默认 `1104*1472`，3:4 竖图）
 - `ALIYUN_IMAGE_TIMEOUT_S`：单次生图请求超时（默认 `180`）
 - `ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S`：下载生成图片超时（默认 `60`）
 - `ALIYUN_IMAGE_MAX_ATTEMPTS`：单条新闻图片失败最大重试次数（默认 `3`；超限会放弃该条图片）
 - `ALIYUN_IMAGE_RETRY_SLEEP_S`：两次重试间隔秒数（默认 `2`）
 - `ALIYUN_IMAGE_CALL_MODE`：`auto` / `sync` / `async` / `text2image`（默认 `auto`；wan2.5/wanx 走异步，其它优先同步，失败自动降级）
-- `ALIYUN_IMAGE_NEGATIVE_PROMPT`：负面提示词（用于降低“文字/水印/logo/海报排版”等不可用输出；未设置时会使用内置默认值；设置为空字符串可关闭默认值）
+- `ALIYUN_IMAGE_NEGATIVE_PROMPT`：负面提示词（用于降低“文字/水印/logo/海报排版”等不可用输出；未设置时不会发送）
 
 注意：文生图 API 返回的是图片 URL（通常 24 小时有效），程序会自动下载保存为本地 PNG/JPG 以便上传。
+
+## 相关改进（已落地）
+- 阿里云 LLM 优先 + 自动回退：额度不足/限流/模型不可用时自动切换到备用提供商
+- 阿里云生图模型列表：支持 `ALIYUN_IMAGE_MODELS` 按顺序尝试与回退
+- 生图事件摘要：LLM 输出 `image_event`（约 30 字）用于降低“新闻海报感/文字”概率
+- 生图提示词收敛：仅用事件描述生成插画，避免“报道/海报/采访”等语义
+- 元数据完整落盘：每条 post 保存 news/image/attempt 等字段，便于追踪与复盘
+
+## 一键快速使用（免费额度版本）
+```powershell
+# 仅需配置阿里云 Key（用于 LLM + 生图）
+$env:ALIYUN_LLM_API_KEY="YOUR_DASHSCOPE_KEY"
+$env:ALIYUN_IMAGE_API_KEY="YOUR_DASHSCOPE_KEY"
+$env:NEWS_PROVIDER="gdelt"
+$env:IMAGE_PROVIDER="aliyun"
+$env:ALIYUN_IMAGE_MODELS="qwen-image-plus-2026-01-09,qwen-image-max,qwen-image,wan2.6-t2i,wan2.6-image,z-image-turbo"
+
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 10 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
+```
 
 
 **每日新闻一行版（无本地图片 → 阿里云生图 → 保存草稿）**
 ```powershell
-$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODEL="qwen-image-plus"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
+$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="qwen-image-plus-2026-01-09,qwen-image-max,qwen-image,wan2.6-t2i,wan2.6-image,z-image-turbo"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
 
 **每日假新闻一行版（无本地图片 → 阿里云生图 → 保存草稿）**
 ```powershell
-$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODEL="qwen-image-plus"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
+$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="qwen-image-plus-2026-01-09,qwen-image-max,qwen-image,wan2.6-t2i,wan2.6-image,z-image-turbo"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
 
 ## 删除草稿（危险操作）

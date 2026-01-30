@@ -6,7 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from src.config import load_llm_config
+from src.config import load_llm_configs
 from src.images.auto_image import (
     ImageGenerationAbandoned,
     fetch_and_download_related_images,
@@ -286,7 +286,7 @@ def create_post_with_draft(
     """
     Generate a draft with LLM and persist post + revision.
     """
-    cfg = load_llm_config()
+    cfgs = load_llm_configs()
     title_norm = (title_hint or "").strip()
     platform_meta: dict = {}
 
@@ -302,7 +302,7 @@ def create_post_with_draft(
             news_prompt = _daily_news_prompt(picked, prompt_norm)
             seed_title = "每日新闻"
             draft = generate_draft(
-                cfg,
+                cfgs,
                 title_hint=seed_title,
                 prompt_hint=news_prompt,
                 asset_paths=asset_paths,
@@ -328,7 +328,7 @@ def create_post_with_draft(
                 "error": str(exc),
             }
             draft = generate_draft(
-                cfg,
+                cfgs,
                 title_hint=title_hint,
                 prompt_hint=f"{prompt_hint}\n(news_fetch_failed: {exc})",
                 asset_paths=asset_paths,
@@ -337,7 +337,7 @@ def create_post_with_draft(
         prompt_norm = (prompt_hint or "").strip()
         fake_prompt = _fake_news_prompt(prompt_norm)
         draft = generate_draft(
-            cfg,
+            cfgs,
             title_hint="每日假新闻",
             prompt_hint=fake_prompt,
             asset_paths=asset_paths,
@@ -361,7 +361,7 @@ def create_post_with_draft(
         }
     else:
         draft = generate_draft(
-            cfg,
+            cfgs,
             title_hint=title_hint,
             prompt_hint=prompt_hint,
             asset_paths=asset_paths,
@@ -432,7 +432,7 @@ def create_daily_news_posts(
     - Use `prompt_hint` to rank candidates, then pick up to `count` items.
     - When `count` is 1, behavior is equivalent to a single best match.
     """
-    cfg = load_llm_config()
+    cfgs = load_llm_configs()
     prompt_norm = (prompt_hint or "").strip()
     if count <= 0:
         count = 1
@@ -447,7 +447,7 @@ def create_daily_news_posts(
     except Exception as exc:
         # Degrade to normal generation if fetching fails.
         draft = generate_draft(
-            cfg,
+            cfgs,
             title_hint="每日新闻",
             prompt_hint=f"{prompt_norm}\n(news_fetch_failed: {exc})",
             asset_paths=asset_paths,
@@ -510,7 +510,7 @@ def create_daily_news_posts(
 
         seed_title = "每日新闻"
         draft = generate_draft(
-            cfg,
+            cfgs,
             title_hint=seed_title,
             prompt_hint=news_prompt,
             asset_paths=asset_paths,

@@ -4,8 +4,8 @@ from src.config import LLMConfig
 from src.workflow import create_post as create_post_mod
 
 
-def _stub_config():
-    return LLMConfig(model="fake", api_key="fake-key", base_url="http://localhost")
+def _stub_configs():
+    return [LLMConfig(model="fake", api_key="fake-key", base_url="http://localhost")]
 
 
 def test_fake_news_adds_disclaimer_and_metadata(monkeypatch, tmp_path: Path):
@@ -20,7 +20,7 @@ def test_fake_news_adds_disclaimer_and_metadata(monkeypatch, tmp_path: Path):
             "topics": ["搞笑历史"],
         }
 
-    monkeypatch.setattr(create_post_mod, "load_llm_config", _stub_config)
+    monkeypatch.setattr(create_post_mod, "load_llm_configs", _stub_configs)
     monkeypatch.setattr(create_post_mod, "generate_draft", fake_generate_draft)
     monkeypatch.setattr(create_post_mod, "save_post", lambda post: None)
     monkeypatch.setattr(create_post_mod, "save_revision", lambda rev: None)
@@ -53,7 +53,7 @@ def test_fake_news_keeps_single_disclaimer(monkeypatch, tmp_path: Path):
             "topics": [],
         }
 
-    monkeypatch.setattr(create_post_mod, "load_llm_config", _stub_config)
+    monkeypatch.setattr(create_post_mod, "load_llm_configs", _stub_configs)
     monkeypatch.setattr(create_post_mod, "generate_draft", fake_generate_draft)
     monkeypatch.setattr(create_post_mod, "save_post", lambda post: None)
     monkeypatch.setattr(create_post_mod, "save_revision", lambda rev: None)

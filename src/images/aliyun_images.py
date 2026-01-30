@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
-DEFAULT_MODEL = "qwen-image-plus"
+DEFAULT_MODEL = "qwen-image-plus-2026-01-09"
 DEFAULT_SIZE = "1104*1472"  # 3:4 (适合小红书竖图)
 DEFAULT_TIMEOUT_S = 180.0
 DEFAULT_DOWNLOAD_TIMEOUT_S = 60.0
@@ -63,6 +63,80 @@ class AliyunImageAPIError(RuntimeError):
         if message:
             parts.append(str(message))
         super().__init__("Aliyun image API error: " + (": ".join(parts) if parts else "unknown"))
+
+
+def _split_models(value: str) -> list[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"[,\s]+", raw)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _is_text_to_image_model(model_name: str) -> bool:
+    """
+    Only keep text-to-image capable models for this workflow.
+    Exclude i2v/t2v/edit/mt-image style models.
+    """
+    m = (model_name or "").strip().lower()
+    if not m:
+        return False
+    if "i2v" in m or "t2v" in m:
+        return False
+    if "edit" in m or "mt-image" in m:
+        return False
+    return True
+
+
+def _resolve_model_candidates(model: Optional[str]) -> list[str]:
+    """
+    Resolve model candidates (ordered) from env or explicit arg.
+
+    Priority:
+      1) ALIYUN_IMAGE_MODELS (comma/space-separated list)
+      2) explicit `model` arg
+      3) ALIYUN_IMAGE_MODEL
+      4) DEFAULT_MODEL
+    """
+    env_models = _split_models(os.getenv("ALIYUN_IMAGE_MODELS") or "")
+    if env_models:
+        candidates = env_models
+    else:
+        single = (model or os.getenv("ALIYUN_IMAGE_MODEL") or DEFAULT_MODEL).strip()
+        candidates = [single] if single else []
+
+    filtered = [m for m in candidates if _is_text_to_image_model(m)]
+    return filtered or candidates
+
+
+def _should_try_next_model(exc: Exception) -> bool:
+    if isinstance(exc, AliyunImageAPIError):
+        code = (exc.code or "").lower()
+        msg = (exc.message or str(exc) or "").lower()
+    else:
+        code = ""
+        msg = str(exc or "").lower()
+    keywords = (
+        "quota",
+        "out of quota",
+        "insufficient",
+        "balance",
+        "limit",
+        "throttl",
+        "rate",
+        "exceeded",
+        "model not found",
+        "unsupported",
+        "not support",
+        "invalid model",
+        "no available",
+        "余额",
+        "配额",
+        "限流",
+        "不足",
+        "超限",
+    )
+    return any(k in code or k in msg for k in keywords)
 
 
 def _parse_kv_file(path: Path) -> dict[str, str]:
@@ -440,7 +514,7 @@ def generate_aliyun_image(
     """
     cfg = load_aliyun_image_config()
 
-    model_name = (model or os.getenv("ALIYUN_IMAGE_MODEL") or DEFAULT_MODEL).strip()
+    model_candidates = _resolve_model_candidates(model)
     size_value = (size or os.getenv("ALIYUN_IMAGE_SIZE") or DEFAULT_SIZE).strip()
     timeout_s = float(os.getenv("ALIYUN_IMAGE_TIMEOUT_S") or (timeout_s or DEFAULT_TIMEOUT_S))
     download_timeout_s = float(
@@ -460,7 +534,7 @@ def generate_aliyun_image(
         env_neg = os.getenv("ALIYUN_IMAGE_NEGATIVE_PROMPT")
         negative_prompt = "" if env_neg is None else (env_neg or "").strip()
 
-    call_mode = (os.getenv("ALIYUN_IMAGE_CALL_MODE") or "auto").strip().lower()
+    call_mode_env = (os.getenv("ALIYUN_IMAGE_CALL_MODE") or "auto").strip().lower()
     poll_interval_s = float(os.getenv("ALIYUN_IMAGE_POLL_INTERVAL_S") or DEFAULT_POLL_INTERVAL_S)
     poll_timeout_s = float(os.getenv("ALIYUN_IMAGE_POLL_TIMEOUT_S") or max(timeout_s, DEFAULT_POLL_TIMEOUT_S))
     query_timeout_s = float(
@@ -471,71 +545,30 @@ def generate_aliyun_image(
         msg = str(err or "").lower()
         return "does not support synchronous calls" in msg or "do not support synchronous calls" in msg
 
-    method = "multimodal_generation_sync"
-    task_id: Optional[str] = None
-    create_resp: dict[str, Any]
-    task_resp: Optional[dict[str, Any]] = None
+    last_exc: Optional[Exception] = None
+    for idx, model_name in enumerate(model_candidates or []):
+        if not _is_text_to_image_model(model_name):
+            continue
 
-    if call_mode == "auto":
-        if _is_text2image_async_model(model_name):
-            call_mode = "async"
-        else:
-            call_mode = "sync"
+        call_mode = call_mode_env
+        method = "multimodal_generation_sync"
+        task_id = None
+        create_resp = None
+        task_resp = None
 
-    # Log the resolved model per generation for quick verification.
-    print(f"[aliyun-image] model={model_name} size={size_value} call_mode={call_mode}")
+        if call_mode == "auto":
+            if _is_text2image_async_model(model_name):
+                call_mode = "async"
+            else:
+                call_mode = "sync"
 
-    if call_mode in ("async", "task", "text2image"):
-        if _is_wan26_model(model_name):
-            method = "wan26_generation_async"
-            create_resp = _call_wan26_generation_async(
-                cfg=cfg,
-                model_name=model_name,
-                prompt=prompt,
-                size_value=size_value,
-                timeout_s=timeout_s,
-                prompt_extend=bool(prompt_extend),
-                watermark=bool(watermark),
-                negative_prompt=negative_prompt or "",
-            )
-        else:
-            method = "text2image_synthesis_async"
-            create_resp = _call_text2image_synthesis_async(
-                cfg=cfg,
-                model_name=model_name,
-                prompt=prompt,
-                size_value=size_value,
-                timeout_s=timeout_s,
-                prompt_extend=bool(prompt_extend),
-                watermark=bool(watermark),
-                negative_prompt=negative_prompt or "",
-            )
-        task_id = _extract_task_id(create_resp)
-        task_resp = _poll_task_result(
-            cfg=cfg,
-            task_id=task_id,
-            poll_timeout_s=poll_timeout_s,
-            poll_interval_s=poll_interval_s,
-            query_timeout_s=query_timeout_s,
-        )
-        image_url = _extract_task_image_url(task_resp)
-    else:
+        # Log the resolved model per generation for quick verification.
+        print(f"[aliyun-image] model={model_name} size={size_value} call_mode={call_mode}")
+
         try:
-            create_resp = _call_multimodal_generation_sync(
-                cfg=cfg,
-                model_name=model_name,
-                prompt=prompt,
-                size_value=size_value,
-                timeout_s=timeout_s,
-                prompt_extend=bool(prompt_extend),
-                watermark=bool(watermark),
-                negative_prompt=negative_prompt or "",
-            )
-        except AliyunImageAPIError as exc:
-            # 某些账号/模型可能不支持同步：自动降级为异步（旧协议 or wan2.6 新协议）
-            if _sync_not_supported(exc):
+            if call_mode in ("async", "task", "text2image"):
                 if _is_wan26_model(model_name):
-                    method = "wan26_generation_async_fallback"
+                    method = "wan26_generation_async"
                     create_resp = _call_wan26_generation_async(
                         cfg=cfg,
                         model_name=model_name,
@@ -547,7 +580,7 @@ def generate_aliyun_image(
                         negative_prompt=negative_prompt or "",
                     )
                 else:
-                    method = "text2image_synthesis_async_fallback"
+                    method = "text2image_synthesis_async"
                     create_resp = _call_text2image_synthesis_async(
                         cfg=cfg,
                         model_name=model_name,
@@ -568,39 +601,97 @@ def generate_aliyun_image(
                 )
                 image_url = _extract_task_image_url(task_resp)
             else:
-                raise
-        else:
-            image_url = _extract_sync_image_url(create_resp)
+                try:
+                    create_resp = _call_multimodal_generation_sync(
+                        cfg=cfg,
+                        model_name=model_name,
+                        prompt=prompt,
+                        size_value=size_value,
+                        timeout_s=timeout_s,
+                        prompt_extend=bool(prompt_extend),
+                        watermark=bool(watermark),
+                        negative_prompt=negative_prompt or "",
+                    )
+                except AliyunImageAPIError as exc:
+                    # 某些账号/模型可能不支持同步：自动降级为异步（旧协议 or wan2.6 新协议）
+                    if _sync_not_supported(exc):
+                        if _is_wan26_model(model_name):
+                            method = "wan26_generation_async_fallback"
+                            create_resp = _call_wan26_generation_async(
+                                cfg=cfg,
+                                model_name=model_name,
+                                prompt=prompt,
+                                size_value=size_value,
+                                timeout_s=timeout_s,
+                                prompt_extend=bool(prompt_extend),
+                                watermark=bool(watermark),
+                                negative_prompt=negative_prompt or "",
+                            )
+                        else:
+                            method = "text2image_synthesis_async_fallback"
+                            create_resp = _call_text2image_synthesis_async(
+                                cfg=cfg,
+                                model_name=model_name,
+                                prompt=prompt,
+                                size_value=size_value,
+                                timeout_s=timeout_s,
+                                prompt_extend=bool(prompt_extend),
+                                watermark=bool(watermark),
+                                negative_prompt=negative_prompt or "",
+                            )
+                        task_id = _extract_task_id(create_resp)
+                        task_resp = _poll_task_result(
+                            cfg=cfg,
+                            task_id=task_id,
+                            poll_timeout_s=poll_timeout_s,
+                            poll_interval_s=poll_interval_s,
+                            query_timeout_s=query_timeout_s,
+                        )
+                        image_url = _extract_task_image_url(task_resp)
+                    else:
+                        raise
+                else:
+                    image_url = _extract_sync_image_url(create_resp)
 
-    data = _download_bytes(url=image_url, timeout_s=download_timeout_s)
+            data = _download_bytes(url=image_url, timeout_s=download_timeout_s)
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    ext = _guess_ext(image_url)
-    out_path = dest_dir / f"ai_aliyun_{ts}{ext}"
-    out_path.write_bytes(data)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            ext = _guess_ext(image_url)
+            out_path = dest_dir / f"ai_aliyun_{ts}{ext}"
+            out_path.write_bytes(data)
 
-    meta: dict[str, Any] = {
-        "mode": "aliyun_image",
-        "provider": "aliyun",
-        "post_id": post_id,
-        "region": cfg.region,
-        "model": model_name,
-        "size": size_value,
-        "prompt": prompt,
-        "prompt_extend": bool(prompt_extend),
-        "watermark": bool(watermark),
-        "negative_prompt": negative_prompt,
-        "call_mode": call_mode,
-        "method": method,
-        "task_id": task_id,
-        "src_url": image_url,
-        "downloaded_path": str(out_path),
-        "downloaded_at": datetime.now(timezone.utc).isoformat(),
-        "request_id": (create_resp or {}).get("request_id"),
-        "usage": (create_resp or {}).get("usage"),
-    }
-    if task_resp is not None:
-        meta["task"] = {"status": _extract_task_status(task_resp)}
+            meta: dict[str, Any] = {
+                "mode": "aliyun_image",
+                "provider": "aliyun",
+                "post_id": post_id,
+                "region": cfg.region,
+                "model": model_name,
+                "size": size_value,
+                "prompt": prompt,
+                "prompt_extend": bool(prompt_extend),
+                "watermark": bool(watermark),
+                "negative_prompt": negative_prompt,
+                "call_mode": call_mode,
+                "method": method,
+                "task_id": task_id,
+                "src_url": image_url,
+                "downloaded_path": str(out_path),
+                "downloaded_at": datetime.now(timezone.utc).isoformat(),
+                "request_id": (create_resp or {}).get("request_id"),
+                "usage": (create_resp or {}).get("usage"),
+            }
+            if task_resp is not None:
+                meta["task"] = {"status": _extract_task_status(task_resp)}
 
-    return AliyunImageResult(path=out_path, meta=meta)
+            return AliyunImageResult(path=out_path, meta=meta)
+        except Exception as exc:
+            last_exc = exc
+            # Try next model for quota/availability errors only.
+            if idx + 1 < len(model_candidates) and _should_try_next_model(exc):
+                continue
+            raise
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("No usable Aliyun image models resolved.")

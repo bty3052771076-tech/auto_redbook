@@ -8,7 +8,7 @@ from src.images import aliyun_images
 def test_qwen_image_does_not_send_negative_prompt_by_default(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ALIYUN_IMAGE_API_KEY", "dummy")
     monkeypatch.setenv("ALIYUN_IMAGE_BASE_URL", "https://example.com")
-    monkeypatch.setenv("ALIYUN_IMAGE_MODEL", "qwen-image-plus")
+    monkeypatch.setenv("ALIYUN_IMAGE_MODEL", "qwen-image-plus-2026-01-09")
     monkeypatch.delenv("ALIYUN_IMAGE_NEGATIVE_PROMPT", raising=False)
 
     seen: dict[str, object] = {}
@@ -34,6 +34,73 @@ def test_qwen_image_does_not_send_negative_prompt_by_default(monkeypatch, tmp_pa
     payload = seen["payload"]
     assert isinstance(payload, dict)
     assert "negative_prompt" not in payload["parameters"]
+
+
+def test_model_list_skips_non_t2i(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("ALIYUN_IMAGE_API_KEY", "dummy")
+    monkeypatch.setenv("ALIYUN_IMAGE_BASE_URL", "https://example.com")
+    monkeypatch.setenv("ALIYUN_IMAGE_MODELS", "wan2.6-i2v-flash,qwen-image-plus-2026-01-09")
+
+    seen: dict[str, object] = {}
+
+    def fake_post_json(*, url, payload, headers, timeout_s):
+        seen["payload"] = payload
+        return {
+            "output": {
+                "choices": [
+                    {"message": {"content": [{"image": "https://example.com/out.png"}]}}
+                ]
+            }
+        }
+
+    def fake_download_bytes(*, url, timeout_s):
+        return b"\x89PNG\r\n\x1a\n" + b"x" * 64
+
+    monkeypatch.setattr(aliyun_images, "_http_post_json", fake_post_json)
+    monkeypatch.setattr(aliyun_images, "_download_bytes", fake_download_bytes)
+
+    res = aliyun_images.generate_aliyun_image(post_id="p", prompt="hi", dest_dir=tmp_path)
+
+    payload = seen["payload"]
+    assert isinstance(payload, dict)
+    assert payload["model"] == "qwen-image-plus-2026-01-09"
+    assert res.meta["model"] == "qwen-image-plus-2026-01-09"
+
+
+def test_model_list_fallback_on_quota(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("ALIYUN_IMAGE_API_KEY", "dummy")
+    monkeypatch.setenv("ALIYUN_IMAGE_BASE_URL", "https://example.com")
+    monkeypatch.setenv("ALIYUN_IMAGE_MODELS", "qwen-image-plus-2026-01-09,qwen-image-max")
+
+    calls = {"n": 0}
+
+    def fake_post_json(*, url, payload, headers, timeout_s):
+        calls["n"] += 1
+        if payload.get("model") == "qwen-image-plus-2026-01-09":
+            raise aliyun_images.AliyunImageAPIError(
+                url=url,
+                status=429,
+                code="QuotaExceeded",
+                message="out of quota",
+            )
+        return {
+            "output": {
+                "choices": [
+                    {"message": {"content": [{"image": "https://example.com/out.png"}]}}
+                ]
+            }
+        }
+
+    def fake_download_bytes(*, url, timeout_s):
+        return b"\x89PNG\r\n\x1a\n" + b"x" * 64
+
+    monkeypatch.setattr(aliyun_images, "_http_post_json", fake_post_json)
+    monkeypatch.setattr(aliyun_images, "_download_bytes", fake_download_bytes)
+
+    res = aliyun_images.generate_aliyun_image(post_id="p", prompt="hi", dest_dir=tmp_path)
+
+    assert calls["n"] == 2
+    assert res.meta["model"] == "qwen-image-max"
 
 
 def test_wan26_forces_n_to_1(monkeypatch, tmp_path: Path):

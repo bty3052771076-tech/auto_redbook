@@ -11,7 +11,7 @@
 # 说明：
 # - 该 API Key 通常可用于多个模型；因此这里不固定 `model` 字段。
 # - 具体模型名称/版本在“调用时”由代码或命令行参数指定。
-# - 支持模型示例：qwen-image-max / qwen-image-plus / qwen-image / z-image-turbo / wan2.6-t2i / wanx2.1-t2i-turbo ...
+# - 支持模型示例：qwen-image-plus-2026-01-09 / qwen-image-max / qwen-image / z-image-turbo / wan2.6-t2i / wan2.6-image / wanx2.1-t2i-turbo ...
 #
 # DashScope API Base URL（常见默认值）
 base_url="https://dashscope.aliyuncs.com"
