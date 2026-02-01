@@ -2,6 +2,18 @@
 
 > 记录按时间倒序（最新在前）
 
+### 2026-02-01
+**Task:** 每日新闻正文首行加入“要点摘要”并加兜底
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | 新增要点摘要提示词与兜底逻辑（首行摘要 + 三段结构）。 | None. |
+| `tests/test_daily_news.py` | DONE | 更新单元测试断言摘要与结构。 | None. |
+| `docs/新闻要点摘要任务书.md` | DONE | 新增任务书与进度记录。 | None. |
+| `README.md` | DONE | 补充每日新闻首行摘要说明与改进清单。 | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
 ### 2026-01-28
 **Task:** 测试：使用 Z-Image 生成每日新闻（count=10）。
 **Git:** `main (dirty)`

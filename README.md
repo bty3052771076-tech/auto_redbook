@@ -206,6 +206,7 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
   - 生成条数由 `--count` 控制（默认 1）
   - 提供 `--prompt`：按提示词相关性排序后取前 N 条
   - 不提供 `--prompt`：按候选顺序取前 N 条
+  - 正文开头新增“要点摘要：”20-40 字，概括新闻最重要部分（不评价）
 
 可选配置（环境变量）：
 - `NEWS_PROVIDER`：`newsapi` / `gdelt`（默认自动；有 `NEWS_API_KEY` 时优先 `newsapi`）
@@ -271,6 +272,7 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 - 生图事件摘要：LLM 输出 `image_event`（约 30 字）用于降低“新闻海报感/文字”概率
 - 生图提示词收敛：仅用事件描述生成插画，避免“报道/海报/采访”等语义
 - 元数据完整落盘：每条 post 保存 news/image/attempt 等字段，便于追踪与复盘
+- 每日新闻要点摘要：正文首行输出 20-40 字关键摘要，突出新闻要点
 
 ## 一键快速使用（免费额度版本）
 ```powershell
@@ -341,3 +343,4 @@ E2E 测试（需要已配置阿里云百炼 key；可选 `--cdp` 复用你已打
 - `docs/工作流新闻任务书.md`
 - `docs/图片查找功能.md`
 - `docs/增加图片api后的错误修正任务书.md`
+- `docs/新闻要点摘要任务书.md`

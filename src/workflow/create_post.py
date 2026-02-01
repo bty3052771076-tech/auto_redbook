@@ -128,6 +128,10 @@ _IMAGE_EVENT_DROP_WORDS = (
     "时间",
 )
 
+_NEWS_SUMMARY_LABEL = "要点摘要："
+_NEWS_CONTENT_LABEL = "新闻内容："
+_NEWS_COMMENT_LABEL = "我的点评："
+
 
 def _normalize_image_event(value: str, *, fallback: str = "", limit: int = 40) -> str:
     """
@@ -153,6 +157,18 @@ def _normalize_image_event(value: str, *, fallback: str = "", limit: int = 40) -
     return text
 
 
+def _normalize_news_summary(value: str, *, fallback: str = "", limit: int = 40) -> str:
+    text = (value or "").strip()
+    if not text:
+        text = (fallback or "").strip()
+    text = re.sub(r"https?://\S+", "", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip("：:，,。.!！？?\"'“”‘’（）()[]【】")
+    if len(text) > limit:
+        text = text[:limit].rstrip()
+    return text
+
+
 def _daily_news_prompt(picked, prompt_norm: str) -> str:
     """
     Prompt for LLM to write publishable body ONLY (no metadata/requirements echoed).
@@ -172,17 +188,19 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
         f"- 链接：{picked.url}\n"
         f"- 用户关注点（可选）：{prompt_norm or '无'}\n\n"
         "输出格式（必须逐行保留标题，不得更名或省略）：\n"
+        "要点摘要：<20-40字，概括新闻最重要部分，不要评价>\n"
         "新闻内容：\n"
         "<不少于200字的完整段落>\n\n"
-        "点评：\n"
+        "我的点评：\n"
         "<不少于100字的完整段落，末尾附带1个互动问题>\n\n"
         "硬性要求：\n"
-        "1) 必须包含且仅包含以上两个段落，段落之间空一行。\n"
-        "2) 不得输出列表或额外小标题，不得合并成一段。\n"
-        "3) 新闻内容（>=200字）：基于上面的信息，说明发生了什么、为何值得关注。\n"
-        "4) 我的点评（>=100字）：给出影响解读/建议/风险提示，可结合用户关注点，但不得新增事实。\n"
-        "5) topics 输出 3-8 个话题词，包含“每日新闻”。\n"
-        "6) image_event 输出一条仅用于配图的事件描述（建议20-40个中文字符，约30字）：只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
+        "1) 首行必须是“要点摘要：”+20-40字，概括新闻最重要部分，不要评价。\n"
+        "2) 必须包含且仅包含以上三段，段落之间空一行。\n"
+        "3) 不得输出列表或额外小标题，不得合并成一段。\n"
+        "4) 新闻内容（>=200字）：基于上面的信息，说明发生了什么、为何值得关注。\n"
+        "5) 我的点评（>=100字）：给出影响解读/建议/风险提示，可结合用户关注点，但不得新增事实。\n"
+        "6) topics 输出 3-8 个话题词，包含“每日新闻”。\n"
+        "7) image_event 输出一条仅用于配图的事件描述（建议20-40个中文字符，约30字）：只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
         "不要出现“新闻/报道/采访/记者/媒体/来源/链接/时间”等词。\n"
     )
 
@@ -193,10 +211,14 @@ def _daily_news_offline_body(picked, prompt_norm: str) -> str:
     """
     focus = prompt_norm.strip()
     focus_line = f"从「{focus}」角度" if focus else "从读者关注点"
+    summary = _normalize_news_summary(
+        picked.description or picked.title, fallback=picked.title, limit=40
+    )
     return (
-        "新闻内容：\n"
+        f"{_NEWS_SUMMARY_LABEL}{summary}\n"
+        f"{_NEWS_CONTENT_LABEL}\n"
         f"{picked.title}。这条新闻反映出当前议题的最新进展，仍需关注后续权威信息披露。\n\n"
-        "我的点评：\n"
+        f"{_NEWS_COMMENT_LABEL}\n"
         f"{focus_line}来看，它可能带来连锁影响，值得持续观察与跟进。"
         "你认为接下来会如何发展？"
     )
@@ -206,12 +228,26 @@ def _ensure_daily_news_sections(body: str, prompt_norm: str) -> str:
     text = (body or "").strip()
     if not text:
         return text
-    if "新闻内容：" in text and "我的点评：" in text:
+    if (
+        text.startswith(_NEWS_SUMMARY_LABEL)
+        and _NEWS_CONTENT_LABEL in text
+        and _NEWS_COMMENT_LABEL in text
+    ):
         return text
 
-    cleaned = text.replace("新闻内容：", "").replace("我的点评：", "").strip()
+    cleaned = (
+        text.replace(_NEWS_SUMMARY_LABEL, "")
+        .replace(_NEWS_CONTENT_LABEL, "")
+        .replace(_NEWS_COMMENT_LABEL, "")
+        .strip()
+    )
     paragraphs = [p.strip() for p in cleaned.splitlines() if p.strip()]
-    if len(paragraphs) >= 2:
+    summary = ""
+    if len(paragraphs) >= 3:
+        summary = paragraphs[0]
+        news = paragraphs[1]
+        comment = " ".join(paragraphs[2:])
+    elif len(paragraphs) >= 2:
         news = paragraphs[0]
         comment = " ".join(paragraphs[1:])
     else:
@@ -219,7 +255,12 @@ def _ensure_daily_news_sections(body: str, prompt_norm: str) -> str:
         focus_line = f"从「{prompt_norm}」角度" if prompt_norm else "从读者关注点"
         comment = f"{focus_line}来看，这条新闻提示我们需要持续关注后续进展与影响。你怎么看？"
 
-    return f"新闻内容：\n{news}\n\n我的点评：\n{comment}"
+    summary = _normalize_news_summary(summary, fallback=news, limit=40)
+
+    return (
+        f"{_NEWS_SUMMARY_LABEL}{summary}\n"
+        f"{_NEWS_CONTENT_LABEL}\n{news}\n\n{_NEWS_COMMENT_LABEL}\n{comment}"
+    )
 
 
 def _news_source_line(picked) -> str:

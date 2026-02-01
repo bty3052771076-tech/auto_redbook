@@ -68,6 +68,7 @@ def test_pick_news_items_with_hint_returns_top_n():
 def test_ensure_daily_news_sections_adds_headings():
     body = "这是只有一段的正文。"
     out = _ensure_daily_news_sections(body, "美国时政")
+    assert "要点摘要：" in out
     assert "新闻内容：" in out
     assert "我的点评：" in out
 
@@ -75,7 +76,8 @@ def test_ensure_daily_news_sections_adds_headings():
 def test_ensure_daily_news_sections_preserves_two_paragraphs():
     body = "第一段内容。\n\n第二段点评。"
     out = _ensure_daily_news_sections(body, "")
-    assert out.splitlines()[0] == "新闻内容："
+    assert out.splitlines()[0].startswith("要点摘要：")
+    assert out.splitlines()[1] == "新闻内容："
     assert "第一段内容。" in out
     assert "我的点评：" in out
 
