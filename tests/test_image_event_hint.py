@@ -24,3 +24,8 @@ def test_normalize_image_event_strips_prefix_words_and_urls():
     assert "报道" not in out
     assert "http" not in out
 
+
+def test_ensure_news_publish_date_inserts_when_missing():
+    body = "要点摘要：简述事件。\n新闻内容：\n这是一段新闻正文。\n\n点评：\n这里是点评。"
+    out = create_post._ensure_news_publish_date(body, "2025-01-02T00:00:00Z")
+    assert out.endswith("发布时间：2025-01-02")

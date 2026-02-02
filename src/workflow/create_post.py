@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -130,7 +131,7 @@ _IMAGE_EVENT_DROP_WORDS = (
 
 _NEWS_SUMMARY_LABEL = "要点摘要："
 _NEWS_CONTENT_LABEL = "新闻内容："
-_NEWS_COMMENT_LABEL = "我的点评："
+_NEWS_COMMENT_LABEL = "点评："
 
 
 def _normalize_image_event(value: str, *, fallback: str = "", limit: int = 40) -> str:
@@ -169,6 +170,34 @@ def _normalize_news_summary(value: str, *, fallback: str = "", limit: int = 40) 
     return text
 
 
+def _format_news_seendate(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return "未知"
+    for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    if "T" in text:
+        return text.split("T", 1)[0].strip() or text
+    if len(text) >= 8 and text[:8].isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text
+
+
+def _ensure_news_publish_date(body: str, seendate: str | None) -> str:
+    text = (body or "").strip()
+    if not text:
+        return text
+    pub = _format_news_seendate(seendate)
+    if pub != "未知" and pub in text:
+        return text
+    if "发布时间" in text:
+        return text
+    return f"{text}\n\n发布时间：{pub}"
+
+
 def _daily_news_prompt(picked, prompt_norm: str) -> str:
     """
     Prompt for LLM to write publishable body ONLY (no metadata/requirements echoed).
@@ -191,7 +220,7 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
         "要点摘要：<20-40字，概括新闻最重要部分，不要评价>\n"
         "新闻内容：\n"
         "<不少于200字的完整段落>\n\n"
-        "我的点评：\n"
+        "点评：\n"
         "<不少于100字的完整段落，末尾附带1个互动问题>\n\n"
         "硬性要求：\n"
         "1) 首行必须是“要点摘要：”+20-40字，概括新闻最重要部分，不要评价。\n"
@@ -200,7 +229,9 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
         "4) 新闻内容（>=200字）：基于上面的信息，说明发生了什么、为何值得关注。\n"
         "5) 我的点评（>=100字）：给出影响解读/建议/风险提示，可结合用户关注点，但不得新增事实。\n"
         "6) topics 输出 3-8 个话题词，包含“每日新闻”。\n"
-        "7) image_event 输出一条仅用于配图的事件描述（建议20-40个中文字符，约30字）：只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
+        "7) 正文末尾单独一行写出“发布时间：YYYY-MM-DD”，使用上面提供的发布时间字段，不要推测。\n"
+        "8) 严格遵循给定字段，不得添加未提供的人名、地点、数字或因果；缺失信息请明确写为“未披露/未知”。\n"
+        "9) image_event 输出一条仅用于配图的事件描述（建议20-40个中文字符，约30字）：只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
         "不要出现“新闻/报道/采访/记者/媒体/来源/链接/时间”等词。\n"
     )
 
@@ -211,6 +242,7 @@ def _daily_news_offline_body(picked, prompt_norm: str) -> str:
     """
     focus = prompt_norm.strip()
     focus_line = f"从「{focus}」角度" if focus else "从读者关注点"
+    pub = _format_news_seendate(picked.seendate)
     summary = _normalize_news_summary(
         picked.description or picked.title, fallback=picked.title, limit=40
     )
@@ -221,6 +253,7 @@ def _daily_news_offline_body(picked, prompt_norm: str) -> str:
         f"{_NEWS_COMMENT_LABEL}\n"
         f"{focus_line}来看，它可能带来连锁影响，值得持续观察与跟进。"
         "你认为接下来会如何发展？"
+        f"\n\n发布时间：{pub}"
     )
 
 
@@ -350,6 +383,9 @@ def create_post_with_draft(
             )
             draft["body"] = _ensure_daily_news_sections(
                 draft.get("body", ""), prompt_norm
+            )
+            draft["body"] = _ensure_news_publish_date(
+                draft["body"], picked.seendate
             )
             if draft.get("_fallback_error"):
                 draft["title"] = _shorten_daily_news_title(picked.title)
@@ -557,6 +593,9 @@ def create_daily_news_posts(
             asset_paths=asset_paths,
         )
         draft["body"] = _ensure_daily_news_sections(draft.get("body", ""), prompt_norm)
+        draft["body"] = _ensure_news_publish_date(
+            draft["body"], picked.seendate
+        )
         if draft.get("_fallback_error"):
             draft["title"] = _shorten_daily_news_title(picked.title)
             draft["body"] = _daily_news_offline_body(picked, prompt_norm)

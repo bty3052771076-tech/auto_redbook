@@ -1,4 +1,4 @@
-from src.news.daily_news import NewsItem, pick_best_news, pick_news_items
+from src.news.daily_news import NewsItem, pick_best_news, pick_news_items, _dedupe_candidates
 from src.workflow.create_post import _append_news_source_line, _ensure_daily_news_sections
 
 
@@ -70,7 +70,7 @@ def test_ensure_daily_news_sections_adds_headings():
     out = _ensure_daily_news_sections(body, "美国时政")
     assert "要点摘要：" in out
     assert "新闻内容：" in out
-    assert "我的点评：" in out
+    assert "点评：" in out
 
 
 def test_ensure_daily_news_sections_preserves_two_paragraphs():
@@ -79,7 +79,7 @@ def test_ensure_daily_news_sections_preserves_two_paragraphs():
     assert out.splitlines()[0].startswith("要点摘要：")
     assert out.splitlines()[1] == "新闻内容："
     assert "第一段内容。" in out
-    assert "我的点评：" in out
+    assert "点评：" in out
 
 
 def test_pick_news_items_prefers_cross_domain_duplicates():
@@ -130,3 +130,13 @@ def test_pick_news_items_dedupes_similar_titles_without_hint():
     picked = pick_news_items(items, "", count=2)
     assert len(picked) == 2
     assert picked[0].title != picked[1].title
+
+
+def test_dedupe_candidates_removes_similar_titles():
+    items = [
+        NewsItem(title="Apple releases new Mac", url="https://a.com/1"),
+        NewsItem(title="Apple releases new Mac", url="https://b.com/1"),
+        NewsItem(title="Global oil prices fall", url="https://c.com/1"),
+    ]
+    deduped = _dedupe_candidates(items)
+    assert len(deduped) == 2

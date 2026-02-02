@@ -1,5 +1,6 @@
 from src.images.auto_image import (
     ImageItem,
+    _build_aliyun_image_prompt,
     _pexels_query_hint,
     build_image_query,
     is_auto_image_enabled,
@@ -198,3 +199,14 @@ def test_pick_top_images_respects_exclude_ids():
     ]
     picked = pick_top_images(items, "coffee", count=1, exclude_ids={"1"})
     assert picked[0].id == "2"
+
+
+def test_build_aliyun_image_prompt_forbids_text():
+    prompt = _build_aliyun_image_prompt(
+        title="每日新闻｜新能源车销量创新高",
+        body="",
+        topics=[],
+        prompt_hint="新能源车销量创新高",
+    )
+    assert "不要出现任何文字" in prompt
+    assert "水印" in prompt

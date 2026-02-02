@@ -143,6 +143,18 @@ def _dedupe_by_title(items: list[NewsItem], *, max_count: int) -> list[NewsItem]
     return picked
 
 
+def _dedupe_candidates(items: list[NewsItem]) -> list[NewsItem]:
+    seen: set[str] = set()
+    unique: list[NewsItem] = []
+    for item in items:
+        key = item.url or item.title
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return _dedupe_by_title(unique, max_count=len(unique))
+
+
 def _parse_seendate_utc(seendate: Optional[str]) -> Optional[datetime]:
     if not seendate:
         return None
@@ -576,6 +588,7 @@ def fetch_daily_news_candidates(
                     timeout_s=timeout_s,
                 )
             if candidates:
+                candidates = _dedupe_candidates(candidates)
                 break
         except Exception as exc:
             last_err = str(exc)

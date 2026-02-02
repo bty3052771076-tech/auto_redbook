@@ -2,6 +2,31 @@
 
 > 记录按时间倒序（最新在前）
 
+### 2026-02-02
+**Task:** 每日新闻加入发布时间、候选去重与严格内容约束
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | 增加发布时间兜底写入、提示词严格约束。 | None. |
+| `src/news/daily_news.py` | DONE | 候选新闻统一去重，减少重复。 | None. |
+| `tests/test_image_event_hint.py` | DONE | 新增发布时间兜底单测。 | None. |
+| `tests/test_daily_news.py` | DONE | 新增候选去重单测。 | None. |
+| `docs/新闻时效性去重与内容规范任务书.md` | DONE | 新增任务书。 | None. |
+| `README.md` | DONE | 补充发布时间与文档索引。 | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+### 2026-02-02
+**Task:** 生图提示词加“无文字”约束
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/images/auto_image.py` | DONE | 生图提示词追加“不要出现文字/水印/标志/海报排版/UI”。 | None. |
+| `tests/test_auto_image.py` | DONE | 新增断言确保提示词包含“无文字”约束。 | None. |
+| `docs/生图事件摘要任务书.md` | DONE | 追加进度记录。 | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
 ### 2026-02-01
 **Task:** 每日新闻正文首行加入“要点摘要”并加兜底
 **Git:** `main (dirty)`

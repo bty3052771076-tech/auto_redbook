@@ -253,7 +253,10 @@ def _build_aliyun_image_prompt(*, title: str, body: str, topics: list[str], prom
 
     # Only use a short event summary (typically from LLM image_event) plus a tiny base instruction.
     # If the hint is missing, fall back to title-derived theme (still event-like).
-    prompt = f"生成一张竖版3:4插画，描绘以下事件：{theme or '事件'}。"
+    prompt = (
+        f"生成一张竖版3:4插画，描绘以下事件：{theme or '事件'}。"
+        "画面中不要出现任何文字、标志、水印、海报排版或UI元素。"
+    )
     return _clip_text(prompt, limit=220)
 
 
