@@ -140,3 +140,18 @@ def test_dedupe_candidates_removes_similar_titles():
     ]
     deduped = _dedupe_candidates(items)
     assert len(deduped) == 2
+
+
+def test_pick_news_items_prefers_china_ratio():
+    items = [
+        NewsItem(title="CN1", url="https://a.cn/1"),
+        NewsItem(title="US1", url="https://a.com/1"),
+        NewsItem(title="CN2", url="https://b.cn/1"),
+        NewsItem(title="US2", url="https://b.com/1"),
+        NewsItem(title="CN3", url="https://c.cn/1"),
+        NewsItem(title="US3", url="https://c.com/1"),
+    ]
+    picked = pick_news_items(items, "", count=5)
+    china_count = sum(1 for it in picked if ".cn/" in it.url)
+    # Default 6:4 => ~60% China, count=5 => 3 China + 2 foreign.
+    assert china_count == 3

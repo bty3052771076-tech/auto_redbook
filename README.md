@@ -88,6 +88,7 @@ NewsAPI（“每日新闻”）：
 - 环境变量：`NEWS_API_KEY`（或 `NEWSAPI_API_KEY`），可选 `NEWS_BASE_URL`
 - 或本机文件：复制 `docs/news_api-key.example.md` 为 `docs/news_api-key.md` 并填写
 - 无需 key 的免费新闻源：`GDELT`（设置 `NEWS_PROVIDER=gdelt` 或不配置 key 时自动回退）
+- 中国/海外新闻比例：默认偏向中国新闻，约 6:4（可用 `NEWS_CHINA_RATIO=0.6` 调整；仅影响“每日新闻”候选排序/挑选）
 
 Pexels（自动配图：当未提供图片素材时）：
 - 环境变量：`PEXELS_API_KEY`，可选 `PEXELS_BASE_URL` / `AUTO_IMAGE_COUNT` / `IMAGE_MIN_SCORE`；`AUTO_IMAGE=0` 可关闭自动配图
@@ -346,3 +347,4 @@ E2E 测试（需要已配置阿里云百炼 key；可选 `--cdp` 复用你已打
 - `docs/增加图片api后的错误修正任务书.md`
 - `docs/新闻要点摘要任务书.md`
 - `docs/新闻时效性去重与内容规范任务书.md`
+- `docs/中国海外新闻比例任务书.md`

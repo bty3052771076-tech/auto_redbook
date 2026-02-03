@@ -27,6 +27,18 @@
 | `docs/生图事件摘要任务书.md` | DONE | 追加进度记录。 | None. |
 | `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
 
+### 2026-02-03
+**Task:** 每日新闻偏向中国新闻（中国:海外≈6:4）
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/news/daily_news.py` | DONE | 增加中国新闻判定 + 比例挑选（默认 0.6）与轻度加分。 | None. |
+| `tests/test_daily_news.py` | DONE | 新增 6:4 比例挑选单测。 | None. |
+| `docs/中国海外新闻比例任务书.md` | DONE | 新增任务书与进度记录。 | None. |
+| `README.md` | DONE | 增加 `NEWS_CHINA_RATIO/NEWS_CHINA_BONUS` 说明与任务书索引。 | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
 ### 2026-02-01
 **Task:** 每日新闻正文首行加入“要点摘要”并加兜底
 **Git:** `main (dirty)`

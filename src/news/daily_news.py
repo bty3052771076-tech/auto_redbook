@@ -19,6 +19,8 @@ DEFAULT_TIMEOUT_S = 20.0
 CROSS_DOMAIN_SIM_THRESHOLD = 0.75
 CROSS_DOMAIN_BONUS = 0.4
 NEWS_DEDUPE_SIM_THRESHOLD = 0.8
+DEFAULT_CHINA_RATIO = 0.6
+DEFAULT_CHINA_BONUS = 0.15
 
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 NEWSAPI_BASE_URL = "https://newsapi.org"
@@ -90,6 +92,89 @@ def _domain_for_item(item: NewsItem) -> str:
         return urllib.parse.urlparse(item.url or "").netloc.strip().lower()
     except Exception:
         return ""
+
+
+def _is_china_item(item: NewsItem) -> bool:
+    # Prefer explicit metadata when available.
+    country = (item.sourcecountry or "").strip().lower()
+    if country in ("china", "cn", "chn", "ch"):
+        return True
+    domain = _domain_for_item(item)
+    if domain.endswith(".cn") or domain.endswith(".gov.cn") or domain.endswith(".edu.cn"):
+        return True
+    return False
+
+
+def _china_ratio() -> float:
+    raw = (os.getenv("NEWS_CHINA_RATIO") or "").strip()
+    if not raw:
+        return DEFAULT_CHINA_RATIO
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_CHINA_RATIO
+    # Clamp to a reasonable range.
+    return max(0.0, min(1.0, value))
+
+
+def _china_bonus() -> float:
+    raw = (os.getenv("NEWS_CHINA_BONUS") or "").strip()
+    if not raw:
+        return DEFAULT_CHINA_BONUS
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_CHINA_BONUS
+
+
+def _balance_china_foreign(items: list[NewsItem], *, count: int) -> list[NewsItem]:
+    """
+    Keep a rough China:foreign ratio (default 6:4) while preserving relevance order.
+    If one side is insufficient, fill from the other side.
+    """
+    if count <= 0 or not items:
+        return []
+    if count == 1:
+        return items[:1]
+
+    ratio = _china_ratio()
+    desired_china = int(round(count * ratio))
+    desired_china = max(0, min(count, desired_china))
+    desired_foreign = count - desired_china
+
+    china_items = [it for it in items if _is_china_item(it)]
+    foreign_items = [it for it in items if not _is_china_item(it)]
+
+    picked: list[NewsItem] = []
+    picked_china = 0
+    picked_foreign = 0
+    i = 0
+    j = 0
+    while len(picked) < count and (i < len(china_items) or j < len(foreign_items)):
+        need_china = picked_china < desired_china
+        need_foreign = picked_foreign < desired_foreign
+        if need_china and i < len(china_items):
+            picked.append(china_items[i])
+            i += 1
+            picked_china += 1
+            continue
+        if need_foreign and j < len(foreign_items):
+            picked.append(foreign_items[j])
+            j += 1
+            picked_foreign += 1
+            continue
+        # Quota reached or missing: fill from remaining.
+        if i < len(china_items):
+            picked.append(china_items[i])
+            i += 1
+            picked_china += 1
+            continue
+        if j < len(foreign_items):
+            picked.append(foreign_items[j])
+            j += 1
+            picked_foreign += 1
+            continue
+    return picked
 
 
 def _title_similar(
@@ -251,14 +336,21 @@ def pick_best_news(items: list[NewsItem], prompt_hint: str) -> NewsItem:
     counts = _cross_domain_counts(items)
     if not (prompt_hint or "").strip():
         if not any(c >= 2 for c in counts):
+            # Default: bias slightly toward China news if possible.
+            ratio = _china_ratio()
+            if ratio <= 0.0:
+                return items[0]
+            for it in items:
+                if _is_china_item(it):
+                    return it
             return items[0]
         best = items[0]
-        best_key = (counts[0], datetime.min.replace(tzinfo=timezone.utc))
+        best_key = (_is_china_item(best), counts[0], datetime.min.replace(tzinfo=timezone.utc))
         for idx, item in enumerate(items):
             seen = _parse_seendate_utc(item.seendate) or datetime.min.replace(
                 tzinfo=timezone.utc
             )
-            key = (counts[idx], seen)
+            key = (_is_china_item(item), counts[idx], seen)
             if key > best_key:
                 best = item
                 best_key = key
@@ -266,9 +358,12 @@ def pick_best_news(items: list[NewsItem], prompt_hint: str) -> NewsItem:
 
     best = items[0]
     best_key = (-1.0, datetime.min.replace(tzinfo=timezone.utc))
+    china_bonus = _china_bonus()
     for idx, item in enumerate(items):
         score = _relevance_score(item, prompt_hint)
         score += max(0, counts[idx] - 1) * CROSS_DOMAIN_BONUS
+        if _is_china_item(item):
+            score += china_bonus
         seen = _parse_seendate_utc(item.seendate) or datetime.min.replace(
             tzinfo=timezone.utc
         )
@@ -301,6 +396,7 @@ def pick_news_items(
     if hint:
         scored: list[tuple[float, datetime, int, NewsItem]] = []
         seen: set[str] = set()
+        china_bonus = _china_bonus()
         for idx, item in enumerate(items):
             key = item.url or item.title
             if key in seen:
@@ -308,13 +404,16 @@ def pick_news_items(
             seen.add(key)
             score = _relevance_score(item, hint)
             score += max(0, counts[idx] - 1) * CROSS_DOMAIN_BONUS
+            if _is_china_item(item):
+                score += china_bonus
             seen_at = _parse_seendate_utc(item.seendate) or datetime.min.replace(
                 tzinfo=timezone.utc
             )
             scored.append((score, seen_at, counts[idx], -idx, item))
         scored.sort(reverse=True)
         order = [item for _, _, _, _, item in scored]
-        return _dedupe_by_title(order, max_count=count)
+        deduped = _dedupe_by_title(order, max_count=len(order))
+        return _balance_china_foreign(deduped, count=count)
 
     seen: set[str] = set()
     if any(c >= 2 for c in counts):
@@ -336,7 +435,8 @@ def pick_news_items(
             continue
         seen.add(key)
         unique.append(item)
-    return _dedupe_by_title(unique, max_count=count)
+    deduped = _dedupe_by_title(unique, max_count=len(unique))
+    return _balance_china_foreign(deduped, count=count)
 
 
 def _gdelt_fetch_articles(
