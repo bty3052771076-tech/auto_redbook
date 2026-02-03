@@ -38,6 +38,56 @@ def _detect_project_root() -> Path:
 PROJECT_ROOT = _detect_project_root()
 ENV_GUI_PATH = PROJECT_ROOT / ".env.gui"
 
+# --- GUI defaults (safe; no secrets) ---
+DEFAULT_TITLE = "每日新闻"
+DEFAULT_ASSETS_GLOB = "assets/pics/*"
+DEFAULT_LOGIN_HOLD = 600
+DEFAULT_WAIT_TIMEOUT = 600
+
+DEFAULT_ALIYUN_LLM_MODEL = "deepseek-v3.2"
+DEFAULT_ALIYUN_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+DEFAULT_IMAGE_PROVIDER = "aliyun"
+DEFAULT_ALIYUN_IMAGE_MODELS = "qwen-image-plus-2026-01-09"
+DEFAULT_ALIYUN_IMAGE_SIZE = "1104*1472"
+# Keep this in env so it can be changed easily; default aims to reduce "image with text" issues.
+DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT = (
+    "no text, no words, no letters, no watermark, no logo, no caption, no subtitle, no signature, no UI"
+)
+
+DEFAULT_NEWS_CHINA_RATIO = "0.6"
+DEFAULT_NEWS_CHINA_BONUS = "0.15"
+
+DEFAULT_DRAFT_URL = "https://creator.xiaohongshu.com/publish/publish"
+
+
+def list_recent_post_ids(*, project_root: Path = PROJECT_ROOT, limit: int = 50) -> list[str]:
+    """
+    List recent post ids from local storage (data/posts/<post_id>/).
+    Used by the GUI to make "run/approve" easier.
+    """
+    posts_dir = project_root / "data" / "posts"
+    if not posts_dir.exists():
+        return []
+
+    def _looks_like_post_id(name: str) -> bool:
+        if len(name) != 32:
+            return False
+        return all(ch in "0123456789abcdef" for ch in name.lower())
+
+    items: list[tuple[float, str]] = []
+    for p in posts_dir.iterdir():
+        if not p.is_dir():
+            continue
+        if not _looks_like_post_id(p.name):
+            continue
+        try:
+            items.append((p.stat().st_mtime, p.name))
+        except Exception:
+            continue
+    items.sort(key=lambda t: t[0], reverse=True)
+    return [name for _, name in items[: max(0, int(limit or 0) or 50)]]
+
 
 def _python_for_cli() -> str:
     """
@@ -139,6 +189,37 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             args.extend(["--wait-timeout", str(wait_timeout)])
             if force:
                 args.append("--force")
+        return args
+
+    if subcommand == "approve":
+        post_id = str(params.get("post_id") or "").strip()
+        if not post_id:
+            raise ValueError("post_id is required")
+        force = bool(params.get("force") or False)
+        args.append(post_id)
+        if force:
+            args.append("--force")
+        return args
+
+    if subcommand == "run":
+        post_id = str(params.get("post_id") or "").strip()
+        if not post_id:
+            raise ValueError("post_id is required")
+        assets_glob = str(params.get("assets_glob") or "").strip()
+        dry_run = bool(params.get("dry_run") or False)
+        login_hold = int(params.get("login_hold") or 0)
+        wait_timeout = int(params.get("wait_timeout") or 300)
+        force = bool(params.get("force") or False)
+
+        args.append(post_id)
+        if assets_glob:
+            args.extend(["--assets-glob", assets_glob])
+        if dry_run:
+            args.append("--dry-run")
+        args.extend(["--login-hold", str(login_hold)])
+        args.extend(["--wait-timeout", str(wait_timeout)])
+        if force:
+            args.append("--force")
         return args
 
     if subcommand == "delete-drafts":
@@ -253,6 +334,33 @@ def main() -> None:
     def _env_default(key: str, default: str = "") -> str:
         return (persisted.get(key) or os.getenv(key) or default).strip()
 
+    PROMPT_PLACEHOLDER = "（可选）例如：中国要闻 / 科技 / 社会热点"
+
+    def _init_prompt_placeholder(widget) -> None:
+        widget.insert("1.0", PROMPT_PLACEHOLDER)
+        widget.configure(fg="#888888")
+
+        def _on_focus_in(_evt=None) -> None:
+            cur = widget.get("1.0", "end-1c")
+            if cur.strip() == PROMPT_PLACEHOLDER:
+                widget.delete("1.0", "end")
+                widget.configure(fg="#000000")
+
+        def _on_focus_out(_evt=None) -> None:
+            cur = widget.get("1.0", "end-1c")
+            if not cur.strip():
+                widget.insert("1.0", PROMPT_PLACEHOLDER)
+                widget.configure(fg="#888888")
+
+        widget.bind("<FocusIn>", _on_focus_in)
+        widget.bind("<FocusOut>", _on_focus_out)
+
+    def _read_prompt(widget) -> str:
+        cur = widget.get("1.0", "end-1c")
+        if cur.strip() == PROMPT_PLACEHOLDER:
+            return ""
+        return cur.strip()
+
     # --- shared widgets ---
     log = ScrolledText(root, height=16)
     log.pack(fill="both", expand=False, padx=10, pady=(10, 6))
@@ -288,9 +396,17 @@ def main() -> None:
 
     cfg_vars: dict[str, tk.StringVar] = {}
 
-    def add_cfg_row(parent, row: int, label: str, key: str, *, secret: bool = False) -> None:
+    def add_cfg_row(
+        parent,
+        row: int,
+        label: str,
+        key: str,
+        *,
+        secret: bool = False,
+        default: str = "",
+    ) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        var = tk.StringVar(value=_env_default(key))
+        var = tk.StringVar(value=_env_default(key, default))
         cfg_vars[key] = var
         entry = ttk.Entry(parent, textvariable=var, width=70, show="*" if secret else "")
         entry.grid(row=row, column=1, sticky="we", pady=4)
@@ -315,25 +431,73 @@ def main() -> None:
     row += 1
 
     # LLM
-    add_cfg_row(cfg_grid, row, "Aliyun LLM 模型 (ALIYUN_LLM_MODEL)", "ALIYUN_LLM_MODEL")
+    add_cfg_row(
+        cfg_grid,
+        row,
+        "Aliyun LLM 模型 (ALIYUN_LLM_MODEL)",
+        "ALIYUN_LLM_MODEL",
+        default=DEFAULT_ALIYUN_LLM_MODEL,
+    )
     row += 1
-    add_cfg_row(cfg_grid, row, "Aliyun LLM Base URL (ALIYUN_LLM_BASE_URL)", "ALIYUN_LLM_BASE_URL")
+    add_cfg_row(
+        cfg_grid,
+        row,
+        "Aliyun LLM Base URL (ALIYUN_LLM_BASE_URL)",
+        "ALIYUN_LLM_BASE_URL",
+        default=DEFAULT_ALIYUN_LLM_BASE_URL,
+    )
     row += 1
 
     # Image
-    add_cfg_row(cfg_grid, row, "图片提供商 (IMAGE_PROVIDER=aliyun/pexels)", "IMAGE_PROVIDER")
+    add_cfg_row(
+        cfg_grid,
+        row,
+        "图片提供商 (IMAGE_PROVIDER=aliyun/pexels)",
+        "IMAGE_PROVIDER",
+        default=DEFAULT_IMAGE_PROVIDER,
+    )
     row += 1
-    add_cfg_row(cfg_grid, row, "阿里云生图模型列表 (ALIYUN_IMAGE_MODELS)", "ALIYUN_IMAGE_MODELS")
+    add_cfg_row(
+        cfg_grid,
+        row,
+        "阿里云生图模型列表 (ALIYUN_IMAGE_MODELS)",
+        "ALIYUN_IMAGE_MODELS",
+        default=DEFAULT_ALIYUN_IMAGE_MODELS,
+    )
     row += 1
-    add_cfg_row(cfg_grid, row, "阿里云生图尺寸 (ALIYUN_IMAGE_SIZE)", "ALIYUN_IMAGE_SIZE")
+    add_cfg_row(
+        cfg_grid,
+        row,
+        "阿里云生图尺寸 (ALIYUN_IMAGE_SIZE)",
+        "ALIYUN_IMAGE_SIZE",
+        default=DEFAULT_ALIYUN_IMAGE_SIZE,
+    )
     row += 1
-    add_cfg_row(cfg_grid, row, "阿里云负面提示词 (ALIYUN_IMAGE_NEGATIVE_PROMPT)", "ALIYUN_IMAGE_NEGATIVE_PROMPT")
+    add_cfg_row(
+        cfg_grid,
+        row,
+        "阿里云负面提示词 (ALIYUN_IMAGE_NEGATIVE_PROMPT)",
+        "ALIYUN_IMAGE_NEGATIVE_PROMPT",
+        default=DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT,
+    )
     row += 1
 
     # News preference
-    add_cfg_row(cfg_grid, row, "中国新闻比例 (NEWS_CHINA_RATIO, 默认0.6)", "NEWS_CHINA_RATIO")
+    add_cfg_row(
+        cfg_grid,
+        row,
+        "中国新闻比例 (NEWS_CHINA_RATIO, 默认0.6)",
+        "NEWS_CHINA_RATIO",
+        default=DEFAULT_NEWS_CHINA_RATIO,
+    )
     row += 1
-    add_cfg_row(cfg_grid, row, "中国新闻加分 (NEWS_CHINA_BONUS, 默认0.15)", "NEWS_CHINA_BONUS")
+    add_cfg_row(
+        cfg_grid,
+        row,
+        "中国新闻加分 (NEWS_CHINA_BONUS, 默认0.15)",
+        "NEWS_CHINA_BONUS",
+        default=DEFAULT_NEWS_CHINA_BONUS,
+    )
     row += 1
 
     def _collect_env_overrides() -> dict[str, str]:
@@ -371,11 +535,13 @@ def main() -> None:
         grid.pack(fill="x", padx=6, pady=6)
         grid.columnconfigure(1, weight=1)
 
-        title_var = tk.StringVar(value="")
+        title_var = tk.StringVar(value=DEFAULT_TITLE)
         prompt_text = tk.Text(grid, height=4)
-        assets_var = tk.StringVar(value="assets/pics/*")
+        assets_var = tk.StringVar(value=DEFAULT_ASSETS_GLOB)
         count_var = tk.IntVar(value=1)
         no_copy_var = tk.BooleanVar(value=False)
+
+        _init_prompt_placeholder(prompt_text)
 
         ttk.Label(grid, text="标题").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(grid, textvariable=title_var).grid(row=0, column=1, sticky="we", pady=4)
@@ -415,8 +581,8 @@ def main() -> None:
     auto_opts.pack(fill="x", padx=12, pady=(0, 8))
     dry_run_var = tk.BooleanVar(value=False)
     force_var = tk.BooleanVar(value=False)
-    login_hold_var = tk.IntVar(value=600)
-    wait_timeout_var = tk.IntVar(value=600)
+    login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
+    wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
 
     ttk.Checkbutton(auto_opts, text="dry-run（仅打开/取证，不上传/保存）", variable=dry_run_var).pack(
         side="left"
@@ -434,7 +600,7 @@ def main() -> None:
     )
 
     def _run_auto() -> None:
-        prompt = auto_form["prompt_text"].get("1.0", "end").strip()
+        prompt = _read_prompt(auto_form["prompt_text"])
         params = {
             "title": auto_form["title_var"].get(),
             "prompt": prompt,
@@ -459,7 +625,7 @@ def main() -> None:
     create_form = _common_form(tab_create)
 
     def _run_create() -> None:
-        prompt = create_form["prompt_text"].get("1.0", "end").strip()
+        prompt = _read_prompt(create_form["prompt_text"])
         params = {
             "title": create_form["title_var"].get(),
             "prompt": prompt,
@@ -473,6 +639,96 @@ def main() -> None:
 
     ttk.Button(tab_create, text="运行 create", command=_run_create).pack(anchor="w", padx=12, pady=(0, 10))
 
+    # --- Run tab ---
+    tab_run = ttk.Frame(nb)
+    nb.add(tab_run, text="run（仅上传）")
+
+    run_grid = ttk.Frame(tab_run)
+    run_grid.pack(fill="x", padx=12, pady=12)
+    run_grid.columnconfigure(1, weight=1)
+
+    post_id_var = tk.StringVar(value="")
+    assets_glob_var = tk.StringVar(value="")
+
+    ttk.Label(run_grid, text="post_id").grid(row=0, column=0, sticky="w", pady=4)
+    post_id_box = ttk.Combobox(run_grid, textvariable=post_id_var, values=[], width=46)
+    post_id_box.grid(row=0, column=1, sticky="we", pady=4)
+
+    def _suggest_run_assets_glob(pid: str) -> str:
+        pid_norm = (pid or "").strip()
+        if not pid_norm:
+            return ""
+        return f"data/posts/{pid_norm}/assets/*"
+
+    def _refresh_post_ids() -> None:
+        ids = list_recent_post_ids(project_root=PROJECT_ROOT, limit=80)
+        post_id_box["values"] = ids
+        if ids and not (post_id_var.get() or "").strip():
+            post_id_var.set(ids[0])
+
+    def _on_post_id_change(*_args) -> None:
+        pid = (post_id_var.get() or "").strip()
+        if not pid:
+            return
+        cur_assets = (assets_glob_var.get() or "").strip()
+        if not cur_assets or cur_assets.startswith("data/posts/"):
+            assets_glob_var.set(_suggest_run_assets_glob(pid))
+
+    post_id_var.trace_add("write", _on_post_id_change)
+
+    ttk.Button(run_grid, text="刷新", command=_refresh_post_ids).grid(
+        row=0, column=2, sticky="e", padx=(8, 0), pady=4
+    )
+
+    ttk.Label(run_grid, text="assets glob").grid(row=1, column=0, sticky="w", pady=4)
+    ttk.Entry(run_grid, textvariable=assets_glob_var).grid(row=1, column=1, sticky="we", pady=4)
+    ttk.Label(run_grid, text="留空则自动使用 post 内的素材").grid(
+        row=1, column=2, sticky="e", padx=(8, 0), pady=4
+    )
+
+    run_opts = ttk.Frame(tab_run)
+    run_opts.pack(fill="x", padx=12, pady=(0, 8))
+    run_dry_var = tk.BooleanVar(value=False)
+    run_force_var = tk.BooleanVar(value=False)
+    run_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
+    run_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
+
+    ttk.Checkbutton(run_opts, text="dry-run（仅打开/取证）", variable=run_dry_var).pack(side="left")
+    ttk.Checkbutton(run_opts, text="force（跳过校验/未审核也上传）", variable=run_force_var).pack(
+        side="left", padx=(12, 0)
+    )
+    ttk.Label(run_opts, text="login-hold").pack(side="left", padx=(12, 0))
+    ttk.Spinbox(run_opts, from_=0, to=3600, textvariable=run_login_hold_var, width=6).pack(side="left")
+    ttk.Label(run_opts, text="wait-timeout").pack(side="left", padx=(12, 0))
+    ttk.Spinbox(run_opts, from_=30, to=3600, textvariable=run_wait_timeout_var, width=6).pack(side="left")
+
+    run_btns = ttk.Frame(tab_run)
+    run_btns.pack(fill="x", padx=12, pady=(0, 10))
+
+    def _run_approve() -> None:
+        params = {"post_id": post_id_var.get(), "force": run_force_var.get()}
+        args = build_cli_args("approve", params=params)
+        env = build_subprocess_env(_collect_env_overrides())
+        runner.run(args, env)
+
+    def _run_run() -> None:
+        params = {
+            "post_id": post_id_var.get(),
+            "assets_glob": assets_glob_var.get(),
+            "dry_run": run_dry_var.get(),
+            "login_hold": run_login_hold_var.get(),
+            "wait_timeout": run_wait_timeout_var.get(),
+            "force": run_force_var.get(),
+        }
+        args = build_cli_args("run", params=params)
+        env = build_subprocess_env(_collect_env_overrides())
+        runner.run(args, env)
+
+    ttk.Button(run_btns, text="运行 approve（审核）", command=_run_approve).pack(side="left")
+    ttk.Button(run_btns, text="运行 run（仅上传）", command=_run_run).pack(side="left", padx=(8, 0))
+
+    _refresh_post_ids()
+
     # --- Delete drafts tab ---
     tab_delete = ttk.Frame(nb)
     nb.add(tab_delete, text="delete-drafts（删除草稿）")
@@ -483,13 +739,13 @@ def main() -> None:
 
     draft_type_var = tk.StringVar(value="image")
     draft_loc_var = tk.StringVar(value="publish")
-    draft_url_var = tk.StringVar(value="")
+    draft_url_var = tk.StringVar(value=DEFAULT_DRAFT_URL)
     all_types_var = tk.BooleanVar(value=False)
     del_limit_var = tk.IntVar(value=0)
     del_dry_var = tk.BooleanVar(value=True)
     del_yes_var = tk.BooleanVar(value=False)
-    del_login_hold_var = tk.IntVar(value=600)
-    del_wait_timeout_var = tk.IntVar(value=600)
+    del_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
+    del_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
 
     ttk.Label(del_grid, text="草稿类型").grid(row=0, column=0, sticky="w", pady=4)
     ttk.Combobox(del_grid, textvariable=draft_type_var, values=["image", "video", "article"], width=10).grid(

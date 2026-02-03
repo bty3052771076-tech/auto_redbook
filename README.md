@@ -49,6 +49,7 @@ python -m playwright install chromium
 ```powershell
 .\.venv\Scripts\python -m apps.gui
 ```
+GUI 内置常用工作流页签：`auto` / `create` / `approve` / `run（仅上传）` / `delete-drafts`。
 
 ### 打包成 exe（可选）
 ```powershell
@@ -362,3 +363,4 @@ E2E 测试（需要已配置阿里云百炼 key；可选 `--cdp` 复用你已打
 - `docs/新闻时效性去重与内容规范任务书.md`
 - `docs/中国海外新闻比例任务书.md`
 - `docs/图形界面任务书.md`
+- `docs/图形界面工作流增强任务书.md`

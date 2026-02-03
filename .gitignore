@@ -13,6 +13,7 @@ exports/
 # Secrets (local-only)
 .env
 .env.*
+.env.gui
 *.env
 docs/*api-key.md
 docs/z-image_api-key.md

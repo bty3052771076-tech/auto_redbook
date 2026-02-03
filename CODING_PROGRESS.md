@@ -3,6 +3,19 @@
 > 记录按时间倒序（最新在前）
 
 ### 2026-02-03
+**Task:** GUI 默认值与“仅上传（approve/run）”工作流增强
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/图形界面工作流增强任务书.md` | DONE | 新增任务书：明确默认值策略、Key 不上传保障、approve/run 工作流。 | None. |
+| `apps/gui.py` | DONE | 配置页补默认值；新增 `run（仅上传）` 页签（支持选择 post_id、approve、run）。 | 手动跑一次 GUI 做冒烟测试。 |
+| `tests/test_gui.py` | DONE | 补充 `approve/run` 的 CLI 参数构造单测。 | None. |
+| `.gitignore` | DONE | 显式忽略 `.env.gui`（并保留 `.env.*` 兜底）。 | None. |
+| `README.md` | DONE | 补充 GUI 工作流说明与任务书索引。 | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+### 2026-02-03
 **Task:** 打包 GUI 为 AutoRedbookGUI.exe（快速启动）
 **Git:** `main (dirty)`
 

@@ -72,3 +72,33 @@ def test_build_cli_args_delete_drafts():
     assert "--dry-run" in args
     assert "--yes" in args
 
+
+def test_build_cli_args_approve():
+    args = build_cli_args(
+        "approve",
+        params={"post_id": "0123456789abcdef0123456789abcdef", "force": True},
+    )
+    assert args[1:4] == ["-m", "apps.cli", "approve"]
+    assert "0123456789abcdef0123456789abcdef" in args
+    assert "--force" in args
+
+
+def test_build_cli_args_run():
+    args = build_cli_args(
+        "run",
+        params={
+            "post_id": "0123456789abcdef0123456789abcdef",
+            "assets_glob": "",
+            "dry_run": True,
+            "login_hold": 10,
+            "wait_timeout": 20,
+            "force": True,
+        },
+    )
+    assert args[1:4] == ["-m", "apps.cli", "run"]
+    assert "0123456789abcdef0123456789abcdef" in args
+    assert "--assets-glob" not in args  # empty glob should be omitted
+    assert "--dry-run" in args
+    assert "--login-hold" in args and "10" in args
+    assert "--wait-timeout" in args and "20" in args
+    assert "--force" in args
