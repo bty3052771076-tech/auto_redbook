@@ -2,6 +2,30 @@
 
 > 记录按时间倒序（最新在前）
 
+### 2026-02-03
+**Task:** 打包 GUI 为 AutoRedbookGUI.exe（快速启动）
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | 支持打包后运行：CLI 调用优先使用 `.venv\\Scripts\\python.exe`，避免 frozen exe 下 `sys.executable` 失效。 | None. |
+| `scripts/build_gui_exe.ps1` | DONE | 新增 PyInstaller 打包脚本（生成并拷贝 `AutoRedbookGUI.exe` 到仓库根目录）。 | 运行脚本生成 exe 并手动打开验证。 |
+| `.gitignore` | DONE | 忽略 PyInstaller 产物（build/dist/*.spec）与本地 exe（AutoRedbookGUI*.exe）。 | None. |
+| `docs/图形界面任务书.md` | DONE | 补充 exe 打包说明与进度记录。 | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
+### 2026-02-03
+**Task:** 图形界面（GUI）用于选择模型/参数并一键执行
+**Git:** `main (dirty)`
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/图形界面任务书.md` | DONE | 新增 GUI 任务书（目标/方案/验收/测试/拆解）。 | None. |
+| `apps/gui.py` | DONE | 新增 Tkinter GUI：auto/create/delete-drafts + `.env.gui` 保存/加载 + 日志输出。 | 手动跑一次 `python -m apps.gui` 验证窗口与执行。 |
+| `tests/test_gui.py` | DONE | 新增 GUI 辅助函数单测（env 读写/命令构造）。 | None. |
+| `README.md` | DONE | 增加 GUI 启动方式与任务书索引。 | None. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry. | Continue logging. |
+
 ### 2026-02-02
 **Task:** 每日新闻加入发布时间、候选去重与严格内容约束
 **Git:** `main (dirty)`

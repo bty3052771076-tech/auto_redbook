@@ -28,3 +28,11 @@ Thumbs.db
 
 # Debug artifacts
 tmp_*.png
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Local GUI launcher binary (optional)
+AutoRedbookGUI*.exe

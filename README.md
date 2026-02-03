@@ -15,6 +15,7 @@
 - 特殊标题「每日新闻」：自动抓取新闻 → 生成草稿并保存
 - 特殊标题「每日假新闻」：LLM 生成幽默虚构新闻 → 生成草稿并保存
 - 批量生成：使用 `--count` 控制单次生成条数（默认 1）
+- 图形界面（GUI）：在窗口中选择模型/参数并一键执行常用命令
 - 自动配图：当未提供图片时，使用图片 API 搜索并下载 3 张相关图片用于上传（默认）
 - 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
 - 落盘与可追溯：`data/posts/<post_id>/` 保存 post / revision / execution / evidence
@@ -42,6 +43,18 @@ python -m playwright install chromium
 # 3) 一键：生成 -> 校验/审批 -> 保存草稿（首次建议给更长登录时间）
 .\.venv\Scripts\python -m apps.cli auto --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*" --login-hold 600
 ```
+
+## 图形界面（GUI）
+适合不想手工拼参数/环境变量时使用（本地配置可保存到 `.env.gui`，已被 `.gitignore` 忽略）：  
+```powershell
+.\.venv\Scripts\python -m apps.gui
+```
+
+### 打包成 exe（可选）
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
+```
+生成：`AutoRedbookGUI.exe`（放在仓库根目录，双击启动）
 
 ## 草稿与浏览器 Profile
 - 草稿箱数据保存在浏览器本地 profile 中，不同 profile 互不可见。
@@ -348,3 +361,4 @@ E2E 测试（需要已配置阿里云百炼 key；可选 `--cdp` 复用你已打
 - `docs/新闻要点摘要任务书.md`
 - `docs/新闻时效性去重与内容规范任务书.md`
 - `docs/中国海外新闻比例任务书.md`
+- `docs/图形界面任务书.md`
