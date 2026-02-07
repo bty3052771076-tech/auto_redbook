@@ -139,15 +139,19 @@ def _first_visible(locator):
     return locator.first
 
 
-def _wait_for_any_locator(page, selectors: List[str], timeout_ms: int) -> str:
+def _wait_for_any_locator(
+    page, selectors: List[str], timeout_ms: int, *, state: str = "visible"
+) -> str:
     per = max(1000, timeout_ms // max(1, len(selectors)))
     for sel in selectors:
         try:
-            page.locator(sel).first.wait_for(state="visible", timeout=per)
+            page.locator(sel).first.wait_for(state=state, timeout=per)
             return sel
         except PlaywrightTimeoutError:
             continue
-    raise PlaywrightTimeoutError(f"timeout waiting for any selector: {selectors}")
+    raise PlaywrightTimeoutError(
+        f"timeout waiting for any selector (state={state}): {selectors}"
+    )
 
 
 def _first_matching_locator(ctx, selectors: List[str]):
@@ -1108,16 +1112,26 @@ def run_save_draft_sync(
                 steps[-1].status = "success"
 
                 _step("wait_for_editor", "in_progress", "")
-                editor_sel = _wait_for_any_locator(
-                    page,
-                    [
+                editor_visible_selectors = (
+                    UPLOAD_BUTTON_SELECTORS
+                    + [
                         "input[type='file']",
                         "input[placeholder*='\u6807\u9898']",
                         "textarea",
                         "[contenteditable='true']",
-                    ],
-                    120000,
+                    ]
                 )
+                try:
+                    editor_sel = _wait_for_any_locator(
+                        page, editor_visible_selectors, 120000
+                    )
+                except PlaywrightTimeoutError:
+                    # New publish page keeps file input hidden; accept attached
+                    # input as a valid ready signal when visible controls are delayed.
+                    attached_sel = _wait_for_any_locator(
+                        page, UPLOAD_INPUT_SELECTORS, 30000, state="attached"
+                    )
+                    editor_sel = f"{attached_sel} (attached)"
                 steps[-1].detail = f"matched {editor_sel}"
                 steps[-1].status = "success"
 

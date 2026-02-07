@@ -67,7 +67,9 @@ powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
 
 查看草稿（默认 profile）：
 ```powershell
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="D:\AI\codex\redbook_workflow\data\browser\chrome-profile" --profile-directory="Default1"
+$chrome = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+$profile = (Resolve-Path "data/browser/chrome-profile").Path
+& $chrome --user-data-dir="$profile" --profile-directory="Default"
 ```
 
 ## 环境准备
@@ -92,7 +94,9 @@ python -m playwright install chromium
 LLM（生成文案）：
 - 主用（阿里云百炼 / DashScope，DeepSeek-V3.2）：
   - 环境变量：`ALIYUN_LLM_API_KEY`（或 `ALIYUN_IMAGE_API_KEY` / `DASHSCOPE_API_KEY`）
-  - 可选：`ALIYUN_LLM_MODEL`（默认 `deepseek-v3.2`）/ `ALIYUN_LLM_BASE_URL`（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）
+  - 可选：`ALIYUN_LLM_MODELS`（文本模型候选列表，逗号/空格分隔，按顺序尝试；优先于 `ALIYUN_LLM_MODEL`）
+  - 可选：`ALIYUN_LLM_MODEL`（单个文本模型，默认 `deepseek-v3.2`；仅在未设置 `ALIYUN_LLM_MODELS` 时使用）
+  - 可选：`ALIYUN_LLM_BASE_URL`（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）
 - 备用（原 OpenAI 兼容提供商）：
   - 环境变量：`LLM_API_KEY`，可选 `LLM_MODEL` / `LLM_BASE_URL`
   - 或本机文件：复制 `docs/llm_api-key.example.md` 为 `docs/llm_api-key.md` 并填写
@@ -284,6 +288,7 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 
 ## 相关改进（已落地）
 - 阿里云 LLM 优先 + 自动回退：额度不足/限流/模型不可用时自动切换到备用提供商
+- 阿里云 LLM 模型列表：支持 `ALIYUN_LLM_MODELS` 按顺序尝试与回退
 - 阿里云生图模型列表：支持 `ALIYUN_IMAGE_MODELS` 按顺序尝试与回退
 - 生图事件摘要：LLM 输出 `image_event`（约 30 字）用于降低“新闻海报感/文字”概率
 - 生图提示词收敛：仅用事件描述生成插画，避免“报道/海报/采访”等语义
@@ -294,6 +299,8 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 ```powershell
 # 仅需配置阿里云 Key（用于 LLM + 生图）
 $env:ALIYUN_LLM_API_KEY="YOUR_DASHSCOPE_KEY"
+# 可选：按顺序尝试多个文本模型（优先于 ALIYUN_LLM_MODEL）
+$env:ALIYUN_LLM_MODELS="kimi-k2.5,qwen3-max-2026-01-23"
 $env:ALIYUN_IMAGE_API_KEY="YOUR_DASHSCOPE_KEY"
 $env:NEWS_PROVIDER="gdelt"
 $env:IMAGE_PROVIDER="aliyun"
@@ -354,6 +361,7 @@ E2E 测试（需要已配置阿里云百炼 key；可选 `--cdp` 复用你已打
 - 没看到“图文笔记”：只运行了 `create` 不会出现在网页草稿箱；需要 `auto` 或 `approve + run`。
 - Playwright 启动失败：关闭所有 Chrome 窗口，避免 profile 被占用。
 - 看到 “offline fallback”：说明 LLM 调用失败，请检查 `LLM_API_KEY/LLM_BASE_URL/LLM_MODEL` 是否可用。
+- 阿里云生图报错 `AllocationQuota.FreeTierOnly`：说明免费额度已耗尽；请改用本地图片/PEXELS，或在百炼控制台开通计费/提升配额后重试。
 
 ## 相关文档（docs）
 - `docs/工作流新闻任务书.md`

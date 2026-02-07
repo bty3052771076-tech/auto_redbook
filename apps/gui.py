@@ -434,6 +434,14 @@ def main() -> None:
     add_cfg_row(
         cfg_grid,
         row,
+        "Aliyun LLM Models (ALIYUN_LLM_MODELS)",
+        "ALIYUN_LLM_MODELS",
+        default="",
+    )
+    row += 1
+    add_cfg_row(
+        cfg_grid,
+        row,
         "Aliyun LLM 模型 (ALIYUN_LLM_MODEL)",
         "ALIYUN_LLM_MODEL",
         default=DEFAULT_ALIYUN_LLM_MODEL,
