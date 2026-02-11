@@ -155,3 +155,21 @@ def test_pick_news_items_prefers_china_ratio():
     china_count = sum(1 for it in picked if ".cn/" in it.url)
     # Default 6:4 => ~60% China, count=5 => 3 China + 2 foreign.
     assert china_count == 3
+
+
+def test_pick_news_items_dedupes_cross_language_by_entities():
+    items = [
+        NewsItem(
+            title="China verurteilt Demokratie-Aktivist Jimmy Lai zu 20 Jahren Haft",
+            url="https://a.com/1",
+        ),
+        NewsItem(
+            title="Hong Kong Sentences Jimmy Lai to 20 Years in Landmark Case",
+            url="https://b.com/1",
+        ),
+        NewsItem(title="Japan inflation rises", url="https://c.com/1"),
+    ]
+    picked = pick_news_items(items, "", count=2)
+    assert len(picked) == 2
+    assert any(item.title == "Japan inflation rises" for item in picked)
+    assert sum("Jimmy Lai" in item.title for item in picked) == 1

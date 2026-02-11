@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import hashlib
 import re
 from dataclasses import asdict
@@ -79,6 +80,70 @@ def _shorten_daily_news_title(news_title: str, *, max_len: int = 20) -> str:
     # Trim title to fit.
     room = max(0, max_len - len(prefix))
     return f"{prefix}{title[:room]}".rstrip("｜").rstrip()
+
+
+def _is_generic_daily_news_title(title: str) -> bool:
+    """
+    LLM sometimes keeps the seed title "每日新闻" unchanged (or returns "每日新闻｜"),
+    which makes the post list hard to scan. Treat these as generic.
+    """
+    text = (title or "").strip()
+    if not text:
+        return True
+    rest = re.sub(r"^(?:每日新闻)(?:[｜:：—\s-]+)?", "", text).strip()
+    return rest == ""
+
+
+def _daily_news_title_key(title: str) -> str:
+    """
+    Normalize a daily-news title for in-batch dedupe.
+
+    - Removes "每日新闻" prefix variants
+    - Normalizes whitespace/punctuation
+    """
+    text = (title or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"^(?:每日新闻)(?:[｜:：—\s-]+)?", "", text).strip() or text
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.strip("｜:：—- ")
+
+
+def _extract_embedded_json_from_daily_news_body(body: str) -> dict | None:
+    """
+    Some providers return a JSON object *inside* the JSON.body string, e.g.:
+        要点摘要：{
+        新闻内容：
+        "title": "...",
+        ...
+        "topics": [...],
+        "image_event": "..."
+        }
+
+    This breaks title/topics extraction and pollutes the final body.
+    Try to recover that embedded JSON draft.
+    """
+    text = (body or "").strip()
+    if not text:
+        return None
+    if not text.startswith(f"{_NEWS_SUMMARY_LABEL}{{"):
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    blob = text[start : end + 1]
+    # Remove section labels that might have leaked into the embedded JSON.
+    blob = blob.replace(_NEWS_CONTENT_LABEL, "").replace(_NEWS_COMMENT_LABEL, "").strip()
+    try:
+        obj = json.loads(blob)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if not any(k in obj for k in ("title", "body", "topics", "image_event")):
+        return None
+    return obj
 
 
 def _clip_text(value: str | None, *, limit: int = 400) -> str:
@@ -204,11 +269,13 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
     """
     return (
         "你正在为小红书图文笔记写《每日新闻》栏目。\n"
-        "请依据下面提供的新闻信息写一篇可直接发布的正文（通俗中文）。\n"
-        "注意：正文里不要包含“来源/时间/链接/提示词/要求”等元信息，也不要复述下面的提示文本。\n"
+        "请依据下面提供的新闻信息，生成一份可直接发布的草稿。\n"
+        "注意：body 正文里不要包含来源名称/链接/提示词/要求等元信息；发布时间仅在文末固定一行输出。\n"
         "只允许使用下列已提供的新闻信息，不得新增事实或编造细节；信息不足时保持保守表述。\n\n"
+        "输出为严格 JSON（仅包含 keys: title, body, topics；可选 key: image_event），不要 Markdown/代码块。\n"
+        "不要把任何 JSON 片段（例如 { } / \"title\": / \"topics\": / \"image_event\":）写进 body。\n\n"
         "可用新闻信息（仅限以下字段，链接仅供参考不要输出）：\n"
-        f"- 标题：{picked.title}\n"
+        f"- 新闻标题：{picked.title}\n"
         f"- 来源名称：{picked.source or '未知'}\n"
         f"- 来源域名：{picked.domain or '未知'}\n"
         f"- 发布时间：{picked.seendate or '未知'}\n"
@@ -216,23 +283,18 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
         f"- 正文片段：{_clip_text(picked.content, limit=500)}\n"
         f"- 链接：{picked.url}\n"
         f"- 用户关注点（可选）：{prompt_norm or '无'}\n\n"
-        "输出格式（必须逐行保留标题，不得更名或省略）：\n"
+        "JSON 字段要求：\n"
+        "title（<=20字）：基于新闻标题/摘要改写生成，必须包含具体事件关键词；不得仅为“每日新闻”（也不得仅为“每日新闻｜”）。\n"
+        "body：正文，必须严格按以下格式输出（保留标签，不得更名/省略；段落之间空一行）：\n"
         "要点摘要：<20-40字，概括新闻最重要部分，不要评价>\n"
         "新闻内容：\n"
         "<不少于200字的完整段落>\n\n"
         "点评：\n"
         "<不少于100字的完整段落，末尾附带1个互动问题>\n\n"
-        "硬性要求：\n"
-        "1) 首行必须是“要点摘要：”+20-40字，概括新闻最重要部分，不要评价。\n"
-        "2) 必须包含且仅包含以上三段，段落之间空一行。\n"
-        "3) 不得输出列表或额外小标题，不得合并成一段。\n"
-        "4) 新闻内容（>=200字）：基于上面的信息，说明发生了什么、为何值得关注。\n"
-        "5) 我的点评（>=100字）：给出影响解读/建议/风险提示，可结合用户关注点，但不得新增事实。\n"
-        "6) topics 输出 3-8 个话题词，包含“每日新闻”。\n"
-        "7) 正文末尾单独一行写出“发布时间：YYYY-MM-DD”，使用上面提供的发布时间字段，不要推测。\n"
-        "8) 严格遵循给定字段，不得添加未提供的人名、地点、数字或因果；缺失信息请明确写为“未披露/未知”。\n"
-        "9) image_event 输出一条仅用于配图的事件描述（建议20-40个中文字符，约30字）：只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
-        "不要出现“新闻/报道/采访/记者/媒体/来源/链接/时间”等词。\n"
+        "发布时间：YYYY-MM-DD\n"
+        "topics（数组，3-8个话题词）：必须包含“每日新闻”。不要把 topics 写进 body。\n"
+        "image_event（字符串，可选，20-40字）：仅用于配图的事件描述，只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
+        "不要出现“新闻/报道/采访/记者/媒体/来源/链接/时间”等词。不要把 image_event 写进 body。\n"
     )
 
 
@@ -381,6 +443,20 @@ def create_post_with_draft(
                 prompt_hint=news_prompt,
                 asset_paths=asset_paths,
             )
+            embedded = _extract_embedded_json_from_daily_news_body(draft.get("body", ""))
+            if embedded:
+                embedded_title = embedded.get("title")
+                embedded_body = embedded.get("body")
+                embedded_topics = embedded.get("topics")
+                embedded_event = embedded.get("image_event")
+                if isinstance(embedded_title, str) and embedded_title.strip():
+                    draft["title"] = embedded_title.strip()
+                if isinstance(embedded_body, str) and embedded_body.strip():
+                    draft["body"] = embedded_body.strip()
+                if isinstance(embedded_topics, list) and embedded_topics:
+                    draft["topics"] = embedded_topics
+                if isinstance(embedded_event, str) and embedded_event.strip():
+                    draft["image_event"] = embedded_event.strip()
             draft["body"] = _ensure_daily_news_sections(
                 draft.get("body", ""), prompt_norm
             )
@@ -391,6 +467,27 @@ def create_post_with_draft(
                 draft["title"] = _shorten_daily_news_title(picked.title)
                 draft["body"] = _daily_news_offline_body(picked, prompt_norm)
                 draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
+            if _is_generic_daily_news_title(draft.get("title", "")):
+                title_src = picked.title or picked.description or prompt_norm
+                draft["title"] = _shorten_daily_news_title(title_src)
+            topics = draft.get("topics") or []
+            if not isinstance(topics, list):
+                topics = [str(topics)]
+            # Deduplicate while preserving order, and ensure "每日新闻" exists.
+            normalized_topics: list[str] = []
+            seen: set[str] = set()
+            for t in topics:
+                tt = str(t or "").strip()
+                if not tt or tt in seen:
+                    continue
+                normalized_topics.append(tt)
+                seen.add(tt)
+            if "每日新闻" not in seen:
+                normalized_topics.insert(0, "每日新闻")
+                seen.add("每日新闻")
+            if prompt_norm and prompt_norm not in seen and len(normalized_topics) < 8:
+                normalized_topics.append(prompt_norm)
+            draft["topics"] = normalized_topics[:8]
             draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
             image_event = _normalize_image_event(
                 str(draft.get("image_event") or ""),
@@ -515,6 +612,7 @@ def create_daily_news_posts(
         count = 1
     auto_image_enabled = auto_image and is_auto_image_enabled()
     used_image_ids: set[str] = set()
+    used_title_keys: set[str] = set()
 
     try:
         candidates, base_meta = fetch_daily_news_candidates(prompt_norm)
@@ -592,6 +690,20 @@ def create_daily_news_posts(
             prompt_hint=news_prompt,
             asset_paths=asset_paths,
         )
+        embedded = _extract_embedded_json_from_daily_news_body(draft.get("body", ""))
+        if embedded:
+            embedded_title = embedded.get("title")
+            embedded_body = embedded.get("body")
+            embedded_topics = embedded.get("topics")
+            embedded_event = embedded.get("image_event")
+            if isinstance(embedded_title, str) and embedded_title.strip():
+                draft["title"] = embedded_title.strip()
+            if isinstance(embedded_body, str) and embedded_body.strip():
+                draft["body"] = embedded_body.strip()
+            if isinstance(embedded_topics, list) and embedded_topics:
+                draft["topics"] = embedded_topics
+            if isinstance(embedded_event, str) and embedded_event.strip():
+                draft["image_event"] = embedded_event.strip()
         draft["body"] = _ensure_daily_news_sections(draft.get("body", ""), prompt_norm)
         draft["body"] = _ensure_news_publish_date(
             draft["body"], picked.seendate
@@ -600,6 +712,31 @@ def create_daily_news_posts(
             draft["title"] = _shorten_daily_news_title(picked.title)
             draft["body"] = _daily_news_offline_body(picked, prompt_norm)
             draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
+        if _is_generic_daily_news_title(draft.get("title", "")):
+            title_src = picked.title or picked.description or prompt_norm
+            draft["title"] = _shorten_daily_news_title(title_src)
+        title_key = _daily_news_title_key(draft.get("title", ""))
+        if title_key:
+            if title_key in used_title_keys:
+                continue
+            used_title_keys.add(title_key)
+        topics = draft.get("topics") or []
+        if not isinstance(topics, list):
+            topics = [str(topics)]
+        normalized_topics: list[str] = []
+        seen: set[str] = set()
+        for t in topics:
+            tt = str(t or "").strip()
+            if not tt or tt in seen:
+                continue
+            normalized_topics.append(tt)
+            seen.add(tt)
+        if "每日新闻" not in seen:
+            normalized_topics.insert(0, "每日新闻")
+            seen.add("每日新闻")
+        if prompt_norm and prompt_norm not in seen and len(normalized_topics) < 8:
+            normalized_topics.append(prompt_norm)
+        draft["topics"] = normalized_topics[:8]
         draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
         image_event = _normalize_image_event(
             str(draft.get("image_event") or ""),

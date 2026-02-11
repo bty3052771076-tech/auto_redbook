@@ -27,6 +27,81 @@ NEWSAPI_BASE_URL = "https://newsapi.org"
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
 _CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
+_ENTITY_RE = re.compile(r"[a-z]{2,}|\d{1,3}", re.IGNORECASE)
+_ENTITY_STOPWORDS = {
+    # Common function words
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "was",
+    "were",
+    "will",
+    "with",
+    # News boilerplate / generic terms
+    "analysis",
+    "daily",
+    "live",
+    "news",
+    "opinion",
+    "report",
+    "reports",
+    "update",
+    "updates",
+    "watch",
+    # Common geopolitics / categories (too generic for dedupe)
+    "china",
+    "chinese",
+    "hong",
+    "kong",
+    "japan",
+    "japanese",
+    "us",
+    "u",
+    "s",
+    "usa",
+    "uk",
+    "eu",
+    "india",
+    "indian",
+    "world",
+    "international",
+    # Generic event words
+    "case",
+    "court",
+    "deal",
+    "deals",
+    "election",
+    "historic",
+    "landmark",
+    "market",
+    "markets",
+    "prices",
+    "sentenced",
+    "sentences",
+    "sentence",
+    "jail",
+    "jails",
+    "years",
+    "year",
+}
 
 
 @dataclass(frozen=True)
@@ -83,6 +158,37 @@ def _tokens(text: str) -> set[str]:
             for i in range(len(part) - 1):
                 out.add(part[i : i + 2])
     return out
+
+
+def _entity_tokens(text: str) -> set[str]:
+    """
+    Extract lightweight entity-ish tokens from a title/description for cross-language dedupe.
+
+    We intentionally ignore CJK here; the main goal is to catch duplicate stories across
+    different languages that still share ASCII names (e.g., "Jimmy Lai") and key numbers
+    (e.g., "20").
+    """
+    text = (text or "").strip().lower()
+    if not text:
+        return set()
+    out: set[str] = set()
+    for m in _ENTITY_RE.finditer(text):
+        tok = (m.group(0) or "").strip().lower()
+        if not tok or tok in _ENTITY_STOPWORDS:
+            continue
+        out.add(tok)
+    return out
+
+
+def _entity_similar(tokens_a: set[str], tokens_b: set[str]) -> bool:
+    if not tokens_a or not tokens_b:
+        return False
+    inter = tokens_a & tokens_b
+    if len(inter) >= 3:
+        return True
+    if len(inter) >= 2 and any(not t.isdigit() for t in inter):
+        return True
+    return False
 
 
 def _domain_for_item(item: NewsItem) -> str:
@@ -223,6 +329,48 @@ def _dedupe_by_title(items: list[NewsItem], *, max_count: int) -> list[NewsItem]
             continue
         picked.append(item)
         picked_tokens.append(tokens)
+        if len(picked) >= max_count:
+            break
+    return picked
+
+
+def _dedupe_by_story(items: list[NewsItem], *, max_count: int) -> list[NewsItem]:
+    """
+    More aggressive than title-only dedupe: also attempts to dedupe cross-language stories
+    by overlapping ASCII "entity-ish" tokens (names/abbreviations/numbers).
+
+    This is used when selecting multiple items to publish. We keep fetch-time candidate
+    dedupe conservative to preserve cross-domain evidence for scoring.
+    """
+    picked: list[NewsItem] = []
+    picked_title_tokens: list[set[str]] = []
+    picked_entity_tokens: list[set[str]] = []
+    for item in items:
+        title_tokens = _tokens(item.title)
+        entity_tokens = _entity_tokens(f"{item.title} {item.description or ''}")
+        if any(
+            _title_similar(title_tokens, t, threshold=NEWS_DEDUPE_SIM_THRESHOLD)
+            for t in picked_title_tokens
+        ):
+            continue
+        # Cross-language dedupe: only apply entity matching when title tokens overlap is low.
+        # This avoids over-deduping highly-related-but-distinct stories like:
+        # "Apple releases new Mac" vs "Apple releases new iPad".
+        max_overlap = 0.0
+        for t in picked_title_tokens:
+            if not title_tokens or not t:
+                continue
+            denom = float(min(len(title_tokens), len(t)) or 1)
+            max_overlap = max(max_overlap, len(title_tokens & t) / denom)
+        if (
+            max_overlap < 0.6
+            and entity_tokens
+            and any(_entity_similar(entity_tokens, e) for e in picked_entity_tokens)
+        ):
+            continue
+        picked.append(item)
+        picked_title_tokens.append(title_tokens)
+        picked_entity_tokens.append(entity_tokens)
         if len(picked) >= max_count:
             break
     return picked
@@ -412,7 +560,7 @@ def pick_news_items(
             scored.append((score, seen_at, counts[idx], -idx, item))
         scored.sort(reverse=True)
         order = [item for _, _, _, _, item in scored]
-        deduped = _dedupe_by_title(order, max_count=len(order))
+        deduped = _dedupe_by_story(order, max_count=len(order))
         return _balance_china_foreign(deduped, count=count)
 
     seen: set[str] = set()
@@ -435,7 +583,7 @@ def pick_news_items(
             continue
         seen.add(key)
         unique.append(item)
-    deduped = _dedupe_by_title(unique, max_count=len(unique))
+    deduped = _dedupe_by_story(unique, max_count=len(unique))
     return _balance_china_foreign(deduped, count=count)
 
 
