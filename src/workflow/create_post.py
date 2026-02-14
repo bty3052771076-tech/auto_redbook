@@ -22,6 +22,7 @@ from src.news.daily_news import (
 )
 from src.storage.files import copy_assets_into_post, post_dir, save_post, save_revision
 from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSource
+from src.validation.rules import MAX_IMAGE_BODY
 
 
 def _sha256(path: Path) -> str:
@@ -153,6 +154,19 @@ def _clip_text(value: str | None, *, limit: int = 400) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}…"
+
+
+def _clamp_image_body(body: str) -> str:
+    """
+    Keep the final body within the platform limit (see validate_post / MAX_IMAGE_BODY).
+
+    Note: daily-news workflow may append source lines after the LLM output, which can
+    push the total length over the limit even if the model followed "Body <= 1000".
+    """
+    text = (body or "").strip()
+    if len(text) <= MAX_IMAGE_BODY:
+        return text
+    return text[:MAX_IMAGE_BODY].rstrip()
 
 
 def _preferred_image_title(post: Post, fallback: str) -> str:
@@ -292,6 +306,10 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
         "点评：\n"
         "<不少于100字的完整段落，末尾附带1个互动问题>\n\n"
         "发布时间：YYYY-MM-DD\n"
+        "长度约束：body 总长度（含换行）务必 <= 900 字符，避免写太长导致发布失败。\n"
+        "点评写作约束：坚持中国立场（以中国国家利益与中国受众视角分析），同时保持客观理性。\n"
+        "先基于已给事实再给判断，不煽动对立、不使用攻击性语言、不做情绪化带节奏表述。\n"
+        "可提示风险与影响，但不得夸大、不得杜撰未提供事实。\n"
         "topics（数组，3-8个话题词）：必须包含“每日新闻”。不要把 topics 写进 body。\n"
         "image_event（字符串，可选，20-40字）：仅用于配图的事件描述，只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
         "不要出现“新闻/报道/采访/记者/媒体/来源/链接/时间”等词。不要把 image_event 写进 body。\n"
@@ -303,7 +321,7 @@ def _daily_news_offline_body(picked, prompt_norm: str) -> str:
     Offline fallback body: keep it publishable and avoid echoing prompt/requirements.
     """
     focus = prompt_norm.strip()
-    focus_line = f"从「{focus}」角度" if focus else "从读者关注点"
+    focus_line = f"从中国视角结合「{focus}」" if focus else "从中国视角和读者关注点"
     pub = _format_news_seendate(picked.seendate)
     summary = _normalize_news_summary(
         picked.description or picked.title, fallback=picked.title, limit=40
@@ -489,6 +507,7 @@ def create_post_with_draft(
                 normalized_topics.append(prompt_norm)
             draft["topics"] = normalized_topics[:8]
             draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
+            draft["body"] = _clamp_image_body(draft.get("body", ""))
             image_event = _normalize_image_event(
                 str(draft.get("image_event") or ""),
                 fallback=picked.title,
@@ -613,6 +632,16 @@ def create_daily_news_posts(
     auto_image_enabled = auto_image and is_auto_image_enabled()
     used_image_ids: set[str] = set()
     used_title_keys: set[str] = set()
+    failed_count = 0
+
+    def _is_fatal_image_config_error(errs: list[str]) -> bool:
+        # Aliyun returns this when using image-to-image models without providing an init image.
+        joined = " ".join(errs or []).lower()
+        return (
+            "got 0 images" in joined
+            or "must contain 1 to 4 images" in joined
+            or "enable_interleave" in joined
+        )
 
     try:
         candidates, base_meta = fetch_daily_news_candidates(prompt_norm)
@@ -738,6 +767,7 @@ def create_daily_news_posts(
             normalized_topics.append(prompt_norm)
         draft["topics"] = normalized_topics[:8]
         draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
+        draft["body"] = _clamp_image_body(draft.get("body", ""))
         image_event = _normalize_image_event(
             str(draft.get("image_event") or ""),
             fallback=picked.title,
@@ -791,6 +821,19 @@ def create_daily_news_posts(
                 rev = Revision(post_id=post.id, source=RevisionSource.llm, content=draft)
                 save_post(post)
                 save_revision(rev)
+                failed_count += 1
+                err_tail = (exc.errors or [""])[-1].strip()
+                if err_tail:
+                    print(f"[auto-image] give_up post_id={post.id} provider={exc.provider} err={err_tail}")
+                else:
+                    print(f"[auto-image] give_up post_id={post.id} provider={exc.provider}")
+                if _is_fatal_image_config_error(exc.errors):
+                    print(
+                        "[auto-image] Detected a likely model/config mismatch: the selected model requires an input image. "
+                        "If you are generating images from text only, set ALIYUN_IMAGE_MODELS to a text-to-image model "
+                        '(e.g. "wan2.6-t2i" or "qwen-image-plus-2026-01-09").'
+                    )
+                    break
                 continue
             post.platform.setdefault("image", image_metas[0])
             post.platform["images"] = image_metas
@@ -810,4 +853,9 @@ def create_daily_news_posts(
         posts.append(post)
         success_idx += 1
 
+    if not posts and failed_count:
+        print(
+            f"[daily_news] no successful posts (failed={failed_count}). "
+            "Check data/posts/*/post.json -> platform.image_generate.errors."
+        )
     return posts
