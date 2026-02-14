@@ -79,27 +79,35 @@ def create(
         raise typer.Exit(code=1)
 
     if title_norm == "每日新闻":
-        posts = create_daily_news_posts(
-            prompt_hint=prompt_norm,
-            asset_paths=asset_paths,
-            copy_assets=not no_copy,
-            count=count,
-            auto_image=True,
-        )
+        try:
+            posts = create_daily_news_posts(
+                prompt_hint=prompt_norm,
+                asset_paths=asset_paths,
+                copy_assets=not no_copy,
+                count=count,
+                auto_image=True,
+            )
+        except Exception as exc:
+            typer.echo(f"error: daily news create failed: {exc}")
+            posts = []
     else:
         used_image_ids: set[str] = set()
         posts = []
-        for _ in range(count):
-            posts.append(
-                create_post_with_draft(
-                    title_hint=title,
-                    prompt_hint=prompt,
-                    asset_paths=asset_paths,
-                    copy_assets=not no_copy,
-                    auto_image=True,
-                    image_exclude_ids=used_image_ids,
+        for idx in range(count):
+            try:
+                posts.append(
+                    create_post_with_draft(
+                        title_hint=title,
+                        prompt_hint=prompt,
+                        asset_paths=asset_paths,
+                        copy_assets=not no_copy,
+                        auto_image=True,
+                        image_exclude_ids=used_image_ids,
+                    )
                 )
-            )
+            except Exception as exc:
+                typer.echo(f"error: create failed ({idx + 1}/{count}): {exc}")
+                continue
 
     if len(posts) == 1:
         post = posts[0]
@@ -287,11 +295,27 @@ def auto(
     for p in posts:
         typer.echo(f"- post_id={p.id} | 标题：{p.title}")
 
+    continue_on_invalid = count > 1
+    skipped_invalid = 0
+    uploaded = 0
+    upload_failed = 0
+
     for post in posts:
         result = validate_post(post)
         _emit_validation(result)
         if result.errors and not force:
-            raise typer.Exit(code=1)
+            if not continue_on_invalid:
+                raise typer.Exit(code=1)
+            skipped_invalid += 1
+            post.status = PostStatus.failed
+            post.platform["validation"] = {
+                "errors": list(result.errors),
+                "warnings": list(result.warnings),
+            }
+            post.updated_at = now_iso()
+            save_post(post)
+            typer.echo(f"skip invalid post_id={post.id}")
+            continue
 
         post.status = PostStatus.approved
         post.updated_at = now_iso()
@@ -300,14 +324,24 @@ def auto(
         resolved_assets = _resolve_asset_paths(post, "")
         attempt = _next_attempt(post.id)
         exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
-        exec_rec = run_save_draft_sync(
-            post,
-            assets=resolved_assets,
-            dry_run=dry_run,
-            login_hold=login_hold,
-            wait_timeout_ms=wait_timeout * 1000,
-            execution=exec_rec,
-        )
+        try:
+            exec_rec = run_save_draft_sync(
+                post,
+                assets=resolved_assets,
+                dry_run=dry_run,
+                login_hold=login_hold,
+                wait_timeout_ms=wait_timeout * 1000,
+                execution=exec_rec,
+            )
+        except Exception as exc:
+            # Defensive: run_save_draft_sync catches most exceptions, but avoid aborting the batch
+            # if something leaks out.
+            post.status = PostStatus.failed
+            post.updated_at = now_iso()
+            save_post(post)
+            upload_failed += 1
+            typer.echo(f"error: post_id={post.id} upload exception: {exc}")
+            continue
 
         post.status = _apply_execution_status(post.status, exec_rec.result)
         post.updated_at = now_iso()
@@ -319,6 +353,15 @@ def auto(
             typer.echo(f"- {s.name}: {s.status}{detail}")
         if exec_rec.error:
             typer.echo(f"error: {exec_rec.error}")
+        if exec_rec.result == "saved_draft":
+            uploaded += 1
+        elif not dry_run:
+            upload_failed += 1
+
+    if skipped_invalid or upload_failed:
+        typer.echo(
+            f"summary: uploaded={uploaded} skipped_invalid={skipped_invalid} upload_failed={upload_failed} total={len(posts)}"
+        )
 
 
 @app.command("delete-drafts")
