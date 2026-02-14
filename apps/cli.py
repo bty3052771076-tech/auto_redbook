@@ -269,27 +269,35 @@ def auto(
         raise typer.Exit(code=1)
 
     if title_norm == "每日新闻":
-        posts = create_daily_news_posts(
-            prompt_hint=prompt_norm,
-            asset_paths=asset_paths,
-            copy_assets=not no_copy,
-            count=count,
-            auto_image=True,
-        )
+        try:
+            posts = create_daily_news_posts(
+                prompt_hint=prompt_norm,
+                asset_paths=asset_paths,
+                copy_assets=not no_copy,
+                count=count,
+                auto_image=True,
+            )
+        except Exception as exc:
+            typer.echo(f"error: daily news create failed: {exc}")
+            posts = []
     else:
         used_image_ids: set[str] = set()
         posts = []
-        for _ in range(count):
-            posts.append(
-                create_post_with_draft(
-                    title_hint=title,
-                    prompt_hint=prompt,
-                    asset_paths=asset_paths,
-                    copy_assets=not no_copy,
-                    auto_image=True,
-                    image_exclude_ids=used_image_ids,
+        for idx in range(count):
+            try:
+                posts.append(
+                    create_post_with_draft(
+                        title_hint=title,
+                        prompt_hint=prompt,
+                        asset_paths=asset_paths,
+                        copy_assets=not no_copy,
+                        auto_image=True,
+                        image_exclude_ids=used_image_ids,
+                    )
                 )
-            )
+            except Exception as exc:
+                typer.echo(f"error: create failed ({idx + 1}/{count}): {exc}")
+                continue
 
     typer.echo(f"创建完成：posts={len(posts)}")
     for p in posts:
