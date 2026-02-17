@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, List, Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
@@ -44,6 +44,8 @@ class Post(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)
     type: PostType = PostType.image
     status: PostStatus = PostStatus.draft
+    uploaded: bool = False
+    uploaded_at: Optional[str] = None
     title: str = ""
     body: str = ""
     topics: List[str] = Field(default_factory=list)
@@ -53,6 +55,15 @@ class Post(BaseModel):
     platform: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
+
+    @model_validator(mode="after")
+    def _normalize_uploaded_fields(self):
+        # Backward compatibility: old post.json files may not have uploaded fields.
+        if self.status == PostStatus.saved_draft and not self.uploaded:
+            self.uploaded = True
+            if not self.uploaded_at:
+                self.uploaded_at = self.updated_at or self.created_at
+        return self
 
 
 class RevisionSource(str, Enum):

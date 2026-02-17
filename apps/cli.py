@@ -51,6 +51,12 @@ def _apply_execution_status(post_status: PostStatus, result: str) -> PostStatus:
     return post_status
 
 
+def _mark_post_uploaded(post, exec_result: str) -> None:
+    if exec_result == "saved_draft":
+        post.uploaded = True
+        post.uploaded_at = now_iso()
+
+
 def _emit_validation(result) -> None:
     for err in result.errors:
         typer.echo(f"error: {err}")
@@ -128,7 +134,9 @@ def _list():
         typer.echo("暂无 post")
         return
     for p in posts:
-        typer.echo(f"{p.id} | {p.type} | {p.status} | 标题:{p.title}")
+        typer.echo(
+            f"{p.id} | {p.type} | {p.status} | uploaded:{p.uploaded} | 标题:{p.title}"
+        )
 
 
 @app.command()
@@ -231,6 +239,7 @@ def run(
     )
 
     post.status = _apply_execution_status(post.status, exec_rec.result)
+    _mark_post_uploaded(post, exec_rec.result)
     post.updated_at = now_iso()
     save_post(post)
 
@@ -352,6 +361,7 @@ def auto(
             continue
 
         post.status = _apply_execution_status(post.status, exec_rec.result)
+        _mark_post_uploaded(post, exec_rec.result)
         post.updated_at = now_iso()
         save_post(post)
 

@@ -1,6 +1,8 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import json
+
 from src.storage.files import (
     copy_assets_into_post,
     ensure_dirs,
@@ -9,7 +11,7 @@ from src.storage.files import (
     save_post,
     save_revision,
 )
-from src.storage.models import Execution, Post, Revision
+from src.storage.models import Execution, Post, PostStatus, Revision
 
 
 def test_save_and_load_post_roundtrip():
@@ -21,6 +23,35 @@ def test_save_and_load_post_roundtrip():
         loaded = load_post(post.id, base=base)
         assert loaded.title == "t"
         assert loaded.body == "b"
+        assert loaded.uploaded is False
+        assert loaded.uploaded_at is None
+
+
+def test_load_legacy_saved_draft_marks_uploaded():
+    with TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        ensure_dirs(base)
+        post_id = "legacy001"
+        path = base / "posts" / post_id / "post.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "id": post_id,
+                    "type": "image",
+                    "status": PostStatus.saved_draft.value,
+                    "title": "t",
+                    "body": "b",
+                    "updated_at": "2026-02-01T00:00:00.000000Z",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_post(post_id, base=base)
+        assert loaded.uploaded is True
+        assert loaded.uploaded_at == "2026-02-01T00:00:00.000000Z"
 
 
 def test_copy_assets_and_execution():
