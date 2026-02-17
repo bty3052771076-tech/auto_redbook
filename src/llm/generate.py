@@ -25,6 +25,21 @@ def _extract_json_block(text: str) -> str | None:
     return None
 
 
+def _looks_like_jsonish_payload(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    return (
+        t.startswith("{")
+        or t.startswith("[")
+        or "```json" in t
+        or '"title"' in t
+        or '"body"' in t
+        or '"topics"' in t
+        or '"image_event"' in t
+    )
+
+
 def _strip_code_fence(text: str) -> str:
     if "```" not in text:
         return text
@@ -124,7 +139,96 @@ def _sanitize_body(body: str) -> str:
     return text
 
 
-def _parse_json_text(text: str) -> Dict[str, Any] | None:
+def _decode_jsonish_string(raw: str) -> str:
+    text = (raw or "").strip().rstrip(",").strip()
+    text = re.sub(r"\n\s*[}\]]\s*$", "", text).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1]
+    text = (
+        text.replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\'", "'")
+    )
+    return _strip_code_fence(text).strip()
+
+
+def _extract_jsonish_field(text: str, key: str, next_keys: List[str]) -> str | None:
+    m = re.search(rf'(?is)"{re.escape(key)}"\s*:\s*', text)
+    if not m:
+        return None
+    start = m.end()
+    end = len(text)
+    for nk in next_keys:
+        m2 = re.search(
+            rf'(?im)^\s*,?\s*"{re.escape(nk)}"\s*:\s*',
+            text[start:],
+        )
+        if m2:
+            end = min(end, start + m2.start())
+    value = text[start:end].strip().rstrip(",").strip()
+    return value or None
+
+
+def _parse_jsonish_topics(raw: str) -> List[str]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    for candidate in (text, text.replace("'", '"')):
+        try:
+            obj = json.loads(candidate)
+            topics = _normalize_topics(obj)
+            if topics:
+                return topics
+        except Exception:
+            pass
+    # Fallback for malformed arrays: pick quoted strings first.
+    quoted = re.findall(r'"([^"\n]{1,40})"', text)
+    if quoted:
+        return [t.strip() for t in quoted if t.strip()]
+    return [seg.strip() for seg in re.split(r"[,，、/|]", text) if seg.strip()]
+
+
+def _recover_jsonish_object(text: str) -> Dict[str, Any] | None:
+    src = _strip_code_fence((text or "")).strip()
+    if not _looks_like_jsonish_payload(src):
+        return None
+
+    out: Dict[str, Any] = {}
+    title_raw = _extract_jsonish_field(src, "title", ["body", "topics", "image_event"])
+    body_raw = _extract_jsonish_field(src, "body", ["topics", "image_event"])
+    topics_raw = _extract_jsonish_field(src, "topics", ["image_event"])
+    event_raw = _extract_jsonish_field(src, "image_event", [])
+
+    if title_raw:
+        title = _decode_jsonish_string(title_raw)
+        if title:
+            out["title"] = title
+    if body_raw:
+        body = _decode_jsonish_string(body_raw)
+        if body:
+            out["body"] = body
+    if topics_raw:
+        topics = _parse_jsonish_topics(topics_raw)
+        if topics:
+            out["topics"] = topics
+    if event_raw:
+        image_event = _decode_jsonish_string(event_raw)
+        if image_event:
+            out["image_event"] = image_event
+
+    if out:
+        return out
+    return None
+
+
+def _parse_json_text(text: Any) -> Dict[str, Any] | None:
+    if not isinstance(text, str):
+        text = _coerce_text(text)
+    text = (text or "").strip()
+    if not text:
+        return None
     json_text = _extract_json_block(text)
     if json_text:
         try:
@@ -132,12 +236,17 @@ def _parse_json_text(text: str) -> Dict[str, Any] | None:
             if isinstance(data, dict):
                 return data
         except json.JSONDecodeError:
-            pass
+            recovered = _recover_jsonish_object(json_text)
+            if recovered:
+                return recovered
     try:
         data = json.loads(text)
         if isinstance(data, dict):
             return data
     except json.JSONDecodeError:
+        recovered = _recover_jsonish_object(text)
+        if recovered:
+            return recovered
         return None
     return None
 
@@ -271,10 +380,21 @@ def generate_draft(
 
     raw_title = _coerce_text(data.get("title", title_hint)).strip()
     raw_body = _coerce_text(data.get("body", "")).strip()
-    if raw_body.startswith("{") or raw_body.startswith("["):
+    if _looks_like_jsonish_payload(raw_body):
         parsed_body = _parse_json_text(raw_body)
         if parsed_body and isinstance(parsed_body, dict):
-            raw_body = _coerce_text(parsed_body.get("body") or parsed_body.get("text") or raw_body)
+            nested_body = _coerce_text(parsed_body.get("body") or parsed_body.get("text")).strip()
+            if nested_body:
+                raw_body = nested_body
+            nested_title = _coerce_text(parsed_body.get("title")).strip()
+            if nested_title and (not raw_title or raw_title == title_hint):
+                raw_title = nested_title
+            nested_topics = _normalize_topics(parsed_body.get("topics"))
+            if nested_topics and not _normalize_topics(data.get("topics")):
+                data["topics"] = nested_topics
+            nested_event = _coerce_text(parsed_body.get("image_event")).strip()
+            if nested_event and not _coerce_text(data.get("image_event")).strip():
+                data["image_event"] = nested_event
 
     raw_body = _sanitize_body(raw_body)
 

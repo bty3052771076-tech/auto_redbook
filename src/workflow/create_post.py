@@ -213,6 +213,61 @@ _NEWS_CONTENT_LABEL = "新闻内容："
 _NEWS_COMMENT_LABEL = "点评："
 
 
+def _looks_like_jsonish_body(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    return (
+        t.startswith("{")
+        or t.startswith("[")
+        or "```json" in t
+        or '"title"' in t
+        or '"body"' in t
+        or '"topics"' in t
+        or '"image_event"' in t
+    )
+
+
+def _strip_json_artifacts(text: str) -> str:
+    """
+    Remove obvious JSON scaffolding leaked into body text.
+    """
+    lines: list[str] = []
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if not s:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        if s in ("{", "}", "[", "]", "},", "],"):
+            continue
+        if re.match(r'^"?title"?\s*:\s*', s, flags=re.IGNORECASE):
+            continue
+        if re.match(r'^"?topics"?\s*:\s*', s, flags=re.IGNORECASE):
+            continue
+        if re.match(r'^"?image_event"?\s*:\s*', s, flags=re.IGNORECASE):
+            continue
+        m = re.match(r'^"?body"?\s*:\s*(.*)$', s, flags=re.IGNORECASE)
+        if m:
+            s = m.group(1).strip()
+        s = s.rstrip(",").strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+            s = s[1:-1]
+        s = (
+            s.replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace('\\"', '"')
+            .replace("\\'", "'")
+            .strip()
+        )
+        if s:
+            lines.extend(s.splitlines())
+    out = "\n".join(lines).strip()
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out
+
+
 def _normalize_image_event(value: str, *, fallback: str = "", limit: int = 40) -> str:
     """
     Normalize the LLM-provided short event description for image generation.
@@ -345,6 +400,7 @@ def _ensure_daily_news_sections(body: str, prompt_norm: str) -> str:
         text.startswith(_NEWS_SUMMARY_LABEL)
         and _NEWS_CONTENT_LABEL in text
         and _NEWS_COMMENT_LABEL in text
+        and not _looks_like_jsonish_body(text)
     ):
         return text
 
@@ -354,6 +410,8 @@ def _ensure_daily_news_sections(body: str, prompt_norm: str) -> str:
         .replace(_NEWS_COMMENT_LABEL, "")
         .strip()
     )
+    if _looks_like_jsonish_body(cleaned):
+        cleaned = _strip_json_artifacts(cleaned)
     paragraphs = [p.strip() for p in cleaned.splitlines() if p.strip()]
     summary = ""
     if len(paragraphs) >= 3:

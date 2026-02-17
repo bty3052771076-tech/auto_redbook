@@ -82,6 +82,28 @@ def test_ensure_daily_news_sections_preserves_two_paragraphs():
     assert "点评：" in out
 
 
+def test_ensure_daily_news_sections_cleans_json_artifacts():
+    body = (
+        "要点摘要：{\n"
+        "新闻内容：\n"
+        '"title": "欧洲核武怀旧潮",\n\n'
+        "点评：\n"
+        '"body": "欧洲安全受质疑，部分国家讨论核政策调整。\\n\\n'
+        '从中国视角看，应关注地区安全外溢风险。",\n'
+        '"topics": ["每日新闻", "欧洲"],\n'
+        '"image_event": "会议现场"\n'
+        "}"
+    )
+    out = _ensure_daily_news_sections(body, "国际局势")
+    assert out.startswith("要点摘要：")
+    assert "新闻内容：" in out
+    assert "点评：" in out
+    assert '"title"' not in out
+    assert '"body"' not in out
+    assert '"topics"' not in out
+    assert '"image_event"' not in out
+
+
 def test_pick_news_items_prefers_cross_domain_duplicates():
     items = [
         NewsItem(title="Event Other Topic", url="https://b.com/1"),
