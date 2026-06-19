@@ -1275,3 +1275,19 @@
 - Live save test: final XHS draft box dry-run shows exactly 2 image drafts: GUI path `e2474373af9d4457847b7230d703715e` (`每日新闻｜科技动态`, NewsAPI/Business Insider, Aliyun `wan2.7-image`) and CLI path `2fc339424dc1446e8a544227f6f23fad` (`每日新闻｜经济动态`, NewsAPI/Pluralistic.net, Aliyun `wan2.7-image`).
 - Risks/Assumptions: GDELT returned `HTTP Error 429` during this run, so both final API news drafts used NewsAPI. A discarded PowerShell-pipe encoding attempt and duplicate-attempt local `data/posts/*` artifacts remain locally, but the platform draft box was cleaned to the final 2 visible drafts.
 - Next steps: Open `Start-GUI.cmd` for manual visual review if desired; before public posting, review the two XHS drafts in the browser because this workflow intentionally saves drafts rather than clicking public publish.
+
+### 2026-06-20 00:34
+**Task:** Add usage instructions, verify API-key safety, back up the previous version, and push to GitHub.
+**Git:** `main` pushed to `origin/main`; backup branch `backup/pre-upload-20260620-002817` and tag `pre-upload-20260620-002817` pushed before the release commit.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `docs/使用说明-自动新闻生成与草稿发布.md` | DONE | Added end-user instructions for GUI startup, CLI news generation, AI image settings, draft deletion, manual review, key safety, and backup checks. | Keep updated when CLI flags or GUI tabs change. |
+| `README.md` | DONE | Added the new usage guide and recent repair/testing docs to the docs index. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this upload/backup/key-safety entry after invoking the file-progress-followup workflow. | Keep appending after future coding work. |
+
+**Notes**
+- Verification: `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider -q` -> 99 passed before the release commit; `git diff --cached --check` passed after fixing doc trailing whitespace.
+- Key safety: `git check-ignore -v` confirmed local `docs/*api-key.md`, `.env`, `.env.gui`, and `data/browser/chrome-profile` are ignored; staged content secret scan returned `staged_findings_count=0`; tracked-file secret scan returned `tracked_findings_count=0`; sensitive-path scan of staged names was empty.
+- Pushes: backup branch/tag were pushed before commit `cd302c4`; `main` was pushed to `https://github.com/bty3052771076-tech/auto_redbook.git`.
+- Risks/Assumptions: The remote push uses the currently configured Git credentials; no API key files were staged or uploaded.
