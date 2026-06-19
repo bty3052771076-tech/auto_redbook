@@ -2,6 +2,29 @@
 
 > 记录按时间倒序（最新在前）
 
+### 2026-06-19 19:22
+**Task:** Fix daily-news prompt leakage, strict XHS draft-title persistence, resilient news sources, and verify 5 AI-image news drafts end-to-end.
+**Git:** `main (dirty)`; working tree already had earlier GUI/model/API changes from this session.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Removed prompt echo from daily-news fallback bodies/topics; stopped unsafe "news fetch failed -> generic one-post generation" fallback. | None. |
+| `src/news/daily_news.py` | DONE | Added NewsAPI -> GDELT auto fallback metadata, `NEWS_PROVIDER=file`, JSON candidate loading, and safer entity dedupe that ignores source boilerplate like `AP`/`Reuters`. | Keep candidate-file schema documented if more source fields are added. |
+| `src/publish/playwright_steps.py` | DONE | Made title/body filling use trusted keyboard input, added fill-settle verification, and kept strict post-save draft-box title verification. | Re-check selectors if XHS publish UI changes. |
+| `apps/cli.py` | DONE | `create`/`auto` now exit with an error when zero posts are created instead of silently succeeding. | None. |
+| `tests/test_daily_news.py` | DONE | Added coverage for prompt-safe fallback, provider fallback, file provider, failed-news-source behavior, and over-dedupe regressions. | None. |
+| `tests/test_playwright_draft_button.py` | DONE | Added coverage for specific draft-title matching and generic-title rejection. | None. |
+| `README.md` | DONE | Documented `NEWS_PROVIDER=file` / `NEWS_CANDIDATES_FILE` and the verified 5-news command pattern. | None. |
+| `docs/新闻自动化修复与实测报告-2026-06-19.md` | DONE | Added a dedicated repair/test report with the 5 real XHS draft IDs, titles, AI image provider, and evidence notes. | None. |
+| `data/news/manual_candidates_20260619.json` | DONE | Added the verified AP News candidate file used for the live 5-draft test while NewsAPI/GDELT were unavailable. | Replace with a fresh verified file for future date-specific runs. |
+| `CODING_PROGRESS.md` | DONE | Logged this entry after invoking `$file-progress-followup`. | Continue logging after future coding work. |
+
+**Notes**
+- Tests/Lint: `py_compile` for changed Python files passed; `pytest tests/test_daily_news.py tests/test_playwright_draft_button.py -q` -> 31 passed; `pytest -q` -> 92 passed in 12.76s.
+- Live XHS result: five posts saved as titled image drafts with Aliyun `wan2.7-image`; latest execution for each ended `saved_draft` with `verified_title=True cover_ready=True`.
+- Risks/Assumptions: NewsAPI returned connection refused and GDELT returned 429 during this run, so the real-news input used a verified file provider; two failed attempts left `暂无笔记标题` test drafts in XHS and were not deleted without user confirmation.
+- Next steps: If desired, run a limited `delete-drafts --dry-run` then delete only the known untitled test drafts after explicit confirmation.
+
 ### 2026-02-03
 **Task:** GUI 默认值与“仅上传（approve/run）”工作流增强
 **Git:** `main (dirty)`
@@ -1131,3 +1154,124 @@
 **Notes**
 - Tests/Lint: Not run (docs-only change); LLM smoke test via `apps.cli create` returned `401 authentication_error` (invalid API key for configured base URL).
 - Next steps: Update to a valid DeepSeek API key (do not paste in chat), rerun `.\.venv\Scripts\python -m apps.cli create ...` to confirm LLM succeeds, then run `auto` to save draft.
+
+### 2026-06-19 14:02
+**Task:** Audit and repair API availability, local cache paths, and Xiaohongshu draft publishing.
+**Git:** `main` (modified: `.gitignore`, `README.md`, `apps/gui.py`, `requirements.txt`, `scripts/build_gui_exe.ps1`, `src/images/auto_image.py`, `src/publish/mcp_driver.py`, `src/publish/playwright_steps.py`, `tests/test_auto_image.py`, `tests/test_gui.py`; untracked tests: `tests/test_mcp_driver.py`, `tests/test_playwright_profile_config.py`, `tests/test_playwright_upload_count.py`)
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `.gitignore` | DONE | Ignored workspace-local npm, pip, and Playwright browser caches. | None. |
+| `README.md` | DONE | Documented workspace-local cache env vars and updated default image-provider wording to Pexels-first. | None. |
+| `apps/gui.py` | DONE | Changed GUI default image provider from Aliyun to Pexels after live quota checks. | Switch back manually only if Aliyun paid quota is available. |
+| `requirements.txt` | DONE | Added `certifi` for stable HTTPS certificate verification. | None. |
+| `scripts/build_gui_exe.ps1` | DONE | Forces pip cache into `.pip-cache` under the workspace. | None. |
+| `src/images/auto_image.py` | DONE | Uses `certifi` HTTPS context for Pexels search/download to fix local SSL certificate failures. | None. |
+| `src/publish/mcp_driver.py` | DONE | Moves Chrome DevTools MCP profile and npm cache defaults into the workspace instead of user home / C drive. | None. |
+| `src/publish/playwright_steps.py` | DONE | Keeps system Chrome as default when a custom XHS profile dir is set, fixes upload-count regex, improves draft button detection/clicking, and records stronger evidence snapshots. | Coordinate fallback may need retuning if XHS changes the publish UI layout. |
+| `tests/test_auto_image.py` | DONE | Added tests proving Pexels HTTP calls pass an explicit TLS context. | None. |
+| `tests/test_gui.py` | DONE | Added regression coverage for the Pexels default provider. | None. |
+| `tests/test_mcp_driver.py` | DONE | Added regression coverage that MCP defaults to a workspace-local browser profile. | None. |
+| `tests/test_playwright_profile_config.py` | DONE | Added regression coverage for custom XHS profile + Chrome channel resolution. | None. |
+| `tests/test_playwright_upload_count.py` | DONE | Added regression coverage for XHS upload-count text matching. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this repair/audit entry. | Keep appending after future coding work. |
+
+**Notes**
+- Tests/Lint: `.\.venv\Scripts\python.exe -m pytest -q` -> 69 passed.
+- Live API smoke: Aliyun LLM and Aliyun image generation both returned `403 AllocationQuota.FreeTierOnly` (free tier exhausted); ppinfra fallback LLM OK; NewsAPI OK; Pexels OK after TLS fix; GDELT timed out from this network.
+- Xiaohongshu smoke: real retry for diagnostic post `75256f74d0694feebb1a59a72a76441b` reached `saved_draft`; evidence under `data/posts/75256f74d0694feebb1a59a72a76441b/evidence/092a4c4ebfc342d5bd403cdbc26a9462/`.
+- Risks/Assumptions: API keys were checked by live minimal requests only, not by provider billing dashboards; a diagnostic draft with a question-mark title may remain in the XHS draft box because the one-off local test script used a PowerShell stdin encoding path.
+- Next steps: If you want Aliyun generation again, add paid quota or disable free-tier-only mode in the Aliyun console; otherwise keep Pexels as the image default and ppinfra as the working LLM fallback.
+
+### 2026-06-19 14:26
+**Task:** Add Aliyun free model options, provider switching, wan2.7 image support, redesigned GUI auto-posting console, and docs.
+**Git:** `main` (modified files from the previous repair entry remain uncommitted; this entry covers the new GUI/model/docs changes)
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | Rebuilt the Tkinter GUI as a publishing console with auto-posting controls for LLM provider, LLM model, image provider, and Aliyun image model. | Manual visual review is useful if you want spacing tweaks after opening the desktop window. |
+| `src/config.py` | DONE | Added the Aliyun free LLM model catalog, changed default Aliyun LLM to `qwen3.7-plus`, and added `LLM_PROVIDER=auto/aliyun/ppinfra`. | Keep the catalog updated if the Aliyun console free list changes. |
+| `src/images/aliyun_images.py` | DONE | Changed default image model to `wan2.7-image` and fixed wan2.6+ protocol detection so wan2.7 uses the new multimodal/image-generation flow. | None. |
+| `src/workflow/create_post.py` | DONE | Updated image model mismatch guidance to recommend `wan2.7-image` / `wan2.7-image-pro`. | None. |
+| `tests/test_aliyun_llm_models.py` | DONE | Added regression coverage for the Aliyun free model list and provider-only selection behavior. | None. |
+| `tests/test_gui.py` | DONE | Added regression coverage for GUI model option catalogs and provider env override generation. | None. |
+| `tests/test_aliyun_image_models.py` | DONE | Added regression coverage that `wan2.7-image` uses the multimodal sync endpoint with `n=1`. | None. |
+| `docs/模型与GUI供应商配置.md` | DONE | Added a dedicated guide for GUI supplier/model selection, env mappings, and recommended combinations. | None. |
+| `docs/llm_api-key.example.md` | DONE | Rewrote the fallback LLM example around ppinfra and linked Aliyun config to the GUI/model guide. | None. |
+| `docs/aliyun_image_api-key.example.md` | DONE | Rewrote the DashScope image example and documented `wan2.7-image` / `wan2.7-image-pro`. | None. |
+| `docs/图形界面任务书.md` | DONE | Appended the 2026-06-19 GUI publishing-console enhancement notes. | None. |
+| `docs/图形界面工作流增强任务书.md` | DONE | Updated old default values to `qwen3.7-plus` and `wan2.7-image`. | None. |
+| `docs/AI生图任务书.md` | DONE | Updated image defaults and added Wan 2.7 model notes. | None. |
+| `docs/图片查找功能.md` | DONE | Updated Aliyun image default model documentation. | None. |
+| `docs/生图事件摘要任务书.md` | DONE | Updated examples to reference Wan 2.7 image models. | None. |
+| `README.md` | DONE | Updated GUI description, default model names, provider selection notes, and quick examples. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry. | Keep appending after future coding work. |
+
+**Notes**
+- Tests/Lint: `.\.venv\Scripts\python.exe -m py_compile apps\gui.py src\config.py src\images\aliyun_images.py src\workflow\create_post.py` -> passed; `.\.venv\Scripts\python.exe -m pytest -q` -> 76 passed.
+- Docs: Added `docs/模型与GUI供应商配置.md` and expanded related docs in `docs/` per the project documentation requirement.
+- External reference: Aliyun official Wan 2.7 image API docs show `wan2.7-image` / `wan2.7-image-pro` use `multimodal-generation/generation` for sync calls and `image-generation/generation` for async calls.
+- Risks/Assumptions: GUI visual layout has automated import/unit coverage but was not manually opened in this session; API quota state still depends on provider console balances and cannot be guaranteed by code alone.
+
+### 2026-06-19 14:41
+**Task:** Test GUI news automation, document results, and fix daily-news prompt leakage found during live testing.
+**Git:** `main` (working tree already contained the earlier repair/model/GUI changes; this entry covers the new test report and prompt-leak regression fix)
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added `_daily_news_body_has_prompt_leak()` and fallback handling for single/batch daily-news flows when an LLM echoes prompt instructions into publishable body text. | None. |
+| `tests/test_daily_news.py` | DONE | Added regression tests for prompt-leak detection and daily-news safe fallback behavior. | None. |
+| `docs/测试报告-2026-06-19-GUI新闻自动化.md` | DONE | Added a full test report covering key presence checks, GUI smoke tests, full pytest, live daily-news generation, and XHS dry-run evidence. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this testing/fix entry. | Keep appending after future coding work. |
+
+**Notes**
+- Tests/Lint: `.\.venv\Scripts\python.exe -m py_compile apps\gui.py src\config.py src\images\aliyun_images.py src\workflow\create_post.py` -> passed; `.\.venv\Scripts\python.exe -m pytest -q` -> 79 passed.
+- Live generation: first test post `bd6bfa4a48bb414cad83670097ca71ff` reproduced prompt leakage; after the fix, new post `0ad0d7e865e64bfd9b3159e6086c2bb0` validated `ok`, had 3 Pexels assets, and `prompt_leak=False`.
+- XHS dry-run: `apps.cli run 0ad0d7e865e64bfd9b3159e6086c2bb0 --dry-run --login-hold 0 --wait-timeout 120 --force` opened the creator publish page, matched `上传图文`, matched `button.upload-button`, and skipped upload/fill/save as expected.
+- Evidence: `data/posts/0ad0d7e865e64bfd9b3159e6086c2bb0/evidence/5e860106014a412c8d2eac60a6d6763c/`.
+- Risks/Assumptions: This test intentionally did not save a real XHS draft; it used dry-run for the browser automation portion to avoid changing the account draft box.
+
+### 2026-06-19 15:01
+**Task:** Complete the live news generation-to-XHS-draft chain and add GUI post-title visibility.
+**Git:** `main` (working tree still contains earlier repair/model/docs changes; this entry covers the final live-chain fix, GUI title list, and updated docs/tests)
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | Added recent-post summaries so the draft/run page lists each post as title + status + post_id, and safely extracts the id from either the label or a raw id. | Open the GUI manually only if visual spacing needs refinement. |
+| `tests/test_gui.py` | DONE | Added regression coverage for recent-post title/status labels and id extraction from GUI choices. | None. |
+| `src/publish/playwright_steps.py` | DONE | Fixed the live draft save path by prioritizing the bottom "暂存离开"/draft action coordinate and keeping ranked text-candidate fallbacks. | Re-check if XHS significantly changes the publish page layout. |
+| `tests/test_playwright_draft_button.py` | DONE | Added regression tests for bottom draft-button targeting and candidate selection. | None. |
+| `README.md` | DONE | Documented that GUI draft handling now shows title + status + post_id for recent posts. | None. |
+| `docs/模型与GUI供应商配置.md` | DONE | Updated GUI provider/model guide to mention the title/status/post_id recent-post selector. | None. |
+| `docs/测试报告-2026-06-19-GUI新闻自动化.md` | DONE | Expanded the report from dry-run coverage to a real generated-news, image-upload, save-draft, and draft-box verification run. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this live-chain verification entry after invoking the file-progress-followup workflow. | Keep appending after future coding work. |
+
+**Notes**
+- Tests/Lint: `.\.venv\Scripts\python.exe -m py_compile apps\gui.py src\publish\playwright_steps.py src\workflow\create_post.py src\config.py src\images\aliyun_images.py` -> passed; `.\.venv\Scripts\python.exe -m pytest -q` -> 84 passed.
+- Live chain: first non-dry-run `apps.cli auto` generated post `19147964f9214ab69fb1eb90f2a1bcc0` but draft verification failed because the old click path hit a preview text node; after the button-targeting fix, `apps.cli retry 19147964f9214ab69fb1eb90f2a1bcc0 --force --login-hold 0 --wait-timeout 180` returned `saved_draft`.
+- XHS evidence: title `每日新闻｜The Korean Tele`, local status `saved_as_draft`, execution `87f704791e314a509b7634e8b484e3b8`, evidence under `data/posts/19147964f9214ab69fb1eb90f2a1bcc0/evidence/87f704791e314a509b7634e8b484e3b8/`; verified steps include `upload_images`, `fill_title_body`, `save_draft`, `verify_draft_saved`, and `verify_draft_box_item`.
+- Risks/Assumptions: The project automation intentionally saves into the Xiaohongshu draft box rather than clicking public "发布"; manual final review is still recommended before public posting.
+
+### 2026-06-20 00:22
+**Task:** Fix daily-news Chinese output/source handling, add GUI draft upload-state details and quick launchers, then complete live delete + two-draft API/AI-image test.
+**Git:** `main` (working tree already had many pre-existing modified/untracked files; this entry covers the files changed for this task)
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Strengthened daily-news prompt rules, added URL stripping, Chinese fallback body/title handling for English items, final source-line cleanup, and local `source_url` persistence. | Consider a future provider-side translation retry if you want less generic offline fallback text when LLM output is rejected. |
+| `apps/gui.py` | DONE | Added uploaded/uploaded_at/updated/execution/body-preview fields to recent-post summaries, richer draft choices/details, XHS quick-open button, and `target=image` creator URL. | Manual visual tuning optional after opening the desktop GUI. |
+| `tests/test_daily_news.py` | DONE | Added regressions for Chinese translation prompt requirements, offline English fallback, no URL in body, and URL persistence in local metadata for single/batch daily news. | None. |
+| `tests/test_gui.py` | DONE | Added regressions for uploaded-state labels, detail text, creator URL, and workspace-local quick-launch scripts. | None. |
+| `docs/新闻中文化与GUI草稿状态修复-2026-06-19.md` | DONE | Documented the new content rules, GUI behavior, quick launchers, tests, and live XHS results. | None. |
+| `scripts/start_gui.ps1` | DONE | Added workspace-local PowerShell launcher for `python -m apps.gui`. | None. |
+| `scripts/open_xhs_creator.ps1` | DONE | Added workspace-local Chrome launcher using `data/browser/chrome-profile` and the XHS image publish URL. | None. |
+| `Start-GUI.cmd` | DONE | Added double-click wrapper for the GUI PowerShell launcher. | None. |
+| `Open-XHS-Creator.cmd` | DONE | Added double-click wrapper for the XHS creator PowerShell launcher. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this task entry after invoking the file-progress-followup workflow. | Keep appending after future coding work. |
+
+**Notes**
+- Tests/Lint: `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_daily_news.py tests/test_gui.py -q` -> 45 passed; `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider -q` -> 99 passed; PowerShell script parse checks passed for both new `.ps1` launchers.
+- Live delete test: `delete-drafts --all --dry-run` found `image total=42`; `delete-drafts --all --yes` deleted `42/42`; follow-up dry-run showed image/video/article all `0`.
+- Live save test: final XHS draft box dry-run shows exactly 2 image drafts: GUI path `e2474373af9d4457847b7230d703715e` (`每日新闻｜科技动态`, NewsAPI/Business Insider, Aliyun `wan2.7-image`) and CLI path `2fc339424dc1446e8a544227f6f23fad` (`每日新闻｜经济动态`, NewsAPI/Pluralistic.net, Aliyun `wan2.7-image`).
+- Risks/Assumptions: GDELT returned `HTTP Error 429` during this run, so both final API news drafts used NewsAPI. A discarded PowerShell-pipe encoding attempt and duplicate-attempt local `data/posts/*` artifacts remain locally, but the platform draft box was cleaned to the final 2 visible drafts.
+- Next steps: Open `Start-GUI.cmd` for manual visual review if desired; before public posting, review the two XHS drafts in the browser because this workflow intentionally saves drafts rather than clicking public publish.

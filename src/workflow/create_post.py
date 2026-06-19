@@ -25,6 +25,21 @@ from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSo
 from src.validation.rules import MAX_IMAGE_BODY
 
 
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+", flags=re.IGNORECASE)
+_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _strip_urls(text: str) -> str:
+    cleaned = _URL_RE.sub("", text or "")
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _has_cjk(text: str | None) -> bool:
+    return bool(_CJK_CHAR_RE.search(text or ""))
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -68,6 +83,16 @@ def _shorten_daily_news_title(news_title: str, *, max_len: int = 20) -> str:
     title = (news_title or "").strip()
     if not title:
         return "每日新闻"
+    if not _has_cjk(title):
+        lower = title.lower()
+        if any(w in lower for w in ("ai", "chip", "tech", "technology", "software", "model")):
+            title = "科技动态"
+        elif any(w in lower for w in ("market", "inflation", "prices", "trade", "economy")):
+            title = "经济动态"
+        elif any(w in lower for w in ("court", "case", "sentence", "police", "school")):
+            title = "社会事件"
+        else:
+            title = "国际动态"
     # Prefer the first segment before long detail separators.
     for sep in ("：", ":", " - ", "—", "（", "("):
         if sep in title:
@@ -212,6 +237,37 @@ _NEWS_SUMMARY_LABEL = "要点摘要："
 _NEWS_CONTENT_LABEL = "新闻内容："
 _NEWS_COMMENT_LABEL = "点评："
 
+_NEWS_PROMPT_LEAK_MARKERS = (
+    "你正在为小红书图文笔记写《每日新闻》栏目",
+    "请依据下面提供的新闻信息",
+    "注意：body 正文里不要包含",
+    "只允许使用下列已提供的新闻信息",
+    "输出为严格 JSON",
+    "可用新闻信息",
+    "新闻标题：",
+    "来源名称：",
+    "来源域名：",
+    "用户关注点",
+    "JSON 字段要求",
+    "title：",
+    "body：正文",
+    "topics（数组",
+    "image_event（字符串",
+)
+
+
+def _daily_news_body_has_prompt_leak(body: str) -> bool:
+    """
+    Detect providers that echo the daily-news prompt into the publishable body.
+
+    The section labels alone are not enough to prove the body is safe because some
+    models keep the labels while filling them with the prompt/instructions.
+    """
+    text = body or ""
+    if not text.strip():
+        return False
+    return any(marker in text for marker in _NEWS_PROMPT_LEAK_MARKERS)
+
 
 def _looks_like_jsonish_body(text: str) -> bool:
     t = (text or "").strip().lower()
@@ -296,12 +352,50 @@ def _normalize_news_summary(value: str, *, fallback: str = "", limit: int = 40) 
     text = (value or "").strip()
     if not text:
         text = (fallback or "").strip()
-    text = re.sub(r"https?://\S+", "", text).strip()
+    text = _strip_urls(text)
     text = re.sub(r"\s+", " ", text).strip()
     text = text.strip("：:，,。.!！？?\"'“”‘’（）()[]【】")
     if len(text) > limit:
         text = text[:limit].rstrip()
     return text
+
+
+def _is_publishable_daily_news_topic(topic: str, prompt_norm: str = "") -> bool:
+    text = (topic or "").strip().lstrip("#")
+    if not text:
+        return False
+    if prompt_norm and text == prompt_norm.strip():
+        return False
+    if len(text) > 20:
+        return False
+    if any(ch in text for ch in ("\n", "\r", "，", "。", "；", "：", "、")):
+        return False
+    blocked = (
+        "选择",
+        "适合小红书",
+        "正文",
+        "提示词",
+        "包含要点",
+        "点评",
+        "生成",
+    )
+    return not any(word in text for word in blocked)
+
+
+def _normalize_daily_news_topics(topics, prompt_norm: str = "") -> list[str]:
+    normalized_topics: list[str] = []
+    seen: set[str] = set()
+    for t in topics or []:
+        tt = str(t or "").strip().lstrip("#")
+        if not _is_publishable_daily_news_topic(tt, prompt_norm):
+            continue
+        if tt in seen:
+            continue
+        normalized_topics.append(tt)
+        seen.add(tt)
+    if "每日新闻" not in seen:
+        normalized_topics.insert(0, "每日新闻")
+    return normalized_topics[:8]
 
 
 def _format_news_seendate(value: str | None) -> str:
@@ -339,7 +433,9 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
     return (
         "你正在为小红书图文笔记写《每日新闻》栏目。\n"
         "请依据下面提供的新闻信息，生成一份可直接发布的草稿。\n"
-        "注意：body 正文里不要包含来源名称/链接/提示词/要求等元信息；发布时间仅在文末固定一行输出。\n"
+        "必须全部使用简体中文；如果原始材料是英文新闻，先翻译并用中文新闻写法改写，不得保留英文长句。\n"
+        "注意：body 正文里不要包含提示词/要求等元信息；不得输出 URL、网址、http(s) 链接。\n"
+        "来源只写来源名称，网址只保存在本地 post.json 的 metadata 中；发布时间和来源仅在文末固定行输出。\n"
         "只允许使用下列已提供的新闻信息，不得新增事实或编造细节；信息不足时保持保守表述。\n\n"
         "输出为严格 JSON（仅包含 keys: title, body, topics；可选 key: image_event），不要 Markdown/代码块。\n"
         "不要把任何 JSON 片段（例如 { } / \"title\": / \"topics\": / \"image_event\":）写进 body。\n\n"
@@ -355,12 +451,13 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
         "JSON 字段要求：\n"
         "title（<=20字）：基于新闻标题/摘要改写生成，必须包含具体事件关键词；不得仅为“每日新闻”（也不得仅为“每日新闻｜”）。\n"
         "body：正文，必须严格按以下格式输出（保留标签，不得更名/省略；段落之间空一行）：\n"
-        "要点摘要：<20-40字，概括新闻最重要部分，不要评价>\n"
+        "要点摘要：<约50字，概括新闻最重要部分，不要评价>\n"
         "新闻内容：\n"
-        "<不少于200字的完整段落>\n\n"
+        "<约200字的完整段落，围绕已给事实说明背景、进展、影响边界；不要写未经证实的细节>\n\n"
         "点评：\n"
-        "<不少于100字的完整段落，末尾附带1个互动问题>\n\n"
+        "<约80-120字的完整段落，末尾附带1个互动问题>\n\n"
         "发布时间：YYYY-MM-DD\n"
+        "来源：来源名称（不要写网址）\n"
         "长度约束：body 总长度（含换行）务必 <= 900 字符，避免写太长导致发布失败。\n"
         "点评写作约束：坚持中国立场（以中国国家利益与中国受众视角分析），同时保持客观理性。\n"
         "先基于已给事实再给判断，不煽动对立、不使用攻击性语言、不做情绪化带节奏表述。\n"
@@ -371,23 +468,62 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
     )
 
 
+def _daily_news_fallback_subject(picked, prompt_norm: str) -> str:
+    title = _strip_urls((picked.title or "").strip())
+    desc = _strip_urls((picked.description or "").strip())
+    if _has_cjk(title):
+        return _normalize_news_summary(title, limit=48)
+    if _has_cjk(desc):
+        return _normalize_news_summary(desc, limit=48)
+
+    lower = " ".join(
+        [
+            picked.title or "",
+            picked.description or "",
+            picked.content or "",
+            prompt_norm or "",
+        ]
+    ).lower()
+    hint = prompt_norm if _has_cjk(prompt_norm) else ""
+    if "科技" in hint or any(w in lower for w in ("ai", "chip", "tech", "technology", "model", "software")):
+        return "一项科技议题出现新进展"
+    if "社会" in hint or any(w in lower for w in ("court", "case", "school", "police", "sentence")):
+        return "一项社会议题出现新进展"
+    if "经济" in hint or any(w in lower for w in ("market", "inflation", "price", "trade", "economy")):
+        return "一项经济议题出现新进展"
+    return "一项国际议题出现新进展"
+
+
 def _daily_news_offline_body(picked, prompt_norm: str) -> str:
     """
     Offline fallback body: keep it publishable and avoid echoing prompt/requirements.
     """
-    focus = prompt_norm.strip()
-    focus_line = f"从中国视角结合「{focus}」" if focus else "从中国视角和读者关注点"
     pub = _format_news_seendate(picked.seendate)
-    summary = _normalize_news_summary(
-        picked.description or picked.title, fallback=picked.title, limit=40
+    subject = _daily_news_fallback_subject(picked, prompt_norm)
+    source_for_copy = (picked.source or picked.domain or "").strip()
+    if not _has_cjk(source_for_copy):
+        source_for_copy = "原始来源"
+    summary = (
+        f"{source_for_copy}披露{subject}，现有信息仍有限，后续需关注权威更新与实际影响。"
+    )
+    if len(summary) > 70:
+        summary = f"{subject}，现有信息仍有限，后续需关注权威更新与实际影响。"
+    content = (
+        f"根据{source_for_copy}提供的公开信息，{subject}。目前能够确认的内容主要来自原始新闻的标题、摘要和正文片段，"
+        "因此这里不扩大事实范围，也不加入未经证实的数字、人物关系或因果判断。"
+        "这条动态的后续价值，在于观察官方或权威机构是否披露更多细节，包括执行时间、影响对象和可能的市场或社会反应。"
+        "在信息仍有限的情况下，读者可以先把它视为一个需要继续跟踪的进展，而不是已经定论的结果。"
+    )
+    comment = (
+        "从中国受众视角看，越是跨地区、跨产业的新闻，越需要区分已确认事实和外界推测。"
+        "接下来更值得关注的是正式文件、权威回应和实际执行效果。你认为这件事最可能影响哪一方？"
     )
     return (
         f"{_NEWS_SUMMARY_LABEL}{summary}\n"
         f"{_NEWS_CONTENT_LABEL}\n"
-        f"{picked.title}。这条新闻反映出当前议题的最新进展，仍需关注后续权威信息披露。\n\n"
+        f"{content}\n\n"
         f"{_NEWS_COMMENT_LABEL}\n"
-        f"{focus_line}来看，它可能带来连锁影响，值得持续观察与跟进。"
-        "你认为接下来会如何发展？"
+        f"{comment}"
         f"\n\n发布时间：{pub}"
     )
 
@@ -423,8 +559,7 @@ def _ensure_daily_news_sections(body: str, prompt_norm: str) -> str:
         comment = " ".join(paragraphs[1:])
     else:
         news = paragraphs[0] if paragraphs else cleaned
-        focus_line = f"从「{prompt_norm}」角度" if prompt_norm else "从读者关注点"
-        comment = f"{focus_line}来看，这条新闻提示我们需要持续关注后续进展与影响。你怎么看？"
+        comment = "从中国视角和读者关注点来看，这条新闻提示我们需要持续关注后续进展与影响。你怎么看？"
 
     summary = _normalize_news_summary(summary, fallback=news, limit=40)
 
@@ -436,20 +571,43 @@ def _ensure_daily_news_sections(body: str, prompt_norm: str) -> str:
 
 def _news_source_line(picked) -> str:
     source = (picked.source or picked.domain or "未知来源").strip()
-    url = (picked.url or "").strip()
-    if url:
-        return f"来源：{source} {url}"
     return f"来源：{source}"
 
 
 def _append_news_source_line(body: str, picked) -> str:
-    text = (body or "").rstrip()
+    text = _strip_urls(body or "").rstrip()
     if not text:
         return text
     line = _news_source_line(picked)
     if re.search(r"(?:\r?\n)*来源：.*\Z", text):
         text = re.sub(r"(?:\r?\n)*来源：.*\Z", "", text).rstrip()
     return f"{text}\n\n{line}".rstrip()
+
+
+def _clamp_daily_news_body(body: str) -> str:
+    text = (body or "").strip()
+    if len(text) <= MAX_IMAGE_BODY:
+        return text
+
+    source_match = re.search(r"\n\n来源：[^\n]+\s*$", text)
+    source_tail = source_match.group(0).strip() if source_match else ""
+    without_source = text[: source_match.start()].rstrip() if source_match else text
+    time_match = re.search(r"\n\n发布时间：[^\n]+\s*$", without_source)
+    time_tail = time_match.group(0).strip() if time_match else ""
+    main = without_source[: time_match.start()].rstrip() if time_match else without_source
+
+    tail_parts = [part for part in (time_tail, source_tail) if part]
+    tail = ("\n\n" + "\n\n".join(tail_parts)) if tail_parts else ""
+    room = max(0, MAX_IMAGE_BODY - len(tail))
+    return f"{main[:room].rstrip()}{tail}".strip()
+
+
+def _finalize_daily_news_body(body: str, picked, prompt_norm: str) -> str:
+    text = _strip_urls(body or "")
+    text = _ensure_daily_news_sections(text, prompt_norm)
+    text = _ensure_news_publish_date(text, picked.seendate)
+    text = _append_news_source_line(text, picked)
+    return _clamp_daily_news_body(text)
 
 
 def _fake_news_prompt(prompt_norm: str) -> str:
@@ -507,6 +665,8 @@ def create_post_with_draft(
             picked, news_meta = fetch_and_pick_daily_news(prompt_hint or "")
             platform_meta["news"] = {
                 **news_meta,
+                "picked": asdict(picked),
+                "source_url": picked.url,
                 "mode": "daily_news",
                 "prompt_hint": (prompt_hint or "").strip(),
             }
@@ -539,33 +699,18 @@ def create_post_with_draft(
             draft["body"] = _ensure_news_publish_date(
                 draft["body"], picked.seendate
             )
-            if draft.get("_fallback_error"):
+            if draft.get("_fallback_error") or _daily_news_body_has_prompt_leak(draft.get("body", "")):
                 draft["title"] = _shorten_daily_news_title(picked.title)
                 draft["body"] = _daily_news_offline_body(picked, prompt_norm)
-                draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
+                draft["topics"] = ["每日新闻"]
             if _is_generic_daily_news_title(draft.get("title", "")):
                 title_src = picked.title or picked.description or prompt_norm
                 draft["title"] = _shorten_daily_news_title(title_src)
             topics = draft.get("topics") or []
             if not isinstance(topics, list):
                 topics = [str(topics)]
-            # Deduplicate while preserving order, and ensure "每日新闻" exists.
-            normalized_topics: list[str] = []
-            seen: set[str] = set()
-            for t in topics:
-                tt = str(t or "").strip()
-                if not tt or tt in seen:
-                    continue
-                normalized_topics.append(tt)
-                seen.add(tt)
-            if "每日新闻" not in seen:
-                normalized_topics.insert(0, "每日新闻")
-                seen.add("每日新闻")
-            if prompt_norm and prompt_norm not in seen and len(normalized_topics) < 8:
-                normalized_topics.append(prompt_norm)
-            draft["topics"] = normalized_topics[:8]
-            draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
-            draft["body"] = _clamp_image_body(draft.get("body", ""))
+            draft["topics"] = _normalize_daily_news_topics(topics, prompt_norm)
+            draft["body"] = _finalize_daily_news_body(draft.get("body", ""), picked, prompt_norm)
             image_event = _normalize_image_event(
                 str(draft.get("image_event") or ""),
                 fallback=picked.title,
@@ -578,12 +723,7 @@ def create_post_with_draft(
                 "prompt_hint": (prompt_hint or "").strip(),
                 "error": str(exc),
             }
-            draft = generate_draft(
-                cfgs,
-                title_hint=title_hint,
-                prompt_hint=f"{prompt_hint}\n(news_fetch_failed: {exc})",
-                asset_paths=asset_paths,
-            )
+            raise RuntimeError(f"daily news fetch failed: {exc}") from exc
     elif title_norm == "每日假新闻":
         prompt_norm = (prompt_hint or "").strip()
         fake_prompt = _fake_news_prompt(prompt_norm)
@@ -701,63 +841,10 @@ def create_daily_news_posts(
             or "enable_interleave" in joined
         )
 
-    try:
-        candidates, base_meta = fetch_daily_news_candidates(prompt_norm)
-        # Pick more than requested so we can skip items whose image generation fails.
-        pick_limit = min(len(candidates), max(count * 5, count + 10))
-        picks = pick_news_items(candidates, prompt_norm, count=pick_limit)
-    except Exception as exc:
-        # Degrade to normal generation if fetching fails.
-        draft = generate_draft(
-            cfgs,
-            title_hint="每日新闻",
-            prompt_hint=f"{prompt_norm}\n(news_fetch_failed: {exc})",
-            asset_paths=asset_paths,
-        )
-        post = Post(
-            type="image",
-            status=PostStatus.draft,
-            title=draft["title"],
-            body=draft["body"],
-            topics=draft.get("topics", []),
-            platform={
-                "news": {
-                    "mode": "daily_news_multi",
-                    "prompt_hint": prompt_norm,
-                    "error": str(exc),
-                }
-            },
-        )
-        assets_paths = [Path(p) for p in asset_paths]
-        effective_copy_assets = copy_assets
-
-        if not assets_paths and auto_image_enabled:
-            dest_dir = post_dir(post.id) / "assets"
-            image_title = draft.get("title") or post.title or "每日新闻"
-            image_paths, image_metas = fetch_and_download_related_images(
-                title=image_title,
-                body=post.body,
-                topics=post.topics,
-                prompt_hint=prompt_norm,
-                dest_dir=dest_dir,
-                exclude_ids=used_image_ids,
-            )
-            post.platform.setdefault("image", image_metas[0])
-            post.platform["images"] = image_metas
-            _merge_image_ids(used_image_ids, image_metas)
-            assets_paths = image_paths
-            effective_copy_assets = False
-
-        if effective_copy_assets:
-            copied = copy_assets_into_post(post.id, assets_paths)
-            post.assets = _build_asset_infos(copied)
-        else:
-            post.assets = _build_asset_infos(assets_paths)
-
-        rev = Revision(post_id=post.id, source=RevisionSource.llm, content=draft)
-        save_post(post)
-        save_revision(rev)
-        return [post]
+    candidates, base_meta = fetch_daily_news_candidates(prompt_norm)
+    # Pick more than requested so we can skip items whose image generation fails.
+    pick_limit = min(len(candidates), max(count * 5, count + 10))
+    picks = pick_news_items(candidates, prompt_norm, count=pick_limit)
 
     target_count = count
     posts: list[Post] = []
@@ -795,10 +882,10 @@ def create_daily_news_posts(
         draft["body"] = _ensure_news_publish_date(
             draft["body"], picked.seendate
         )
-        if draft.get("_fallback_error"):
+        if draft.get("_fallback_error") or _daily_news_body_has_prompt_leak(draft.get("body", "")):
             draft["title"] = _shorten_daily_news_title(picked.title)
             draft["body"] = _daily_news_offline_body(picked, prompt_norm)
-            draft["topics"] = [t for t in ["每日新闻", prompt_norm] if t]
+            draft["topics"] = ["每日新闻"]
         if _is_generic_daily_news_title(draft.get("title", "")):
             title_src = picked.title or picked.description or prompt_norm
             draft["title"] = _shorten_daily_news_title(title_src)
@@ -810,22 +897,8 @@ def create_daily_news_posts(
         topics = draft.get("topics") or []
         if not isinstance(topics, list):
             topics = [str(topics)]
-        normalized_topics: list[str] = []
-        seen: set[str] = set()
-        for t in topics:
-            tt = str(t or "").strip()
-            if not tt or tt in seen:
-                continue
-            normalized_topics.append(tt)
-            seen.add(tt)
-        if "每日新闻" not in seen:
-            normalized_topics.insert(0, "每日新闻")
-            seen.add("每日新闻")
-        if prompt_norm and prompt_norm not in seen and len(normalized_topics) < 8:
-            normalized_topics.append(prompt_norm)
-        draft["topics"] = normalized_topics[:8]
-        draft["body"] = _append_news_source_line(draft.get("body", ""), picked)
-        draft["body"] = _clamp_image_body(draft.get("body", ""))
+        draft["topics"] = _normalize_daily_news_topics(topics, prompt_norm)
+        draft["body"] = _finalize_daily_news_body(draft.get("body", ""), picked, prompt_norm)
         image_event = _normalize_image_event(
             str(draft.get("image_event") or ""),
             fallback=picked.title,
@@ -842,6 +915,7 @@ def create_daily_news_posts(
                 "news": {
                     **base_meta,
                     "picked": asdict(picked),
+                    "source_url": picked.url,
                     "mode": "daily_news_multi" if target_count > 1 else "daily_news",
                     "prompt_hint": prompt_norm,
                     "pick_index": success_idx + 1,
@@ -889,7 +963,7 @@ def create_daily_news_posts(
                     print(
                         "[auto-image] Detected a likely model/config mismatch: the selected model requires an input image. "
                         "If you are generating images from text only, set ALIYUN_IMAGE_MODELS to a text-to-image model "
-                        '(e.g. "wan2.6-t2i" or "qwen-image-plus-2026-01-09").'
+                        '(e.g. "wan2.7-image" or "wan2.7-image-pro").'
                     )
                     break
                 continue

@@ -18,7 +18,27 @@ class LLMConfig:
 DEFAULT_LLM_BASE_URL = "https://api.ppinfra.com/openai"
 DEFAULT_LLM_MODEL = "deepseek/deepseek-v3-0324"
 DEFAULT_ALIYUN_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DEFAULT_ALIYUN_LLM_MODEL = "deepseek-v3.2"
+ALIYUN_FREE_LLM_MODELS = [
+    "qwen3.7-plus",
+    "deepseek-v4-flash",
+    "qwen3.6-flash-2026-04-16",
+    "qwen3.6-35b-a3b",
+    "qwen3.7-max-2026-05-17",
+    "qwen3.7-max-2026-06-08",
+    "glm-5.1",
+    "qwen3.6-plus-2026-04-02",
+    "qwen3.7-max-preview",
+    "glm-5.2",
+    "qwen3.6-plus",
+    "qwen3.5-plus-2026-04-20",
+    "qwen3.6-max-preview",
+    "qwen3.7-max",
+    "kimi-k2.6",
+    "qwen3.7-max-2026-05-20",
+    "qwen3.7-plus-2026-05-26",
+    "qwen3.6-flash",
+]
+DEFAULT_ALIYUN_LLM_MODEL = ALIYUN_FREE_LLM_MODELS[0]
 
 
 def _parse_llm_key_file(path: Path) -> dict[str, str]:
@@ -130,23 +150,48 @@ def _load_aliyun_llm_configs() -> list[LLMConfig]:
     ]
 
 
+def _normalize_llm_provider(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return "auto"
+    aliases = {
+        "dashscope": "aliyun",
+        "bailian": "aliyun",
+        "ali": "aliyun",
+        "pp": "ppinfra",
+        "fallback": "ppinfra",
+        "openai": "ppinfra",
+        "default": "auto",
+    }
+    raw = aliases.get(raw, raw)
+    if raw not in {"auto", "aliyun", "ppinfra"}:
+        raise RuntimeError(
+            f"Unsupported LLM_PROVIDER={value!r}; supported: auto, aliyun, ppinfra"
+        )
+    return raw
+
+
 def load_llm_configs(
     *,
     llm_file: Path | str = Path("docs/llm_api-key.md"),
 ) -> list[LLMConfig]:
     configs: list[LLMConfig] = []
-    configs.extend(_load_aliyun_llm_configs())
+    provider = _normalize_llm_provider(os.getenv("LLM_PROVIDER") or "auto")
 
-    fallback_cfg = _load_fallback_llm_config(llm_file=llm_file)
-    if fallback_cfg:
-        # Avoid duplicates if the user reuses the same base_url/model/key.
-        if not any(
-            c.base_url == fallback_cfg.base_url
-            and c.model == fallback_cfg.model
-            and c.api_key == fallback_cfg.api_key
-            for c in configs
-        ):
-            configs.append(fallback_cfg)
+    if provider in ("auto", "aliyun"):
+        configs.extend(_load_aliyun_llm_configs())
+
+    if provider in ("auto", "ppinfra"):
+        fallback_cfg = _load_fallback_llm_config(llm_file=llm_file)
+        if fallback_cfg:
+            # Avoid duplicates if the user reuses the same base_url/model/key.
+            if not any(
+                c.base_url == fallback_cfg.base_url
+                and c.model == fallback_cfg.model
+                and c.api_key == fallback_cfg.api_key
+                for c in configs
+            ):
+                configs.append(fallback_cfg)
 
     if not configs:
         raise RuntimeError(

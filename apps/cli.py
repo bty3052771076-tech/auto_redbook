@@ -115,6 +115,10 @@ def create(
                 typer.echo(f"error: create failed ({idx + 1}/{count}): {exc}")
                 continue
 
+    if not posts:
+        typer.echo("error: no posts created")
+        raise typer.Exit(code=1)
+
     if len(posts) == 1:
         post = posts[0]
         typer.echo(f"创建完成：post_id={post.id}")
@@ -311,6 +315,9 @@ def auto(
     typer.echo(f"创建完成：posts={len(posts)}")
     for p in posts:
         typer.echo(f"- post_id={p.id} | 标题：{p.title}")
+    if not posts:
+        typer.echo("error: no posts created")
+        raise typer.Exit(code=1)
 
     continue_on_invalid = count > 1
     skipped_invalid = 0

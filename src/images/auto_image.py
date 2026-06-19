@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -90,6 +91,15 @@ _ENTITY_MAP = {
     "朝鲜": "North Korea",
     "印度": "India",
 }
+
+
+def _https_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 @dataclass(frozen=True)
@@ -574,7 +584,7 @@ def _pexels_search_photos(
         method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s, context=_https_context()) as resp:
             raw = resp.read()
     except Exception as exc:
         raise RuntimeError(f"Pexels request failed: {exc}") from exc
@@ -644,7 +654,7 @@ def _download_image(
         method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s, context=_https_context()) as resp:
             data = resp.read()
     except Exception as exc:
         raise RuntimeError(f"image download failed: {exc}") from exc

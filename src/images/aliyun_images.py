@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
-DEFAULT_MODEL = "qwen-image-plus-2026-01-09"
+DEFAULT_MODEL = "wan2.7-image"
 DEFAULT_SIZE = "1104*1472"  # 3:4 (适合小红书竖图)
 DEFAULT_TIMEOUT_S = 180.0
 DEFAULT_DOWNLOAD_TIMEOUT_S = 60.0
@@ -303,8 +303,16 @@ def _extract_task_image_url(resp: dict[str, Any]) -> str:
     return _extract_sync_image_url(resp)
 
 
-def _is_wan26_model(model_name: str) -> bool:
-    return (model_name or "").strip().lower().startswith("wan2.6")
+def _wan2_minor_version(model_name: str) -> Optional[int]:
+    match = re.match(r"^wan2\.(\d+)", (model_name or "").strip().lower())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _is_wan26_or_newer_model(model_name: str) -> bool:
+    minor = _wan2_minor_version(model_name)
+    return minor is not None and minor >= 6
 
 
 def _is_text2image_async_model(model_name: str) -> bool:
@@ -312,7 +320,7 @@ def _is_text2image_async_model(model_name: str) -> bool:
     Old protocol is required for wan2.5 and earlier models (and some legacy wanx).
     """
     m = (model_name or "").strip().lower()
-    if m.startswith("wan2.") and not m.startswith("wan2.6"):
+    if m.startswith("wan2.") and not _is_wan26_or_newer_model(m):
         return True
     if m.startswith("wanx") or m.startswith("wanx-"):
         return True
@@ -324,7 +332,7 @@ def _supports_negative_prompt(model_name: str) -> bool:
     Not all Aliyun/Bailian image models accept negative_prompt.
 
     - z-image docs don't list negative_prompt, so we avoid sending it.
-    - qwen-image / wan2.6 docs support it.
+    - qwen-image / wan2.6+ docs support it.
     """
     m = (model_name or "").strip().lower()
     if m.startswith("z-image"):
@@ -354,8 +362,8 @@ def _call_multimodal_generation_sync(
         "prompt_extend": bool(prompt_extend),
         "watermark": bool(watermark),
     }
-    # Wan2.6 默认 n=4；这里强制 n=1，避免多出 3 张图的时间与费用。
-    if _is_wan26_model(model_name):
+    # Wan2.6+ may default to multiple images. Keep this workflow at one image.
+    if _is_wan26_or_newer_model(model_name):
         parameters["n"] = 1
     if negative_prompt and _supports_negative_prompt(model_name):
         parameters["negative_prompt"] = negative_prompt
@@ -567,7 +575,7 @@ def generate_aliyun_image(
 
         try:
             if call_mode in ("async", "task", "text2image"):
-                if _is_wan26_model(model_name):
+                if _is_wan26_or_newer_model(model_name):
                     method = "wan26_generation_async"
                     create_resp = _call_wan26_generation_async(
                         cfg=cfg,
@@ -615,7 +623,7 @@ def generate_aliyun_image(
                 except AliyunImageAPIError as exc:
                     # 某些账号/模型可能不支持同步：自动降级为异步（旧协议 or wan2.6 新协议）
                     if _sync_not_supported(exc):
-                        if _is_wan26_model(model_name):
+                        if _is_wan26_or_newer_model(model_name):
                             method = "wan26_generation_async_fallback"
                             create_resp = _call_wan26_generation_async(
                                 cfg=cfg,

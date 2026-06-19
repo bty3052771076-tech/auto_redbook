@@ -57,12 +57,14 @@ _ENTITY_STOPWORDS = {
     "with",
     # News boilerplate / generic terms
     "analysis",
+    "ap",
     "daily",
     "live",
     "news",
     "opinion",
     "report",
     "reports",
+    "reuters",
     "update",
     "updates",
     "watch",
@@ -740,6 +742,47 @@ def _newsapi_fetch_articles(
     return items
 
 
+def _file_fetch_articles(*, path: str, max_records: int) -> list[NewsItem]:
+    file_path = Path(path)
+    data = json.loads(file_path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        records = data.get("items") or data.get("candidates") or data.get("news") or []
+    else:
+        records = data
+    if not isinstance(records, list):
+        raise RuntimeError("NEWS_CANDIDATES_FILE must contain a JSON list or an object with items/candidates/news")
+
+    items: list[NewsItem] = []
+    for rec in records[:max_records]:
+        if not isinstance(rec, dict):
+            continue
+        title = (rec.get("title") or "").strip()
+        url = (rec.get("url") or rec.get("link") or "").strip()
+        if not title or not url:
+            continue
+        domain = (rec.get("domain") or "").strip()
+        if not domain:
+            try:
+                domain = urllib.parse.urlparse(url).netloc.strip().lower()
+            except Exception:
+                domain = ""
+        items.append(
+            NewsItem(
+                title=title,
+                url=url,
+                source=(rec.get("source") or rec.get("source_name") or "").strip() or None,
+                description=(rec.get("description") or rec.get("summary") or "").strip() or None,
+                content=(rec.get("content") or "").strip() or None,
+                domain=domain or None,
+                seendate=(rec.get("seendate") or rec.get("published_at") or rec.get("publishedAt") or "").strip() or None,
+                language=(rec.get("language") or "").strip() or None,
+                socialimage=(rec.get("socialimage") or rec.get("image") or "").strip() or None,
+                sourcecountry=(rec.get("sourcecountry") or rec.get("country") or "").strip() or None,
+            )
+        )
+    return items
+
+
 def fetch_daily_news_candidates(
     prompt_hint: str,
     *,
@@ -765,18 +808,27 @@ def fetch_daily_news_candidates(
     from_iso = start_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
     to_iso = end_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    provider = provider_env
-    if not provider:
-        # Auto: prefer NewsAPI when a key is configured, otherwise fall back to GDELT.
-        try:
-            _load_newsapi_config()
-            provider = "newsapi"
-        except Exception:
-            provider = DEFAULT_PROVIDER
+    provider_attempts: list[str]
+    if provider_env:
+        provider_attempts = [provider_env]
+    else:
+        file_path = (os.getenv("NEWS_CANDIDATES_FILE") or "").strip()
+        if file_path:
+            provider_attempts = ["file"]
+        else:
+            # Auto: prefer NewsAPI when a key is configured, then fall back to GDELT.
+            try:
+                _load_newsapi_config()
+                provider_attempts = ["newsapi", DEFAULT_PROVIDER]
+            except Exception:
+                provider_attempts = [DEFAULT_PROVIDER]
+    provider_attempts = list(dict.fromkeys(provider_attempts))
 
-    if provider not in ("gdelt", "newsapi"):
+    supported_providers = ("gdelt", "newsapi", "file")
+    unsupported = [p for p in provider_attempts if p not in supported_providers]
+    if unsupported:
         raise RuntimeError(
-            f"unsupported NEWS_PROVIDER={provider!r}; supported: gdelt, newsapi"
+            f"unsupported NEWS_PROVIDER={unsupported[0]!r}; supported: {', '.join(supported_providers)}"
         )
 
     default_query = (os.getenv("NEWS_QUERY_DEFAULT") or DEFAULT_QUERY).strip()
@@ -785,70 +837,90 @@ def fetch_daily_news_candidates(
     queries = [q for q in (hint_query, hint_en, default_query) if q]
 
     last_err: Optional[str] = None
+    provider_errors: list[str] = []
     chosen_query = default_query
+    chosen_provider = provider_attempts[0]
     candidates: list[NewsItem] = []
     used_time_range = False
-    for q in queries:
-        chosen_query = q
-        try:
-            if provider == "newsapi":
-                api_key, base_url = _load_newsapi_config()
-                sort_by = "relevancy" if q in (hint_query, hint_en) and q else "publishedAt"
-                raw = _newsapi_fetch_articles(
-                    api_key=api_key,
-                    base_url=base_url,
-                    query=q,
-                    from_iso=from_iso,
-                    to_iso=to_iso,
-                    sort_by=sort_by,
-                    page_size=max_records,
-                    timeout_s=timeout_s,
-                )
-                if not raw:
-                    # If today's time window yields no results (common in early hours),
-                    # fall back to an unbounded search and filter locally.
+    for provider in provider_attempts:
+        for q in queries:
+            chosen_provider = provider
+            chosen_query = q
+            try:
+                if provider == "newsapi":
+                    api_key, base_url = _load_newsapi_config()
+                    sort_by = "relevancy" if q in (hint_query, hint_en) and q else "publishedAt"
                     raw = _newsapi_fetch_articles(
                         api_key=api_key,
                         base_url=base_url,
                         query=q,
-                        from_iso=None,
-                        to_iso=None,
+                        from_iso=from_iso,
+                        to_iso=to_iso,
                         sort_by=sort_by,
                         page_size=max_records,
                         timeout_s=timeout_s,
                     )
-                in_today = []
-                for item in raw:
-                    seen = _parse_seendate_utc(item.seendate)
-                    if seen and start_dt <= seen <= end_dt:
-                        in_today.append(item)
-                candidates = in_today or raw
-                used_time_range = bool(in_today)
-                # If user provided a hint and nothing matches it, try the next query variant.
-                if hint_query and q != default_query and _best_relevance(candidates, q) <= 0.0:
-                    candidates = []
-            else:
-                candidates = _gdelt_fetch_articles(
-                    query=q,
-                    startdatetime=startdatetime,
-                    enddatetime=enddatetime,
-                    max_records=max_records,
-                    timeout_s=timeout_s,
-                )
-            if candidates:
-                candidates = _dedupe_candidates(candidates)
-                break
-        except Exception as exc:
-            last_err = str(exc)
-            candidates = []
+                    if not raw:
+                        # If today's time window yields no results (common in early hours),
+                        # fall back to an unbounded search and filter locally.
+                        raw = _newsapi_fetch_articles(
+                            api_key=api_key,
+                            base_url=base_url,
+                            query=q,
+                            from_iso=None,
+                            to_iso=None,
+                            sort_by=sort_by,
+                            page_size=max_records,
+                            timeout_s=timeout_s,
+                        )
+                    in_today = []
+                    for item in raw:
+                        seen = _parse_seendate_utc(item.seendate)
+                        if seen and start_dt <= seen <= end_dt:
+                            in_today.append(item)
+                    candidates = in_today or raw
+                    used_time_range = bool(in_today)
+                    # If user provided a hint and nothing matches it, try the next query variant.
+                    if hint_query and q != default_query and _best_relevance(candidates, q) <= 0.0:
+                        candidates = []
+                else:
+                    if provider == "gdelt":
+                        candidates = _gdelt_fetch_articles(
+                            query=q,
+                            startdatetime=startdatetime,
+                            enddatetime=enddatetime,
+                            max_records=max_records,
+                            timeout_s=timeout_s,
+                        )
+                        used_time_range = True
+                    else:
+                        file_path = (os.getenv("NEWS_CANDIDATES_FILE") or "").strip()
+                        if not file_path:
+                            raise RuntimeError("NEWS_CANDIDATES_FILE is required when NEWS_PROVIDER=file")
+                        candidates = _file_fetch_articles(
+                            path=file_path,
+                            max_records=max_records,
+                        )
+                        used_time_range = False
+                if candidates:
+                    candidates = _dedupe_candidates(candidates)
+                    break
+            except Exception as exc:
+                last_err = f"{provider}/{q}: {exc}"
+                provider_errors.append(last_err)
+                candidates = []
+        if candidates:
+            break
 
     if not candidates:
         raise RuntimeError(
-            f"no news returned (provider={provider}, query={chosen_query}, err={last_err})"
+            f"no news returned (providers={','.join(provider_attempts)}, query={chosen_query}, err={last_err})"
         )
 
     meta: dict[str, Any] = {
-        "provider": provider,
+        "provider": chosen_provider,
+        "provider_attempts": provider_attempts,
+        "provider_errors": provider_errors[-10:],
         "tz": tz_name,
         "query": chosen_query,
         "query_variants": queries,

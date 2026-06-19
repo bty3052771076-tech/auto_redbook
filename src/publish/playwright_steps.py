@@ -33,6 +33,7 @@ DRAFT_TEXTS = [
     "\u5b58\u8349\u7a3f",
     "\u5b58\u4e3a\u8349\u7a3f",
 ]
+DRAFT_TEXT_PRIORITY = {text: idx for idx, text in enumerate(DRAFT_TEXTS)}
 # Upload/processing hints shown around image thumbnails. Keep the more specific
 # ones first so we don't miss them when there are many partial matches.
 PROCESSING_TEXTS = [
@@ -79,7 +80,8 @@ SAVE_OK_TEXTS = [
 DRAFT_BOX_TEXT = "\u8349\u7a3f\u7bb1"
 DRAFT_ITEM_SELECTOR = ".draft-item"
 WAIT_TIMEOUT_MS = 300000
-UPLOAD_COUNT_PATTERN = re.compile(r"(\\d+)\\s*/\\s*18")
+UPLOAD_COUNT_PATTERN = re.compile(r"(\d+)\s*/\s*18")
+GENERIC_DRAFT_TITLES = {"", "\u6682\u65e0\u7b14\u8bb0\u6807\u9898", "\u65e0\u6807\u9898"}
 
 
 def _repo_root() -> Path:
@@ -93,9 +95,7 @@ def _resolve_profile_config() -> tuple[Path, Optional[str], list[str]]:
         if user_data_dir
         else _repo_root() / "data" / "browser" / "chrome-profile"
     )
-    channel = os.getenv("XHS_BROWSER_CHANNEL")
-    if not channel and not user_data_dir:
-        channel = "chrome"
+    channel = os.getenv("XHS_BROWSER_CHANNEL") or "chrome"
     profile_name = os.getenv("XHS_CHROME_PROFILE")
     args: list[str] = []
     if profile_name:
@@ -162,6 +162,65 @@ def _first_matching_locator(ctx, selectors: List[str]):
     return None
 
 
+def _commit_input_value(target, value: str) -> None:
+    """
+    Make framework-controlled fields observe the final value.
+
+    Some XHS inputs can read back correctly after Playwright.fill(), while the
+    Vue state that is persisted to drafts is still stale. Dispatching native
+    input/change/blur events after setting the DOM value keeps both layers in sync.
+    """
+    try:
+        target.evaluate(
+            """
+            (el, value) => {
+              const fire = (name, event) => el.dispatchEvent(event || new Event(name, { bubbles: true }));
+              if (el.getAttribute && el.getAttribute('contenteditable') === 'true') {
+                el.focus();
+                el.textContent = value;
+                fire('input', new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                fire('change');
+                fire('blur');
+                return;
+              }
+              const tag = (el.tagName || '').toLowerCase();
+              const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+              el.focus();
+              if (setter) setter.call(el, value);
+              else el.value = value;
+              fire('input', new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+              fire('change');
+              fire('blur');
+            }
+            """,
+            value,
+        )
+    except Exception:
+        pass
+
+
+def _trusted_type_value(target, value: str) -> bool:
+    """
+    Prefer real keyboard events for framework-controlled editors.
+
+    XHS can render Playwright.fill() values in the DOM/preview while the Vue state
+    used for draft persistence is still stale. Selecting all and typing the final
+    value produces trusted keyboard/input events, which makes the saved draft title
+    match the visible editor much more reliably.
+    """
+    try:
+        target.click()
+        target.press("Control+A")
+        delay_ms = int(os.getenv("XHS_TYPE_DELAY_MS") or 5)
+        target.type(value, delay=max(0, delay_ms))
+        _commit_input_value(target, value)
+        target.press("Tab")
+    except Exception:
+        return False
+    return _matches_value(_read_target_value(target), value)
+
+
 def _fill_if_found(locator, value: str) -> bool:
     if locator is None or locator.count() == 0:
         return False
@@ -174,8 +233,13 @@ def _fill_if_found(locator, value: str) -> bool:
         target.scroll_into_view_if_needed()
     except Exception:
         pass
+
+    if len(value or "") <= 1200 and _trusted_type_value(target, value):
+        return True
+
     target.click()
     target.fill(value)
+    _commit_input_value(target, value)
     try:
         target.press("Tab")
     except Exception:
@@ -186,6 +250,7 @@ def _fill_if_found(locator, value: str) -> bool:
     try:
         target.fill("")
         target.type(value, delay=20)
+        _commit_input_value(target, value)
         target.press("Tab")
     except Exception:
         pass
@@ -425,14 +490,232 @@ def _verify_title_body(page, title: str, body: str) -> tuple[bool, bool]:
     return title_ok, body_ok
 
 
+def _pick_draft_click_candidate(candidates: list[dict]) -> Optional[dict]:
+    def _priority(item: dict) -> tuple[int, int, int]:
+        text = str(item.get("text") or "")
+        text_rank = min(
+            [rank for draft_text, rank in DRAFT_TEXT_PRIORITY.items() if draft_text in text]
+            or [len(DRAFT_TEXT_PRIORITY)]
+        )
+        bottom = int(item.get("bottom") or item.get("y") or 0)
+        area = int(item.get("width") or 0) * int(item.get("height") or 0)
+        # Prefer the current sticky action bar near the bottom, then smaller clickable target.
+        return (text_rank, -bottom, area)
+
+    usable = []
+    for item in candidates or []:
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        if not any(draft_text in text for draft_text in DRAFT_TEXTS):
+            continue
+        try:
+            int(item.get("x") or 0)
+            int(item.get("y") or 0)
+        except Exception:
+            continue
+        usable.append(item)
+    if not usable:
+        return None
+    return sorted(usable, key=_priority)[0]
+
+
+def _bottom_draft_click_point(viewport_size: Optional[dict]) -> tuple[int, int]:
+    size = viewport_size or {}
+    width = int(size.get("width") or 1280)
+    height = int(size.get("height") or 720)
+    x = max(120, min(width - 120, int(width * 0.43)))
+    y = max(80, height - 45)
+    return x, y
+
+
 def _click_draft(page) -> tuple[bool, str]:
-    page.evaluate("window.scrollTo(0, 0)")
-    for text in DRAFT_TEXTS:
-        if _click_first(page.get_by_role("button", name=text)):
-            return True, f"button:{text}"
-    for text in DRAFT_TEXTS:
-        if _click_first(page.locator(f"button:has-text('{text}')")):
-            return True, f"button-text:{text}"
+    def _visible_button_texts() -> list[str]:
+        script = """
+        () => {
+          const visible = (el) => {
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style && style.visibility !== 'hidden' && style.display !== 'none'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const nodes = Array.from(document.querySelectorAll('button, [role="button"], .d-button, .btn'));
+          return nodes
+            .filter(visible)
+            .map(el => (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' '))
+            .filter(Boolean)
+            .slice(0, 40);
+        }
+        """
+        try:
+            values = page.evaluate(script)
+        except Exception:
+            return []
+        return [str(v) for v in values if str(v).strip()]
+
+    def _collect_draft_text_candidates() -> list[dict]:
+        script = """
+        (texts) => {
+          const visible = (el) => {
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style && style.visibility !== 'hidden' && style.display !== 'none'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const out = [];
+          const nodes = Array.from(document.querySelectorAll('body *'));
+          for (const el of nodes) {
+            if (!visible(el)) continue;
+            const value = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
+            if (!value || value.includes('发布') && !texts.some(t => value.includes(t))) continue;
+            const matched = texts.find(t => value.includes(t));
+            if (!matched) continue;
+            const target = el.closest('button,[role="button"],a,[class*="button"],[class*="btn"]') || el;
+            if (!visible(target)) continue;
+            const rect = target.getBoundingClientRect();
+            out.push({
+              text: matched,
+              x: Math.round(rect.left + rect.width / 2),
+              y: Math.round(rect.top + rect.height / 2),
+              bottom: Math.round(rect.bottom),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height)
+            });
+          }
+          return out.slice(0, 80);
+        }
+        """
+        try:
+            values = page.evaluate(script, DRAFT_TEXTS)
+        except Exception:
+            return []
+        return [v for v in values if isinstance(v, dict)]
+
+    def _click_ranked_candidate(prefix: str) -> tuple[bool, str]:
+        picked = _pick_draft_click_candidate(_collect_draft_text_candidates())
+        if not picked:
+            return False, ""
+        try:
+            x = int(picked.get("x") or 0)
+            y = int(picked.get("y") or 0)
+            page.mouse.click(x, y)
+            return True, f"{prefix}:ranked-text:{picked.get('text')}:x={x},y={y}"
+        except Exception:
+            return False, ""
+
+    def _click_direct_candidates(prefix: str) -> tuple[bool, str]:
+        for text in DRAFT_TEXTS:
+            if _click_first(page.get_by_role("button", name=text)):
+                return True, f"{prefix}:role-button:{text}"
+        for text in DRAFT_TEXTS:
+            selectors = [
+                f"button:has-text('{text}')",
+                f"[role='button']:has-text('{text}')",
+                f".d-button:has-text('{text}')",
+            ]
+            for sel in selectors:
+                if _click_first(page.locator(sel)):
+                    return True, f"{prefix}:{sel}"
+        return False, ""
+
+    def _click_by_text_js(prefix: str) -> tuple[bool, str]:
+        script = """
+        (texts) => {
+          const visible = (el) => {
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style && style.visibility !== 'hidden' && style.display !== 'none'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const selectors = ['button', '[role="button"]', '.d-button', '.btn'];
+          const candidates = Array.from(document.querySelectorAll(selectors.join(',')));
+          for (const text of texts) {
+            for (const el of candidates) {
+              const value = (el.innerText || el.textContent || '').trim();
+              if (!value.includes(text) || !visible(el)) continue;
+              el.scrollIntoView({ block: 'center', inline: 'center' });
+              el.click();
+              return text;
+            }
+            const textMatches = Array.from(document.querySelectorAll('body *'))
+              .filter(el => {
+                const value = (el.innerText || el.textContent || '').trim();
+                if (!value.includes(text) || !visible(el)) return false;
+                return true;
+              })
+              .sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return (ar.width * ar.height) - (br.width * br.height);
+              });
+            if (textMatches.length) {
+              const el = textMatches[0];
+              const target = el.closest('button,[role="button"],a,[class*="button"],[class*="btn"]') || el;
+              target.scrollIntoView({ block: 'center', inline: 'center' });
+              target.click();
+              return text;
+            }
+          }
+          return '';
+        }
+        """
+        try:
+            clicked = page.evaluate(script, DRAFT_TEXTS)
+        except Exception:
+            clicked = ""
+        if clicked:
+            return True, f"{prefix}:js-text:{clicked}"
+        return False, ""
+
+    try:
+        x, y = _bottom_draft_click_point(page.viewport_size)
+        page.mouse.click(x, y)
+        return True, f"coordinate-bottom-draft:x={x},y={y}"
+    except Exception:
+        pass
+
+    ok, detail = _click_ranked_candidate("current")
+    if ok:
+        return True, detail
+    ok, detail = _click_direct_candidates("current")
+    if ok:
+        return True, detail
+    ok, detail = _click_by_text_js("current")
+    if ok:
+        return True, detail
+
+    for prefix, scroll_script in (
+        (
+            "bottom",
+            """
+            (() => {
+              const root = document.scrollingElement || document.documentElement || document.body;
+              if (root) root.scrollTop = root.scrollHeight;
+              window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+              for (const el of Array.from(document.querySelectorAll('*'))) {
+                if (el.scrollHeight > el.clientHeight + 20) {
+                  el.scrollTop = el.scrollHeight;
+                }
+              }
+            })()
+            """,
+        ),
+        ("top", "window.scrollTo(0, 0)"),
+    ):
+        try:
+            page.evaluate(scroll_script)
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+        ok, detail = _click_ranked_candidate(prefix)
+        if ok:
+            return True, detail
+        ok, detail = _click_direct_candidates(prefix)
+        if ok:
+            return True, detail
+        ok, detail = _click_by_text_js(prefix)
+        if ok:
+            return True, detail
 
     publish_candidates = [
         page.get_by_role("button", name="\u53d1\u5e03"),
@@ -444,7 +727,13 @@ def _click_draft(page) -> tuple[bool, str]:
     for text in DRAFT_TEXTS:
         if _click_first(page.locator(f"button:has-text('{text}')")):
             return True, f"menu:{text}"
-    return False, "draft button not found"
+    try:
+        x, y = _bottom_draft_click_point(page.viewport_size)
+        page.mouse.click(x, y)
+        return True, f"coordinate-bottom-draft:x={x},y={y}"
+    except Exception:
+        pass
+    return False, f"draft button not found; visible_buttons={_visible_button_texts()}"
 
 
 def _click_first(locator, *, force: bool = False, timeout_ms: int | None = None) -> bool:
@@ -642,7 +931,7 @@ def _confirm_delete_dialog(page, timeout_s: float = 3.0) -> bool:
 
 
 def _verify_draft_item(page, title: str) -> bool:
-    return _draft_item_has_cover(page, title)
+    return _draft_item_exists(page, title) and _draft_item_has_cover(page, title)
 
 
 def _extract_draft_count(page) -> Optional[int]:
@@ -673,6 +962,45 @@ def _extract_upload_count(page) -> Optional[int]:
     return int(match.group(1))
 
 
+def _title_match_terms(title: str) -> list[str]:
+    text = (title or "").strip()
+    if not text:
+        return []
+    for sep in ("｜", "|", " - ", "—", "：", ":"):
+        if sep in text:
+            tail = text.split(sep, 1)[1].strip()
+            if tail:
+                text = tail
+                break
+    text = re.sub(r"^(?:每日新闻|每日假新闻)[\s｜|:：\-—]*", "", text).strip()
+    parts = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", text)
+    terms: list[str] = []
+    for part in parts:
+        value = part.strip()
+        if not value or value in ("每日新闻", "每日假新闻"):
+            continue
+        if value not in terms:
+            terms.append(value)
+    if not terms and text and text not in ("每日新闻", "每日假新闻"):
+        terms.append(text)
+    return terms[:4]
+
+
+def _draft_title_matches_expected(actual: str, expected: str) -> bool:
+    actual_text = (actual or "").strip()
+    if actual_text in GENERIC_DRAFT_TITLES:
+        return False
+    expected_text = (expected or "").strip()
+    if not actual_text or not expected_text:
+        return False
+    if actual_text == expected_text:
+        return True
+    terms = _title_match_terms(expected_text)
+    if not terms:
+        return expected_text[:6] in actual_text
+    return any(term and term in actual_text for term in terms)
+
+
 def _count_uploaded_images(page) -> int:
     total = 0
     for sel in ("img[src^='blob:']", "img[src^='data:']"):
@@ -698,17 +1026,22 @@ def _wait_for_upload_ready(page, expected: int, timeout_ms: int = 120000) -> boo
 
 
 def _draft_item_has_cover(page, title: str) -> bool:
-    snippet = (title or "").strip()[:6]
     return bool(
         page.evaluate(
             """
-            (snippet) => {
+            ({expected, terms, genericTitles}) => {
               const items = Array.from(document.querySelectorAll('.draft-item'));
               if (!items.length) return false;
-              const match = snippet
-                ? items.filter(item => item.textContent && item.textContent.includes(snippet))
-                : [];
-              if (snippet && !match.length) return false;
+              const generic = new Set(genericTitles || []);
+              const titleMatches = (item) => {
+                const titleEl = item.querySelector('.draft-title-text');
+                const title = titleEl ? (titleEl.textContent || '').trim() : '';
+                if (!title || generic.has(title)) return false;
+                if (expected && title === expected) return true;
+                return (terms || []).some(term => term && title.includes(term));
+              };
+              const match = items.filter(titleMatches);
+              if (!match.length) return false;
               const candidates = match.length ? match : [items[0]];
               const hasCover = (item) => {
                 const img = item.querySelector('img.content, .draft-cover img');
@@ -722,24 +1055,37 @@ def _draft_item_has_cover(page, title: str) -> bool:
               return candidates.some(hasCover);
             }
             """,
-            snippet,
+            {
+                "expected": (title or "").strip(),
+                "terms": _title_match_terms(title),
+                "genericTitles": sorted(GENERIC_DRAFT_TITLES),
+            },
         )
     )
 
 
 def _draft_item_exists(page, title: str) -> bool:
-    snippet = (title or "").strip()[:6]
     return bool(
         page.evaluate(
             """
-            (snippet) => {
+            ({expected, terms, genericTitles}) => {
               const items = Array.from(document.querySelectorAll('.draft-item'));
               if (!items.length) return false;
-              if (!snippet) return true;
-              return items.some(item => (item.textContent || '').includes(snippet));
+              const generic = new Set(genericTitles || []);
+              return items.some(item => {
+                const titleEl = item.querySelector('.draft-title-text');
+                const title = titleEl ? (titleEl.textContent || '').trim() : '';
+                if (!title || generic.has(title)) return false;
+                if (expected && title === expected) return true;
+                return (terms || []).some(term => term && title.includes(term));
+              });
             }
             """,
-            snippet,
+            {
+                "expected": (title or "").strip(),
+                "terms": _title_match_terms(title),
+                "genericTitles": sorted(GENERIC_DRAFT_TITLES),
+            },
         )
     )
 
@@ -1220,9 +1566,19 @@ def run_save_draft_sync(
 
                 _step("verify_title_body", "in_progress", "")
                 v_title, v_body = _verify_title_body(page, post.title, post.body)
+                fill_settle_s = float(os.getenv("XHS_FILL_SETTLE_S") or 2.0)
+                if v_title and v_body and fill_settle_s > 0:
+                    time.sleep(fill_settle_s)
+                    v_title, v_body = _verify_title_body(page, post.title, post.body)
                 steps[-1].detail = f"title={v_title} body={v_body}"
                 if not (v_title and v_body):
                     raise RuntimeError("title/body not filled")
+                steps[-1].status = "success"
+
+                _step("snapshot_after_fill", "in_progress", "")
+                after_fill = ev_dir / "after_fill.png"
+                page.screenshot(path=str(after_fill), full_page=True)
+                steps[-1].detail = f"saved to {after_fill}"
                 steps[-1].status = "success"
 
                 _step("save_draft", "in_progress", "")
@@ -1290,79 +1646,66 @@ def run_save_draft_sync(
                     raise RuntimeError("draft save verification failed")
                 steps[-1].status = "success"
 
-                # From here on, draft-box navigation is best-effort. If the UI changes,
-                # keep the saved result but leave evidence for manual verification.
-                exec_rec.result = "saved_draft"
+                _step("open_draft_box", "in_progress", "")
+                opened = _open_draft_box(page)
+                steps[-1].detail = f"opened={opened}"
+                if not opened:
+                    raise RuntimeError("draft box not opened after save")
+                steps[-1].status = "success"
 
+                _step("open_draft_tab", "in_progress", "")
+                opened_tab = _open_image_draft_tab(page)
+                steps[-1].detail = f"opened={opened_tab}"
+                if not opened_tab:
+                    raise RuntimeError("image draft tab not opened after save")
+                steps[-1].status = "success"
+
+                _step("wait_for_draft_items", "in_progress", "")
                 try:
-                    _step("open_draft_box", "in_progress", "")
-                    opened = _open_draft_box(page)
-                    steps[-1].detail = f"opened={opened}"
-                    if not opened:
-                        steps[-1].status = "skipped"
-                        return exec_rec
+                    page.locator(DRAFT_ITEM_SELECTOR).first.wait_for(timeout=30000)
+                    steps[-1].detail = "ready"
                     steps[-1].status = "success"
+                except PlaywrightTimeoutError:
+                    raise RuntimeError("draft items not visible after save")
 
-                    _step("open_draft_tab", "in_progress", "")
-                    opened_tab = _open_image_draft_tab(page)
-                    steps[-1].detail = f"opened={opened_tab}"
-                    if not opened_tab:
-                        steps[-1].status = "skipped"
-                        return exec_rec
-                    steps[-1].status = "success"
-
-                    _step("wait_for_draft_items", "in_progress", "")
-                    try:
-                        page.locator(DRAFT_ITEM_SELECTOR).first.wait_for(timeout=30000)
-                        steps[-1].detail = "ready"
-                        steps[-1].status = "success"
-                    except PlaywrightTimeoutError:
-                        steps[-1].detail = "timeout"
-                        steps[-1].status = "skipped"
-                        return exec_rec
-
-                    _step("wait_for_draft_cover", "in_progress", "")
-                    cover_ready = False
-                    try:
-                        cover_ready = _wait_for_draft_cover(page, post.title)
-                        steps[-1].detail = f"ready={cover_ready}"
-                        steps[-1].status = "success"
-                    except Exception as exc:
-                        steps[-1].detail = f"error: {exc}"
-                        steps[-1].status = "skipped"
-
-                    _step("snapshot_draft_box", "in_progress", "")
-                    try:
-                        draft_shot = ev_dir / "draft_box.png"
-                        page.screenshot(path=str(draft_shot), full_page=True)
-                        steps[-1].detail = f"saved to {draft_shot}"
-                        steps[-1].status = "success"
-                    except Exception as exc:
-                        steps[-1].detail = f"error: {exc}"
-                        steps[-1].status = "skipped"
-
-                    _step("html_draft_box", "in_progress", "")
-                    try:
-                        draft_html = ev_dir / "draft_box.html"
-                        draft_html.write_text(page.content(), encoding="utf-8")
-                        steps[-1].detail = f"saved to {draft_html}"
-                        steps[-1].status = "success"
-                    except Exception as exc:
-                        steps[-1].detail = f"error: {exc}"
-                        steps[-1].status = "skipped"
-
-                    _step("verify_draft_box_item", "in_progress", "")
-                    try:
-                        verified = _verify_draft_item(page, post.title)
-                        steps[-1].detail = f"verified={verified} cover_ready={cover_ready}"
-                        steps[-1].status = "success" if (verified and cover_ready) else "skipped"
-                    except Exception as exc:
-                        steps[-1].detail = f"error: {exc}"
-                        steps[-1].status = "skipped"
+                _step("wait_for_draft_cover", "in_progress", "")
+                cover_ready = False
+                try:
+                    cover_ready = _wait_for_draft_cover(page, post.title)
+                    steps[-1].detail = f"ready={cover_ready}"
+                    steps[-1].status = "success" if cover_ready else "skipped"
                 except Exception as exc:
-                    # Do not fail the whole run after the draft has already been saved.
-                    _step("draft_box_optional", "skipped", f"error: {exc}")
-                    return exec_rec
+                    steps[-1].detail = f"error: {exc}"
+                    steps[-1].status = "skipped"
+
+                _step("snapshot_draft_box", "in_progress", "")
+                try:
+                    draft_shot = ev_dir / "draft_box.png"
+                    page.screenshot(path=str(draft_shot), full_page=True)
+                    steps[-1].detail = f"saved to {draft_shot}"
+                    steps[-1].status = "success"
+                except Exception as exc:
+                    steps[-1].detail = f"error: {exc}"
+                    steps[-1].status = "skipped"
+
+                _step("html_draft_box", "in_progress", "")
+                try:
+                    draft_html = ev_dir / "draft_box.html"
+                    draft_html.write_text(page.content(), encoding="utf-8")
+                    steps[-1].detail = f"saved to {draft_html}"
+                    steps[-1].status = "success"
+                except Exception as exc:
+                    steps[-1].detail = f"error: {exc}"
+                    steps[-1].status = "skipped"
+
+                _step("verify_draft_box_item", "in_progress", "")
+                verified_title = _draft_item_exists(page, post.title)
+                verified_cover = _draft_item_has_cover(page, post.title) if verified_title else False
+                steps[-1].detail = f"verified_title={verified_title} cover_ready={verified_cover}"
+                if not verified_title:
+                    raise RuntimeError("draft title not found after save")
+                steps[-1].status = "success"
+                exec_rec.result = "saved_draft"
             finally:
                 if should_close_context:
                     context.close()

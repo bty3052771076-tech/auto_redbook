@@ -3,8 +3,8 @@
 本项目用于在本地生成小红书图文内容，并通过 Playwright 自动保存为草稿（不发布）。
 
 ## 免费运行说明（默认配置即可）
-- 文案生成：优先使用阿里云百炼（DeepSeek-V3.2，OpenAI 兼容接口）
-- 图片生成：使用阿里云百炼文生图（Qwen-Image / 通义万相 / Z-Image）
+- 文案生成：优先使用阿里云百炼（默认 `qwen3.7-plus`，OpenAI 兼容接口），可切换 ppinfra
+- 图片来源：默认可用 Pexels 自动配图；也可手动切换阿里云百炼文生图（默认 `wan2.7-image`）
 - 新闻来源：默认可使用 GDELT（无需 key 的免费新闻源）
 - 费用说明：上述能力在**免费额度内可运行**；若超出平台免费额度会产生计费，请自行关注控制台余额/配额
 
@@ -27,11 +27,13 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
 # 1) 安装依赖与浏览器（首次）
+$env:PIP_CACHE_DIR=(Resolve-Path ".").Path + "\.pip-cache"
+$env:PLAYWRIGHT_BROWSERS_PATH=(Resolve-Path ".").Path + "\.playwright-browsers"
 pip install -r requirements.txt
 python -m playwright install chromium
 
 # 2) 配置密钥（推荐用环境变量）
-#   - ALIYUN_LLM_API_KEY：生成文案（推荐，Aliyun DeepSeek-V3.2）
+#   - ALIYUN_LLM_API_KEY：生成文案（推荐，Aliyun qwen3.7-plus）
 #   - LLM_API_KEY：生成文案（可选：作为阿里云无额度时的备用）
 #   - ALIYUN_IMAGE_API_KEY：生图（可与 LLM 共用同一把 DashScope Key）
 #   - NEWS_API_KEY：每日新闻（可选；不配则回退到无需 key 的新闻源）
@@ -49,7 +51,9 @@ python -m playwright install chromium
 ```powershell
 .\.venv\Scripts\python -m apps.gui
 ```
-GUI 内置常用工作流页签：`auto` / `create` / `approve` / `run（仅上传）` / `delete-drafts`。
+GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、配图来源（Pexels / 阿里云）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，便于确认每个帖子的标题后再审核或上传。
+
+更多说明见：`docs/模型与GUI供应商配置.md`。
 
 ### 打包成 exe（可选）
 ```powershell
@@ -81,9 +85,11 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
 # 2) 安装依赖
+$env:PIP_CACHE_DIR=(Resolve-Path ".").Path + "\.pip-cache"
 pip install -r requirements.txt
 
 # 3) 安装 Playwright 浏览器
+$env:PLAYWRIGHT_BROWSERS_PATH=(Resolve-Path ".").Path + "\.playwright-browsers"
 python -m playwright install chromium
 ```
 
@@ -92,20 +98,22 @@ python -m playwright install chromium
 - 推荐使用环境变量（更安全），或仅在本机创建 `docs/*api-key.md`（不要提交）。
 
 LLM（生成文案）：
-- 主用（阿里云百炼 / DashScope，DeepSeek-V3.2）：
+- 主用（阿里云百炼 / DashScope，默认 `qwen3.7-plus`）：
   - 环境变量：`ALIYUN_LLM_API_KEY`（或 `ALIYUN_IMAGE_API_KEY` / `DASHSCOPE_API_KEY`）
   - 可选：`ALIYUN_LLM_MODELS`（文本模型候选列表，逗号/空格分隔，按顺序尝试；优先于 `ALIYUN_LLM_MODEL`）
-  - 可选：`ALIYUN_LLM_MODEL`（单个文本模型，默认 `deepseek-v3.2`；仅在未设置 `ALIYUN_LLM_MODELS` 时使用）
+  - 可选：`ALIYUN_LLM_MODEL`（单个文本模型，默认 `qwen3.7-plus`；仅在未设置 `ALIYUN_LLM_MODELS` 时使用）
   - 可选：`ALIYUN_LLM_BASE_URL`（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）
-- 备用（原 OpenAI 兼容提供商）：
+- 备用（ppinfra / OpenAI 兼容提供商）：
   - 环境变量：`LLM_API_KEY`，可选 `LLM_MODEL` / `LLM_BASE_URL`
   - 或本机文件：复制 `docs/llm_api-key.example.md` 为 `docs/llm_api-key.md` 并填写
-- 说明：若同时配置主用与备用，阿里云优先；当出现额度/限流/模型不可用等错误时自动回退
+- 可选：`LLM_PROVIDER=auto|aliyun|ppinfra`。`auto` 表示阿里云优先；当出现额度/限流/模型不可用等错误时自动回退到 ppinfra。
+- 阿里云免费模型完整列表见：`docs/模型与GUI供应商配置.md`
 
 NewsAPI（“每日新闻”）：
 - 环境变量：`NEWS_API_KEY`（或 `NEWSAPI_API_KEY`），可选 `NEWS_BASE_URL`
 - 或本机文件：复制 `docs/news_api-key.example.md` 为 `docs/news_api-key.md` 并填写
 - 无需 key 的免费新闻源：`GDELT`（设置 `NEWS_PROVIDER=gdelt` 或不配置 key 时自动回退）
+- 已核验候选文件：`NEWS_PROVIDER=file` + `NEWS_CANDIDATES_FILE=data/news/xxx.json`，适合 NewsAPI/GDELT 临时不可用、但仍需要使用真实来源新闻完成自动生成与草稿保存时使用
 - 中国/海外新闻比例：默认偏向中国新闻，约 6:4（可用 `NEWS_CHINA_RATIO=0.6` 调整；仅影响“每日新闻”候选排序/挑选）
 
 Pexels（自动配图：当未提供图片素材时）：
@@ -179,6 +187,11 @@ $env:NEWS_PROVIDER="newsapi"
 # 无提示词：默认生成 1 条，可用 --count 调整
 .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --assets-glob "assets/pics/*" --login-hold 600
 .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --assets-glob "assets/pics/*" --count 3 --login-hold 600
+
+# 外部新闻 API 临时不可用时：使用已核验 JSON 候选文件
+$env:NEWS_PROVIDER="file"
+$env:NEWS_CANDIDATES_FILE="data/news/manual_candidates_20260619.json"
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "科技、社会或国际新闻" --assets-glob "assets/empty/*" --count 5 --login-hold 0 --wait-timeout 300 --force
 ```
 
 ### 3) 无图片上传 → Pexels 自动配图 → 保存草稿
@@ -268,14 +281,13 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 - 或本机文件：复制 `docs/aliyun_image_api-key.example.md` 为 `docs/aliyun_image_api-key.md` 并填写（已被 `.gitignore` 忽略）
 
 支持模型（文生图，模型名以百炼控制台为准，均使用同一把 API Key）：
-- Qwen-Image：`qwen-image-plus-2026-01-09` / `qwen-image-max` / `qwen-image`
-- Z-Image：`z-image-turbo`
-- 通义万相：`wan2.6-t2i` / `wan2.6-image` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等
+- 通义万相 2.7：`wan2.7-image` / `wan2.7-image-pro`（GUI 内置，默认 `wan2.7-image`）
+- 兼容旧模型：`qwen-image-plus-2026-01-09` / `qwen-image-max` / `qwen-image` / `z-image-turbo` / `wan2.6-t2i` / `wan2.6-image` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等
 - 说明：本流程仅使用“文生图”模型；`i2v`/`t2v`/`edit`/`mt-image` 会被自动跳过
 
 常用可选参数（环境变量）：
 - `ALIYUN_IMAGE_MODELS`：生图模型候选列表（逗号/空格分隔，按顺序尝试；优先于 `ALIYUN_IMAGE_MODEL`）
-- `ALIYUN_IMAGE_MODEL`：生图模型（默认 `qwen-image-plus-2026-01-09`；仅在未设置 `ALIYUN_IMAGE_MODELS` 时使用）
+- `ALIYUN_IMAGE_MODEL`：生图模型（默认 `wan2.7-image`；仅在未设置 `ALIYUN_IMAGE_MODELS` 时使用）
 - `ALIYUN_IMAGE_SIZE`：尺寸（默认 `1104*1472`，3:4 竖图）
 - `ALIYUN_IMAGE_TIMEOUT_S`：单次生图请求超时（默认 `180`）
 - `ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S`：下载生成图片超时（默认 `60`）
@@ -300,11 +312,11 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 # 仅需配置阿里云 Key（用于 LLM + 生图）
 $env:ALIYUN_LLM_API_KEY="YOUR_DASHSCOPE_KEY"
 # 可选：按顺序尝试多个文本模型（优先于 ALIYUN_LLM_MODEL）
-$env:ALIYUN_LLM_MODELS="kimi-k2.5,qwen3-max-2026-01-23"
+$env:ALIYUN_LLM_MODELS="qwen3.7-plus,deepseek-v4-flash,qwen3.6-flash"
 $env:ALIYUN_IMAGE_API_KEY="YOUR_DASHSCOPE_KEY"
 $env:NEWS_PROVIDER="gdelt"
 $env:IMAGE_PROVIDER="aliyun"
-$env:ALIYUN_IMAGE_MODELS="qwen-image-plus-2026-01-09,qwen-image-max,qwen-image,wan2.6-t2i,wan2.6-image,z-image-turbo"
+$env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro"
 
 .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 10 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
@@ -312,12 +324,12 @@ $env:ALIYUN_IMAGE_MODELS="qwen-image-plus-2026-01-09,qwen-image-max,qwen-image,w
 
 **每日新闻一行版（无本地图片 → 阿里云生图 → 保存草稿）**
 ```powershell
-$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="qwen-image-plus-2026-01-09,qwen-image-max,qwen-image,wan2.6-t2i,wan2.6-image,z-image-turbo"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
+$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
 
 **每日假新闻一行版（无本地图片 → 阿里云生图 → 保存草稿）**
 ```powershell
-$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="qwen-image-plus-2026-01-09,qwen-image-max,qwen-image,wan2.6-t2i,wan2.6-image,z-image-turbo"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
+$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
 
 ## 删除草稿（危险操作）
@@ -364,6 +376,9 @@ E2E 测试（需要已配置阿里云百炼 key；可选 `--cdp` 复用你已打
 - 阿里云生图报错 `AllocationQuota.FreeTierOnly`：说明免费额度已耗尽；请改用本地图片/PEXELS，或在百炼控制台开通计费/提升配额后重试。
 
 ## 相关文档（docs）
+- `docs/使用说明-自动新闻生成与草稿发布.md`
+- `docs/新闻中文化与GUI草稿状态修复-2026-06-19.md`
+- `docs/模型与GUI供应商配置.md`
 - `docs/工作流新闻任务书.md`
 - `docs/图片查找功能.md`
 - `docs/增加图片api后的错误修正任务书.md`

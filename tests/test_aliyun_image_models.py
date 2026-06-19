@@ -138,6 +138,42 @@ def test_wan26_forces_n_to_1(monkeypatch, tmp_path: Path):
     assert res.path.suffix == ".png"
 
 
+def test_wan27_image_uses_multimodal_sync(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("ALIYUN_IMAGE_API_KEY", "dummy")
+    monkeypatch.setenv("ALIYUN_IMAGE_BASE_URL", "https://example.com")
+    monkeypatch.setenv("ALIYUN_IMAGE_MODEL", "wan2.7-image")
+
+    seen: dict[str, object] = {}
+
+    def fake_post_json(*, url, payload, headers, timeout_s):
+        seen["url"] = url
+        seen["payload"] = payload
+        return {
+            "output": {
+                "choices": [
+                    {"message": {"content": [{"image": "https://example.com/out.png"}]}}
+                ]
+            },
+            "request_id": "req",
+        }
+
+    def fake_download_bytes(*, url, timeout_s):
+        return b"\x89PNG\r\n\x1a\n" + b"x" * 64
+
+    monkeypatch.setattr(aliyun_images, "_http_post_json", fake_post_json)
+    monkeypatch.setattr(aliyun_images, "_download_bytes", fake_download_bytes)
+
+    res = aliyun_images.generate_aliyun_image(post_id="p", prompt="hi", dest_dir=tmp_path)
+
+    assert str(seen["url"]).endswith("/api/v1/services/aigc/multimodal-generation/generation")
+    payload = seen["payload"]
+    assert isinstance(payload, dict)
+    assert payload["model"] == "wan2.7-image"
+    assert payload["parameters"]["n"] == 1
+    assert res.meta["method"] == "multimodal_generation_sync"
+    assert res.meta["model"] == "wan2.7-image"
+
+
 def test_z_image_does_not_send_negative_prompt(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ALIYUN_IMAGE_API_KEY", "dummy")
     monkeypatch.setenv("ALIYUN_IMAGE_BASE_URL", "https://example.com")

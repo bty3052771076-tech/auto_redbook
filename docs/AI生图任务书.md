@@ -58,7 +58,7 @@ Key 配置（二选一）：
 
 可选参数（环境变量）：
 - `ALIYUN_IMAGE_MODELS`：生图模型候选列表（逗号/空格分隔，按顺序尝试；优先于 `ALIYUN_IMAGE_MODEL`）
-- `ALIYUN_IMAGE_MODEL`：默认 `qwen-image-plus-2026-01-09`（仅在未设置 `ALIYUN_IMAGE_MODELS` 时使用）
+- `ALIYUN_IMAGE_MODEL`：默认 `wan2.7-image`（仅在未设置 `ALIYUN_IMAGE_MODELS` 时使用）
 - `ALIYUN_IMAGE_SIZE`：默认 `1104*1472`
 - `ALIYUN_IMAGE_TIMEOUT_S`：默认 `180`
 - `ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S`：默认 `60`
@@ -67,6 +67,7 @@ Key 配置（二选一）：
 - `ALIYUN_IMAGE_CALL_MODE`：`auto` / `sync` / `async` / `text2image`（默认 `auto`）
 
 支持模型（文生图，模型名以百炼控制台为准，均使用同一把 API Key）：
+- 通义万相 2.7：`wan2.7-image` / `wan2.7-image-pro`（GUI 内置，默认 `wan2.7-image`）
 - Qwen-Image：`qwen-image-plus-2026-01-09` / `qwen-image-max` / `qwen-image`
 - Z-Image：`z-image-turbo`
 - 通义万相：`wan2.6-t2i` / `wan2.6-image` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等

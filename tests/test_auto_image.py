@@ -1,7 +1,9 @@
 from src.images.auto_image import (
     ImageItem,
     _build_aliyun_image_prompt,
+    _download_image,
     _pexels_query_hint,
+    _pexels_search_photos,
     build_image_query,
     is_auto_image_enabled,
     pick_best_image,
@@ -199,6 +201,65 @@ def test_pick_top_images_respects_exclude_ids():
     ]
     picked = pick_top_images(items, "coffee", count=1, exclude_ids={"1"})
     assert picked[0].id == "2"
+
+
+def test_pexels_search_uses_explicit_https_context(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"photos":[]}'
+
+    def fake_urlopen(req, **kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    _pexels_search_photos(
+        api_key="key",
+        base_url="https://api.pexels.com",
+        query="lifestyle",
+        per_page=1,
+        orientation="portrait",
+        timeout_s=1,
+    )
+
+    assert captured.get("context") is not None
+
+
+def test_download_image_uses_explicit_https_context(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b"image-bytes"
+
+    def fake_urlopen(req, **kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    _download_image(
+        url="https://images.pexels.com/photos/test.jpg",
+        dest_path=tmp_path / "test.jpg",
+        timeout_s=1,
+    )
+
+    assert captured.get("context") is not None
 
 
 def test_build_aliyun_image_prompt_forbids_text():

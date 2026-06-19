@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $venvPy = Join-Path $root ".venv\\Scripts\\python.exe"
+$env:PIP_CACHE_DIR = Join-Path $root ".pip-cache"
 
 if (!(Test-Path $venvPy)) {
   Write-Host "ERROR: venv python not found: $venvPy"
@@ -33,4 +34,3 @@ Copy-Item -Force $distExe $rootExe
 Write-Host ""
 Write-Host "OK: $rootExe"
 Write-Host "Tip: place this exe in the repo root so it can find .venv and run the CLI."
-
