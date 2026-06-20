@@ -1,5 +1,20 @@
 # CODING_PROGRESS
 
+### 2026-06-20 10:11
+**Task:** Add README quick-use section and back up the previous version before upload.
+**Git:** `main (dirty)`; `README.md` modified after pushing backup branch/tag `pre-readme-quickuse-20260620-101059`.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `README.md` | DONE | Added `快速使用` with required 小红书账号、阿里云账号（LLM/VLM/图像能力）和 Python 环境； included workspace-local setup, Aliyun env vars, GUI launch, and one CLI news command. Also updated quick-start comments from Pexels-default to Aliyun-default. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry after invoking the file-progress-followup workflow. | Keep updating after future coding/docs work. |
+
+**Notes**
+- Backup: pushed branch `backup/pre-readme-quickuse-20260620-101059` and tag `pre-readme-quickuse-20260620-101059`, both pointing to pre-change commit `a912802`.
+- Tests/Lint: README inspected with `Get-Content`; `git diff --check` passed. No Python tests were run because this is documentation-only.
+- Risks/Assumptions: The README uses placeholder key values only; real API keys remain excluded by `.gitignore`.
+- Next steps: Commit and push the README quick-use update to `main`.
+
 ### 2026-06-20 10:06
 **Task:** Tighten daily-news title/prompt/source-grounding rules and improve GUI defaults, profile login, and Beijing-time draft display.
 **Git:** `main (dirty)`; modified news workflow, GUI, tests, README/docs; added one repair note.

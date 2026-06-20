@@ -10,6 +10,47 @@
 
 > ⚠️ 费用/额度风险提示：请务必在阿里云百炼控制台确认你的**免费额度**与**到期时间**。超出免费额度后将产生计费，建议在运行前检查余额/配额并设置合理的调用频率。
 
+## 快速使用
+运行前请先准备好这三类环境：
+
+- 小红书账号：用于登录小红书创作服务平台。本项目不会绕过登录/验证码，首次使用请在 GUI 中点击 `登录/检查Profile`，或运行时设置较长 `--login-hold` 完成扫码/验证。
+- 阿里云账号：用于阿里云百炼 / DashScope 免费额度，当前默认用于 LLM 文案生成和 VLM/图像生成能力。建议在百炼控制台确认 `qwen3.7-plus`、`wan2.7-image` 等模型的免费额度、到期时间和 API Key。
+- Python 环境：推荐 Python 3.10+。所有依赖、pip 缓存和 Playwright 浏览器都建议放在当前工作区，避免安装到 C 盘。
+
+首次初始化（PowerShell）：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+$env:PIP_CACHE_DIR=(Resolve-Path ".").Path + "\.pip-cache"
+$env:PLAYWRIGHT_BROWSERS_PATH=(Resolve-Path ".").Path + "\.playwright-browsers"
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+配置阿里云 Key（推荐只在当前 PowerShell 会话里设置，不写入仓库）：
+
+```powershell
+$env:ALIYUN_LLM_API_KEY="YOUR_DASHSCOPE_KEY"
+$env:ALIYUN_IMAGE_API_KEY="YOUR_DASHSCOPE_KEY"
+$env:LLM_PROVIDER="aliyun"
+$env:IMAGE_PROVIDER="aliyun"
+$env:ALIYUN_LLM_MODEL="qwen3.7-plus"
+$env:ALIYUN_IMAGE_MODEL="wan2.7-image"
+```
+
+启动 GUI：
+
+```powershell
+.\AutoRedbookGUI-Launcher.exe
+```
+
+命令行生成并保存 1 条新闻草稿：
+
+```powershell
+.\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --prompt "选择适合小红书图文的科技、社会或国际新闻，摘要约50字，正文约200字，内容必须严谨真实。" --assets-glob "assets/empty/*" --count 1 --login-hold 600 --wait-timeout 300 --force
+```
+
 ## 功能一览
 - 普通图文：`标题 + 提示词（可选） + 图片（可选）` → 生成草稿并保存到草稿箱
 - 特殊标题「每日新闻」：自动抓取新闻 → 生成草稿并保存
@@ -37,10 +78,10 @@ python -m playwright install chromium
 #   - LLM_API_KEY：生成文案（可选：作为阿里云无额度时的备用）
 #   - ALIYUN_IMAGE_API_KEY：生图（可与 LLM 共用同一把 DashScope Key）
 #   - NEWS_API_KEY：每日新闻（可选；不配则回退到无需 key 的新闻源）
-#   - PEXELS_API_KEY：自动配图（可选；不配则必须手动提供图片）
+#   - PEXELS_API_KEY：Pexels 备用配图（可选；默认配图走阿里云生图）
 # 例如（PowerShell）：
-#   $env:LLM_API_KEY="..."
-#   $env:PEXELS_API_KEY="..."
+#   $env:ALIYUN_LLM_API_KEY="..."
+#   $env:ALIYUN_IMAGE_API_KEY="..."
 #
 # 3) 一键：生成 -> 校验/审批 -> 保存草稿（首次建议给更长登录时间）
 .\.venv\Scripts\python -m apps.cli auto --title "标题" --prompt "提示词（可选）" --assets-glob "assets/pics/*" --login-hold 600
