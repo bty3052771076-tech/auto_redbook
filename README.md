@@ -51,15 +51,25 @@ python -m playwright install chromium
 ```powershell
 .\.venv\Scripts\python -m apps.gui
 ```
+如果只想双击启动当前设计版 GUI，使用轻量启动器：
+```powershell
+.\AutoRedbookGUI-Launcher.exe
+```
+也可以使用脚本入口：
+```powershell
+.\Start-GUI.cmd
+```
 GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、配图来源（Pexels / 阿里云）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，便于确认每个帖子的标题后再审核或上传。
 
 更多说明见：`docs/模型与GUI供应商配置.md`。
 
-### 打包成 exe（可选）
+### 生成快速启动 exe（可选）
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
 ```
-生成：`AutoRedbookGUI.exe`（放在仓库根目录，双击启动）
+生成：`AutoRedbookGUI-Launcher.exe`（放在仓库根目录，双击后调用 `.\.venv\Scripts\pythonw.exe -m apps.gui`）。
+
+旧的 `AutoRedbookGUI.exe` 是历史打包产物，不再推荐使用。
 
 ## 草稿与浏览器 Profile
 - 草稿箱数据保存在浏览器本地 profile 中，不同 profile 互不可见。

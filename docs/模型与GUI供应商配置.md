@@ -6,9 +6,31 @@
 
 ## GUI 入口
 
+推荐双击轻量启动器：
+
+```powershell
+.\AutoRedbookGUI-Launcher.exe
+```
+
+如果还没有生成 launcher：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
+```
+
+脚本入口：
+
+```powershell
+.\Start-GUI.cmd
+```
+
+源码入口：
+
 ```powershell
 .\.venv\Scripts\python.exe -m apps.gui
 ```
+
+旧的 `AutoRedbookGUI.exe` 是历史打包产物，不再推荐使用；新版 launcher 只负责启动当前工作区的设计版 GUI。
 
 新版 GUI 采用“发布控制台”布局：
 

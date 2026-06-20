@@ -1,36 +1,37 @@
 $ErrorActionPreference = "Stop"
 
-$root = Split-Path -Parent $PSScriptRoot
-$venvPy = Join-Path $root ".venv\\Scripts\\python.exe"
-$env:PIP_CACHE_DIR = Join-Path $root ".pip-cache"
+$Root = Split-Path -Parent $PSScriptRoot
+$Source = Join-Path $PSScriptRoot "AutoRedbookGuiLauncher.cs"
+$Output = Join-Path $Root "AutoRedbookGUI-Launcher.exe"
 
-if (!(Test-Path $venvPy)) {
-  Write-Host "ERROR: venv python not found: $venvPy"
-  Write-Host "Create venv first: python -m venv .venv"
-  exit 1
+if (-not (Test-Path -LiteralPath $Source)) {
+    Write-Host "ERROR: launcher source not found: $Source"
+    exit 1
 }
 
-Write-Host "[1/3] Ensure PyInstaller installed..."
-& $venvPy -m pip install -q --upgrade pip pyinstaller
+$CscCandidates = @(
+    (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
+    (Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe"),
+    (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v3.5\csc.exe"),
+    (Join-Path $env:WINDIR "Microsoft.NET\Framework\v3.5\csc.exe")
+)
 
-Write-Host "[2/3] Build exe (onefile, windowed)..."
-Push-Location $root
-try {
-  & $venvPy -m PyInstaller --noconfirm --clean --onefile --windowed --name AutoRedbookGUI "apps\\gui.py"
-} finally {
-  Pop-Location
+$Csc = $CscCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $Csc) {
+    Write-Host "ERROR: .NET Framework csc.exe not found."
+    Write-Host "Fallback: use Start-GUI.cmd or run .\.venv\Scripts\python.exe -m apps.gui"
+    exit 1
 }
 
-$distExe = Join-Path $root "dist\\AutoRedbookGUI.exe"
-if (!(Test-Path $distExe)) {
-  Write-Host "ERROR: build succeeded but exe not found: $distExe"
-  exit 1
-}
+Write-Host "Building lightweight GUI launcher..."
+& $Csc /nologo /target:winexe /out:$Output /reference:System.Windows.Forms.dll $Source
 
-Write-Host "[3/3] Copy to project root for quick launch..."
-$rootExe = Join-Path $root "AutoRedbookGUI.exe"
-Copy-Item -Force $distExe $rootExe
+if (-not (Test-Path -LiteralPath $Output)) {
+    Write-Host "ERROR: launcher build finished but exe not found: $Output"
+    exit 1
+}
 
 Write-Host ""
-Write-Host "OK: $rootExe"
-Write-Host "Tip: place this exe in the repo root so it can find .venv and run the CLI."
+Write-Host "OK: $Output"
+Write-Host "This exe launches: .\.venv\Scripts\pythonw.exe -m apps.gui"
+Write-Host "It does not bundle the GUI and does not install dependencies."

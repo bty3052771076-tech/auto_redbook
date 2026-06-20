@@ -1291,3 +1291,20 @@
 - Key safety: `git check-ignore -v` confirmed local `docs/*api-key.md`, `.env`, `.env.gui`, and `data/browser/chrome-profile` are ignored; staged content secret scan returned `staged_findings_count=0`; tracked-file secret scan returned `tracked_findings_count=0`; sensitive-path scan of staged names was empty.
 - Pushes: backup branch/tag were pushed before commit `cd302c4`; `main` was pushed to `https://github.com/bty3052771076-tech/auto_redbook.git`.
 - Risks/Assumptions: The remote push uses the currently configured Git credentials; no API key files were staged or uploaded.
+
+### 2026-06-20 09:18
+**Task:** Replace the ugly historical GUI exe with a lightweight launcher for the redesigned `apps.gui` interface.
+**Git:** `main` pending launcher-source/docs commit at time of entry.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `scripts/AutoRedbookGuiLauncher.cs` | DONE | Added a small Windows launcher that starts `.venv\Scripts\pythonw.exe -m apps.gui` from the repo root and shows an error dialog if `.venv` is missing. | None. |
+| `scripts/build_gui_exe.ps1` | DONE | Replaced the old PyInstaller build with a no-install .NET Framework compile step for `AutoRedbookGUI-Launcher.exe`. | None. |
+| `README.md` | DONE | Updated GUI quick-start docs to prefer `AutoRedbookGUI-Launcher.exe` / `Start-GUI.cmd` and mark old `AutoRedbookGUI.exe` as deprecated. | None. |
+| `docs/使用说明-自动新闻生成与草稿发布.md` | DONE | Documented the new launcher, build command, and deprecation of the old full exe. | None. |
+| `docs/模型与GUI供应商配置.md` | DONE | Added launcher-based GUI entry instructions. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this launcher replacement entry. | Keep appending after future coding work. |
+
+**Notes**
+- Verification: Removed old `AutoRedbookGUI.exe`; built `AutoRedbookGUI-Launcher.exe` via `scripts/build_gui_exe.ps1`; launched it and observed new `pythonw.exe -m apps.gui` processes, then stopped the test processes.
+- Key/upload safety: `AutoRedbookGUI*.exe` is ignored by `.gitignore`, so the local launcher binary is not staged/uploaded; only launcher source and docs are intended for Git.
