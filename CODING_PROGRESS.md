@@ -1308,3 +1308,27 @@
 **Notes**
 - Verification: Removed old `AutoRedbookGUI.exe`; built `AutoRedbookGUI-Launcher.exe` via `scripts/build_gui_exe.ps1`; launched it and observed new `pythonw.exe -m apps.gui` processes, then stopped the test processes.
 - Key/upload safety: `AutoRedbookGUI*.exe` is ignored by `.gitignore`, so the local launcher binary is not staged/uploaded; only launcher source and docs are intended for Git.
+
+### 2026-06-20 09:24
+**Task:** Clean up the workspace while preserving previous news draft records.
+**Git:** `main` clean before cleanup; only this progress entry remains after documenting the cleanup.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `build/` | DONE | Removed old PyInstaller build artifacts for the deprecated GUI exe. | Regenerate only if needed via the new launcher build script. |
+| `dist/` | DONE | Removed empty old distribution directory. | None. |
+| `exports/` | DONE | Removed empty exports directory. | Recreated by workflow if future exports are needed. |
+| `logs/` | DONE | Removed old local run logs; execution/evidence records under `data/posts` were preserved. | Use `data/posts/<id>/executions` for durable run evidence. |
+| `.pytest_cache/` and `__pycache__/` | DONE | Removed Python/pytest caches outside `.venv` and outside protected draft records. | Caches will be recreated by Python/pytest as needed. |
+| `tmp_*.png` / `tmp_diag_dom.png` | DONE | Removed old root-level diagnostic screenshots/DOM dump. | None. |
+| `AutoRedbookGUI.spec` | DONE | Removed obsolete PyInstaller spec for the old GUI exe. | Use `scripts/build_gui_exe.ps1` for the new launcher. |
+| `data/diagnostics` / `data/indexes` | DONE | Removed empty local data directories. | Workflow can recreate indexes if needed. |
+| `data/posts/` | DONE | Protected and preserved all previous local draft records. | Do not delete unless explicitly requested. |
+| `CODING_PROGRESS.md` | DONE | Appended this cleanup entry. | Keep appending after future workspace changes. |
+
+**Notes**
+- Cleanup safety: deletion script verified every resolved path stayed under `E:\AI\codex\redbook_workflow` and refused anything under `data/posts`.
+- Preserved records: `data/posts` remained at 1120 directories after cleanup.
+- Removed: 22 cache/build/temp items, about 12.668 MB.
+- Verification: `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider -q` -> 99 passed.
+- Kept intentionally: `data/posts` (draft records), `data/browser` (XHS login/browser profile), `data/events` (audit events), `.venv`, and `AutoRedbookGUI-Launcher.exe`.
