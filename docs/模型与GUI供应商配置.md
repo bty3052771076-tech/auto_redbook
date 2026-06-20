@@ -1,6 +1,6 @@
 # 模型与 GUI 供应商配置
 
-更新时间：2026-06-19
+更新时间：2026-06-20
 
 本文说明图形化自动发帖界面中的供应商、模型选项，以及它们最终注入 CLI 子进程的环境变量。
 
@@ -36,7 +36,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
 
 - `自动发帖`：一键执行 `create -> approve -> run`，并在同一界面选择 LLM 供应商、LLM 模型、配图来源和阿里云生图模型。
 - `仅生成`：只生成本地草稿，便于检查文案和图片。
-- `草稿处理`：对已有帖子执行审核、上传和保存草稿；列表按“标题 + 状态 + post_id”显示最近帖子，避免只看到一串 id。
+- `草稿处理`：对已有帖子执行审核、上传和保存草稿；列表按“标题 + 状态 + post_id”显示最近帖子，时间在独立框中按北京时间展示，避免只看到一串 id 或混在同一行。
 - `删除草稿`：预览或删除小红书草稿箱草稿。
 - `配置`：保存本机 `.env.gui`，用于密钥和默认参数。
 
@@ -108,8 +108,8 @@ LLM_BASE_URL=https://api.ppinfra.com/openai
 
 | 供应商 | 用途 | 主要环境变量 |
 |---|---|---|
-| `pexels` | 搜索并下载图库图片，适合作为稳定默认项 | `IMAGE_PROVIDER=pexels`, `PEXELS_API_KEY` |
-| `aliyun` | 使用阿里云百炼 / DashScope 文生图 | `IMAGE_PROVIDER=aliyun`, `DASHSCOPE_API_KEY` 或 `ALIYUN_IMAGE_API_KEY`, `ALIYUN_IMAGE_MODEL` |
+| `aliyun` | 使用阿里云百炼 / DashScope 文生图，当前 GUI 默认项 | `IMAGE_PROVIDER=aliyun`, `DASHSCOPE_API_KEY` 或 `ALIYUN_IMAGE_API_KEY`, `ALIYUN_IMAGE_MODEL` |
+| `pexels` | 搜索并下载图库图片，可作为无生图额度时的备用 | `IMAGE_PROVIDER=pexels`, `PEXELS_API_KEY` |
 
 ### 阿里云生图模型选项
 
@@ -132,12 +132,13 @@ ALIYUN_IMAGE_MODELS=<所选模型>
 
 ## 推荐组合
 
-稳定少折腾：
+推荐默认：
 
 ```text
 LLM 供应商：aliyun
 LLM 模型：qwen3.7-plus
-配图来源：pexels
+配图来源：aliyun
+阿里云生图模型：wan2.7-image
 ```
 
 全部使用阿里云免费额度：
@@ -154,7 +155,7 @@ LLM 模型：qwen3.7-plus
 ```text
 LLM 供应商：auto
 LLM 模型：阿里云免费模型列表（顺序回退）
-配图来源：pexels 或 aliyun
+配图来源：aliyun（默认）或 pexels
 ```
 
 ## CLI 等价配置示例

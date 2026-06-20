@@ -5,15 +5,18 @@ from pathlib import Path
 from apps.gui import (
     ALIYUN_IMAGE_MODEL_OPTIONS,
     ALIYUN_LLM_MODEL_OPTIONS,
+    DEFAULT_LOGIN_URL,
     DEFAULT_DRAFT_URL,
     DEFAULT_IMAGE_PROVIDER,
     LLM_PROVIDER_OPTIONS,
+    build_xhs_login_launch_args,
     build_xhs_creator_launch_args,
     build_cli_args,
     build_provider_env_overrides,
     extract_post_id_from_choice,
     format_post_choice,
     format_post_detail,
+    format_post_time_detail,
     list_recent_posts,
     load_env_file,
     open_xhs_creator,
@@ -21,8 +24,8 @@ from apps.gui import (
 )
 
 
-def test_gui_default_image_provider_prefers_available_search_provider():
-    assert DEFAULT_IMAGE_PROVIDER == "pexels"
+def test_gui_default_image_provider_prefers_ai_generation():
+    assert DEFAULT_IMAGE_PROVIDER == "aliyun"
 
 
 def test_gui_exposes_llm_and_image_provider_model_options():
@@ -63,6 +66,19 @@ def test_build_provider_env_overrides_for_ppinfra_model():
     assert "ALIYUN_LLM_MODEL" not in env
     assert env["IMAGE_PROVIDER"] == "pexels"
     assert "ALIYUN_IMAGE_MODEL" not in env
+
+
+def test_build_provider_env_overrides_invalid_image_provider_falls_back_to_aliyun():
+    env = build_provider_env_overrides(
+        {},
+        llm_provider="aliyun",
+        llm_model="qwen3.7-plus",
+        image_provider="unknown-provider",
+        image_model="wan2.7-image",
+    )
+
+    assert env["IMAGE_PROVIDER"] == "aliyun"
+    assert env["ALIYUN_IMAGE_MODEL"] == "wan2.7-image"
 
 
 def test_env_file_roundtrip(tmp_path: Path):
@@ -117,11 +133,34 @@ def test_list_recent_posts_includes_titles_and_status(tmp_path: Path):
     }
     assert any("第一条新闻" in label and "未上传" in label for label in labels)
     assert any("第二条新闻" in label and "已上传至小红书草稿" in label for label in labels)
-    assert any("2026-06-19 12:34:56" in label for label in labels)
+    assert all("2026-06-19 12:34:56" not in label for label in labels)
     assert second_item.uploaded is True
     assert second_item.uploaded_at == "2026-06-19T12:34:56.000000Z"
     assert second_item.latest_execution_result == "saved_draft"
     assert second_item.asset_count == 1
+
+
+def test_format_post_time_detail_shows_beijing_time():
+    from apps.gui import RecentPostSummary
+
+    summary = RecentPostSummary(
+        post_id="0123456789abcdef0123456789abcdef",
+        title="AI芯片新品发布",
+        status="saved_as_draft",
+        uploaded=True,
+        uploaded_at="2026-06-19T12:34:56.000000Z",
+        updated_at="2026-06-19T12:35:00.000000Z",
+        latest_execution_started_at="2026-06-19T12:30:00.000000Z",
+        latest_execution_ended_at="2026-06-19T12:34:56.000000Z",
+    )
+
+    detail = format_post_time_detail(summary)
+
+    assert "北京时间" in detail
+    assert "上传时间：2026-06-19 20:34:56 北京时间" in detail
+    assert "本地更新时间：2026-06-19 20:35:00 北京时间" in detail
+    assert "执行开始：2026-06-19 20:30:00 北京时间" in detail
+    assert "执行结束：2026-06-19 20:34:56 北京时间" in detail
 
 
 def test_extract_post_id_from_choice_accepts_label_or_raw_id():
@@ -152,7 +191,7 @@ def test_format_post_detail_shows_upload_state_time_and_body_preview():
 
     assert "AI芯片新品发布" in detail
     assert "已上传至小红书草稿" in detail
-    assert "2026-06-19 12:34:56" in detail
+    assert "2026-06-19 20:34:56 北京时间" in detail
     assert "saved_draft" in detail
     assert "素材数量：1" in detail
     assert "要点摘要" in detail
@@ -160,6 +199,7 @@ def test_format_post_detail_shows_upload_state_time_and_body_preview():
 
 def test_xhs_creator_quick_launch_target_uses_image_publish_url():
     assert DEFAULT_DRAFT_URL == "https://creator.xiaohongshu.com/publish/publish?target=image"
+    assert DEFAULT_LOGIN_URL == "https://creator.xiaohongshu.com"
 
 
 def test_xhs_creator_launch_args_use_workspace_chrome_profile(tmp_path: Path):
@@ -191,6 +231,17 @@ def test_xhs_creator_launch_args_allow_profile_override(tmp_path: Path):
 
     assert f"--user-data-dir={custom_profile}" in args
     assert "--profile-directory=Profile 1" in args
+
+
+def test_xhs_login_launch_args_use_workspace_profile(tmp_path: Path):
+    chrome = tmp_path / "chrome.exe"
+    chrome.write_text("", encoding="utf-8")
+
+    args = build_xhs_login_launch_args(project_root=tmp_path, chrome_path=chrome, env={})
+
+    assert f"--user-data-dir={tmp_path / 'data' / 'browser' / 'chrome-profile'}" in args
+    assert "--profile-directory=Default" in args
+    assert args[-1] == DEFAULT_LOGIN_URL
 
 
 def test_open_xhs_creator_launches_chrome_with_workspace_profile(monkeypatch, tmp_path: Path):

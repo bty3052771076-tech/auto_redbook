@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
+import urllib.error
+import urllib.request
 from dataclasses import asdict
+from dataclasses import replace
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -27,6 +32,9 @@ from src.validation.rules import MAX_IMAGE_BODY
 
 _URL_RE = re.compile(r"(?:https?://|www\.)\S+", flags=re.IGNORECASE)
 _CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
+_JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
+_DAILY_NEWS_PREFIX_RE = re.compile(r"^(?:每日新闻)(?:[｜|:：\-—–\s]+)?")
+_SOURCE_LOOKUP_MIN_CHARS = 120
 
 
 def _strip_urls(text: str) -> str:
@@ -38,6 +46,118 @@ def _strip_urls(text: str) -> str:
 
 def _has_cjk(text: str | None) -> bool:
     return bool(_CJK_CHAR_RE.search(text or ""))
+
+
+def _has_japanese_kana(text: str | None) -> bool:
+    return bool(_JAPANESE_KANA_RE.search(text or ""))
+
+
+def _source_lookup_min_chars() -> int:
+    raw = (os.getenv("NEWS_SOURCE_CONTEXT_MIN_CHARS") or "").strip()
+    if not raw:
+        return _SOURCE_LOOKUP_MIN_CHARS
+    try:
+        return max(40, int(raw))
+    except ValueError:
+        return _SOURCE_LOOKUP_MIN_CHARS
+
+
+def _source_lookup_enabled() -> bool:
+    raw = (os.getenv("NEWS_SOURCE_LOOKUP") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _source_lookup_timeout_s() -> float:
+    raw = (os.getenv("NEWS_SOURCE_LOOKUP_TIMEOUT_S") or "").strip()
+    if not raw:
+        return 8.0
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 8.0
+
+
+def _daily_news_context_is_incomplete(picked) -> bool:
+    description = _strip_urls(getattr(picked, "description", "") or "")
+    content = _strip_urls(getattr(picked, "content", "") or "")
+    text = re.sub(r"\s+", " ", f"{description} {content}").strip()
+    if len(text) < _source_lookup_min_chars():
+        return True
+    # NewsAPI frequently returns truncated snippets such as "[+123 chars]".
+    return bool(re.search(r"\[\+\d+\s+chars?\]", text, flags=re.IGNORECASE))
+
+
+def _fetch_original_news_excerpt(
+    url: str,
+    *,
+    timeout_s: float = 8.0,
+    max_chars: int = 1200,
+) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+            )
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        raw = resp.read(600_000)
+    html = raw.decode(charset, errors="replace")
+    html = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", html)
+    html = re.sub(r"(?is)<br\s*/?>", "\n", html)
+    text = re.sub(r"(?is)<[^>]+>", " ", html)
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+    return text
+
+
+def _enrich_daily_news_item(picked):
+    meta = {
+        "source_lookup": {
+            "needed": False,
+            "ok": False,
+            "skipped": "",
+            "chars": 0,
+        }
+    }
+    if not _daily_news_context_is_incomplete(picked):
+        return picked, meta
+    meta["source_lookup"]["needed"] = True
+    if not _source_lookup_enabled():
+        meta["source_lookup"]["skipped"] = "disabled"
+        return picked, meta
+    if not (getattr(picked, "url", "") or "").strip():
+        meta["source_lookup"]["skipped"] = "missing_url"
+        return picked, meta
+
+    try:
+        excerpt = _fetch_original_news_excerpt(
+            picked.url,
+            timeout_s=_source_lookup_timeout_s(),
+            max_chars=1200,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        meta["source_lookup"]["error"] = str(exc)
+        return picked, meta
+
+    excerpt = _strip_urls(excerpt)
+    if not excerpt:
+        meta["source_lookup"]["skipped"] = "empty_excerpt"
+        return picked, meta
+
+    parts = [str(getattr(picked, "content", "") or "").strip(), f"原文摘录：{excerpt}"]
+    content = "\n".join(part for part in parts if part).strip()
+    meta["source_lookup"]["ok"] = True
+    meta["source_lookup"]["chars"] = len(excerpt)
+    return replace(picked, content=content), meta
 
 
 def _sha256(path: Path) -> str:
@@ -79,33 +199,75 @@ def _merge_image_ids(target: Optional[set[str]], metas: list[dict]) -> None:
             target.add(str(image_id))
 
 
-def _shorten_daily_news_title(news_title: str, *, max_len: int = 20) -> str:
-    title = (news_title or "").strip()
-    if not title:
-        return "每日新闻"
-    if not _has_cjk(title):
-        lower = title.lower()
-        if any(w in lower for w in ("ai", "chip", "tech", "technology", "software", "model")):
-            title = "科技动态"
-        elif any(w in lower for w in ("market", "inflation", "prices", "trade", "economy")):
-            title = "经济动态"
-        elif any(w in lower for w in ("court", "case", "sentence", "police", "school")):
-            title = "社会事件"
-        else:
-            title = "国际动态"
-    # Prefer the first segment before long detail separators.
-    for sep in ("：", ":", " - ", "—", "（", "("):
-        if sep in title:
-            head = title.split(sep, 1)[0].strip()
+def _clean_daily_news_title_candidate(value: str) -> str:
+    text = _strip_urls(value or "")
+    text = _DAILY_NEWS_PREFIX_RE.sub("", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip(" \t\r\n:：|｜-—–，,。.!！?？\"'“”‘’（）()[]【】")
+    for sep in ("。", "；", ";", "，", ",", "：", ":", " - ", "—", "（", "("):
+        if sep in text:
+            head = text.split(sep, 1)[0].strip()
             if head:
-                title = head
+                text = head
                 break
-    prefix = "每日新闻｜"
-    if len(prefix) + len(title) <= max_len:
-        return f"{prefix}{title}"
-    # Trim title to fit.
-    room = max(0, max_len - len(prefix))
-    return f"{prefix}{title[:room]}".rstrip("｜").rstrip()
+    return text.strip(" \t\r\n:：|｜-—–，,。.!！?？\"'“”‘’（）()[]【】")
+
+
+def _keyword_daily_news_title(text: str, prompt_norm: str = "") -> str:
+    lower = f"{text or ''} {prompt_norm or ''}".lower()
+    if (
+        "外贸" in text
+        or "贸易" in text
+        or "貿易" in text
+        or "貿" in text
+        or any(w in lower for w in ("trade", "export", "import"))
+    ):
+        return "外贸数据出现变化"
+    if "科技" in text or "人工智能" in text or any(
+        w in lower for w in ("ai", "chip", "tech", "technology", "software", "model")
+    ):
+        return "科技议题出现进展"
+    if "经济" in text or any(w in lower for w in ("market", "inflation", "prices", "economy")):
+        return "经济议题出现变化"
+    if "社会" in text or any(w in lower for w in ("court", "case", "sentence", "police", "school")):
+        return "社会事件出现进展"
+    return "国际议题出现进展"
+
+
+def _normalize_daily_news_title(
+    title: str,
+    picked=None,
+    prompt_norm: str = "",
+    *,
+    max_len: int = 20,
+) -> str:
+    candidates: list[str] = [title]
+    if picked is not None:
+        candidates.extend(
+            [
+                getattr(picked, "description", "") or "",
+                getattr(picked, "content", "") or "",
+                getattr(picked, "title", "") or "",
+            ]
+        )
+    candidates.append(prompt_norm)
+
+    for candidate in candidates:
+        cleaned = _clean_daily_news_title_candidate(candidate)
+        if not cleaned or _has_japanese_kana(cleaned) or not _has_cjk(cleaned):
+            continue
+        if len(cleaned) > max_len:
+            cleaned = cleaned[:max_len].rstrip("，,。.!！?？:：|｜-—–")
+        if cleaned and not _has_japanese_kana(cleaned):
+            return cleaned
+
+    joined = " ".join(candidates)
+    fallback = _keyword_daily_news_title(joined, prompt_norm)
+    return fallback[:max_len].rstrip()
+
+
+def _shorten_daily_news_title(news_title: str, *, max_len: int = 20) -> str:
+    return _normalize_daily_news_title(news_title, None, "", max_len=max_len)
 
 
 def _is_generic_daily_news_title(title: str) -> bool:
@@ -433,10 +595,11 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
     return (
         "你正在为小红书图文笔记写《每日新闻》栏目。\n"
         "请依据下面提供的新闻信息，生成一份可直接发布的草稿。\n"
-        "必须全部使用简体中文；如果原始材料是英文新闻，先翻译并用中文新闻写法改写，不得保留英文长句。\n"
+        "必须全部使用简体中文；如果原始材料是英文新闻、日文新闻或其他语言新闻，先翻译并用中文新闻写法改写，不得保留外文长句或日文假名。\n"
         "注意：body 正文里不要包含提示词/要求等元信息；不得输出 URL、网址、http(s) 链接。\n"
         "来源只写来源名称，网址只保存在本地 post.json 的 metadata 中；发布时间和来源仅在文末固定行输出。\n"
-        "只允许使用下列已提供的新闻信息，不得新增事实或编造细节；信息不足时保持保守表述。\n\n"
+        "只允许使用下列已提供的新闻信息，不得新增事实或编造细节；内容不完整时，必须先查阅原新闻/原文摘录后再评价。\n"
+        "如果原文摘录仍不足，不得推测数字、因果、人物关系或后续结果，只能说明“现有信息有限，需等待权威更新”。\n\n"
         "输出为严格 JSON（仅包含 keys: title, body, topics；可选 key: image_event），不要 Markdown/代码块。\n"
         "不要把任何 JSON 片段（例如 { } / \"title\": / \"topics\": / \"image_event\":）写进 body。\n\n"
         "可用新闻信息（仅限以下字段，链接仅供参考不要输出）：\n"
@@ -449,18 +612,18 @@ def _daily_news_prompt(picked, prompt_norm: str) -> str:
         f"- 链接：{picked.url}\n"
         f"- 用户关注点（可选）：{prompt_norm or '无'}\n\n"
         "JSON 字段要求：\n"
-        "title（<=20字）：基于新闻标题/摘要改写生成，必须包含具体事件关键词；不得仅为“每日新闻”（也不得仅为“每日新闻｜”）。\n"
+        "title：标题必须是20字以内的简体中文总结标题，基于新闻标题/摘要/原文摘录改写，必须包含具体事件关键词；不要加“每日新闻｜”前缀，不得仅为“每日新闻”，不得出现日文假名。\n"
         "body：正文，必须严格按以下格式输出（保留标签，不得更名/省略；段落之间空一行）：\n"
         "要点摘要：<约50字，概括新闻最重要部分，不要评价>\n"
         "新闻内容：\n"
         "<约200字的完整段落，围绕已给事实说明背景、进展、影响边界；不要写未经证实的细节>\n\n"
         "点评：\n"
-        "<约80-120字的完整段落，末尾附带1个互动问题>\n\n"
+        "<约80-120字的完整段落，必须基于上方新闻事实和原文摘录进行评价；信息不足时只做保守提醒，末尾附带1个互动问题>\n\n"
         "发布时间：YYYY-MM-DD\n"
         "来源：来源名称（不要写网址）\n"
         "长度约束：body 总长度（含换行）务必 <= 900 字符，避免写太长导致发布失败。\n"
         "点评写作约束：坚持中国立场（以中国国家利益与中国受众视角分析），同时保持客观理性。\n"
-        "先基于已给事实再给判断，不煽动对立、不使用攻击性语言、不做情绪化带节奏表述。\n"
+        "先查阅并基于已给事实/原文摘录再给判断，不得推测，不煽动对立、不使用攻击性语言、不做情绪化带节奏表述。\n"
         "可提示风险与影响，但不得夸大、不得杜撰未提供事实。\n"
         "topics（数组，3-8个话题词）：必须包含“每日新闻”。不要把 topics 写进 body。\n"
         "image_event（字符串，可选，20-40字）：仅用于配图的事件描述，只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
@@ -663,8 +826,10 @@ def create_post_with_draft(
     if title_norm == "每日新闻":
         try:
             picked, news_meta = fetch_and_pick_daily_news(prompt_hint or "")
+            picked, lookup_meta = _enrich_daily_news_item(picked)
             platform_meta["news"] = {
                 **news_meta,
+                **lookup_meta,
                 "picked": asdict(picked),
                 "source_url": picked.url,
                 "mode": "daily_news",
@@ -700,12 +865,13 @@ def create_post_with_draft(
                 draft["body"], picked.seendate
             )
             if draft.get("_fallback_error") or _daily_news_body_has_prompt_leak(draft.get("body", "")):
-                draft["title"] = _shorten_daily_news_title(picked.title)
+                draft["title"] = _normalize_daily_news_title(picked.title, picked, prompt_norm)
                 draft["body"] = _daily_news_offline_body(picked, prompt_norm)
                 draft["topics"] = ["每日新闻"]
             if _is_generic_daily_news_title(draft.get("title", "")):
                 title_src = picked.title or picked.description or prompt_norm
-                draft["title"] = _shorten_daily_news_title(title_src)
+                draft["title"] = _normalize_daily_news_title(title_src, picked, prompt_norm)
+            draft["title"] = _normalize_daily_news_title(draft.get("title", ""), picked, prompt_norm)
             topics = draft.get("topics") or []
             if not isinstance(topics, list):
                 topics = [str(topics)]
@@ -853,6 +1019,7 @@ def create_daily_news_posts(
     for candidate_idx, picked in enumerate(picks, start=1):
         if len(posts) >= target_count:
             break
+        picked, lookup_meta = _enrich_daily_news_item(picked)
         news_prompt = _daily_news_prompt(picked, prompt_norm)
         if target_count > 1:
             news_prompt = f"（第 {success_idx + 1}/{target_count} 条）\n{news_prompt}"
@@ -883,12 +1050,13 @@ def create_daily_news_posts(
             draft["body"], picked.seendate
         )
         if draft.get("_fallback_error") or _daily_news_body_has_prompt_leak(draft.get("body", "")):
-            draft["title"] = _shorten_daily_news_title(picked.title)
+            draft["title"] = _normalize_daily_news_title(picked.title, picked, prompt_norm)
             draft["body"] = _daily_news_offline_body(picked, prompt_norm)
             draft["topics"] = ["每日新闻"]
         if _is_generic_daily_news_title(draft.get("title", "")):
             title_src = picked.title or picked.description or prompt_norm
-            draft["title"] = _shorten_daily_news_title(title_src)
+            draft["title"] = _normalize_daily_news_title(title_src, picked, prompt_norm)
+        draft["title"] = _normalize_daily_news_title(draft.get("title", ""), picked, prompt_norm)
         title_key = _daily_news_title_key(draft.get("title", ""))
         if title_key:
             if title_key in used_title_keys:
@@ -914,6 +1082,7 @@ def create_daily_news_posts(
             platform={
                 "news": {
                     **base_meta,
+                    **lookup_meta,
                     "picked": asdict(picked),
                     "source_url": picked.url,
                     "mode": "daily_news_multi" if target_count > 1 else "daily_news",

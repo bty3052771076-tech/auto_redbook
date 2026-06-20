@@ -1,5 +1,27 @@
 # CODING_PROGRESS
 
+### 2026-06-20 10:06
+**Task:** Tighten daily-news title/prompt/source-grounding rules and improve GUI defaults, profile login, and Beijing-time draft display.
+**Git:** `main (dirty)`; modified news workflow, GUI, tests, README/docs; added one repair note.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added Japanese-kana detection, 20-char Chinese title normalization without `每日新闻｜`, original-news excerpt lookup for incomplete snippets, stronger source-grounded prompt rules, and per-post source lookup metadata. | None. |
+| `apps/gui.py` | DONE | Changed GUI default image provider to `aliyun`, added profile login launch URL/button, removed mixed time from draft choices, and added Beijing-time formatting/detail helpers. | None. |
+| `tests/test_daily_news.py` | DONE | Added regression tests for Japanese-title cleanup, Japanese trade-title fallback, source lookup enrichment, and no-speculation prompt requirements. | None. |
+| `tests/test_gui.py` | DONE | Updated default image provider tests and added coverage for Aliyun fallback, login launch args, and Beijing-time draft detail. | None. |
+| `README.md` | DONE | Documented Aliyun as default image provider, source lookup env vars, stricter daily-news title rules, and GUI Beijing-time/profile login behavior. | None. |
+| `docs/模型与GUI供应商配置.md` | DONE | Updated GUI default provider documentation and draft-processing time display description. | None. |
+| `docs/使用说明-自动新闻生成与草稿发布.md` | DONE | Documented profile login button, Beijing-time draft time panel, title cleanup, no-Japanese rule, and source lookup behavior. | None. |
+| `docs/GUI小红书Profile修复-2026-06-20.md` | DONE | Added the new `登录/检查Profile` button note. | None. |
+| `docs/新闻标题提示词与GUI默认项修复-2026-06-20.md` | DONE | Added focused repair documentation for title/prompt/source lookup and GUI defaults. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry after invoking the file-progress-followup workflow. | Keep updating after future coding work. |
+
+**Notes**
+- Tests/Lint: TDD red check first failed on missing helpers/constants; after implementation, `py_compile src/workflow/create_post.py apps/gui.py` passed, `pytest tests/test_daily_news.py tests/test_gui.py -q` -> 55 passed, and full `pytest -q` -> 109 passed in 33.57s.
+- Risks/Assumptions: Original-news lookup uses a simple HTML text extractor with an 8s default timeout; if source pages block bots/paywall, the prompt falls back to conservative no-speculation language.
+- Next steps: Use GUI default Aliyun image provider for the next real draft run; if login state fails, click `登录/检查Profile` before running upload.
+
 ### 2026-06-20 09:35
 **Task:** Fix GUI "打开小红书创作平台" to open the workspace Chrome profile instead of the system default profile.
 **Git:** `main (dirty)`; modified GUI/profile launch code, tests, quick-launch script, README, usage docs; added one repair note.

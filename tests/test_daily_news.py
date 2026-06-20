@@ -7,9 +7,13 @@ from src.workflow import create_post
 from src.workflow.create_post import (
     _append_news_source_line,
     _daily_news_body_has_prompt_leak,
+    _daily_news_context_is_incomplete,
+    _enrich_daily_news_item,
     _daily_news_offline_body,
     _daily_news_prompt,
     _ensure_daily_news_sections,
+    _has_japanese_kana,
+    _normalize_daily_news_title,
 )
 
 
@@ -225,6 +229,83 @@ def test_daily_news_prompt_requires_chinese_translation_no_url_and_target_length
     assert "约200字" in prompt
     assert "不得输出 URL" in prompt
     assert "网址只保存在本地" in prompt
+
+
+def test_daily_news_title_normalization_removes_japanese_and_prefix():
+    picked = NewsItem(
+        title="今年1～5月 中国西部地域の貿易が拡大",
+        url="https://example.com/jp",
+        source="Example",
+        domain="example.com",
+        description="中国西部地区外贸增长，跨境物流保持活跃。",
+    )
+
+    title = _normalize_daily_news_title("每日新闻｜今年1～5月 中国西部地域の貿", picked, "经济新闻")
+
+    assert len(title) <= 20
+    assert not title.startswith("每日新闻")
+    assert not _has_japanese_kana(title)
+    assert "の" not in title
+    assert "外贸" in title or "中国西部" in title
+
+
+def test_daily_news_title_fallback_maps_japanese_trade_title_to_chinese_summary():
+    picked = NewsItem(
+        title="今年1～5月 中国西部地域の貿易が拡大",
+        url="https://example.com/jp",
+        source="Example",
+        domain="example.com",
+    )
+
+    title = _normalize_daily_news_title(picked.title, picked, "")
+
+    assert title == "外贸数据出现变化"
+    assert len(title) <= 20
+    assert not _has_japanese_kana(title)
+
+
+def test_daily_news_context_lookup_fetches_original_when_context_incomplete(monkeypatch):
+    picked = NewsItem(
+        title="Sparse source title",
+        url="https://example.com/original",
+        source="Example",
+        domain="example.com",
+        description="too short",
+        content="",
+    )
+    calls: list[str] = []
+
+    def fake_fetch(url: str, *, timeout_s: float = 8.0, max_chars: int = 1200) -> str:
+        calls.append(url)
+        return "原新闻显示，相关机构公布了更完整的事实背景、时间线和影响范围。"
+
+    monkeypatch.setattr(create_post, "_fetch_original_news_excerpt", fake_fetch)
+
+    enriched, meta = _enrich_daily_news_item(picked)
+
+    assert _daily_news_context_is_incomplete(picked) is True
+    assert calls == ["https://example.com/original"]
+    assert "原新闻显示" in (enriched.content or "")
+    assert meta["source_lookup"]["ok"] is True
+
+
+def test_daily_news_prompt_requires_source_lookup_before_evaluation():
+    picked = NewsItem(
+        title="Sparse source title",
+        url="https://example.com/original",
+        source="Example",
+        domain="example.com",
+        description="too short",
+        content="原新闻显示，相关机构公布了更完整的事实背景、时间线和影响范围。",
+    )
+
+    prompt = _daily_news_prompt(picked, "国际新闻")
+
+    assert "内容不完整时" in prompt
+    assert "先查阅原新闻" in prompt
+    assert "不得推测" in prompt
+    assert "标题必须是20字以内" in prompt
+    assert "不得出现日文假名" in prompt
 
 
 def test_daily_news_offline_body_for_english_item_uses_chinese_publishable_shell():

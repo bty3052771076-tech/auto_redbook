@@ -4,7 +4,7 @@
 
 ## 免费运行说明（默认配置即可）
 - 文案生成：优先使用阿里云百炼（默认 `qwen3.7-plus`，OpenAI 兼容接口），可切换 ppinfra
-- 图片来源：默认可用 Pexels 自动配图；也可手动切换阿里云百炼文生图（默认 `wan2.7-image`）
+- 图片来源：默认使用阿里云百炼文生图（默认 `wan2.7-image`）；也可手动切换 Pexels 图片检索
 - 新闻来源：默认可使用 GDELT（无需 key 的免费新闻源）
 - 费用说明：上述能力在**免费额度内可运行**；若超出平台免费额度会产生计费，请自行关注控制台余额/配额
 
@@ -16,7 +16,7 @@
 - 特殊标题「每日假新闻」：LLM 生成幽默虚构新闻 → 生成草稿并保存
 - 批量生成：使用 `--count` 控制单次生成条数（默认 1）
 - 图形界面（GUI）：在窗口中选择模型/参数并一键执行常用命令
-- 自动配图：当未提供图片时，使用图片 API 搜索并下载 3 张相关图片用于上传（默认）
+- 自动配图：当未提供图片时，默认用阿里云百炼生成 1 张相关图片用于上传，也可切换 Pexels 检索下载
 - 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
 - 落盘与可追溯：`data/posts/<post_id>/` 保存 post / revision / execution / evidence
 
@@ -59,7 +59,7 @@ python -m playwright install chromium
 ```powershell
 .\Start-GUI.cmd
 ```
-GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、配图来源（Pexels / 阿里云）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，便于确认每个帖子的标题后再审核或上传。
+GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、配图来源（默认阿里云，也可选 Pexels）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，并在独立时间框显示北京时间，便于确认每个帖子的标题后再审核或上传。
 
 更多说明见：`docs/模型与GUI供应商配置.md`。
 
@@ -74,7 +74,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
 ## 草稿与浏览器 Profile
 - 草稿箱数据保存在浏览器本地 profile 中，不同 profile 互不可见。
 - 默认使用：`data/browser/chrome-profile`（复用 Chrome 渠道）。
-- GUI 顶部的“打开小红书创作平台”和 `Open-XHS-Creator.cmd` 都会使用这个 profile，而不是系统默认浏览器 profile。
+- GUI 顶部的“打开小红书创作平台”、`登录/检查Profile` 和 `Open-XHS-Creator.cmd` 都会使用这个 profile，而不是系统默认浏览器 profile。
 - 若需自定义 profile，设置：
   - `XHS_BROWSER_CHANNEL=chrome`
   - `XHS_CHROME_PATH=<chrome.exe 路径>`（可选；找不到 Chrome 时使用）
@@ -140,7 +140,7 @@ Pexels（自动配图：当未提供图片素材时）：
 
 ## 使用顺序（推荐）
 推荐直接使用 `auto` 一键完成：
-1) 准备图片：放到 `assets/pics/*`；或配置 `PEXELS_API_KEY` 让系统在“无图”时自动配图
+1) 准备图片：放到 `assets/pics/*`；或配置阿里云生图 Key 让系统在“无图”时自动生成配图
 2) 首次登录：运行时把 `--login-hold` 设大一些（例如 600 秒）用于扫码登录
 3) 执行一键保存草稿：
 
@@ -206,12 +206,13 @@ $env:NEWS_CANDIDATES_FILE="data/news/manual_candidates_20260619.json"
 .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "科技、社会或国际新闻" --assets-glob "assets/empty/*" --count 5 --login-hold 0 --wait-timeout 300 --force
 ```
 
-### 3) 无图片上传 → Pexels 自动配图 → 保存草稿
-前提：已配置 `PEXELS_API_KEY`（或本机 `docs/pexels_api-key.md`）。
+### 3) 无图片上传 → 阿里云生图（默认）→ 保存草稿
+前提：已配置 `ALIYUN_IMAGE_API_KEY` 或 `DASHSCOPE_API_KEY`（或本机 `docs/aliyun_image_api-key.md`）。
 ```powershell
 $env:LLM_API_KEY="YOUR_LLM_API_KEY"
-$env:PEXELS_API_KEY="YOUR_PEXELS_API_KEY"
-$env:IMAGE_PROVIDER="pexels"
+$env:ALIYUN_IMAGE_API_KEY="YOUR_DASHSCOPE_KEY"
+$env:IMAGE_PROVIDER="aliyun"
+$env:ALIYUN_IMAGE_MODEL="wan2.7-image"
 .\.venv\Scripts\python -m apps.cli auto --title "上海周末咖啡馆推荐" --prompt "安静、适合学习办公" --assets-glob "assets/empty/*" --login-hold 600
 ```
 
@@ -252,11 +253,16 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
   - 不提供 `--prompt`：按候选顺序取前 N 条
   - 正文会明确写出发布时间（提升时效性）
   - 正文开头新增“要点摘要：”20-40 字，概括新闻最重要部分（不评价）
+  - 标题会被规范为 20 字以内的中文总结标题，不再自动添加“每日新闻｜”前缀，并会清理日文假名
+  - 当候选新闻摘要/正文不足或被截断时，会尝试读取原新闻页面摘录，再交给 LLM 评价；若仍不足，则要求保守表达、不得推测
 
 可选配置（环境变量）：
 - `NEWS_PROVIDER`：`newsapi` / `gdelt`（默认自动；有 `NEWS_API_KEY` 时优先 `newsapi`）
 - `NEWS_TZ`：默认 `Asia/Shanghai`
 - `NEWS_QUERY_DEFAULT`：提示词无结果时的回退 query（默认 `china`）
+- `NEWS_SOURCE_LOOKUP`：默认 `1`，候选内容不足时尝试抓取原新闻摘录；设为 `0` 可关闭
+- `NEWS_SOURCE_LOOKUP_TIMEOUT_S`：原新闻摘录抓取超时，默认 `8`
+- `NEWS_SOURCE_CONTEXT_MIN_CHARS`：判断候选内容是否不足的阈值，默认 `120`
 
 ## 每日假新闻（特殊标题）
 - 当 `--title "每日假新闻"`：使用 LLM 生成一条幽默、明显虚构的娱乐新闻，并保存草稿。
@@ -279,8 +285,8 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 ## 自动配图（无图片时）
 - 当 `--assets-glob` 未命中任何图片：会自动生成/下载图片到 `data/posts/<post_id>/assets/`，然后继续上传并保存草稿。
 - 通过 `IMAGE_PROVIDER` 选择来源：
-  - `pexels`（默认）：图片检索下载（需要 `PEXELS_API_KEY`）
-  - `aliyun`：阿里云百炼（DashScope）API 生图并落盘（支持 Qwen-Image / Z-Image / 通义万相 wan2.x/wanx 系列）
+  - `aliyun`（默认）：阿里云百炼（DashScope）API 生图并落盘（支持 Qwen-Image / Z-Image / 通义万相 wan2.x/wanx 系列）
+  - `pexels`：图片检索下载（需要 `PEXELS_API_KEY`）
 - 调整张数：`AUTO_IMAGE_COUNT=3`（上限 18；`pexels` 默认 3，`aliyun` 默认 1）。
 - 提高相关性：`IMAGE_MIN_SCORE=0.12`（分数越高越严格，图片数量可能减少）。
 - 关闭自动配图：`AUTO_IMAGE=0`（注意：图文 post 仍需要至少 1 张图片，否则校验会失败）。

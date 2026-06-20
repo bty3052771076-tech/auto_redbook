@@ -13,6 +13,7 @@ data/browser/chrome-profile
 ## 修复
 
 - `apps.gui.open_xhs_creator()` 改为优先启动本机 Chrome，并显式传入 `--user-data-dir=<工作区>/data/browser/chrome-profile`。
+- GUI 新增 `登录/检查Profile` 按钮，用同一个 profile 打开 `https://creator.xiaohongshu.com`，便于登录失效时直接检查账号状态。
 - `scripts/open_xhs_creator.ps1` 与 GUI 使用一致的 profile 规则。
 - 找不到 Chrome 时，保留系统默认浏览器兜底打开链接，但此时可能不是正确 profile。
 

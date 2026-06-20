@@ -8,6 +8,7 @@ import sys
 import threading
 import webbrowser
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
@@ -62,7 +63,7 @@ PPINFRA_LLM_MODEL_OPTIONS = [DEFAULT_LLM_MODEL]
 AUTO_LLM_MODEL_OPTION = "阿里云免费模型列表（顺序回退）"
 
 DEFAULT_LLM_PROVIDER = "aliyun"
-DEFAULT_IMAGE_PROVIDER = "pexels"
+DEFAULT_IMAGE_PROVIDER = "aliyun"
 
 ALIYUN_IMAGE_MODEL_OPTIONS = ["wan2.7-image", "wan2.7-image-pro"]
 DEFAULT_ALIYUN_IMAGE_MODELS = ALIYUN_IMAGE_MODEL_OPTIONS[0]
@@ -74,9 +75,11 @@ DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT = (
 DEFAULT_NEWS_CHINA_RATIO = "0.6"
 DEFAULT_NEWS_CHINA_BONUS = "0.15"
 DEFAULT_DRAFT_URL = "https://creator.xiaohongshu.com/publish/publish?target=image"
+DEFAULT_LOGIN_URL = "https://creator.xiaohongshu.com"
 DEFAULT_XHS_CHROME_PROFILE = "Default"
 XHS_CHROME_PROFILE_RELATIVE = Path("data") / "browser" / "chrome-profile"
 POST_ID_RE = re.compile(r"[0-9a-fA-F]{32}")
+BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -108,13 +111,34 @@ def _shorten_choice_text(value: str, *, limit: int = 42) -> str:
 
 
 def _format_display_time(value: str) -> str:
+    return _format_beijing_time(value)
+
+
+def _parse_stored_time(value: str) -> datetime | None:
     text = (value or "").strip()
     if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            dt = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ")
+            return dt.replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        try:
+            dt = datetime.strptime(text.split(".", 1)[0].replace("T", " "), "%Y-%m-%d %H:%M:%S")
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+
+def _format_beijing_time(value: str) -> str:
+    dt = _parse_stored_time(value)
+    if not dt:
         return ""
-    text = text.replace("T", " ").rstrip("Z")
-    if "." in text:
-        text = text.split(".", 1)[0]
-    return text
+    return dt.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S 北京时间")
 
 
 def format_upload_state(post: RecentPostSummary) -> str:
@@ -203,10 +227,7 @@ def list_recent_posts(*, project_root: Path = PROJECT_ROOT, limit: int = 50) -> 
 
 def format_post_choice(post: RecentPostSummary) -> str:
     status = f" [{post.status}]" if post.status else ""
-    time_value = post.uploaded_at if post.uploaded else (post.updated_at or post.latest_execution_ended_at)
-    time_label = _format_display_time(time_value)
-    time_part = f" · {time_label}" if time_label else ""
-    return f"{_shorten_choice_text(post.title)}{status} · {format_upload_state(post)}{time_part} | {post.post_id}"
+    return f"{_shorten_choice_text(post.title)}{status} · {format_upload_state(post)} | {post.post_id}"
 
 
 def format_post_detail(post: RecentPostSummary) -> str:
@@ -233,6 +254,24 @@ def format_post_detail(post: RecentPostSummary) -> str:
     lines.append("正文预览：")
     lines.append(post.body_preview or "（无正文预览）")
     return "\n".join(lines)
+
+
+def format_post_time_detail(post: RecentPostSummary) -> str:
+    rows = [("显示时区", "北京时间 UTC+8")]
+    time_fields = [
+        ("创建时间", post.created_at),
+        ("本地更新时间", post.updated_at),
+        ("上传时间", post.uploaded_at),
+        ("执行开始", post.latest_execution_started_at),
+        ("执行结束", post.latest_execution_ended_at),
+    ]
+    for label, raw in time_fields:
+        formatted = _format_beijing_time(raw)
+        if formatted:
+            rows.append((label, formatted))
+    if len(rows) == 1:
+        rows.append(("时间", "暂无记录"))
+    return "\n".join(f"{label}：{value}" for label, value in rows)
 
 
 def extract_post_id_from_choice(value: str) -> str:
@@ -297,6 +336,7 @@ def build_xhs_creator_launch_args(
     project_root: Path = PROJECT_ROOT,
     env: Mapping[str, str] | None = None,
     chrome_path: str | Path | None = None,
+    url: str = DEFAULT_DRAFT_URL,
 ) -> list[str]:
     chrome = Path(chrome_path).expanduser() if chrome_path else find_chrome_executable(env=env)
     if not chrome:
@@ -308,22 +348,41 @@ def build_xhs_creator_launch_args(
         str(chrome),
         f"--user-data-dir={profile_dir}",
         f"--profile-directory={profile_name}",
-        DEFAULT_DRAFT_URL,
+        url,
     ]
+
+
+def build_xhs_login_launch_args(
+    *,
+    project_root: Path = PROJECT_ROOT,
+    env: Mapping[str, str] | None = None,
+    chrome_path: str | Path | None = None,
+) -> list[str]:
+    return build_xhs_creator_launch_args(
+        project_root=project_root,
+        env=env,
+        chrome_path=chrome_path,
+        url=DEFAULT_LOGIN_URL,
+    )
 
 
 def open_xhs_creator(
     *,
     project_root: Path = PROJECT_ROOT,
     env: Mapping[str, str] | None = None,
+    url: str = DEFAULT_DRAFT_URL,
 ) -> bool:
     profile_dir = build_xhs_creator_profile_dir(project_root=project_root, env=env)
-    args = build_xhs_creator_launch_args(project_root=project_root, env=env)
+    args = build_xhs_creator_launch_args(project_root=project_root, env=env, url=url)
     if args:
         profile_dir.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(args, cwd=str(project_root))
         return True
-    return bool(webbrowser.open(DEFAULT_DRAFT_URL))
+    return bool(webbrowser.open(url))
+
+
+def open_xhs_profile_login() -> bool:
+    return open_xhs_creator(url=DEFAULT_LOGIN_URL)
 
 
 def _python_for_cli() -> str:
@@ -665,6 +724,7 @@ def main() -> None:
     header.pack(fill="x", padx=18, pady=(14, 10))
     ttk.Label(header, text="Auto Redbook 发布控制台", style="Title.TLabel").pack(side="left")
     ttk.Button(header, text="打开小红书创作平台", command=open_xhs_creator).pack(side="right")
+    ttk.Button(header, text="登录/检查Profile", command=open_xhs_profile_login).pack(side="right", padx=(0, 8))
     ttk.Label(
         header,
         text="新闻生成、AI 配图、草稿状态和删除验证放在同一个工作流里，减少反复改配置文件。",
@@ -1003,6 +1063,21 @@ def main() -> None:
 
     detail_frame = ttk.Frame(tab_run)
     detail_frame.pack(fill="both", expand=True, padx=4, pady=(0, 10))
+    time_frame = ttk.Frame(detail_frame)
+    time_frame.pack(fill="x", pady=(0, 8))
+    ttk.Label(time_frame, text="时间（北京时间）", style="Section.TLabel").pack(anchor="w")
+    post_time_detail = ScrolledText(
+        time_frame,
+        height=5,
+        bg="#fffaf0",
+        fg=palette["ink"],
+        insertbackground=palette["ink"],
+        relief="solid",
+        bd=1,
+        font=base_font,
+        wrap="word",
+    )
+    post_time_detail.pack(fill="x", pady=(6, 0))
     ttk.Label(detail_frame, text="草稿详情", style="Section.TLabel").pack(anchor="w")
     post_detail = ScrolledText(
         detail_frame,
@@ -1023,6 +1098,12 @@ def main() -> None:
         post_detail.insert("1.0", text)
         post_detail.configure(state="disabled")
 
+    def _set_post_time_detail(text: str) -> None:
+        post_time_detail.configure(state="normal")
+        post_time_detail.delete("1.0", "end")
+        post_time_detail.insert("1.0", text)
+        post_time_detail.configure(state="disabled")
+
     def _suggest_run_assets_glob(pid: str) -> str:
         pid_norm = extract_post_id_from_choice(pid)
         return f"data/posts/{pid_norm}/assets/*" if pid_norm else ""
@@ -1039,11 +1120,13 @@ def main() -> None:
         elif choices:
             _on_post_id_change()
         else:
+            _set_post_time_detail("暂无本地草稿时间记录。")
             _set_post_detail("暂无本地草稿。")
 
     def _on_post_id_change(*_args) -> None:
         pid = extract_post_id_from_choice(post_id_var.get())
         if not pid:
+            _set_post_time_detail("请选择一个本地草稿以查看北京时间。")
             _set_post_detail("请选择一个本地草稿。")
             return
         cur_assets = assets_glob_var.get().strip()
@@ -1051,8 +1134,10 @@ def main() -> None:
             assets_glob_var.set(_suggest_run_assets_glob(pid))
         summary = post_lookup.get(pid)
         if summary:
+            _set_post_time_detail(format_post_time_detail(summary))
             _set_post_detail(format_post_detail(summary))
         else:
+            _set_post_time_detail("未找到本地草稿时间记录。")
             _set_post_detail(f"未找到本地草稿：{pid}")
 
     post_id_var.trace_add("write", _on_post_id_change)
