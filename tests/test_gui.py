@@ -8,6 +8,7 @@ from apps.gui import (
     DEFAULT_DRAFT_URL,
     DEFAULT_IMAGE_PROVIDER,
     LLM_PROVIDER_OPTIONS,
+    build_xhs_creator_launch_args,
     build_cli_args,
     build_provider_env_overrides,
     extract_post_id_from_choice,
@@ -15,6 +16,7 @@ from apps.gui import (
     format_post_detail,
     list_recent_posts,
     load_env_file,
+    open_xhs_creator,
     save_env_file,
 )
 
@@ -158,6 +160,70 @@ def test_format_post_detail_shows_upload_state_time_and_body_preview():
 
 def test_xhs_creator_quick_launch_target_uses_image_publish_url():
     assert DEFAULT_DRAFT_URL == "https://creator.xiaohongshu.com/publish/publish?target=image"
+
+
+def test_xhs_creator_launch_args_use_workspace_chrome_profile(tmp_path: Path):
+    chrome = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
+    chrome.parent.mkdir(parents=True)
+    chrome.write_text("", encoding="utf-8")
+
+    args = build_xhs_creator_launch_args(project_root=tmp_path, chrome_path=chrome, env={})
+
+    assert args[0] == str(chrome)
+    assert f"--user-data-dir={tmp_path / 'data' / 'browser' / 'chrome-profile'}" in args
+    assert "--profile-directory=Default" in args
+    assert args[-1] == DEFAULT_DRAFT_URL
+
+
+def test_xhs_creator_launch_args_allow_profile_override(tmp_path: Path):
+    chrome = tmp_path / "chrome.exe"
+    chrome.write_text("", encoding="utf-8")
+    custom_profile = tmp_path / "custom-xhs-profile"
+
+    args = build_xhs_creator_launch_args(
+        project_root=tmp_path,
+        chrome_path=chrome,
+        env={
+            "XHS_CHROME_USER_DATA_DIR": str(custom_profile),
+            "XHS_CHROME_PROFILE": "Profile 1",
+        },
+    )
+
+    assert f"--user-data-dir={custom_profile}" in args
+    assert "--profile-directory=Profile 1" in args
+
+
+def test_open_xhs_creator_launches_chrome_with_workspace_profile(monkeypatch, tmp_path: Path):
+    chrome = tmp_path / "chrome.exe"
+    chrome.write_text("", encoding="utf-8")
+    launched: list[tuple[list[str], Path | None]] = []
+
+    def fake_popen(args, cwd=None):
+        launched.append((list(args), Path(cwd) if cwd else None))
+
+        class FakeProcess:
+            pid = 123
+
+        return FakeProcess()
+
+    monkeypatch.setattr("apps.gui.find_chrome_executable", lambda env=None: chrome)
+    monkeypatch.setattr("apps.gui.subprocess.Popen", fake_popen)
+
+    assert open_xhs_creator(project_root=tmp_path, env={}) is True
+
+    profile_dir = tmp_path / "data" / "browser" / "chrome-profile"
+    assert profile_dir.exists()
+    assert launched == [
+        (
+            [
+                str(chrome),
+                f"--user-data-dir={profile_dir}",
+                "--profile-directory=Default",
+                DEFAULT_DRAFT_URL,
+            ],
+            tmp_path,
+        )
+    ]
 
 
 def test_quick_launch_scripts_are_workspace_local():

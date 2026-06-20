@@ -1,5 +1,25 @@
 # CODING_PROGRESS
 
+### 2026-06-20 09:35
+**Task:** Fix GUI "打开小红书创作平台" to open the workspace Chrome profile instead of the system default profile.
+**Git:** `main (dirty)`; modified GUI/profile launch code, tests, quick-launch script, README, usage docs; added one repair note.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | Replaced `webbrowser.open()`-only behavior with Chrome launch args that use `data/browser/chrome-profile`; added `XHS_CHROME_PATH`, `XHS_CHROME_USER_DATA_DIR`, and `XHS_CHROME_PROFILE` support. | None. |
+| `scripts/open_xhs_creator.ps1` | DONE | Aligned the standalone quick-launch script with the GUI profile rules and added Chrome path/profile overrides. | None. |
+| `tests/test_gui.py` | DONE | Added regression tests for workspace profile launch args, profile overrides, and actual GUI launch invocation. | None. |
+| `README.md` | DONE | Documented that the GUI button and `Open-XHS-Creator.cmd` use the workspace profile. | None. |
+| `docs/使用说明-自动新闻生成与草稿发布.md` | DONE | Added the same GUI profile note and optional override variables. | None. |
+| `docs/GUI小红书Profile修复-2026-06-20.md` | DONE | Added a focused repair note with root cause, fix behavior, config variables, and verification commands. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry after invoking the file-progress-followup workflow. | Keep updating after future coding work. |
+
+**Notes**
+- Tests/Lint: first TDD red check failed with missing `build_xhs_creator_launch_args`; after the fix, `pytest tests/test_gui.py -q` -> 18 passed, `py_compile apps/gui.py` passed, PowerShell script parser passed, and full `pytest -q` -> 102 passed in 13.77s.
+- Verification: non-invasive runtime check reports `C:\Program Files\Google\Chrome\Application\chrome.exe --user-data-dir=E:\AI\codex\redbook_workflow\data\browser\chrome-profile --profile-directory=Default https://creator.xiaohongshu.com/publish/publish?target=image`.
+- Risks/Assumptions: I did not force-open Chrome during final verification to avoid interrupting your current browser session; the generated launch args point to the correct existing workspace profile.
+- Next steps: Open GUI and click “打开小红书创作平台”; it should now show the same logged-in account and drafts as the automation profile.
+
 > 记录按时间倒序（最新在前）
 
 ### 2026-06-19 19:22

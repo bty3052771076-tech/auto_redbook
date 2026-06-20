@@ -9,7 +9,7 @@ import threading
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 from src.config import (
     ALIYUN_FREE_LLM_MODELS,
@@ -74,6 +74,8 @@ DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT = (
 DEFAULT_NEWS_CHINA_RATIO = "0.6"
 DEFAULT_NEWS_CHINA_BONUS = "0.15"
 DEFAULT_DRAFT_URL = "https://creator.xiaohongshu.com/publish/publish?target=image"
+DEFAULT_XHS_CHROME_PROFILE = "Default"
+XHS_CHROME_PROFILE_RELATIVE = Path("data") / "browser" / "chrome-profile"
 POST_ID_RE = re.compile(r"[0-9a-fA-F]{32}")
 
 
@@ -245,7 +247,82 @@ def list_recent_post_ids(*, project_root: Path = PROJECT_ROOT, limit: int = 50) 
     return [post.post_id for post in list_recent_posts(project_root=project_root, limit=limit)]
 
 
-def open_xhs_creator() -> bool:
+def _env_lookup(env: Mapping[str, str] | None = None) -> Mapping[str, str]:
+    return os.environ if env is None else env
+
+
+def build_xhs_creator_profile_dir(
+    *,
+    project_root: Path = PROJECT_ROOT,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    value = str(_env_lookup(env).get("XHS_CHROME_USER_DATA_DIR") or "").strip()
+    if value:
+        return Path(value).expanduser()
+    return project_root / XHS_CHROME_PROFILE_RELATIVE
+
+
+def build_xhs_creator_profile_name(*, env: Mapping[str, str] | None = None) -> str:
+    value = str(_env_lookup(env).get("XHS_CHROME_PROFILE") or "").strip()
+    return value or DEFAULT_XHS_CHROME_PROFILE
+
+
+def find_chrome_executable(*, env: Mapping[str, str] | None = None) -> Path | None:
+    source = _env_lookup(env)
+    explicit = str(source.get("XHS_CHROME_PATH") or "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        if path.exists():
+            return path
+
+    candidates: list[Path] = []
+    program_files = str(source.get("ProgramFiles") or "").strip()
+    if program_files:
+        candidates.append(Path(program_files) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    program_files_x86 = str(source.get("ProgramFiles(x86)") or "").strip()
+    if program_files_x86:
+        candidates.append(Path(program_files_x86) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    local_app_data = str(source.get("LOCALAPPDATA") or "").strip()
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "Google" / "Chrome" / "Application" / "chrome.exe")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def build_xhs_creator_launch_args(
+    *,
+    project_root: Path = PROJECT_ROOT,
+    env: Mapping[str, str] | None = None,
+    chrome_path: str | Path | None = None,
+) -> list[str]:
+    chrome = Path(chrome_path).expanduser() if chrome_path else find_chrome_executable(env=env)
+    if not chrome:
+        return []
+
+    profile_dir = build_xhs_creator_profile_dir(project_root=project_root, env=env)
+    profile_name = build_xhs_creator_profile_name(env=env)
+    return [
+        str(chrome),
+        f"--user-data-dir={profile_dir}",
+        f"--profile-directory={profile_name}",
+        DEFAULT_DRAFT_URL,
+    ]
+
+
+def open_xhs_creator(
+    *,
+    project_root: Path = PROJECT_ROOT,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    profile_dir = build_xhs_creator_profile_dir(project_root=project_root, env=env)
+    args = build_xhs_creator_launch_args(project_root=project_root, env=env)
+    if args:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(args, cwd=str(project_root))
+        return True
     return bool(webbrowser.open(DEFAULT_DRAFT_URL))
 
 

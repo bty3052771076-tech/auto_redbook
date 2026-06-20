@@ -74,8 +74,10 @@ powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
 ## 草稿与浏览器 Profile
 - 草稿箱数据保存在浏览器本地 profile 中，不同 profile 互不可见。
 - 默认使用：`data/browser/chrome-profile`（复用 Chrome 渠道）。
+- GUI 顶部的“打开小红书创作平台”和 `Open-XHS-Creator.cmd` 都会使用这个 profile，而不是系统默认浏览器 profile。
 - 若需自定义 profile，设置：
   - `XHS_BROWSER_CHANNEL=chrome`
+  - `XHS_CHROME_PATH=<chrome.exe 路径>`（可选；找不到 Chrome 时使用）
   - `XHS_CHROME_USER_DATA_DIR=<profile 目录>`
   - `XHS_CHROME_PROFILE=Default`（或 `Profile 1` 等）
 
