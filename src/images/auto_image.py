@@ -224,6 +224,36 @@ def _body_snippet_for_prompt(body: str, *, limit: int = 180) -> str:
     """
     if not body:
         return ""
+    try:
+        obj = json.loads(body)
+    except Exception:
+        obj = None
+    if isinstance(obj, dict):
+        parts = [
+            str(obj.get("内容") or "").strip(),
+            str(obj.get("评价") or "").strip(),
+        ]
+        json_text = " ".join(part for part in parts if part)
+        if json_text:
+            return _clip_text(_strip_urls(_strip_hashtags(json_text)), limit=limit)
+    rendered_parts: list[str] = []
+    for label, next_labels in (("内容", ("评价", "日期", "来源")), ("评价", ("日期", "来源"))):
+        marker = f"{label}：\n"
+        start = body.find(marker)
+        if start < 0:
+            continue
+        value_start = start + len(marker)
+        stops = [
+            body.find(f"\n\n{next_label}：", value_start)
+            for next_label in next_labels
+            if body.find(f"\n\n{next_label}：", value_start) >= 0
+        ]
+        value_end = min(stops) if stops else len(body)
+        value = body[value_start:value_end].strip()
+        if value:
+            rendered_parts.append(value)
+    if rendered_parts:
+        return _clip_text(_strip_urls(_strip_hashtags(" ".join(rendered_parts))), limit=limit)
     cleaned = _strip_urls(_strip_hashtags(body))
     # The post body often contains section headings like “新闻内容：/我的点评：”.
     # Strip them so the image prompt doesn't accidentally steer towards a "news poster" style.

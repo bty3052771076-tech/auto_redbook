@@ -1,5 +1,9 @@
 $ErrorActionPreference = "Stop"
 
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $PSDefaultParameterValues["Invoke-WebRequest:UseBasicParsing"] = $true
+}
+
 $Root = Split-Path -Parent $PSScriptRoot
 $Source = Join-Path $PSScriptRoot "AutoRedbookGuiLauncher.cs"
 $Output = Join-Path $Root "AutoRedbookGUI-Launcher.exe"

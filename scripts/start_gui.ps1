@@ -1,5 +1,9 @@
 $ErrorActionPreference = "Stop"
 
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $PSDefaultParameterValues["Invoke-WebRequest:UseBasicParsing"] = $true
+}
+
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 

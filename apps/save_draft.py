@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import os
 import sys
 from pathlib import Path
 
@@ -20,6 +21,20 @@ def _ensure_utf8_output() -> None:
         pass
 
 
+def _headless_env_enabled() -> bool:
+    return (os.getenv("XHS_HEADLESS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def _headless_option_value(headless: bool):
+    return True if headless else None
+
+
 @app.command()
 def run(
     post_id: str = typer.Argument(..., help="post_id (data/posts/<id>/post.json)"),
@@ -37,6 +52,11 @@ def run(
     login_only: bool = typer.Option(
         False, help="only wait for login/publish UI then exit"
     ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="run Chrome without a visible window; requires an already logged-in profile",
+    ),
     wait_timeout: int = typer.Option(
         300, help="seconds to wait for publish UI before failing"
     ),
@@ -51,6 +71,12 @@ def run(
     glob_pattern = assets_glob or f"data/posts/{post_id}/assets/*"
     asset_paths = [p for p in glob.glob(glob_pattern) if Path(p).is_file()]
 
+    if (headless or _headless_env_enabled()) and login_hold > 0:
+        typer.echo(
+            "warn: --headless requires an already logged-in Chrome profile; "
+            "login-hold cannot display QR/captcha windows"
+        )
+
     exec_rec = run_save_draft_sync(
         post,
         assets=asset_paths,
@@ -58,6 +84,8 @@ def run(
         login_hold=login_hold,
         login_only=login_only,
         wait_timeout_ms=wait_timeout * 1000,
+        headless=_headless_option_value(headless),
+        progress_callback=lambda message: typer.echo(f"{message} | post_id={post.id}"),
     )
     typer.echo(f"result: {exec_rec.result}")
     for s in exec_rec.steps:

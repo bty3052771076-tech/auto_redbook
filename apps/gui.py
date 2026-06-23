@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import json
+import queue
 import re
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -20,6 +22,7 @@ from src.config import (
     DEFAULT_LLM_MODEL,
 )
 from src.storage.files import latest_execution
+from src.workflow.create_post import DEFAULT_EVALUATION_VIEWPOINT
 
 
 def _detect_project_root() -> Path:
@@ -52,11 +55,16 @@ ENV_GUI_PATH = PROJECT_ROOT / ".env.gui"
 # --- GUI defaults (safe; no secrets) ---
 DEFAULT_TITLE = "每日新闻"
 DEFAULT_ASSETS_GLOB = "assets/pics/*"
+AUTO_IMAGE_ASSETS_GLOB = "assets/empty/*"
 DEFAULT_LOGIN_HOLD = 600
 DEFAULT_WAIT_TIMEOUT = 600
+DEFAULT_COMMAND_HEARTBEAT_S = 20.0
+COMMAND_OUTPUT_POLL_S = 0.2
 
 LLM_PROVIDER_OPTIONS = ["aliyun", "ppinfra", "auto"]
-IMAGE_PROVIDER_OPTIONS = ["pexels", "aliyun"]
+IMAGE_SOURCE_LOCAL = "local"
+IMAGE_PROVIDER_OPTIONS = ["aliyun", "pexels"]
+IMAGE_SOURCE_OPTIONS = [IMAGE_SOURCE_LOCAL] + IMAGE_PROVIDER_OPTIONS
 
 ALIYUN_LLM_MODEL_OPTIONS = list(ALIYUN_FREE_LLM_MODELS)
 PPINFRA_LLM_MODEL_OPTIONS = [DEFAULT_LLM_MODEL]
@@ -64,8 +72,13 @@ AUTO_LLM_MODEL_OPTION = "阿里云免费模型列表（顺序回退）"
 
 DEFAULT_LLM_PROVIDER = "aliyun"
 DEFAULT_IMAGE_PROVIDER = "aliyun"
+DEFAULT_IMAGE_SOURCE = DEFAULT_IMAGE_PROVIDER
 
-ALIYUN_IMAGE_MODEL_OPTIONS = ["wan2.7-image", "wan2.7-image-pro"]
+ALIYUN_IMAGE_MODEL_OPTIONS = [
+    "wan2.7-image",
+    "wan2.7-image-pro",
+    "qwen-image-2.0-pro-2026-04-22",
+]
 DEFAULT_ALIYUN_IMAGE_MODELS = ALIYUN_IMAGE_MODEL_OPTIONS[0]
 DEFAULT_ALIYUN_IMAGE_SIZE = "1104*1472"
 DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT = (
@@ -77,8 +90,15 @@ DEFAULT_NEWS_CHINA_BONUS = "0.15"
 DEFAULT_DRAFT_URL = "https://creator.xiaohongshu.com/publish/publish?target=image"
 DEFAULT_LOGIN_URL = "https://creator.xiaohongshu.com"
 DEFAULT_XHS_CHROME_PROFILE = "Default"
+DELETE_MODE_PREVIEW = "安全预览（不删除）"
+DELETE_MODE_DELETE = "正式删除（会删除小红书草稿）"
+DELETE_MODE_OPTIONS = [DELETE_MODE_PREVIEW, DELETE_MODE_DELETE]
+DELETE_CONFIRM_ASK = "执行前确认（推荐）"
+DELETE_CONFIRM_AUTO = "自动确认（不再弹出确认）"
+DELETE_CONFIRM_OPTIONS = [DELETE_CONFIRM_ASK, DELETE_CONFIRM_AUTO]
 XHS_CHROME_PROFILE_RELATIVE = Path("data") / "browser" / "chrome-profile"
 POST_ID_RE = re.compile(r"[0-9a-fA-F]{32}")
+DISPLAY_STATUS_SYMBOL_RE = re.compile(r"[✅❌✔✘✖✓☑☒]")
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
@@ -108,6 +128,14 @@ def _shorten_choice_text(value: str, *, limit: int = 42) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _clean_display_title(value: str) -> str:
+    text = DISPLAY_STATUS_SYMBOL_RE.sub("", value or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if re.fullmatch(r"[\?？�]+", text):
+        text = ""
+    return text or "(无标题)"
 
 
 def _format_display_time(value: str) -> str:
@@ -227,12 +255,13 @@ def list_recent_posts(*, project_root: Path = PROJECT_ROOT, limit: int = 50) -> 
 
 def format_post_choice(post: RecentPostSummary) -> str:
     status = f" [{post.status}]" if post.status else ""
-    return f"{_shorten_choice_text(post.title)}{status} · {format_upload_state(post)} | {post.post_id}"
+    title = _shorten_choice_text(_clean_display_title(post.title))
+    return f"{title}{status} · {format_upload_state(post)} | {post.post_id}"
 
 
 def format_post_detail(post: RecentPostSummary) -> str:
     lines = [
-        f"标题：{post.title}",
+        f"标题：{_clean_display_title(post.title)}",
         f"post_id：{post.post_id}",
         f"本地状态：{post.status or '未知'}",
         f"上传状态：{format_upload_state(post)}",
@@ -443,6 +472,34 @@ def save_env_file(path: Path, values: dict[str, str]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def normalize_image_source(value: str) -> str:
+    source = (value or "").strip().lower()
+    if source not in IMAGE_SOURCE_OPTIONS:
+        return IMAGE_SOURCE_LOCAL
+    return source
+
+
+def resolve_assets_glob_for_image_source(image_source: str, assets_glob: str) -> str:
+    source = normalize_image_source(image_source)
+    if source == IMAGE_SOURCE_LOCAL:
+        return (assets_glob or DEFAULT_ASSETS_GLOB).strip()
+    return AUTO_IMAGE_ASSETS_GLOB
+
+
+def resolve_delete_mode_flags(delete_mode: str, confirm_mode: str) -> tuple[bool, bool]:
+    """
+    Translate human-readable delete choices into CLI flags.
+
+    Preview mode must never pass auto-confirm, even if the confirm selector is
+    changed, so the command remains semantically unambiguous.
+    """
+    dry_run = (delete_mode or DELETE_MODE_PREVIEW).strip() != DELETE_MODE_DELETE
+    if dry_run:
+        return True, False
+    yes = (confirm_mode or DELETE_CONFIRM_ASK).strip() == DELETE_CONFIRM_AUTO
+    return False, yes
+
+
 def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
     """
     Build `python -m apps.cli <subcommand> ...` args from typed parameters.
@@ -455,13 +512,22 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         if not title:
             raise ValueError("title is required")
         prompt = str(params.get("prompt") or "").strip()
-        assets_glob = str(params.get("assets_glob") or "assets/pics/*").strip()
+        evaluation_viewpoint = (
+            str(params.get("evaluation_viewpoint") or DEFAULT_EVALUATION_VIEWPOINT).strip()
+            or DEFAULT_EVALUATION_VIEWPOINT
+        )
+        image_source = str(params.get("image_source") or IMAGE_SOURCE_LOCAL)
+        assets_glob = resolve_assets_glob_for_image_source(
+            image_source,
+            str(params.get("assets_glob") or DEFAULT_ASSETS_GLOB),
+        )
         count = int(params.get("count") or 1)
         no_copy = bool(params.get("no_copy") or False)
 
         args.extend(["--title", title])
         if prompt:
             args.extend(["--prompt", prompt])
+        args.extend(["--evaluation-viewpoint", evaluation_viewpoint])
         if assets_glob:
             args.extend(["--assets-glob", assets_glob])
         args.extend(["--count", str(count)])
@@ -470,11 +536,14 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
 
         if subcommand == "auto":
             dry_run = bool(params.get("dry_run") or False)
+            headless = bool(params.get("headless") or False)
             login_hold = int(params.get("login_hold") or 0)
             wait_timeout = int(params.get("wait_timeout") or 300)
             force = bool(params.get("force") or False)
             if dry_run:
                 args.append("--dry-run")
+            if headless:
+                args.append("--headless")
             args.extend(["--login-hold", str(login_hold)])
             args.extend(["--wait-timeout", str(wait_timeout)])
             if force:
@@ -496,6 +565,7 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             raise ValueError("post_id is required")
         assets_glob = str(params.get("assets_glob") or "").strip()
         dry_run = bool(params.get("dry_run") or False)
+        headless = bool(params.get("headless") or False)
         login_hold = int(params.get("login_hold") or 0)
         wait_timeout = int(params.get("wait_timeout") or 300)
         force = bool(params.get("force") or False)
@@ -505,6 +575,8 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             args.extend(["--assets-glob", assets_glob])
         if dry_run:
             args.append("--dry-run")
+        if headless:
+            args.append("--headless")
         args.extend(["--login-hold", str(login_hold)])
         args.extend(["--wait-timeout", str(wait_timeout)])
         if force:
@@ -518,6 +590,7 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         all_types = bool(params.get("all_types") or False)
         limit = int(params.get("limit") or 0)
         dry_run = bool(params.get("dry_run") or False)
+        headless = bool(params.get("headless") or False)
         yes = bool(params.get("yes") or False)
         login_hold = int(params.get("login_hold") or 0)
         wait_timeout = int(params.get("wait_timeout") or 300)
@@ -531,6 +604,8 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         args.extend(["--limit", str(limit)])
         if dry_run:
             args.append("--dry-run")
+        if headless:
+            args.append("--headless")
         if yes:
             args.append("--yes")
         args.extend(["--login-hold", str(login_hold)])
@@ -587,9 +662,17 @@ def build_provider_env_overrides(
         elif model in PPINFRA_LLM_MODEL_OPTIONS:
             env["LLM_MODEL"] = model
 
-    img_provider = (image_provider or DEFAULT_IMAGE_PROVIDER).strip().lower()
+    img_provider = (image_provider or DEFAULT_IMAGE_SOURCE).strip().lower()
+    if img_provider == IMAGE_SOURCE_LOCAL:
+        env["AUTO_IMAGE"] = "0"
+        env.pop("IMAGE_PROVIDER", None)
+        env.pop("ALIYUN_IMAGE_MODEL", None)
+        env.pop("ALIYUN_IMAGE_MODELS", None)
+        return env
+
     if img_provider not in IMAGE_PROVIDER_OPTIONS:
         img_provider = DEFAULT_IMAGE_PROVIDER
+    env["AUTO_IMAGE"] = "1"
     env["IMAGE_PROVIDER"] = img_provider
 
     if img_provider == "aliyun":
@@ -603,44 +686,146 @@ def build_provider_env_overrides(
     return env
 
 
+def ensure_daily_news_candidate_pool_env(
+    env_overrides: dict[str, str],
+    *,
+    title: str,
+    count: object,
+) -> dict[str, str]:
+    env = _clean_env(dict(env_overrides or {}))
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+
+    try:
+        count_int = int(count or 1)
+    except (TypeError, ValueError):
+        count_int = 1
+    if (title or "").strip() != DEFAULT_TITLE or count_int <= 1:
+        return env
+
+    desired = max(60, count_int * 20)
+    raw_current = (env.get("NEWS_MAX_RECORDS") or os.getenv("NEWS_MAX_RECORDS") or "").strip()
+    try:
+        current = int(raw_current) if raw_current else 0
+    except ValueError:
+        current = 0
+    env["NEWS_MAX_RECORDS"] = str(max(current, desired))
+    return env
+
+
 def build_subprocess_env(env_overrides: dict[str, str]) -> dict[str, str]:
     env = dict(os.environ)
     env.update(_clean_env(env_overrides or {}))
-    env.setdefault("PYTHONIOENCODING", "utf-8")
-    env.setdefault("PYTHONUTF8", "1")
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
     return env
+
+
+def env_flag_enabled(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int_value(value: str | None, default: int, *, min_value: int | None = None) -> int:
+    try:
+        parsed = int((value or "").strip())
+    except (TypeError, ValueError):
+        parsed = default
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    return parsed
 
 
 @dataclass
 class _RunState:
     proc: Optional[subprocess.Popen] = None
     thread: Optional[threading.Thread] = None
+    running: bool = False
+
+
+class UiEventQueue:
+    """Queue callbacks from worker threads and drain them on the Tk main thread."""
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[tuple[Callable[..., None], tuple[object, ...]]] = queue.Queue()
+
+    def put(self, callback: Callable[..., None], *args: object) -> None:
+        self._queue.put((callback, args))
+
+    def drain(self, *, max_items: int = 200) -> int:
+        count = 0
+        while count < max_items:
+            try:
+                callback, args = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            callback(*args)
+            count += 1
+        return count
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _heartbeat_line(elapsed_seconds: float) -> str:
+    return (
+        f"[gui] 仍在运行，已耗时 {_format_elapsed(elapsed_seconds)}；"
+        "当前可能在等待新闻 API、LLM、VLM 生图或小红书页面响应。\n"
+    )
 
 
 class CommandRunner:
-    def __init__(self, *, on_line: Callable[[str], None], on_exit: Callable[[int], None]):
+    def __init__(
+        self,
+        *,
+        on_line: Callable[[str], None],
+        on_exit: Callable[[int], None],
+        on_status: Callable[[str], None] | None = None,
+        heartbeat_seconds: float = DEFAULT_COMMAND_HEARTBEAT_S,
+    ):
         self._on_line = on_line
         self._on_exit = on_exit
+        self._on_status = on_status or (lambda _status: None)
+        self._heartbeat_seconds = float(heartbeat_seconds)
         self._state = _RunState()
 
     def is_running(self) -> bool:
-        return bool(self._state.proc and self._state.proc.poll() is None)
+        return self._state.running or bool(self._state.proc and self._state.proc.poll() is None)
 
     def stop(self) -> None:
+        if not self.is_running():
+            self._on_line("[gui] 当前没有正在运行的任务。\n")
+            self._on_status("空闲")
+            return
+        self._on_status("正在停止")
         proc = self._state.proc
         if not proc or proc.poll() is not None:
+            self._on_line("[gui] 任务正在启动或已经结束，无法发送停止信号。\n")
             return
         try:
             proc.terminate()
+            self._on_line("[gui] 已请求停止当前任务，正在等待子进程退出...\n")
         except Exception:
-            pass
+            self._on_line("[gui] 停止请求失败，请查看是否已有残留子进程。\n")
 
     def run(self, args: list[str], env: dict[str, str]) -> None:
         if self.is_running():
             self._on_line("[gui] 已有任务正在运行，请先停止当前任务。\n")
             return
+        self._state.running = True
+        self._on_status("运行中：正在启动")
 
         def _target() -> None:
+            code = 1
+            started_at = time.monotonic()
+            next_heartbeat = started_at + self._heartbeat_seconds
+            sentinel = object()
             try:
                 self._on_line(f"[cmd] {' '.join(args)}\n")
                 proc = subprocess.Popen(
@@ -654,15 +839,43 @@ class CommandRunner:
                     errors="replace",
                 )
                 self._state.proc = proc
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    self._on_line(line)
+                self._on_status(f"运行中：pid={getattr(proc, 'pid', 'unknown')}")
+                output_queue: queue.Queue[object] = queue.Queue()
+
+                def _read_stdout() -> None:
+                    try:
+                        assert proc.stdout is not None
+                        for line in proc.stdout:
+                            output_queue.put(line)
+                    except Exception as exc:
+                        output_queue.put(f"[gui] 读取子进程输出失败：{exc}\n")
+                    finally:
+                        output_queue.put(sentinel)
+
+                reader = threading.Thread(target=_read_stdout, daemon=True)
+                reader.start()
+                while True:
+                    try:
+                        item = output_queue.get(timeout=COMMAND_OUTPUT_POLL_S)
+                    except queue.Empty:
+                        if self._heartbeat_seconds > 0 and time.monotonic() >= next_heartbeat:
+                            now = time.monotonic()
+                            self._on_line(_heartbeat_line(now - started_at))
+                            next_heartbeat = now + self._heartbeat_seconds
+                        continue
+                    if item is sentinel:
+                        break
+                    self._on_line(str(item))
+                    if self._heartbeat_seconds > 0:
+                        next_heartbeat = time.monotonic() + self._heartbeat_seconds
                 code = int(proc.wait())
+                reader.join(timeout=1)
             except Exception as exc:
                 self._on_line(f"[gui] 运行失败：{exc}\n")
-                code = 1
             finally:
                 self._state.proc = None
+                self._state.running = False
+                self._on_status("空闲")
                 self._on_exit(code)
 
         t = threading.Thread(target=_target, daemon=True)
@@ -706,8 +919,12 @@ def main() -> None:
     style.configure("TLabel", background=palette["paper"], foreground=palette["ink"])
     style.configure("Muted.TLabel", background=palette["paper"], foreground=palette["muted"])
     style.configure("Panel.TLabel", background=palette["panel"], foreground=palette["ink"])
+    style.configure("PanelMuted.TLabel", background=palette["panel"], foreground=palette["muted"])
     style.configure("Title.TLabel", font=title_font, background=palette["paper"], foreground=palette["ink"])
     style.configure("Section.TLabel", font=section_font, background=palette["paper"], foreground=palette["ink"])
+    style.configure("PanelSection.TLabel", font=section_font, background=palette["panel"], foreground=palette["ink"])
+    style.configure("Panel.TCheckbutton", background=palette["panel"], foreground=palette["ink"], padding=(0, 2))
+    style.map("Panel.TCheckbutton", background=[("active", palette["panel"])])
     style.configure("Accent.TButton", foreground="#ffffff", background=palette["accent"], padding=(14, 7))
     style.map("Accent.TButton", background=[("active", palette["accent_dark"])])
     style.configure("TNotebook", background=palette["paper"], borderwidth=0)
@@ -756,14 +973,36 @@ def main() -> None:
     )
     log.pack(fill="both", expand=True)
 
-    def log_line(s: str) -> None:
+    ui_events = UiEventQueue()
+
+    def _append_log(s: str) -> None:
         log.insert("end", s)
         log.see("end")
 
-    def log_exit(code: int) -> None:
-        log_line(f"\n[exit] code={code}\n")
+    def _append_exit(code: int) -> None:
+        _append_log(f"\n[exit] code={code}\n")
 
-    runner = CommandRunner(on_line=log_line, on_exit=log_exit)
+    def _drain_ui_events() -> None:
+        ui_events.drain()
+        root.after(50, _drain_ui_events)
+
+    def log_line(s: str) -> None:
+        ui_events.put(_append_log, s)
+
+    def log_exit(code: int) -> None:
+        ui_events.put(_append_exit, code)
+
+    status_var = tk.StringVar(value="状态：空闲")
+
+    def _set_status(status: str) -> None:
+        status_var.set(f"状态：{status}")
+
+    def log_status(status: str) -> None:
+        ui_events.put(_set_status, status)
+
+    root.after(50, _drain_ui_events)
+
+    runner = CommandRunner(on_line=log_line, on_exit=log_exit, on_status=log_status)
 
     log_actions = ttk.Frame(right)
     log_actions.pack(fill="x", pady=(8, 0))
@@ -771,9 +1010,45 @@ def main() -> None:
     ttk.Button(log_actions, text="清空日志", command=lambda: log.delete("1.0", "end")).pack(
         side="left", padx=(8, 0)
     )
+    ttk.Label(log_actions, textvariable=status_var, style="Muted.TLabel").pack(side="right")
 
     nb = ttk.Notebook(left)
     nb.pack(fill="both", expand=True)
+
+    def _add_scrollable_tab(text: str):
+        outer = ttk.Frame(nb)
+        nb.add(outer, text=text)
+        canvas = tk.Canvas(outer, bg=palette["paper"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        inner = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync_scroll_region(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_inner_width(event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def _on_mousewheel(event) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_mousewheel(_event=None) -> None:
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_mousewheel(_event=None) -> None:
+            canvas.unbind_all("<MouseWheel>")
+
+        inner.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_inner_width)
+        canvas.bind("<Enter>", _bind_mousewheel)
+        canvas.bind("<Leave>", _unbind_mousewheel)
+        inner.bind("<Enter>", _bind_mousewheel)
+        inner.bind("<Leave>", _unbind_mousewheel)
+        return inner
 
     cfg_vars: dict[str, tk.StringVar] = {}
 
@@ -782,6 +1057,72 @@ def main() -> None:
         entry = ttk.Entry(parent, textvariable=var, width=width, show="*" if secret else "")
         entry.grid(row=row, column=1, sticky="we", pady=5, padx=(10, 0))
         return entry
+
+    def _add_execution_options(
+        parent,
+        *,
+        dry_run_var,
+        headless_var,
+        login_hold_var,
+        wait_timeout_var,
+        force_var=None,
+        dry_label: str = "dry-run 只验证",
+        headless_label: str = "无界面上传",
+    ) -> None:
+        panel = ttk.Frame(parent, style="Panel.TFrame", padding=(12, 10))
+        panel.pack(fill="x", padx=4, pady=(8, 10))
+        panel.columnconfigure(0, weight=1)
+
+        ttk.Label(panel, text="运行选项", style="PanelSection.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            panel,
+            text="无界面模式需要已登录的工作区 Profile；首次扫码或验证码请先用可视浏览器完成。",
+            style="PanelMuted.TLabel",
+            wraplength=620,
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        body = ttk.Frame(panel, style="Panel.TFrame")
+        body.grid(row=2, column=0, sticky="we", pady=(10, 0))
+        body.columnconfigure(0, weight=1)
+
+        mode_row = ttk.Frame(body, style="Panel.TFrame")
+        mode_row.grid(row=0, column=0, sticky="nw")
+        ttk.Checkbutton(
+            mode_row,
+            text=dry_label,
+            variable=dry_run_var,
+            style="Panel.TCheckbutton",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 2))
+        ttk.Checkbutton(
+            mode_row,
+            text=headless_label,
+            variable=headless_var,
+            style="Panel.TCheckbutton",
+        ).grid(row=0, column=1, sticky="w", padx=(20, 0), pady=(0, 2))
+        if force_var is not None:
+            ttk.Checkbutton(
+                mode_row,
+                text="force 跳过校验",
+                variable=force_var,
+                style="Panel.TCheckbutton",
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+        wait_row = ttk.Frame(body, style="Panel.TFrame")
+        wait_row.grid(row=0, column=1, sticky="ne", padx=(24, 0))
+        ttk.Label(wait_row, text="登录等待（秒）", style="Panel.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Spinbox(wait_row, from_=0, to=3600, textvariable=login_hold_var, width=8).grid(
+            row=0, column=1, sticky="w", padx=(8, 0), pady=(0, 4)
+        )
+        ttk.Label(wait_row, text="页面等待（秒）", style="Panel.TLabel").grid(
+            row=1, column=0, sticky="w"
+        )
+        ttk.Spinbox(wait_row, from_=30, to=3600, textvariable=wait_timeout_var, width=8).grid(
+            row=1, column=1, sticky="w", padx=(8, 0)
+        )
 
     def _cfg_var(key: str, default: str = ""):
         var = tk.StringVar(value=_env_default(key, default))
@@ -797,11 +1138,16 @@ def main() -> None:
         except Exception as exc:
             log_line(f"[gui] 参数错误：{exc}\n")
             return
+        if subcommand in ("auto", "create"):
+            env_overrides = ensure_daily_news_candidate_pool_env(
+                env_overrides,
+                title=str(params.get("title") or ""),
+                count=params.get("count") or 1,
+            )
         runner.run(args, build_subprocess_env(env_overrides))
 
     # --- Auto tab ---
-    tab_auto = ttk.Frame(nb)
-    nb.add(tab_auto, text="自动发帖")
+    tab_auto = _add_scrollable_tab("自动发帖")
 
     auto_top = ttk.Frame(tab_auto)
     auto_top.pack(fill="x", padx=4, pady=(8, 10))
@@ -813,7 +1159,6 @@ def main() -> None:
     ).pack(anchor="w", pady=(2, 0))
 
     auto_grid = ttk.Frame(tab_auto)
-    auto_grid.pack(fill="x", padx=4, pady=(0, 8))
     auto_grid.columnconfigure(1, weight=1)
     auto_grid.columnconfigure(3, weight=1)
 
@@ -822,9 +1167,11 @@ def main() -> None:
     count_var = tk.IntVar(value=1)
     no_copy_var = tk.BooleanVar(value=False)
     dry_run_var = tk.BooleanVar(value=False)
+    headless_var = tk.BooleanVar(value=False)
     force_var = tk.BooleanVar(value=False)
     login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
+    evaluation_viewpoint_var = tk.StringVar(value=DEFAULT_EVALUATION_VIEWPOINT)
 
     prompt_placeholder = "可选，例如：中国要闻 / 科技热点 / 上海周末活动"
 
@@ -855,32 +1202,44 @@ def main() -> None:
 
     _add_labeled_entry(auto_grid, 0, "标题", title_var)
     quick_titles = ttk.Frame(auto_grid)
-    quick_titles.grid(row=0, column=2, columnspan=2, sticky="e", padx=(10, 0))
+    quick_titles.grid(row=1, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
     ttk.Button(quick_titles, text="每日新闻", command=lambda: title_var.set("每日新闻")).pack(side="left")
     ttk.Button(quick_titles, text="每日假新闻", command=lambda: title_var.set("每日假新闻")).pack(
         side="left", padx=(8, 0)
     )
 
-    ttk.Label(auto_grid, text="提示词").grid(row=1, column=0, sticky="nw", pady=5)
+    ttk.Label(auto_grid, text="提示词").grid(row=2, column=0, sticky="nw", pady=5)
     prompt_text = tk.Text(auto_grid, height=4, relief="solid", bd=1, wrap="word", font=base_font)
-    prompt_text.grid(row=1, column=1, columnspan=3, sticky="we", pady=5, padx=(10, 0))
+    prompt_text.grid(row=2, column=1, columnspan=3, sticky="we", pady=5, padx=(10, 0))
     _init_prompt_placeholder(prompt_text)
 
-    _add_labeled_entry(auto_grid, 2, "素材 glob", assets_var)
-    ttk.Label(auto_grid, text="没有本地图片时会按配图来源自动补图", style="Muted.TLabel").grid(
-        row=2, column=2, columnspan=2, sticky="e", padx=(10, 0)
+    _add_labeled_entry(auto_grid, 3, "评价视角", evaluation_viewpoint_var)
+
+    assets_entry = _add_labeled_entry(auto_grid, 4, "本地 assets glob", assets_var)
+    assets_hint_var = tk.StringVar(value="")
+    ttk.Label(auto_grid, textvariable=assets_hint_var, style="Muted.TLabel").grid(
+        row=5, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 4)
     )
 
-    ttk.Label(auto_grid, text="数量").grid(row=3, column=0, sticky="w", pady=5)
+    ttk.Label(auto_grid, text="数量").grid(row=6, column=0, sticky="w", pady=5)
     ttk.Spinbox(auto_grid, from_=1, to=50, textvariable=count_var, width=8).grid(
-        row=3, column=1, sticky="w", pady=5, padx=(10, 0)
+        row=6, column=1, sticky="w", pady=5, padx=(10, 0)
     )
     ttk.Checkbutton(auto_grid, text="不复制素材 (--no-copy)", variable=no_copy_var).grid(
-        row=3, column=2, sticky="w", padx=(10, 0)
+        row=6, column=2, sticky="w", padx=(10, 0)
     )
-    ttk.Checkbutton(auto_grid, text="force 跳过校验错误继续", variable=force_var).grid(
-        row=3, column=3, sticky="e"
+
+    _add_execution_options(
+        tab_auto,
+        dry_run_var=dry_run_var,
+        headless_var=headless_var,
+        login_hold_var=login_hold_var,
+        wait_timeout_var=wait_timeout_var,
+        force_var=force_var,
+        dry_label="dry-run 只验证",
+        headless_label="无界面上传",
     )
+    auto_grid.pack(fill="x", padx=4, pady=(0, 8))
 
     model_grid = ttk.Frame(tab_auto)
     model_grid.pack(fill="x", padx=4, pady=(10, 8))
@@ -897,7 +1256,14 @@ def main() -> None:
         or DEFAULT_ALIYUN_LLM_MODEL
     )
     llm_model_var = tk.StringVar(value=initial_llm_model)
-    image_provider_var = tk.StringVar(value=_env_default("IMAGE_PROVIDER", DEFAULT_IMAGE_PROVIDER))
+    initial_image_source = (
+        _env_default("IMAGE_SOURCE")
+        or _env_default("IMAGE_PROVIDER")
+        or DEFAULT_IMAGE_SOURCE
+    ).strip().lower()
+    if initial_image_source not in IMAGE_SOURCE_OPTIONS:
+        initial_image_source = DEFAULT_IMAGE_SOURCE
+    image_provider_var = tk.StringVar(value=initial_image_source)
     image_model_var = tk.StringVar(
         value=_env_default("ALIYUN_IMAGE_MODEL", DEFAULT_ALIYUN_IMAGE_MODELS)
     )
@@ -916,11 +1282,11 @@ def main() -> None:
     llm_model_box = ttk.Combobox(model_grid, textvariable=llm_model_var, values=ALIYUN_LLM_MODEL_OPTIONS)
     llm_model_box.grid(row=1, column=3, sticky="we", padx=(10, 0), pady=5)
 
-    ttk.Label(model_grid, text="配图来源").grid(row=2, column=0, sticky="w", pady=5)
+    ttk.Label(model_grid, text="图片来源").grid(row=2, column=0, sticky="w", pady=5)
     image_provider_box = ttk.Combobox(
         model_grid,
         textvariable=image_provider_var,
-        values=IMAGE_PROVIDER_OPTIONS,
+        values=IMAGE_SOURCE_OPTIONS,
         state="readonly",
         width=14,
     )
@@ -950,23 +1316,24 @@ def main() -> None:
             llm_model_var.set(fallback)
 
     def _sync_image_model_state(*_args) -> None:
-        if image_provider_var.get().strip().lower() == "aliyun":
+        source = normalize_image_source(image_provider_var.get())
+        if source == "aliyun":
             image_model_box.configure(state="normal")
         else:
             image_model_box.configure(state="disabled")
+        if source == IMAGE_SOURCE_LOCAL:
+            assets_entry.configure(state="normal")
+            assets_hint_var.set("选择 local 时使用本地文件；找不到图片时不会自动调用 AI/Pexels。")
+        else:
+            assets_entry.configure(state="disabled")
+            assets_hint_var.set(
+                f"选择 {source} 时会忽略本地 assets，自动使用 {AUTO_IMAGE_ASSETS_GLOB} 触发自动配图。"
+            )
 
     llm_provider_var.trace_add("write", _sync_llm_model_values)
     image_provider_var.trace_add("write", _sync_image_model_state)
     _sync_llm_model_values()
     _sync_image_model_state()
-
-    timing = ttk.Frame(tab_auto)
-    timing.pack(fill="x", padx=4, pady=(8, 8))
-    ttk.Checkbutton(timing, text="dry-run 只验证不上传/保存", variable=dry_run_var).pack(side="left")
-    ttk.Label(timing, text="login-hold").pack(side="left", padx=(18, 6))
-    ttk.Spinbox(timing, from_=0, to=3600, textvariable=login_hold_var, width=8).pack(side="left")
-    ttk.Label(timing, text="wait-timeout").pack(side="left", padx=(18, 6))
-    ttk.Spinbox(timing, from_=30, to=3600, textvariable=wait_timeout_var, width=8).pack(side="left")
 
     def _auto_env() -> dict[str, str]:
         return build_provider_env_overrides(
@@ -981,10 +1348,13 @@ def main() -> None:
         params = {
             "title": title_var.get(),
             "prompt": _read_prompt(prompt_text),
+            "evaluation_viewpoint": evaluation_viewpoint_var.get(),
             "assets_glob": assets_var.get(),
+            "image_source": image_provider_var.get(),
             "count": count_var.get(),
             "no_copy": no_copy_var.get(),
             "dry_run": dry_run_var.get(),
+            "headless": headless_var.get(),
             "login_hold": login_hold_var.get(),
             "wait_timeout": wait_timeout_var.get(),
             "force": force_var.get(),
@@ -1002,6 +1372,38 @@ def main() -> None:
         style="Muted.TLabel",
     ).pack(side="left", padx=(14, 0))
 
+    def _maybe_autorun_from_env() -> None:
+        if (os.getenv("AUTO_REDBOOK_GUI_AUTORUN") or "").strip().lower() != "auto":
+            return
+
+        title_var.set(os.getenv("AUTO_REDBOOK_GUI_TITLE") or DEFAULT_TITLE)
+        evaluation_viewpoint_var.set(
+            os.getenv("AUTO_REDBOOK_GUI_EVALUATION_VIEWPOINT") or DEFAULT_EVALUATION_VIEWPOINT
+        )
+        assets_var.set(os.getenv("AUTO_REDBOOK_GUI_ASSETS_GLOB") or AUTO_IMAGE_ASSETS_GLOB)
+        count_var.set(env_int_value(os.getenv("AUTO_REDBOOK_GUI_COUNT"), count_var.get(), min_value=1))
+        dry_run_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_DRY_RUN")))
+        headless_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_HEADLESS")))
+        force_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_FORCE")))
+        login_hold_var.set(env_int_value(os.getenv("AUTO_REDBOOK_GUI_LOGIN_HOLD"), login_hold_var.get(), min_value=0))
+        wait_timeout_var.set(env_int_value(os.getenv("AUTO_REDBOOK_GUI_WAIT_TIMEOUT"), wait_timeout_var.get(), min_value=30))
+
+        image_provider_var.set(os.getenv("AUTO_REDBOOK_GUI_IMAGE_SOURCE") or DEFAULT_IMAGE_SOURCE)
+        image_model_var.set(os.getenv("AUTO_REDBOOK_GUI_IMAGE_MODEL") or image_model_var.get())
+        llm_provider_var.set(os.getenv("AUTO_REDBOOK_GUI_LLM_PROVIDER") or llm_provider_var.get())
+        llm_model_var.set(os.getenv("AUTO_REDBOOK_GUI_LLM_MODEL") or llm_model_var.get())
+
+        prompt_value = (os.getenv("AUTO_REDBOOK_GUI_PROMPT") or "").strip()
+        if prompt_value:
+            prompt_text.delete("1.0", "end")
+            prompt_text.insert("1.0", prompt_value)
+            prompt_text.configure(fg=palette["ink"])
+
+        log_line("[gui] AUTO_REDBOOK_GUI_AUTORUN=auto，已从 GUI 自动触发 auto 任务。\n")
+        root.after(300, _run_auto)
+
+    root.after(500, _maybe_autorun_from_env)
+
     # --- Create tab ---
     tab_create = ttk.Frame(nb)
     nb.add(tab_create, text="仅生成")
@@ -1013,25 +1415,28 @@ def main() -> None:
     create_assets_var = tk.StringVar(value=DEFAULT_ASSETS_GLOB)
     create_count_var = tk.IntVar(value=1)
     create_no_copy_var = tk.BooleanVar(value=False)
+    create_evaluation_viewpoint_var = tk.StringVar(value=DEFAULT_EVALUATION_VIEWPOINT)
     create_prompt = tk.Text(create_grid, height=4, relief="solid", bd=1, wrap="word", font=base_font)
 
     _add_labeled_entry(create_grid, 0, "标题", create_title_var)
     ttk.Label(create_grid, text="提示词").grid(row=1, column=0, sticky="nw", pady=5)
     create_prompt.grid(row=1, column=1, sticky="we", pady=5, padx=(10, 0))
     _init_prompt_placeholder(create_prompt)
-    _add_labeled_entry(create_grid, 2, "素材 glob", create_assets_var)
-    ttk.Label(create_grid, text="数量").grid(row=3, column=0, sticky="w", pady=5)
+    _add_labeled_entry(create_grid, 2, "评价视角", create_evaluation_viewpoint_var)
+    _add_labeled_entry(create_grid, 3, "素材 glob", create_assets_var)
+    ttk.Label(create_grid, text="数量").grid(row=4, column=0, sticky="w", pady=5)
     ttk.Spinbox(create_grid, from_=1, to=50, textvariable=create_count_var, width=8).grid(
-        row=3, column=1, sticky="w", pady=5, padx=(10, 0)
+        row=4, column=1, sticky="w", pady=5, padx=(10, 0)
     )
     ttk.Checkbutton(create_grid, text="不复制素材 (--no-copy)", variable=create_no_copy_var).grid(
-        row=4, column=1, sticky="w", pady=5, padx=(10, 0)
+        row=5, column=1, sticky="w", pady=5, padx=(10, 0)
     )
 
     def _run_create() -> None:
         params = {
             "title": create_title_var.get(),
             "prompt": _read_prompt(create_prompt),
+            "evaluation_viewpoint": create_evaluation_viewpoint_var.get(),
             "assets_glob": create_assets_var.get(),
             "count": create_count_var.get(),
             "no_copy": create_no_copy_var.get(),
@@ -1052,6 +1457,7 @@ def main() -> None:
     post_id_var = tk.StringVar(value="")
     assets_glob_var = tk.StringVar(value="")
     run_dry_var = tk.BooleanVar(value=False)
+    run_headless_var = tk.BooleanVar(value=False)
     run_force_var = tk.BooleanVar(value=False)
     run_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     run_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
@@ -1149,14 +1555,16 @@ def main() -> None:
         row=1, column=2, sticky="e", padx=(8, 0)
     )
 
-    run_opts = ttk.Frame(tab_run)
-    run_opts.pack(fill="x", padx=4, pady=(0, 8))
-    ttk.Checkbutton(run_opts, text="dry-run 只验证", variable=run_dry_var).pack(side="left")
-    ttk.Checkbutton(run_opts, text="force 跳过校验", variable=run_force_var).pack(side="left", padx=(12, 0))
-    ttk.Label(run_opts, text="login-hold").pack(side="left", padx=(18, 6))
-    ttk.Spinbox(run_opts, from_=0, to=3600, textvariable=run_login_hold_var, width=8).pack(side="left")
-    ttk.Label(run_opts, text="wait-timeout").pack(side="left", padx=(18, 6))
-    ttk.Spinbox(run_opts, from_=30, to=3600, textvariable=run_wait_timeout_var, width=8).pack(side="left")
+    _add_execution_options(
+        tab_run,
+        dry_run_var=run_dry_var,
+        headless_var=run_headless_var,
+        login_hold_var=run_login_hold_var,
+        wait_timeout_var=run_wait_timeout_var,
+        force_var=run_force_var,
+        dry_label="dry-run 只验证",
+        headless_label="无界面上传",
+    )
 
     run_buttons = ttk.Frame(tab_run)
     run_buttons.pack(fill="x", padx=4, pady=(0, 12))
@@ -1175,6 +1583,7 @@ def main() -> None:
                 "post_id": extract_post_id_from_choice(post_id_var.get()),
                 "assets_glob": assets_glob_var.get(),
                 "dry_run": run_dry_var.get(),
+                "headless": run_headless_var.get(),
                 "login_hold": run_login_hold_var.get(),
                 "wait_timeout": run_wait_timeout_var.get(),
                 "force": run_force_var.get(),
@@ -1200,8 +1609,10 @@ def main() -> None:
     draft_url_var = tk.StringVar(value=DEFAULT_DRAFT_URL)
     all_types_var = tk.BooleanVar(value=False)
     del_limit_var = tk.IntVar(value=0)
-    del_dry_var = tk.BooleanVar(value=True)
-    del_yes_var = tk.BooleanVar(value=False)
+    del_headless_var = tk.BooleanVar(value=False)
+    del_mode_var = tk.StringVar(value=DELETE_MODE_PREVIEW)
+    del_confirm_var = tk.StringVar(value=DELETE_CONFIRM_ASK)
+    del_hint_var = tk.StringVar(value="")
     del_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     del_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
 
@@ -1217,26 +1628,58 @@ def main() -> None:
         row=1, column=1, sticky="w", padx=(10, 0), pady=5
     )
     ttk.Entry(del_grid, textvariable=draft_url_var).grid(row=1, column=2, sticky="we", padx=(10, 0), pady=5)
-    ttk.Label(del_grid, text="limit (0=不限)").grid(row=2, column=0, sticky="w", pady=5)
+    ttk.Label(del_grid, text="删除模式").grid(row=2, column=0, sticky="w", pady=5)
+    ttk.Combobox(
+        del_grid,
+        textvariable=del_mode_var,
+        values=DELETE_MODE_OPTIONS,
+        state="readonly",
+        width=28,
+    ).grid(row=2, column=1, columnspan=2, sticky="we", padx=(10, 0), pady=5)
+
+    ttk.Label(del_grid, text="limit (0=不限)").grid(row=3, column=0, sticky="w", pady=5)
     ttk.Spinbox(del_grid, from_=0, to=500, textvariable=del_limit_var, width=8).grid(
-        row=2, column=1, sticky="w", padx=(10, 0), pady=5
-    )
-    ttk.Checkbutton(del_grid, text="dry-run 只预览", variable=del_dry_var).grid(
-        row=2, column=2, sticky="e", padx=(10, 0)
-    )
-    ttk.Checkbutton(del_grid, text="--yes 跳过确认", variable=del_yes_var).grid(
-        row=3, column=2, sticky="e", padx=(10, 0)
-    )
-    ttk.Label(del_grid, text="login-hold").grid(row=3, column=0, sticky="w", pady=5)
-    ttk.Spinbox(del_grid, from_=0, to=3600, textvariable=del_login_hold_var, width=8).grid(
         row=3, column=1, sticky="w", padx=(10, 0), pady=5
     )
-    ttk.Label(del_grid, text="wait-timeout").grid(row=4, column=0, sticky="w", pady=5)
+
+    ttk.Label(del_grid, text="确认方式").grid(row=4, column=0, sticky="w", pady=5)
+    ttk.Combobox(
+        del_grid,
+        textvariable=del_confirm_var,
+        values=DELETE_CONFIRM_OPTIONS,
+        state="readonly",
+        width=28,
+    ).grid(row=4, column=1, columnspan=2, sticky="we", padx=(10, 0), pady=5)
+    ttk.Label(del_grid, textvariable=del_hint_var, style="Muted.TLabel", wraplength=520).grid(
+        row=5, column=0, columnspan=3, sticky="we", pady=(0, 8)
+    )
+    ttk.Checkbutton(del_grid, text="无界面运行 (--headless)", variable=del_headless_var).grid(
+        row=6, column=2, sticky="e", padx=(10, 0)
+    )
+    ttk.Label(del_grid, text="login-hold").grid(row=6, column=0, sticky="w", pady=5)
+    ttk.Spinbox(del_grid, from_=0, to=3600, textvariable=del_login_hold_var, width=8).grid(
+        row=6, column=1, sticky="w", padx=(10, 0), pady=5
+    )
+    ttk.Label(del_grid, text="wait-timeout").grid(row=7, column=0, sticky="w", pady=5)
     ttk.Spinbox(del_grid, from_=30, to=3600, textvariable=del_wait_timeout_var, width=8).grid(
-        row=4, column=1, sticky="w", padx=(10, 0), pady=5
+        row=7, column=1, sticky="w", padx=(10, 0), pady=5
     )
 
+    def _sync_delete_hint(*_args) -> None:
+        dry_run, yes = resolve_delete_mode_flags(del_mode_var.get(), del_confirm_var.get())
+        if dry_run:
+            del_hint_var.set("当前为安全预览：只列出将被删除的草稿，不会删除任何平台草稿。")
+        elif yes:
+            del_hint_var.set("当前为正式删除 + 自动确认：点击后会直接删除匹配的小红书草稿，请先确认 limit 和 --all。")
+        else:
+            del_hint_var.set("当前为正式删除：命令行会再次询问确认，确认后才会删除平台草稿。")
+
+    del_mode_var.trace_add("write", _sync_delete_hint)
+    del_confirm_var.trace_add("write", _sync_delete_hint)
+    _sync_delete_hint()
+
     def _run_delete() -> None:
+        dry_run, yes = resolve_delete_mode_flags(del_mode_var.get(), del_confirm_var.get())
         _run_command(
             "delete-drafts",
             {
@@ -1245,8 +1688,9 @@ def main() -> None:
                 "draft_url": draft_url_var.get(),
                 "all_types": all_types_var.get(),
                 "limit": del_limit_var.get(),
-                "dry_run": del_dry_var.get(),
-                "yes": del_yes_var.get(),
+                "dry_run": dry_run,
+                "headless": del_headless_var.get(),
+                "yes": yes,
                 "login_hold": del_login_hold_var.get(),
                 "wait_timeout": del_wait_timeout_var.get(),
             },

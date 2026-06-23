@@ -1,5 +1,6 @@
 from src.images.auto_image import (
     ImageItem,
+    _body_snippet_for_prompt,
     _build_aliyun_image_prompt,
     _download_image,
     _pexels_query_hint,
@@ -67,6 +68,45 @@ def test_build_image_query_compresses_long_english_title():
     assert "trump" in q.lower()
     assert "venezuela" in q.lower()
     assert "court" not in q.lower()
+
+
+def test_body_snippet_for_prompt_reads_daily_news_json_body():
+    body = (
+        '{\n'
+        '  "原文标题": "AI芯片新品发布",\n'
+        '  "内容": "这家芯片企业披露新一代人工智能加速器，面向推理计算场景。",\n'
+        '  "评价": "AI芯片竞争会影响算力供给和应用成本。",\n'
+        '  "日期": "2026-06-19",\n'
+        '  "来源": "Example News"\n'
+        '}'
+    )
+
+    snippet = _body_snippet_for_prompt(body)
+
+    assert "人工智能加速器" in snippet
+    assert "算力供给" in snippet
+    assert "原文标题" not in snippet
+    assert "Example News" not in snippet
+
+
+def test_body_snippet_for_prompt_reads_rendered_daily_news_body():
+    body = (
+        "原文标题：AI芯片新品发布\n\n"
+        "内容：\n"
+        "这家芯片企业披露新一代人工智能加速器，面向推理计算场景。\n\n"
+        "评价：\n"
+        "AI芯片竞争会影响算力供给和应用成本。\n\n"
+        "日期：2026-06-19\n"
+        "来源：Example News"
+    )
+
+    snippet = _body_snippet_for_prompt(body)
+
+    assert "人工智能加速器" in snippet
+    assert "算力供给" in snippet
+    assert "原文标题" not in snippet
+    assert "日期" not in snippet
+    assert "Example News" not in snippet
 
 
 def test_pexels_query_hint_maps_us_politics():

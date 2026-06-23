@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -24,7 +25,16 @@ WAIT_TEXTS = [
     "\u56fe\u6587",
 ]
 TITLE_HINTS = ["\u586b\u5199\u6807\u9898", "\u6807\u9898", "\u66f4\u591a\u8d5e"]
-BODY_HINTS = ["\u8f93\u5165\u6b63\u6587", "\u6b63\u6587", "\u586b\u5199\u6b63\u6587"]
+BODY_HINTS = [
+    "\u8f93\u5165\u6b63\u6587",
+    "\u6b63\u6587",
+    "\u586b\u5199\u6b63\u6587",
+    "\u6dfb\u52a0\u6b63\u6587",
+    "\u8f93\u5165\u6b63\u6587\u63cf\u8ff0",
+    "\u7b14\u8bb0\u5185\u5bb9",
+    "\u5206\u4eab\u4f60\u7684\u60f3\u6cd5",
+    "\u771f\u8bda\u6709\u4ef7\u503c",
+]
 DRAFT_TEXTS = [
     "\u6682\u5b58\u79bb\u5f00",
     "\u6682\u5b58\u5e76\u79bb\u5f00",
@@ -82,6 +92,33 @@ DRAFT_ITEM_SELECTOR = ".draft-item"
 WAIT_TIMEOUT_MS = 300000
 UPLOAD_COUNT_PATTERN = re.compile(r"(\d+)\s*/\s*18")
 GENERIC_DRAFT_TITLES = {"", "\u6682\u65e0\u7b14\u8bb0\u6807\u9898", "\u65e0\u6807\u9898"}
+READY_PAGE_HINTS = [
+    "\u4e0a\u4f20\u56fe\u6587",
+    "\u53d1\u5e03\u56fe\u6587",
+    "\u586b\u5199\u6807\u9898",
+    "\u8f93\u5165\u6b63\u6587",
+    DRAFT_BOX_TEXT,
+    "\u56fe\u6587\u7b14\u8bb0",
+]
+LOGIN_PAGE_HINTS = [
+    "\u626b\u7801\u767b\u5f55",
+    "\u9a8c\u8bc1\u7801\u767b\u5f55",
+    "\u624b\u673a\u53f7\u767b\u5f55",
+    "\u5bc6\u7801\u767b\u5f55",
+    "\u5c0f\u7ea2\u4e66\u53f7\u767b\u5f55",
+    "\u53d1\u9001\u9a8c\u8bc1\u7801",
+    "\u8bf7\u5148\u767b\u5f55",
+    "\u767b\u5f55\u540e",
+    "\u8bf7\u5b8c\u6210\u5b89\u5168\u9a8c\u8bc1",
+]
+EDITOR_READY_SELECTORS = (
+    UPLOAD_BUTTON_SELECTORS
+    + [
+        "input[placeholder*='\u6807\u9898']",
+        "textarea",
+        "[contenteditable='true']",
+    ]
+)
 
 
 def _repo_root() -> Path:
@@ -118,6 +155,46 @@ def _resolve_cdp_url() -> Optional[str]:
     return raw
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _resolve_headless(headless: Optional[bool] = None) -> bool:
+    if headless is not None:
+        return bool(headless)
+    return _env_flag("XHS_HEADLESS", False)
+
+
+def _format_progress_message(name: str, status: str, detail: str = "") -> str:
+    message = f"[xhs-upload] {name}: {status}"
+    if detail:
+        message += f" | {detail}"
+    return message
+
+
+def _emit_progress(
+    progress_callback: Optional[Callable[[str], None]],
+    name: str,
+    status: str,
+    detail: str = "",
+) -> None:
+    if not progress_callback:
+        return
+    try:
+        progress_callback(_format_progress_message(name, status, detail))
+    except Exception:
+        # Progress reporting must never break the browser automation itself.
+        pass
+
+
 def _wait_for_any_text(page, texts: List[str], timeout_ms: int) -> str:
     per = max(1000, timeout_ms // max(1, len(texts)))
     for text in texts:
@@ -136,7 +213,7 @@ def _first_visible(locator):
         item = locator.nth(i)
         if item.is_visible():
             return item
-    return locator.first
+    return None
 
 
 def _wait_for_any_locator(
@@ -154,12 +231,156 @@ def _wait_for_any_locator(
     )
 
 
+def _locator_has_visible(page, selector: str) -> bool:
+    try:
+        locator = page.locator(selector)
+        count = locator.count()
+    except Exception:
+        return False
+    for idx in range(count):
+        try:
+            if locator.nth(idx).is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _page_has_ready_selector(page) -> bool:
+    return any(_locator_has_visible(page, selector) for selector in EDITOR_READY_SELECTORS)
+
+
+def _read_page_body_text(page, *, timeout_ms: int = 1000, max_chars: int = 8000) -> str:
+    try:
+        text = page.locator("body").inner_text(timeout=timeout_ms)
+    except Exception:
+        return ""
+    return str(text or "")[:max_chars]
+
+
+def _classify_xhs_page_state(url: str, title: str, body_text: str) -> str:
+    """
+    Return ready/login/unknown for the current creator page.
+
+    Login overlays can leave publish-page text in the background, so strong login
+    hints deliberately win over ready hints.
+    """
+    haystack = "\n".join([url or "", title or "", body_text or ""]).lower()
+    if "login" in haystack or any(hint in haystack for hint in LOGIN_PAGE_HINTS):
+        return "login"
+    if any(hint in (body_text or "") for hint in READY_PAGE_HINTS):
+        return "ready"
+    if "creator.xiaohongshu.com/publish" in haystack and "target=" in haystack:
+        return "unknown"
+    return "unknown"
+
+
+def _detect_xhs_page_state(page) -> tuple[str, str]:
+    url = ""
+    title = ""
+    try:
+        url = str(page.url or "")
+    except Exception:
+        pass
+    try:
+        title = str(page.title() or "")
+    except Exception:
+        pass
+    body_text = _read_page_body_text(page)
+    state = _classify_xhs_page_state(url, title, body_text)
+    if state != "login" and _page_has_ready_selector(page):
+        state = "ready"
+    detail = f"state={state} url={url or 'unknown'} title={title or 'unknown'}"
+    return state, detail
+
+
+def _wait_for_xhs_ready(
+    page,
+    *,
+    login_hold: int = 0,
+    headless: bool = False,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    state_reader: Optional[Callable[[object], tuple[str, str]]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+) -> str:
+    """
+    Wait only while login is actually needed or the creator app is still loading.
+
+    A non-zero login_hold is now an upper bound for manual login, not an
+    unconditional sleep. In headless mode, a detected login page fails fast
+    because the user cannot scan a QR/captcha in an invisible browser.
+    """
+    reader = state_reader or _detect_xhs_page_state
+    state, detail = reader(page)
+    if state == "ready":
+        _emit_progress(progress_callback, "login_check", "success", detail)
+        return detail
+    if headless and state == "login":
+        raise RuntimeError(
+            "xiaohongshu login required but browser is headless; "
+            "open GUI '登录/检查Profile' or run once without --headless"
+        )
+    if login_hold <= 0:
+        _emit_progress(progress_callback, "login_check", "skipped", detail)
+        return detail
+
+    deadline = monotonic_fn() + max(0, login_hold)
+    _emit_progress(
+        progress_callback,
+        "login_check",
+        "in_progress",
+        f"{detail} timeout={login_hold}s",
+    )
+    next_report = monotonic_fn() + 15
+    last_detail = detail
+    while monotonic_fn() < deadline:
+        sleep_fn(1)
+        state, detail = reader(page)
+        last_detail = detail
+        if state == "ready":
+            _emit_progress(progress_callback, "login_check", "success", detail)
+            return detail
+        if headless and state == "login":
+            raise RuntimeError(
+                "xiaohongshu login required but browser is headless; "
+                "open GUI '登录/检查Profile' or run once without --headless"
+            )
+        now = monotonic_fn()
+        if now >= next_report:
+            remain = max(0, int(deadline - now))
+            _emit_progress(
+                progress_callback,
+                "login_check",
+                "in_progress",
+                f"{detail} remaining={remain}s",
+            )
+            next_report = now + 15
+
+    if state == "login":
+        raise RuntimeError(
+            f"xiaohongshu login not completed within {login_hold}s; {last_detail}"
+        )
+    return last_detail
+
+
 def _first_matching_locator(ctx, selectors: List[str]):
     for sel in selectors:
         loc = ctx.locator(sel)
         if loc.count() > 0:
             return loc
     return None
+
+
+def _html_for_contenteditable_text(value: str) -> str:
+    lines = (value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines:
+        return "<p><br></p>"
+    parts: list[str] = []
+    for line in lines:
+        text = html.escape(line, quote=False)
+        parts.append(f"<p>{text}</p>" if text else "<p><br></p>")
+    return "".join(parts)
 
 
 def _commit_input_value(target, value: str) -> None:
@@ -171,14 +392,24 @@ def _commit_input_value(target, value: str) -> None:
     input/change/blur events after setting the DOM value keeps both layers in sync.
     """
     try:
+        editable_html = _html_for_contenteditable_text(value)
         target.evaluate(
             """
-            (el, value) => {
+            (el, payload) => {
+              const [value, editableHtml] = payload;
               const fire = (name, event) => el.dispatchEvent(event || new Event(name, { bubbles: true }));
-              if (el.getAttribute && el.getAttribute('contenteditable') === 'true') {
+              const editable = el.getAttribute && (
+                el.getAttribute('contenteditable') === 'true' ||
+                el.getAttribute('role') === 'textbox' ||
+                el.classList.contains('ProseMirror') ||
+                el.classList.contains('ql-editor')
+              );
+              if (editable) {
                 el.focus();
-                el.textContent = value;
+                el.innerHTML = editableHtml;
                 fire('input', new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                fire('beforeinput', new InputEvent('beforeinput', { bubbles: true, inputType: 'insertText', data: value }));
+                fire('keyup', new KeyboardEvent('keyup', { bubbles: true, key: 'Process' }));
                 fire('change');
                 fire('blur');
                 return;
@@ -194,7 +425,7 @@ def _commit_input_value(target, value: str) -> None:
               fire('blur');
             }
             """,
-            value,
+            [value, editable_html],
         )
     except Exception:
         pass
@@ -210,7 +441,7 @@ def _trusted_type_value(target, value: str) -> bool:
     match the visible editor much more reliably.
     """
     try:
-        target.click()
+        target.click(timeout=3000)
         target.press("Control+A")
         delay_ms = int(os.getenv("XHS_TYPE_DELAY_MS") or 5)
         target.type(value, delay=max(0, delay_ms))
@@ -237,7 +468,10 @@ def _fill_if_found(locator, value: str) -> bool:
     if len(value or "") <= 1200 and _trusted_type_value(target, value):
         return True
 
-    target.click()
+    try:
+        target.click(timeout=3000)
+    except Exception:
+        return False
     target.fill(value)
     _commit_input_value(target, value)
     try:
@@ -262,6 +496,89 @@ def _fill_with_selectors(ctx, selectors: List[str], value: str) -> bool:
         if _fill_if_found(ctx.locator(sel), value):
             return True
     return False
+
+
+def _fill_body_by_placeholder_text(page, body: str) -> bool:
+    placeholder_texts = [
+        "\u8f93\u5165\u6b63\u6587\u63cf\u8ff0",
+        "\u771f\u8bda\u6709\u4ef7\u503c",
+        "\u5206\u4eab\u4e88\u4eba\u6e29\u6696",
+        "\u8f93\u5165\u6b63\u6587",
+    ]
+    for text in placeholder_texts:
+        try:
+            loc = page.get_by_text(text, exact=False)
+            target = _first_visible(loc)
+            if target is None:
+                continue
+            target.click(timeout=3000)
+            page.keyboard.press("Control+A")
+            page.keyboard.insert_text(body)
+            page.keyboard.press("Tab")
+            page.wait_for_timeout(300)
+            if _matches_body_value(page.locator("body").inner_text(timeout=3000), body):
+                return True
+        except Exception:
+            continue
+    try:
+        editable_html = _html_for_contenteditable_text(body)
+        return bool(
+            page.evaluate(
+                """
+                ({ value, editableHtml }) => {
+                  const hints = ['输入正文描述', '真诚有价值', '分享予人温暖', '输入正文'];
+                  const nodes = Array.from(document.querySelectorAll('*')).filter(el => {
+                    const text = (el.textContent || '').trim();
+                    if (!text || !hints.some(h => text.includes(h))) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                  });
+                  const target = nodes.sort((a, b) => {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    return (ar.width * ar.height) - (br.width * br.height);
+                  })[0];
+                  if (!target) return false;
+                  target.click();
+                  const active = document.activeElement;
+                  const editor = active && active !== document.body ? active : target;
+                  if (editor.getAttribute && editor.getAttribute('contenteditable') === 'true') {
+                    editor.innerHTML = editableHtml;
+                    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                    editor.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                  }
+                  return false;
+                }
+                """,
+                {"value": body, "editableHtml": editable_html},
+            )
+        )
+    except Exception:
+        return False
+
+
+def _fill_body_by_title_offset(page, body: str) -> bool:
+    title_loc = page.locator("input[placeholder*='\u6807\u9898']").first
+    try:
+        box = title_loc.bounding_box(timeout=3000)
+    except Exception:
+        box = None
+    if not box:
+        return False
+    # XHS places the body editor directly below the title input in the same card.
+    x = box["x"] + 24
+    y = box["y"] + max(48, box["height"] + 22)
+    try:
+        page.mouse.click(x, y)
+        page.keyboard.press("Control+A")
+        page.keyboard.insert_text(body)
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(500)
+        return _matches_body_value(page.locator("body").inner_text(timeout=3000), body)
+    except Exception:
+        return False
 
 
 def _try_upload_with_button(page, assets: list[str]) -> tuple[bool, str]:
@@ -417,8 +734,14 @@ def _locators_for_body(ctx) -> List[str]:
         [
             "textarea",
             "[contenteditable='true']",
+            "[role='textbox']",
+            ".ProseMirror",
+            ".ql-editor",
         ]
     )
+    for hint in BODY_HINTS:
+        selectors.append(f"[data-placeholder*='{hint}']")
+        selectors.append(f"[aria-label*='{hint}']")
     return selectors
 
 
@@ -429,6 +752,10 @@ def _fill_text_fields(page, title: str, body: str) -> tuple[bool, bool]:
         return title_ok, body_ok
 
     title_ok, body_ok = _fill_in_context(page)
+    if not body_ok:
+        body_ok = _fill_body_by_placeholder_text(page, body)
+    if not body_ok:
+        body_ok = _fill_body_by_title_offset(page, body)
     if title_ok and body_ok:
         return title_ok, body_ok
     for frame in page.frames:
@@ -437,6 +764,10 @@ def _fill_text_fields(page, title: str, body: str) -> tuple[bool, bool]:
         f_title, f_body = _fill_in_context(frame)
         title_ok = title_ok or f_title
         body_ok = body_ok or f_body
+        if not body_ok:
+            body_ok = _fill_body_by_placeholder_text(page, body)
+        if not body_ok:
+            body_ok = _fill_body_by_title_offset(page, body)
         if title_ok and body_ok:
             break
     return title_ok, body_ok
@@ -477,6 +808,11 @@ def _verify_title_body(page, title: str, body: str) -> tuple[bool, bool]:
     for ctx in contexts:
         title_ok = title_ok or _verify_filled(ctx, _locators_for_title(ctx), title)
         body_ok = body_ok or _verify_filled(ctx, _locators_for_body(ctx), body)
+        if not body_ok:
+            try:
+                body_ok = _matches_body_value(page.locator("body").inner_text(timeout=3000), body)
+            except Exception:
+                body_ok = False
         if title_ok and body_ok:
             break
     if not (title_ok and body_ok):
@@ -1011,17 +1347,51 @@ def _count_uploaded_images(page) -> int:
     return total
 
 
-def _wait_for_upload_ready(page, expected: int, timeout_ms: int = 120000) -> bool:
+def _wait_for_upload_ready(
+    page,
+    expected: int,
+    timeout_ms: int = 120000,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> bool:
     if expected <= 0:
+        _emit_progress(
+            progress_callback,
+            "wait_for_upload_complete",
+            "success",
+            "uploaded=0/0",
+        )
         return True
     deadline = time.time() + timeout_ms / 1000
+    last_detail = ""
     while time.time() < deadline:
         count = _extract_upload_count(page)
-        if count is not None and count >= expected:
-            return True
-        if _count_uploaded_images(page) >= expected:
+        if count is None:
+            count = _count_uploaded_images(page)
+        shown_count = max(0, min(int(count or 0), expected))
+        detail = f"uploaded={shown_count}/{expected}"
+        if detail != last_detail:
+            _emit_progress(
+                progress_callback,
+                "wait_for_upload_complete",
+                "in_progress",
+                detail,
+            )
+            last_detail = detail
+        if count >= expected:
+            _emit_progress(
+                progress_callback,
+                "wait_for_upload_complete",
+                "success",
+                f"uploaded={expected}/{expected}",
+            )
             return True
         time.sleep(1)
+    _emit_progress(
+        progress_callback,
+        "wait_for_upload_complete",
+        "failed",
+        last_detail or f"uploaded=0/{expected}",
+    )
     return False
 
 
@@ -1281,6 +1651,28 @@ def _matches_value(actual: str, expected: str) -> bool:
     return snippet in actual
 
 
+def _body_match_terms(body: str) -> list[str]:
+    terms: list[str] = []
+    try:
+        obj = json.loads(body)
+    except Exception:
+        obj = None
+    if isinstance(obj, dict):
+        for key in ("\u539f\u6587\u6807\u9898", "\u5185\u5bb9", "\u8bc4\u4ef7", "\u6765\u6e90"):
+            value = str(obj.get(key) or "").strip()
+            if value:
+                terms.append(value[: min(12, len(value))])
+    if not terms and body:
+        terms.append(body[: min(12, len(body))])
+    return [term for term in terms if term]
+
+
+def _matches_body_value(actual: str, expected: str) -> bool:
+    if _matches_value(actual, expected):
+        return True
+    return any(term in (actual or "") for term in _body_match_terms(expected))
+
+
 def _processing_visible(page) -> bool:
     for text in PROCESSING_TEXTS:
         try:
@@ -1379,12 +1771,15 @@ def run_save_draft_sync(
     login_only: bool = False,
     wait_timeout_ms: int = WAIT_TIMEOUT_MS,
     execution: Optional[Execution] = None,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Execution:
     exec_rec = execution or Execution(post_id=post.id, result="pending")
     steps: List[StepResult] = []
 
     def _step(name: str, status: str, detail: str = ""):
         steps.append(StepResult(name=name, status=status, detail=detail))
+        _emit_progress(progress_callback, name, status, detail)
 
     assets = [str(Path(p)) for p in (assets or []) if Path(p).is_file()]
     context = None
@@ -1393,8 +1788,16 @@ def run_save_draft_sync(
     try:
         profile_dir, channel, args = _resolve_profile_config()
         profile_dir.mkdir(parents=True, exist_ok=True)
+        headless_value = _resolve_headless(headless)
+        if headless_value and login_hold > 0:
+            _emit_progress(
+                progress_callback,
+                "headless_login",
+                "warning",
+                "headless requires an already logged-in profile; login_hold cannot show QR/captcha",
+            )
 
-        _step("launch", "in_progress", str(profile_dir))
+        _step("launch", "in_progress", f"{profile_dir} | headless={headless_value}")
         with sync_playwright() as p:
             cdp_url = _resolve_cdp_url()
             if cdp_url:
@@ -1405,7 +1808,7 @@ def run_save_draft_sync(
                 should_close_context = False
                 steps[-1].detail = f"cdp={cdp_url}"
             else:
-                launch_kwargs = {"headless": False}
+                launch_kwargs = {"headless": headless_value}
                 if channel:
                     launch_kwargs["channel"] = channel
                 if args:
@@ -1420,10 +1823,14 @@ def run_save_draft_sync(
                 page.goto(TARGET_URL, wait_until="domcontentloaded")
                 steps[-1].status = "success"
 
-                if login_hold > 0:
-                    _step("login_hold", "in_progress", f"wait {login_hold}s for login")
-                    time.sleep(login_hold)
-                    steps[-1].status = "success"
+                _step("login_check", "in_progress", f"login_hold={login_hold}s")
+                steps[-1].detail = _wait_for_xhs_ready(
+                    page,
+                    login_hold=login_hold,
+                    headless=headless_value,
+                    progress_callback=progress_callback,
+                )
+                steps[-1].status = "success"
 
                 ev_dir = evidence_dir(post.id, exec_rec.id)
                 ev_dir.mkdir(parents=True, exist_ok=True)
@@ -1458,15 +1865,7 @@ def run_save_draft_sync(
                 steps[-1].status = "success"
 
                 _step("wait_for_editor", "in_progress", "")
-                editor_visible_selectors = (
-                    UPLOAD_BUTTON_SELECTORS
-                    + [
-                        "input[type='file']",
-                        "input[placeholder*='\u6807\u9898']",
-                        "textarea",
-                        "[contenteditable='true']",
-                    ]
-                )
+                editor_visible_selectors = EDITOR_READY_SELECTORS + ["input[type='file']"]
                 try:
                     editor_sel = _wait_for_any_locator(
                         page, editor_visible_selectors, 120000
@@ -1506,7 +1905,11 @@ def run_save_draft_sync(
                         pass
                     steps[-1].status = "success"
                     _step("wait_for_upload_complete", "in_progress", "")
-                    confirmed = _wait_for_upload_ready(page, len(assets))
+                    confirmed = _wait_for_upload_ready(
+                        page,
+                        len(assets),
+                        progress_callback=progress_callback,
+                    )
                     steps[-1].detail = f"confirmed={confirmed}"
                     if not confirmed:
                         raise RuntimeError("upload count not ready")
@@ -1706,12 +2109,14 @@ def run_save_draft_sync(
                     raise RuntimeError("draft title not found after save")
                 steps[-1].status = "success"
                 exec_rec.result = "saved_draft"
+                _emit_progress(progress_callback, "save_draft_chain", "success", post.id)
             finally:
                 if should_close_context:
                     context.close()
     except Exception as exc:  # pragma: no cover
         exec_rec.result = "failed"
         exec_rec.error = {"message": str(exc)}
+        _emit_progress(progress_callback, "save_draft_chain", "failed", str(exc))
     finally:
         exec_rec.steps = steps
         save_execution(exec_rec)
@@ -1728,6 +2133,7 @@ def run_delete_drafts_sync(
     dry_run: bool = False,
     login_hold: int = 0,
     wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    headless: Optional[bool] = None,
 ) -> dict:
     result = {
         "draft_type": draft_type,
@@ -1742,10 +2148,11 @@ def run_delete_drafts_sync(
 
     profile_dir, channel, args = _resolve_profile_config()
     profile_dir.mkdir(parents=True, exist_ok=True)
+    headless_value = _resolve_headless(headless)
 
     try:
         with sync_playwright() as p:
-            launch_kwargs = {"headless": False}
+            launch_kwargs = {"headless": headless_value}
             if channel:
                 launch_kwargs["channel"] = channel
             if args:
@@ -1799,8 +2206,11 @@ def run_delete_drafts_sync(
             def _collect_for_type(dtype: str) -> list[dict[str, str]]:
                 _goto_draft_page(dtype)
 
-                if login_hold > 0:
-                    time.sleep(login_hold)
+                _wait_for_xhs_ready(
+                    page,
+                    login_hold=login_hold,
+                    headless=headless_value,
+                )
                 if location == "publish":
                     _wait_for_any_text(page, WAIT_TEXTS, wait_timeout_ms)
                     if not _open_draft_box(page):

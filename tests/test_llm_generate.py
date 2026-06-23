@@ -1,4 +1,8 @@
-from src.llm.generate import _parse_json_text
+import json
+
+from src.config import LLMConfig
+import src.llm.generate as generate_mod
+from src.llm.generate import _coerce_text, _parse_json_text
 
 
 def test_parse_json_text_recovers_from_malformed_body_quotes():
@@ -32,3 +36,57 @@ def test_parse_json_text_accepts_list_content_payload():
     assert data.get("body") == "正文A"
     assert data.get("topics") == ["话题A", "话题B"]
 
+
+def test_coerce_text_preserves_daily_news_body_object_as_json():
+    body_obj = {
+        "原文标题": "AI芯片新品发布",
+        "内容": "这是一段正文。",
+        "评价": "",
+        "日期": "2026-06-19",
+        "来源": "Example News",
+    }
+
+    out = _coerce_text(body_obj)
+
+    assert json.loads(out) == body_obj
+
+
+def test_generate_draft_uses_25565_max_tokens(monkeypatch):
+    captured = {}
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "FakeResponse",
+                (),
+                {
+                    "content": json.dumps(
+                        {
+                            "title": "测试标题",
+                            "body": "这是一段用于测试的正文。",
+                            "topics": ["测试"],
+                        },
+                        ensure_ascii=False,
+                    )
+                },
+            )()
+
+    def fake_init_chat_model(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeModel()
+
+    monkeypatch.setattr(generate_mod, "init_chat_model", fake_init_chat_model)
+
+    generate_mod.generate_draft(
+        LLMConfig(
+            model="fake-model",
+            api_key="fake-key",
+            base_url="https://example.invalid/v1",
+        ),
+        title_hint="测试标题",
+        prompt_hint="测试提示",
+        asset_paths=[],
+    )
+
+    assert captured["kwargs"]["max_tokens"] == 25565

@@ -1,5 +1,359 @@
 # CODING_PROGRESS
 
+### 2026-06-23 02:35
+**Task:** Fix daily-news `原文标题` being replaced by generic fallback summaries.
+**Git:** `main (dirty)`; this entry covers workflow title fallback hardening, prompt wording, regression tests, and docs.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added generic-original-title detection, separated `原文标题` fallback from short-title fallback, and passed the normalized post title into final body rendering so non-Chinese source titles no longer become `科技/国际议题出现进展`. Updated the prompt to forbid generic fallback phrases in `原文标题`. | Old XHS/platform drafts still need deletion/regeneration if they already contain bad `原文标题`. |
+| `tests/test_daily_news.py` | DONE | Added regressions for `科技议题出现进展` and `平台封锁VPN用户` being replaced by the relevant normalized Chinese post title. | None. |
+| `README.md` / `docs/每日新闻原文标题泛化修复-2026-06-23.md` | DONE | Documented the root cause, fix rules, old-draft caveat, and verification. | None. |
+
+**Verification**
+- Red: the two new regression tests failed with `原文标题` still equal to `科技议题出现进展` / `国际议题出现进展`.
+- Green: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py::test_create_daily_news_posts_replaces_generic_original_title_with_post_title tests\test_daily_news.py::test_create_daily_news_posts_prefers_post_title_over_mismatched_original_summary -q` -> 2 passed.
+- `.\.venv\Scripts\python.exe -m py_compile src\workflow\create_post.py tests\test_daily_news.py` -> passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py -q` -> 129 passed.
+- `git diff --check` -> no whitespace errors; only existing LF/CRLF conversion warnings.
+
+### 2026-06-23 02:05
+**Task:** Raise the unified LLM output token limit to `25565`.
+**Git:** `main (dirty)`; this entry covers the LLM call parameter, regression test, and docs.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/llm/generate.py` | DONE | Added `DEFAULT_LLM_MAX_TOKENS = 25565` and passed it to `init_chat_model(..., max_tokens=...)`. | If a provider rejects this limit, lower per-provider handling may be needed later. |
+| `tests/test_llm_generate.py` | DONE | Added a regression proving `generate_draft()` passes `max_tokens=25565` to the LLM client. | None. |
+| `README.md` / `docs/*` | DONE | Documented the new default and the provider/model limit caveat in `docs/LLM输出token上限调整-2026-06-23.md`. | None. |
+
+**Verification**
+- Red: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_generate.py::test_generate_draft_uses_25565_max_tokens -q` failed with `assert 1200 == 25565`.
+- Green: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_generate.py::test_generate_draft_uses_25565_max_tokens -q` -> 1 passed.
+- `.\.venv\Scripts\python.exe -m py_compile src\llm\generate.py` -> passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_llm_generate.py -q` -> 4 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py tests\test_llm_generate.py -q` -> 131 passed.
+- `git diff --check` -> no whitespace errors; only existing LF/CRLF conversion warnings.
+
+### 2026-06-23 01:45
+**Task:** Diagnose and fix incomplete sentence tails in daily-news `评价` content.
+**Git:** `main (dirty)`; this entry covers workflow postprocessing, regression tests, and docs.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added `评价`-specific cleanup so leaked `发布时间` / `日期` / `来源` markers and obviously incomplete trailing clauses are removed before the final five-section body is rendered. | Old already-uploaded XHS drafts need deletion/regeneration if they contain half sentences. |
+| `tests/test_daily_news.py` | DONE | Added a regression covering the OLED certification draft where `评价` ended with an incomplete clause before `发布时间`. | None. |
+| `README.md` / `docs/每日新闻评价半句截断修复-2026-06-23.md` | DONE | Documented why this is not only a `max_tokens` issue, the root cause, cleanup behavior, and verification. | None. |
+
+**Verification**
+- `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py::test_finalize_daily_news_body_removes_incomplete_comment_tail_before_publish_time -q` -> 1 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py -q` -> 127 passed.
+
+### 2026-06-23 01:20
+**Task:** Diagnose and fix daily-news image/text mismatch caused by cross-candidate field leakage.
+**Git:** `main (dirty)`; this entry covers workflow hardening, regression tests, and docs.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added high-signal context matching for `原文标题` and `image_event`; cross-candidate values are replaced with picked-news/final-title derived values before image generation. Added OLED/display/certification English title mapping. | Old already-uploaded XHS drafts need deletion/regeneration if they have mismatched images. |
+| `tests/test_daily_news.py` | DONE | Added a regression reproducing the LG OLED body paired with `锂提取技术获进展` original title/image event. | None. |
+| `README.md` / `docs/每日新闻图文不符修复-2026-06-23.md` | DONE | Documented the root cause, exact local evidence, fix, and verification. | None. |
+
+**Verification**
+- `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py::test_create_daily_news_posts_replaces_cross_candidate_title_and_image_event -q` -> 1 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py -q` -> 126 passed.
+
+### 2026-06-23 00:45
+**Task:** Fix GUI perceived freezes during long auto-generation tasks and rebuild the quick launcher.
+**Git:** `main (dirty)`; this entry covers GUI runner responsiveness, docs, tests, and launcher rebuild.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | Added unbuffered subprocess output, a heartbeat for silent long-running CLI subprocesses, explicit run/stop/idle status display, and clearer stop feedback. | If a specific external API hangs beyond its own timeout, inspect the CLI command shown in the GUI log. |
+| `tests/test_gui.py` | DONE | Added regressions proving silent subprocesses emit heartbeat logs, status transitions are reported, and GUI subprocess env forces UTF-8 unbuffered output. | None. |
+| `AutoRedbookGUI-Launcher.exe` | DONE | Rebuilt the lightweight launcher from `scripts/AutoRedbookGuiLauncher.cs`; it still only starts `.venv\Scripts\pythonw.exe -m apps.gui` and installs nothing. | Reopen GUI from the regenerated exe. |
+| `README.md` / `docs/*` | DONE | Documented the GUI heartbeat/status behavior, troubleshooting guidance, and verification in `docs/GUI运行流畅度与心跳修复-2026-06-23.md`. | None. |
+
+**Verification**
+- `.\.venv\Scripts\python.exe -m py_compile apps\gui.py` -> passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_gui.py -q` -> 37 passed.
+- `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_gui_exe.ps1` -> rebuilt `AutoRedbookGUI-Launcher.exe`.
+- Controlled launcher smoke test -> started new `pythonw.exe -m apps.gui` processes and stopped only the test-started processes.
+
+### 2026-06-23 00:00
+**Task:** Add a configurable daily-news `评价视角` parameter with neutral default.
+**Git:** `main (dirty)`; this entry covers CLI, GUI, prompt, docs, and non-network verification.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added `DEFAULT_EVALUATION_VIEWPOINT`, normalized viewpoint handling, injected the viewpoint into `_daily_news_prompt(...)`, removed the hardcoded China-stance prompt line, and persisted `platform.news.evaluation_viewpoint`. | Monitor live drafts for whether specific custom viewpoints produce overly opinionated wording. |
+| `apps/cli.py` | DONE | Added `--evaluation-viewpoint` to `create` and `auto`, defaulting to `无视角评价`, and passed it into the daily-news workflow. | None. |
+| `apps/gui.py` | DONE | Added `评价视角` controls to `自动发帖` and `仅生成`, passed them to CLI args, and supported `AUTO_REDBOOK_GUI_EVALUATION_VIEWPOINT` for GUI autorun. | Reopen GUI to see the new field. |
+| `tests/test_daily_news.py` / `tests/test_gui.py` | DONE | Added regression coverage for default/custom viewpoint prompt text and GUI CLI argument construction. | None. |
+| `README.md` / `docs/*` | DONE | Documented usage, GUI behavior, workflow metadata, and verification in `docs/每日新闻评价视角参数-2026-06-23.md`. | None. |
+
+**Verification**
+- `.\.venv\Scripts\python.exe -m py_compile apps\cli.py apps\gui.py src\workflow\create_post.py` -> passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py::test_daily_news_prompt_requires_chinese_translation_no_url_and_target_lengths tests\test_daily_news.py::test_daily_news_prompt_makes_comment_optional_and_forbids_generic_comment tests\test_daily_news.py::test_daily_news_prompt_defaults_to_no_viewpoint_and_accepts_custom_viewpoint tests\test_gui.py::test_build_cli_args_auto tests\test_gui.py::test_build_cli_args_auto_aliyun_image_source_ignores_local_assets tests\test_gui.py::test_build_cli_args_create -q` -> 6 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py tests\test_gui.py -q` -> 159 passed.
+
+### 2026-06-22 14:45
+**Task:** Add Aliyun visual model `qwen-image-2.0-pro-2026-04-22` for later manual testing.
+**Git:** `main (dirty)`; this entry covers model-list, docs, and non-network verification.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | Added `qwen-image-2.0-pro-2026-04-22` to the Aliyun image model dropdown. Default remains `wan2.7-image`. | Manually test against Aliyun when ready. |
+| `tests/test_gui.py` / `tests/test_aliyun_image_models.py` | DONE | Updated GUI model-list expectation and added a unit test proving the new model name is passed to the Aliyun multimodal generation payload. | None. |
+| `README.md` / `docs/*` | DONE | Documented the new GUI image model option and added a commented manual-test env line. | None. |
+
+**Verification**
+- `python -m py_compile apps/gui.py src/images/aliyun_images.py` -> passed.
+- `pytest tests/test_gui.py tests/test_aliyun_image_models.py -q` -> 41 passed.
+- No live Aliyun API call was made; this change prepares the model for the user's manual test.
+
+### 2026-06-22 14:25
+**Task:** Fix GUI startup/runtime reliability after PowerShell security prompt and unstable long-task behavior.
+**Git:** `main (dirty)`; this entry covers GUI event-thread hardening, startup-script safety, docs, and verification.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | Added `UiEventQueue` so worker threads no longer write Tk widgets directly; `CommandRunner` now marks jobs running before spawning the worker to block duplicate clicks. | Close already-open old GUI windows and reopen to use the new code. |
+| `scripts/start_gui.ps1` / `scripts/open_xhs_creator.ps1` / `scripts/build_gui_exe.ps1` | DONE | Set `Invoke-WebRequest:UseBasicParsing` by default for Windows PowerShell 5.1 script processes to avoid the IE parsing security prompt. | If the prompt still appears, check external PowerShell profiles/scripts or old processes. |
+| `tests/test_gui.py` | DONE | Added regression coverage for UI event queue ordering and duplicate-run rejection while a process is starting. | None. |
+| `docs/GUI启动与运行稳定性修复-2026-06-22.md` / `README.md` | DONE | Documented the screenshot symptom, root cause investigation, fix, restart advice, and verification commands. | None. |
+
+**Verification**
+- `python -m py_compile apps/gui.py` -> passed.
+- `pytest tests/test_gui.py -q` -> 33 passed.
+- PowerShell parser checks for GUI/startup scripts -> parse-ok.
+- Controlled GUI startup smoke -> process stayed alive for 5s, stderr/stdout empty.
+- Sensitive token/key scan across repository files -> 0 findings.
+- `git diff --check` -> no whitespace errors; only existing LF/CRLF conversion warnings.
+
+### 2026-06-22 13:35
+**Task:** Live-test two daily-news XHS drafts, fix English-content leakage, and regenerate two qualified AI-image drafts.
+**Git:** `main (dirty)`; this entry covers the live test, quality-gate fix, docs, and verification.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added English phrase leakage detection for daily-news `内容`, blocked insufficient-material fallback markers, treated `AI议题出现进展` as a generic title, and changed English fallback generation to produce Chinese facts for known topics or skip unknown candidates. | Investigate `delete-drafts --limit 2` returning `type=image total=0` if draft cleanup is required. |
+| `tests/test_daily_news.py` | DONE | Added regressions for English phrase leakage and generic AI-progress titles while preserving valid English-source Chinese fallback cases. | None. |
+| `docs/每日新闻英文泄漏闸门与两条草稿实测-2026-06-22.md` / `README.md` | DONE | Documented the issue, fix, command, final two XHS draft IDs, AI image provider, and verification evidence. | None. |
+
+**Live Result**
+- First online run saved two drafts but content review found one body with an English phrase; this was treated as a failed quality test.
+- Attempted cleanup with `delete-drafts --limit 2 --yes`, but the command returned `type=image total=0`, so no deletion was executed.
+- Final qualified uploaded image drafts:
+  - `7decc80b27a7449fb21c2b2f8bb1f91a` -> `在香江细读潮汕“情书”`, `aliyun/wan2.7-image-pro`, `verified_title=True cover_ready=True`.
+  - `c01de0e3735540af9eb639471d4b8717` -> `美伊谈判在即瑞士现场直击`, `aliyun/wan2.7-image-pro`, `verified_title=True cover_ready=True`.
+- Local review confirmed both final bodies contain no URL and no 4-word English phrase.
+
+**Verification**
+- `pytest tests/test_daily_news.py -q` -> 124 passed.
+- `pytest -q` -> 236 passed.
+- `git diff --check` -> no whitespace errors; only existing LF/CRLF conversion warnings.
+- Secret scan on changed relevant files -> 0 key/token assignment findings.
+
+### 2026-06-22 12:30
+**Task:** Fix GUI daily-news `count>1` jobs generating/uploading fewer drafts than requested.
+**Git:** `main (dirty)`; this entry covers the candidate-pool/count-safety fix and docs/tests.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Increased daily-news candidate attempts for multi-count jobs and made partial generation fail with `created only x/y` instead of returning fewer posts to upload. | Run a live GUI auto job if a new XHS upload verification is required. |
+| `apps/gui.py` | DONE | Added `ensure_daily_news_candidate_pool_env(...)`; GUI `auto`/`create` now injects `NEWS_MAX_RECORDS=max(60,count*20)` for multi-count daily-news jobs and forces UTF-8 subprocess output. | None. |
+| `tests/test_daily_news.py` / `tests/test_gui.py` | DONE | Added regressions for quality-gate skips beyond the first 15 candidates, partial-count failure, GUI env expansion, and UTF-8 env propagation. | None. |
+| `docs/GUI每日新闻数量不足修复-2026-06-22.md` / `README.md` / `docs/工作流新闻任务书.md` | DONE | Documented root cause, user-visible behavior, verification, and the GUI `NEWS_MAX_RECORDS` behavior. | None. |
+
+**Verification**
+- `pytest tests/test_gui.py tests/test_daily_news.py -q` -> 153 passed.
+- `pytest -q` -> 234 passed.
+- `git diff --check` -> no whitespace errors; only existing LF/CRLF conversion warnings.
+- Secret scan on changed relevant files -> 0 key/token assignment findings.
+
+### 2026-06-22 11:35
+**Task:** Finish the interrupted 3-draft live test, harden daily-news quality gates, delete bad XHS drafts, and upload 3 corrected AI-image drafts.
+**Git:** `main (dirty)`; this entry covers the final live delete/regenerate verification.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added HTML-artifact stripping, site-sidebar noise gates, final `comment_mismatch` detection, tighter AI/copyright comment gating, and factual fallbacks for 大湾区科创 / 韩国科技资金 / 夏播粮食 samples. Added specific title compression for 大湾区、科幻论坛、韩国科技 to avoid 17-18 char truncation. | None. |
+| `tests/test_daily_news.py` | DONE | Added regressions for broken HTML image tags, 21jingji sidebar noise, mismatched 美股 comments, 大湾区 title compression, and 韩国科技 title/comment cleanup. | None. |
+| `docs/每日新闻三条草稿最终实测-2026-06-22.md` | DONE | Added the final live-test report, online provider failure states, verification commands, and final XHS draft IDs/titles/times. | None. |
+
+**Live Result**
+- Deleted the previously uploaded bad image drafts from XHS creator-center using `delete-drafts --draft-type image --yes`.
+- Confirmed the draft box was empty before the final upload: `type=image total=0`, `type=video total=0`, `type=article total=0`.
+- Final uploaded image drafts:
+  - `83a5dbc8aa2d490b8a65160b44b7780a` -> `大湾区前沿技术落地`, saved at `2026-06-22 11:22:20`.
+  - `2fdaeadf7f7847c19c2caa8a076e1a76` -> `大湾区科创中心建设提速`, saved at `2026-06-22 11:24:18`.
+  - `211bacff2cc24208954a39b6c6ef39cc` -> `全球资金布局韩国科技`, saved at `2026-06-22 11:26:16`.
+- Final dry-run confirmation: `type=image total=3`; upload logs for all three posts showed `result: saved_draft` and `verified_title=True cover_ready=True`.
+- Online provider status during live testing: Juhe returned daily quota exceeded, GNews returned HTTP 429, NewsAPI timed out from the current network. Final upload used a local cached GNews candidate file via `NEWS_PROVIDER=file` and did not persist any API keys.
+
+**Verification**
+- `pytest tests/test_daily_news.py -q` -> 120 passed.
+- `pytest -q` -> 229 passed.
+
+### 2026-06-21 19:45
+**Task:** Delete old XHS creator-center drafts, tighten daily-news quality, and regenerate 3 daily-news drafts.
+**Git:** `main (dirty)`; this entry covers the quality fix before the final live delete/regenerate run.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Rewrote truncated 17-18 char LLM titles from source facts, filtered Juhe/site datelines and footer fragments, removed broken quote fragments, made AI/copyright comment detection whitespace-robust, required final daily-news bodies to include `原文标题/内容/日期/来源`, and added factual comment fallbacks for consumer-product checks, consumption subsidies, concert network保障, and WeChat AI assistant/product-boundary news. | Run final live delete/regenerate verification. |
+| `tests/test_daily_news.py` | DONE | Added regressions for the real bad samples: truncated titles, missing content section, The Paper footer/责任编辑/ICP noise, irrelevant AI/copyright comment, WeChat AI wrong-template comment, and broken `苏新消费·品` content. | None. |
+| `docs/每日新闻正文渲染修复-2026-06-21.md` | DONE | Documented the latest title/content/comment quality gates and verification commands. | Update with final live post IDs after regeneration if needed. |
+
+**Verification**
+- `pytest tests/test_daily_news.py -q` -> 103 passed.
+- `pytest -q` -> 212 passed.
+
+### 2026-06-21 18:55
+**Task:** Live-test Juhe by generating two daily-news drafts and fix issues found during inspection.
+**Git:** `main (dirty)`; this entry covers daily-news quality cleanup and live local draft generation.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Tightened irrelevant AI/copyright comment detection, added industry-tech / securities-regulation factual comment fallbacks, removed audio-column/byline noise, and made daily-news body finalization idempotent by running a second normalize pass. | None. |
+| `tests/test_daily_news.py` | DONE | Added regressions for industrial AI news, finance/trade news, securities penalties, audio-column noise, reporter byline cleanup, and repeated broken-tail cleanup. | None. |
+
+**Live Result**
+- Generated local Juhe daily-news draft: `9a4af4e4510a4ee6b314fb5c03f728ae`, title `第二十四届海创会落幕`, provider `juhe`, source `厦门日报`, body has no URL and no AI/copyright mismatch.
+- Generated local Juhe daily-news draft: `a8d51a33f697474d9bce4a4de7e04bcc`, title `新海达码头流动机械装上360度全景`, provider `juhe`, source `厦门日报`, body has no URL and no AI/copyright mismatch.
+
+**Verification**
+- `pytest tests/test_daily_news.py -q` -> 97 passed.
+- `pytest -q` -> 206 passed.
+- Secret scan: no Juhe/appkey 32-hex secret-like matches in tracked code/docs/tests.
+
+### 2026-06-21 18:10
+**Task:** Add Juhe news headline and finance-news providers without persisting user API keys.
+**Git:** `main (dirty)`; this entry covers provider implementation, docs, and tests.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/news/daily_news.py` | DONE | Added `NEWS_PROVIDER=juhe`, Juhe key loading, headline list/detail mapping, finance-news mapping, auto-provider detection, category routing, and key-safe Juhe error messages. | Run a live request only after the user sets keys in local env/session; real keys were not written to tracked files. |
+| `tests/test_daily_news.py` | DONE | Added Juhe regressions for headline detail content, finance query routing, auto-mode discovery, and APP-key leak prevention. | None. |
+| `README.md` / `docs/使用说明-自动新闻生成与草稿发布.md` / `docs/工作流新闻任务书.md` | DONE | Documented Juhe env vars, auto-provider order, usage examples, and secret-handling workflow. | None. |
+| `docs/juhe_api-key.example.md` / `docs/聚合数据新闻源接入-2026-06-21.md` | DONE | Added placeholder-only local key template and dedicated Juhe integration note. | None. |
+
+**Notes**
+- Juhe is treated as a category API, not a full-text keyword API, so the generic keyword relevance filter is not applied before accepting category results.
+- Secret safety: the user-provided APP-keys were not copied into code, docs, tests, commands, or tracked config files.
+- Verification: `pytest tests/test_daily_news.py -q` -> 91 passed; `pytest -q` -> 200 passed; `git diff --check` -> no whitespace errors, only existing CRLF warnings.
+
+### 2026-06-21 17:15
+**Task:** Remove GDELT news source and harden daily-news quality gates after live XHS draft inspection.
+**Git:** `main (dirty)`; this entry covers news-provider routing, daily-news title/body/comment cleanup, docs, and tests.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/news/daily_news.py` | DONE | Removed GDELT production fetch path and `gdelt` from supported providers. `NEWS_PROVIDER=auto` now tries only configured NewsAPI/GNews or `file`, and errors clearly when no provider is configured. | None. |
+| `src/workflow/create_post.py` | DONE | Added title/body language quality gates, common Traditional-to-Simplified normalization, site-noise cleanup, generic fallback rejection, NASA/World-Cup comment correction, and final single-post daily-news quality checks. | None. |
+| `apps/cli.py` | DONE | Removed stale `gdelt` stage keyword while keeping NewsAPI/GNews/file errors mapped to `stage=获取新闻`. | None. |
+| `tests/test_daily_news.py` | DONE | Added regressions for no GDELT fallback, unsupported `NEWS_PROVIDER=gdelt`, foreign excerpt title rejection, site-noise cleanup, and wrong sports-template comment replacement. Updated old GDELT tests to GNews behavior. | None. |
+| `README.md` | DONE | Replaced GDELT usage docs with NewsAPI/GNews/file guidance and added the new repair document to the docs index. | None. |
+| `docs/每日新闻质量闸门与GDELT移除-2026-06-21.md` | DONE | Added repair notes, usage guidance, and verification result. | None. |
+| `docs/使用说明-自动新闻生成与草稿发布.md` / `docs/工作流新闻任务书.md` | DONE | Updated news-source troubleshooting and provider contract to remove GDELT. | None. |
+
+**Notes**
+- Root cause: GDELT fallback could provide only titles/low-quality snippets, allowing foreign/title-fragment drafts and generic filler to reach XHS.
+- Verification: `pytest tests/test_daily_news.py -q` -> 87 passed.
+
+### 2026-06-21 15:50
+**Task:** Diagnose GUI/CLI `delete-drafts` showing `type=image total=0` even when XHS image drafts exist.
+**Git:** `main (dirty)`; this entry covers CLI delete-draft preview error reporting, docs, and tests.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/cli.py` | DONE | `delete-drafts` now prints preview `errors` and exits with code 1 before deletion when the dry-run enumeration fails, instead of silently reporting `未找到草稿`. | None. |
+| `tests/test_cli_delete_drafts.py` | DONE | Added regression coverage for `total=0 + errors`, ensuring the CLI prints the real error and does not claim the draft box is empty. | None. |
+| `docs/GUI删除草稿total0诊断-2026-06-21.md` | DONE | Documented the root cause, safe dry-run command, `--limit 0` semantics, and verification result. | None. |
+| `README.md` | DONE | Added the new diagnostic doc to the docs index. | None. |
+
+**Notes**
+- Investigation: latest saved XHS draft evidence HTML contains 21 `.draft-item` entries, and a fresh headless dry-run against the workspace profile returned `type=image total=20`, so the user's `total=0` was not proof that drafts were absent.
+- Verification: `pytest tests/test_cli_delete_drafts.py tests/test_cli_headless.py -q` -> 10 passed; safe dry-run command returned 20 image drafts and printed the first 5.
+- Safety: no deletion command was executed; only dry-run preview was used.
+
+### 2026-06-21 11:32
+**Task:** Tighten daily-news draft title/content quality after XHS screenshot review.
+**Git:** `main (dirty)`; this entry focuses on daily-news prompt/content normalization, tests, and docs while earlier uncommitted GUI/upload/news-source changes remain in the working tree.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Daily-news titles now prefer a summarized 12-18 character Chinese title, ideal around 15 characters, instead of blindly preserving/truncating/copying original titles. Original-source lookup now runs by default when a URL exists and keeps up to `NEWS_SOURCE_LOOKUP_MAX_CHARS` characters for grounded LLM summarization. Content cleanup removes browser-upgrade notices, site navigation noise, media IDs, protocol-relative image URLs, generic methodology filler, duplicate fact sentences, photo-credit tails, Xinhua dateline fragments, recommendation-read noise, and copied title fragments before final body rendering. `内容` is capped at 150 Chinese characters. Fact/评价 consistency checks now replace unsupported hallucinated content and irrelevant commentary templates. | None. |
+| `tests/test_daily_news.py` | DONE | Added/updated regression coverage for semantic title compression, no-copy short title rewriting, balanced Chinese quotes, column-prefix stripping, browser/navigation-noise removal, original-source enrichment, 150-char content limit, generic filler removal, Xinhua caption/dateline cleanup, unsupported-content fallback, irrelevant-comment replacement, repeated named-subject dedupe, and contextual topic fallback. | None. |
+| `README.md` | DONE | Updated daily-news usage rules: five-section body, 12-18 char title, 150-char content, source lookup, and `NEWS_SOURCE_LOOKUP_MAX_CHARS`. | None. |
+| `docs/使用说明-自动新闻生成与草稿发布.md` | DONE | Expanded user-facing daily-news rules for title length, five-section rendering, source lookup, and no-URL/no-noise output. | None. |
+| `docs/每日新闻正文JSON结构稳定化-2026-06-20.md` | DONE | Updated the stable body contract so `内容` is 150 characters or fewer. | None. |
+| `docs/每日新闻正文渲染修复-2026-06-21.md` | DONE | Added the latest rendering/quality constraints, including generic-filler removal and original-source lookup depth. | None. |
+
+**Notes**
+- Skills used: `$using-superpowers` for workflow discipline, plus systematic debugging, TDD, prompt optimization, screenshot verification, and verification-before-completion.
+- Tests/Lint: targeted daily-news tests were red before implementation; after fixes, `pytest tests/test_daily_news.py -q` -> 82 passed. Full-suite and diff checks are tracked in the final turn summary.
+- Live XHS verification: after multiple screenshot-driven fixes, generated and uploaded `eac90d3a7b554ad28ff8bad5aca2ca61` with Aliyun `wan2.7-image-pro`; XHS draft-box screenshot shows title `中国共商全球人权治理`, saved at Beijing time `2026-06-21 13:18:14`, with title verified and cover ready.
+- Risks/Assumptions: NewsAPI/GDELT/GNews were rate-limited during this final run, so the accepted live verification used a local Xinhua candidate file while still fetching the original article page for grounded summarization.
+- Next steps: None for this specific repair; optional cleanup is to delete older iterative test drafts from the XHS draft box if you no longer need them.
+
+### 2026-06-20 10:51
+**Task:** Unify GUI image source selection into local assets, Aliyun, and Pexels.
+**Git:** `main (dirty)`; this entry focuses on `apps/gui.py`, `tests/test_gui.py`, `README.md`, and the new image-source doc, while earlier uncommitted headless/upload-layout files remain in the working tree.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | Added `local` / `aliyun` / `pexels` image source semantics, route non-local sources through `assets/empty/*`, disable local assets input when automatic providers are selected, disable auto image for local source, and bind mouse wheel for the scrollable auto tab. | None. |
+| `tests/test_gui.py` | DONE | Added coverage for three image sources, local source disabling auto-image, non-local source forcing `assets/empty/*`, and Aliyun auto command behavior. | None. |
+| `README.md` | DONE | Documented GUI image source choices and clarified that Aliyun/Pexels ignore local assets to trigger automatic image generation/search. | None. |
+| `docs/GUI图片来源统一-2026-06-20.md` | DONE | Added dedicated explanation of the old confusion, new mapping, CLI/env behavior, and verification. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry after invoking the file-progress-followup workflow. | Keep updating after future coding/docs work. |
+
+**Notes**
+- Tests/Lint: `py_compile apps/gui.py` passed; `pytest tests/test_gui.py -q` -> 24 passed; full `pytest -q` -> 121 passed in 41.57s.
+- Screenshot verification: GUI launched successfully and temporary screenshots were deleted; automated wheel scrolling was unreliable in the capture harness, so final verification relies on unit tests plus successful Tk window construction.
+- Risks/Assumptions: `local` intentionally injects `AUTO_IMAGE=0`; if the local glob is empty, the user should choose `aliyun` or `pexels` instead of expecting fallback.
+- Next steps: Consider applying the same unified image-source selector to the `仅生成` tab if you want create-only runs to expose Aliyun/Pexels explicitly too.
+
+### 2026-06-20 10:37
+**Task:** Redesign the GUI auto-post run-options area to prevent clipped controls and verify with screenshots.
+**Git:** `main (dirty)`; this entry focuses on `apps/gui.py` and the new GUI layout doc, while earlier uncommitted headless-upload files remain in the working tree.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | Replaced the cramped one-line run-options layout with a panel layout, moved run options above the main form, added a scrollable auto-post tab, and moved title shortcut/buttons plus image hint text to separate rows to prevent right-edge clipping. | None. |
+| `docs/GUI运行选项布局修复-2026-06-20.md` | DONE | Added root cause, layout changes, validation commands, and screenshot-verification note. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry after invoking the file-progress-followup workflow. | Keep updating after future coding/docs work. |
+
+**Notes**
+- Tests/Lint: `py_compile apps/gui.py` passed; `pytest tests/test_gui.py -q` -> 21 passed; full `pytest -q` -> 118 passed in 47.09s.
+- Screenshot verification: captured GUI window via Windows window handle; confirmed `dry-run`, `无界面上传`, `force`, `登录等待（秒）`, and `页面等待（秒）` are fully visible without right-edge clipping. Temporary screenshots were deleted after inspection.
+- Risks/Assumptions: Verification was visual/manual because Tkinter widget geometry is best validated against an actual rendered window; no upload or XHS automation was executed.
+- Next steps: If this layout feels good in daily use, keep the same panel pattern for future GUI option groups.
+
+### 2026-06-20 10:22
+**Task:** Add optional headless XHS draft upload and live terminal progress reporting.
+**Git:** `main (dirty)`; modified upload automation, CLI/GUI entry points, tests, README, and added a docs note.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Added `XHS_HEADLESS` / `headless` resolution, protected progress callbacks, incremental upload-ready progress, and headless launch support for save-draft and delete-drafts flows. | Live XHS behavior still depends on the already logged-in workspace profile and platform headless tolerance. |
+| `apps/cli.py` | DONE | Added `--headless` to `run`, `auto`, `retry`, and `delete-drafts`; wired live `[xhs-upload]` progress to terminal output with `post_id`. | None. |
+| `apps/save_draft.py` | DONE | Added `--headless` and real-time progress output for the legacy save-draft entry point. | None. |
+| `apps/gui.py` | DONE | Added GUI headless options for auto upload, draft processing upload, and draft deletion; command builder now emits `--headless`. | None. |
+| `tests/test_cli_headless.py` | DONE | Added regression coverage ensuring CLI default `False` does not override `XHS_HEADLESS=1`, while explicit `--headless` still passes through. | None. |
+| `tests/test_playwright_profile_config.py` | DONE | Added regression coverage for headless env/argument precedence and incremental upload progress messages. | None. |
+| `tests/test_gui.py` | DONE | Added regression coverage that GUI command construction includes `--headless` for auto/run/delete paths. | None. |
+| `README.md` | DONE | Documented quick headless usage, GUI headless checkbox behavior, profile requirement, and terminal progress format at a high level. | None. |
+| `docs/无界面上传与终端进度-2026-06-20.md` | DONE | Added focused usage documentation with CLI examples, GUI steps, progress output examples, and limitations. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this entry after invoking the file-progress-followup workflow. | Keep updating after future coding/docs work. |
+
+**Notes**
+- Tests/Lint: `pytest tests/test_cli_headless.py tests/test_playwright_profile_config.py tests/test_gui.py -q` -> 31 passed; `py_compile src/publish/playwright_steps.py apps/cli.py apps/save_draft.py apps/gui.py` passed; full `pytest -q` -> 118 passed in 39.71s; CLI help checks for `run`, `auto`, `delete-drafts`, and `apps.save_draft run` showed `--headless`.
+- Risks/Assumptions: Headless upload requires an already logged-in `data/browser/chrome-profile`; first login, QR/captcha, and account risk checks still require visible Chrome. If XHS blocks headless automation, visible mode remains the default fallback.
+- Next steps: Use `--headless --login-hold 0` only after confirming the workspace profile is logged in; if a headless upload fails, open `Open-XHS-Creator.cmd` or GUI `登录/检查Profile` and retry without `--headless`.
+
 ### 2026-06-20 10:11
 **Task:** Add README quick-use section and back up the previous version before upload.
 **Git:** `main (dirty)`; `README.md` modified after pushing backup branch/tag `pre-readme-quickuse-20260620-101059`.
@@ -1389,3 +1743,245 @@
 - Removed: 22 cache/build/temp items, about 12.668 MB.
 - Verification: `.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider -q` -> 99 passed.
 - Kept intentionally: `data/posts` (draft records), `data/browser` (XHS login/browser profile), `data/events` (audit events), `.venv`, and `AutoRedbookGUI-Launcher.exe`.
+
+### 2026-06-20 11:45
+**Task:** Fix daily-news prompt/category title leakage, then complete one CLI and one GUI AI-image draft upload test.
+**Git:** `main` with pre-existing modified/untracked files from earlier GUI/headless work; this entry covers the additional quality-gate, docs, and live-test changes.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added prompt-like title rejection, prompt-slice/category title rejection, generic-title rejection, source-field-only English fallback titles, generic-body fallback detection, and Chinese `image_event` fallback for English news. | Add more deterministic English-title mappings over time if new providers return unfamiliar headline patterns. |
+| `tests/test_daily_news.py` | DONE | Added regressions for prompt-like title leakage, prompt-category title + generic-body fallback, and NATO/Europe defense news not being misclassified as technology due to user prompt text. | None. |
+| `docs/新闻质量闸门与终端GUI实测-2026-06-20.md` | DONE | Documented the quality-gate fix, automated tests, CLI/GUI live upload evidence, and diagnostic samples that should not be treated as final accepted drafts. | None. |
+| `README.md` | DONE | Added the new quality-gate/live-test report to the docs index. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this progress entry. | Keep appending after future coding work. |
+
+**Notes**
+- Regression verification: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py tests\test_gui.py tests\test_cli_headless.py -q` -> 65 passed after the quality-gate changes.
+- CLI live accepted sample: `68f348cdefa248d89aa35e049e62df26`, title `防晒审批迎来进展`, `uploaded=True`, `status=saved_as_draft`, XHS draft box `verified_title=True cover_ready=True`, image provider `aliyun`, model `wan2.7-image`.
+- GUI live accepted sample: `53e095f286384eae8f75b61e9f91dc89`, generated by launching `apps.gui`, filling the auto tab, invoking the GUI auto button, and waiting for the GUI subprocess; `uploaded=True`, `status=saved_as_draft`, XHS draft box `verified_title=True cover_ready=True`, image provider `aliyun`, model `wan2.7-image`.
+- Diagnostic samples left in local/XHS drafts: `6058671d3d5e47e9bfc6066d799c40c4` had a prompt/category title before the fix; `d47abc2ed7bd4a769e17b9e9dee58b3f` had a generic GUI title/body before the defense-news fallback fix. Review/delete these manually before public posting if they remain in the platform draft box.
+- Safety: no API key files were edited; docs avoid signed image URLs and secrets.
+
+### 2026-06-20 12:18
+**Task:** Verify GUI delete-drafts workflow, redesign unclear preview/confirmation controls, and smoke-test GUI pages.
+**Git:** `main` with existing uncommitted GUI/headless/news-quality changes; this entry covers the delete UI/verification additions.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `apps/gui.py` | DONE | Replaced delete-page `dry-run` / `--yes` checkboxes with explicit delete-mode and confirmation-mode comboboxes, added dynamic risk hints, added safe flag resolution, and sanitized old symbolic/garbled titles in GUI display. | Consider adding a per-draft targeted delete if the platform DOM remains stable enough for title-specific matching. |
+| `tests/test_gui.py` | DONE | Added regressions for explicit delete labels, preview-mode safety, removing symbolic status marks from displayed titles, and replacing all-question-mark garbled titles with `(无标题)`. | None. |
+| `docs/GUI删除草稿验证与提示优化-2026-06-20.md` | DONE | Documented the new GUI delete controls, how to delete all drafts safely, dry-run/real-delete verification, and GUI smoke results. | None. |
+| `README.md` | DONE | Added the new delete verification/UX doc to the docs index. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this progress entry. | Keep appending after future coding work. |
+
+**Notes**
+- GUI dry-run verification: launched `apps.gui`, selected `删除草稿`, clicked GUI `运行 delete-drafts` with `--all`, `limit=0`, safe preview; result `image total=11`, `video total=0`, `article total=0`, exit `0`.
+- GUI real-delete verification: launched `apps.gui`, selected `正式删除（会删除小红书草稿）` + `自动确认（不再弹出确认）`, set `--all`, `limit=1`, clicked GUI `运行 delete-drafts`; result deleted `1/11` image drafts, `0/0` video, `0/0` article, exit `0`.
+- Follow-up preview: `image total=10`, `video total=0`, `article total=0`, confirming the platform draft count decreased by one.
+- Local-record safety: `data/posts/53e095f286384eae8f75b61e9f91dc89/post.json` and `data/posts/68f348cdefa248d89aa35e049e62df26/post.json` still exist after platform deletion; `local_posts_count=1130`.
+- GUI smoke: window launches with 5 tabs, key `auto` / `create` / `delete-drafts` controls present, `.env.gui` config area present, new delete combobox options present, old delete labels absent, garbled `???? [saved_as_draft]` choices no longer shown.
+
+### 2026-06-20 12:45
+**Task:** Change empty-prompt daily-news behavior so it no longer defaults to `china`, and verify candidate fetching.
+**Git:** `main` with existing uncommitted GUI/headless/news-quality changes; this entry covers the news-query default changes.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/news/daily_news.py` | DONE | Replaced the hardcoded empty-prompt default `china` with a broad default query pool (`technology/world/science/business/health/climate/society/international`), randomized query order, `NEWS_QUERY_DEFAULT` list parsing, and empty-prompt candidate aggregation across default queries when needed. | Consider exposing the default query pool in GUI config if you want non-technical editing. |
+| `tests/test_daily_news.py` | DONE | Added regressions ensuring empty-prompt defaults are not single `china`, and empty-prompt fetch can aggregate candidates from multiple default queries. | None. |
+| `README.md` | DONE | Updated daily-news docs to explain no-prompt random/default query pool behavior and `NEWS_QUERY_DEFAULT` override. | None. |
+| `docs/工作流新闻任务书.md` | DONE | Updated workflow spec and config notes to remove the old default-`china` behavior. | None. |
+| `docs/使用说明-自动新闻生成与草稿发布.md` | DONE | Added a note that no-prompt daily news now uses the default broad query pool; prompt or `NEWS_QUERY_DEFAULT` can be used to fix a topic direction. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this progress entry. | Keep appending after future coding work. |
+
+**Notes**
+- Root cause: `DEFAULT_QUERY` was previously `china`, so empty prompt used only `china`; when NewsAPI timed out/returned no candidates and GDELT was rate-limited, `auto` produced `posts=0`.
+- Live candidate verification: forced `NEWS_PROVIDER=newsapi` and called `fetch_daily_news_candidates("")`; result provider `newsapi`, `query_variants=['technology', 'climate', 'society', 'international', 'world', 'science', 'business', 'health']`, `queries_used=['technology']`, `count=8`.
+- Targeted tests: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py -q` -> 39 passed; `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py tests\test_gui.py tests\test_cli_headless.py -q` -> 71 passed.
+- Full five-draft generation/upload was not rerun in this step to avoid unintended LLM/image quota usage; the verified failure point was candidate fetching.
+
+### 2026-06-20 15:20
+**Task:** Fix XHS login-hold behavior so it detects real login/editor readiness, then verify the complete daily-news generation + AI image + XHS draft chain with 2 posts.
+**Git:** `main` with existing uncommitted GUI/headless/news-quality changes; this entry covers the login-state detection, daily-news quality fixes, docs, and live verification.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Replaced unconditional `time.sleep(login_hold)` with XHS page-state detection (`ready/login/unknown`), fast continuation when editor is ready, fast failure for headless login pages, and `login_check` progress output. Applied to save-draft and delete-drafts paths. | Consider porting the same behavior to legacy `src/publish/mcp_steps.py` if that old MCP publisher is reactivated. |
+| `src/news/daily_news.py` | DONE | Added low-quality candidate filtering for package releases, repository-style updates, `Watch:` video snippets, and `News in brief`; fixed prompted fallback query bug (`default_query` undefined). | NewsAPI/GDELT can still rate-limit; use provider fallback or cached/file provider for deterministic tests. |
+| `src/workflow/create_post.py` | DONE | Added English word-boundary keyword matching, stricter generic-title/body quality gates, fact-based offline bodies for seawater battery / NATO troop review / AI authors, and candidate skipping before AI image generation when content remains too generic. | Add more fact-based templates only if live candidates repeatedly need deterministic fallback. |
+| `tests/test_playwright_profile_config.py` | DONE | Added login-state classification and wait behavior tests, including “ready pages must not sleep for login_hold”. | None. |
+| `tests/test_daily_news.py` | DONE | Added regressions for French `importe` not matching `import`, package/video/brief candidate filtering, prompted query fallback, generic quality rejection, and fact-based fallback body. | None. |
+| `README.md` / `docs/小红书登录态检测与每日新闻链路实测-2026-06-20.md` | DONE | Documented the new `login-hold` semantics, quality fixes, deletion of bad test drafts, API rate-limit handling, and final live-chain results. | None. |
+
+**Notes**
+- Login dry-run verification: ran `apps.cli run <post_id> --headless --login-hold 600 --wait-timeout 90 --dry-run --force`; `login_check` reached `state=ready`, total elapsed about 5.7s, so it did not wait 600s.
+- Initial live NewsAPI run produced two low-quality drafts (`外贸数据出现变化`, `AI议题出现进展`); after identifying the quality issue, deleted those two platform drafts with `delete-drafts --limit 2 --yes`, result `deleted 2/12 drafts (image)`.
+- NewsAPI and GDELT later returned 429 rate limits, so the final chain used `NEWS_PROVIDER=file` with local cache `data/news_candidates_api_cache_2026-06-20.json` derived from the just-returned API candidates.
+- Final live accepted drafts:
+  - `c30ccbd535fd4c19a96c0410be483b3d` / `海水电池技术突破` / `saved_draft` / `verified_title=True cover_ready=True` / image `aliyun wan2.7-image`.
+  - `eef16f64e55847e58ed98e43f6a0b370` / `美军欧洲部署审查` / `saved_draft` / `verified_title=True cover_ready=True` / image `aliyun wan2.7-image`.
+- Final platform dry-run top items: `美军欧洲部署审查` saved at `2026-06-20 15:11:03`, `海水电池技术突破` saved at `2026-06-20 15:09:58`, image drafts total `12`.
+- Verification: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py -q` -> 44 passed; `.\.venv\Scripts\python.exe -m pytest -q` -> 141 passed.
+- Safety: no API-key files were printed or edited; local draft records under `data/posts` were preserved.
+
+### 2026-06-20 16:05
+**Task:** Add GNews as a daily-news provider without persisting secrets, and add terminal stage labels for failures.
+**Git:** `main` with existing uncommitted GUI/headless/news-quality changes; this entry covers only the GNews provider, CLI stage-error output, docs, and tests.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/news/daily_news.py` | DONE | Added `NEWS_PROVIDER=gnews`, `GNEWS_API_KEY` / `GNEWS_TOKEN`, optional `GNEWS_LANG` / `GNEWS_COUNTRY` / `GNEWS_MAX` / `GNEWS_BASE_URL`, GNews `/search` mapping to `NewsItem`, and auto-mode fallback order including GNews. | Live GNews requests require setting the key via local env or ignored `docs/gnews_api-key.md`; the real key was not written to tracked files. |
+| `apps/cli.py` | DONE | Added `error: stage=...` formatting for create/auto/run upload failures and refined stage classification for `获取新闻` / `LLM` / `VLM生图` / `上传`. | Keep adding provider-specific keywords if new integrations introduce distinct errors. |
+| `tests/test_daily_news.py` | DONE | Added GNews provider mapping and auto-mode GNews fallback regressions. | None. |
+| `tests/test_cli_headless.py` | DONE | Added stage-error formatting and classification regressions, including VLM image key errors not being mislabeled as LLM. | None. |
+| `README.md` / `docs/gnews_api-key.example.md` / `docs/GNews新闻源接入与阶段化错误提示-2026-06-20.md` | DONE | Documented safe GNews configuration, ignored local key-file workflow, auto fallback order, and stage-error meanings. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this progress entry. | Keep appending after future coding work. |
+
+**Notes**
+- Secret safety: the user-provided GNews key was not repeated in code, docs, test fixtures, commands, or committed files. Only placeholders such as `YOUR_GNEWS_API_KEY` were added.
+- Official GNews reference checked: Search endpoint `https://gnews.io/api/v4/search`, API key parameter `apikey`, optional `lang` / `country` / `max` / `from` / `to` / `sortby`.
+- Expected failure examples now include `error: stage=获取新闻 | ...`, `error: stage=LLM | ...`, `error: stage=VLM生图 | ...`, and `error: stage=上传 | ...`.
+
+### 2026-06-20 16:35
+**Task:** Re-test generation of 2 daily-news drafts, fix fallback-body quality conflict, and verify XHS draft upload.
+**Git:** `main` with existing uncommitted GUI/headless/news/GNews changes; this entry covers the fallback-body fix, docs, and two-draft live verification.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added context-aware daily-news offline fallback body so candidates with usable title/summary/content no longer fall into the old generic template that the quality gate rejects. Sparse candidates still remain blocked. | Consider adding provider-specific summaries only if new live sources repeatedly return English topics that cannot be summarized by the current rules. |
+| `tests/test_daily_news.py` | DONE | Added regression for context-rich candidates passing `generic_body` gate while sparse candidates still fail; re-ran full daily-news tests. | None. |
+| `docs/每日新闻兜底正文与两条草稿实测-2026-06-20.md` | DONE | Documented the failed first run, root cause, fix, command, and final two uploaded draft results. | None. |
+| `README.md` | DONE | Added the new test report to the docs index. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this progress entry. | Keep appending after future coding work. |
+
+**Notes**
+- Initial live run failed before post creation: `skipped_quality=7`, `posts=0`, because fallback bodies were intentionally generic and then rejected by the quality gate.
+- After fix, deterministic end-to-end run used `NEWS_PROVIDER=file` with `data/news_candidates_api_cache_2026-06-20.json` to avoid live NewsAPI/GDELT rate-limit or low-quality candidate noise.
+- Created and uploaded two XHS drafts with AI images:
+  - `3b3ffeb323d140898a352ac8bd369262` / `海水电池技术突破` / source `Geeky Gadgets` / `uploaded=True` / `status=saved_as_draft` / image `aliyun wan2.7-image` / XHS `verified_title=True cover_ready=True`.
+  - `0dd946893d024b2482e81a33ca0cfafd` / `美军欧洲部署审查` / source `Dailymail.com` / `uploaded=True` / `status=saved_as_draft` / image `aliyun wan2.7-image` / XHS `verified_title=True cover_ready=True`.
+- Verification: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py -q` -> 47 passed.
+- Safety: no API-key files were printed or edited; user-provided GNews key remains absent from tracked files.
+
+### 2026-06-20 17:05
+**Task:** Add daily-news historical URL dedupe so repeated source links are skipped before generation.
+**Git:** `main` with existing uncommitted GUI/headless/news/GNews changes; this entry covers only the historical URL dedupe feature, docs, and tests.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/news/history.py` | DONE | Added URL normalization, local `data/posts/*/post.json` history scanning, and filtering helpers for previously used news URLs. | Extend tracking-param list only if new providers introduce additional noisy params. |
+| `src/news/daily_news.py` | DONE | Integrated history URL filtering into candidate fetching after in-batch candidate dedupe; continues to later query/provider when duplicates are skipped; records `history_dedupe` metadata. | None. |
+| `tests/test_daily_news.py` | DONE | Added TDD regressions for URL normalization and skipping a duplicate historical URL while keeping the next fresh candidate. | None. |
+| `README.md` / `docs/每日新闻历史URL查重-2026-06-20.md` | DONE | Documented default behavior, metadata, URL normalization rules, and `NEWS_HISTORY_DEDUPE=0` escape hatch. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this progress entry. | Keep appending after future coding work. |
+
+**Notes**
+- Default behavior is enabled: local history URLs are read from `platform.news.source_url` and `platform.news.picked.url`.
+- Normalization removes common tracking params (`utm_*`, `fbclid`, `gclid`, etc.), strips fragments, lowercases scheme/domain, and normalizes trailing slashes.
+- Verification: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py -q` -> 49 passed; `.\.venv\Scripts\python.exe -m pytest -q` -> 151 passed.
+- Local functional check: with `NEWS_PROVIDER=file` and the cached 2026-06-20 candidates, history dedupe skipped the two URLs already used in prior drafts and returned only the fresh AI-authors candidate; with `NEWS_HISTORY_DEDUPE=0`, all three candidates returned.
+- Safety: no API-key files were printed or edited.
+
+### 2026-06-20 17:45
+**Task:** Perform engineering-wide check and generate two daily-news drafts with AI images.
+**Git:** `main` with existing uncommitted GUI/headless/news/GNews/history-dedupe changes; this entry covers the additional quality fix, docs, tests, and live draft results from this check.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Fixed title normalization for person-colon headlines, stripped site suffixes such as `_新闻频道_中华网` / `-- 国际 -- 人民网`, and cleaned original-page excerpts before using them in summaries/bodies. | Consider adding title-specific source quality scoring if live sources keep returning sports/event photo pages. |
+| `tests/test_daily_news.py` | DONE | Added regressions for rejecting person-name-only titles and removing navigation/share noise from original excerpts. | None. |
+| `docs/工程性全面检测与每日新闻AI配图实测-2026-06-20.md` | DONE | Documented the engineering checks, initial quality issues, fix, final generated drafts, and external service warnings. | None. |
+| `README.md` | DONE | Added the new engineering test report to the docs index. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this progress entry. | Keep appending after future coding work. |
+
+**Notes**
+- Fresh verification before live run: `.\.venv\Scripts\python.exe -m pytest -q` -> 151 passed.
+- First live run uploaded two drafts but quality review found issues:
+  - `15fdb4d8ae454c2b99913e295f2385dd`: body included navigation noise.
+  - `b70583b47aa44a6cadd58a301845261d`: title collapsed to `谢晖`.
+- Regression verification after fix: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py -q` -> 51 passed.
+- Final accepted drafts:
+  - `3bd038ad974f4eeaa698d4df5395beb9` / `2026年世界体操联合会艺术体操世界挑战` / `uploaded=True` / `status=saved_as_draft` / image `aliyun wan2.7-image` / XHS `verified_title=True cover_ready=True`.
+  - `6a3e21e506c44641a3c33ebefe18587b` / `作家使用AI引争议` / `uploaded=True` / `status=saved_as_draft` / image `aliyun wan2.7-image` / XHS `verified_title=True cover_ready=True`.
+- External service notes: one GDELT request returned 429 and one Aliyun image request was connection-refused; workflow skipped failed/low-quality candidates and completed with replacement drafts.
+- Safety: no API-key files were printed or edited.
+
+### 2026-06-20 18:20
+**Task:** Optimize daily-news commentary so empty template comments are removed and factual comments are optional.
+**Git:** `main` with existing uncommitted GUI/headless/news/GNews/history-dedupe changes; this entry covers only commentary prompt logic, fallback body behavior, docs, and tests.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Made `点评` optional in the LLM prompt, added generic-comment detection/removal, stopped auto-inventing comments for one-paragraph bodies, and added fact-based offline comments only when supported by news facts. | Monitor live drafts for new empty commentary phrases and add them to the marker list if needed. |
+| `tests/test_daily_news.py` | DONE | Added regressions for optional comments, removing the exact generic commentary template, prompt constraints, and fact-supported weather/disaster comments. | None. |
+| `README.md` / `docs/每日新闻点评与正文通顺优化-2026-06-20.md` | DONE | Documented optional commentary behavior, prompt constraints, cleanup rules, and verification command. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this progress entry. | Keep appending after future coding work. |
+
+**Notes**
+- Regression verification: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py` -> 54 passed.
+- The known bad commentary template (`这类新闻适合先看事实，再看影响...`) is now removed instead of published.
+- Sparse daily-news fallback bodies no longer add a fake `点评：` block; they remain generic enough for the quality gate to reject when facts are insufficient.
+- Safety: no API-key files were printed or edited.
+
+### 2026-06-20 19:10
+**Task:** Stabilize daily-news publish body as fixed JSON and prepare live delete/regenerate verification.
+**Git:** `main` with existing uncommitted GUI/headless/news/GNews/history-dedupe changes; this entry covers only daily-news body JSON structure, image prompt compatibility, docs, and tests.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Added final 5-field body JSON normalization (`原文标题/内容/评价/日期/来源`), URL scrubbing, old-label compatibility, JSON-safe field-level clamping, and prompt updates requiring body-as-JSON-object-text. | Live verify with two uploaded XHS drafts after deleting old platform drafts. |
+| `src/llm/generate.py` | DONE | Preserves direct dict-style `body` values as JSON strings when the model returns the 5 Chinese fields; relaxed the global “body plain text” instruction for explicit JSON-body prompts. | None. |
+| `src/images/auto_image.py` | DONE | Reads `内容/评价` from JSON body for image prompt snippets so AI image generation is not polluted by JSON field names. | None. |
+| `tests/test_daily_news.py` / `tests/test_llm_generate.py` / `tests/test_auto_image.py` | DONE | Added regressions for fixed JSON body, URL-only-in-metadata, valid JSON after clamping, dict body coercion, and JSON-body image snippets. | None. |
+| `README.md` / `docs/使用说明-自动新闻生成与草稿发布.md` / `docs/每日新闻正文JSON结构稳定化-2026-06-20.md` | DONE | Documented the new 5-field body contract and where URLs are stored. | None. |
+
+**Notes**
+- Targeted verification: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py tests\test_llm_generate.py tests\test_auto_image.py` -> 77 passed.
+- Multi-agent side review flagged the JSON truncation risk; `_dump_daily_news_body_json(...)` now shrinks fields and re-dumps JSON instead of slicing the raw JSON string.
+- Safety: no API-key files were printed or edited.
+
+### 2026-06-20 19:55
+**Task:** Complete live deletion and regeneration test for two daily-news drafts after JSON body changes.
+**Git:** `main` with existing uncommitted GUI/headless/news/GNews/history-dedupe changes; this entry covers upload-selector fixes and live platform verification.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/publish/playwright_steps.py` | DONE | Added rich-text body editor selectors, JSON-aware body verification, placeholder-text fallback, and title-offset coordinate fallback for XHS body entry. | Consider adding targeted delete-by-title if platform DOM remains stable. |
+| `tests/test_playwright_profile_config.py` | DONE | Added regressions for rich-text body selectors and JSON body verification by field terms. | None. |
+| `docs/每日新闻正文JSON结构稳定化-2026-06-20.md` | DONE | Added live deletion/regeneration/upload verification results. | None. |
+| `CODING_PROGRESS.md` | DONE | Appended this live verification entry. | Keep appending after future coding work. |
+
+**Notes**
+- Deleted existing XHS creator-center drafts: initial dry-run `image total=16`, real delete `deleted 16/16 drafts (image)`.
+- Debug runs briefly left failed drafts because XHS saved title/image even when body filling failed; those were deleted with `delete-drafts --draft-type image --limit 1/2 --yes`.
+- Final generated/uploaded drafts:
+  - `7acb42d5494e4d35b45c9caab1607f6d` / `海水电池技术突破` / `saved_draft` / source `Geeky Gadgets` / image `aliyun wan2.7-image` / final XHS `verified_title=True cover_ready=True`.
+  - `21c4aefc218349bd83c1fccbdc704103` / `美军欧洲部署审查` / `saved_draft` / source `Dailymail.com` / image `aliyun wan2.7-image` / final XHS `verified_title=True cover_ready=True`.
+- Final platform dry-run: `type=image total=2`, showing only the two regenerated drafts.
+- Verification: `.\.venv\Scripts\python.exe -m pytest -q` -> 162 passed; `git diff --check` -> no patch errors, only CRLF warnings.
+- Safety: no API-key files were printed or edited.
+
+### 2026-06-21
+**Task:** Fix daily-news JSON body leaking into the publishable XHS正文.
+**Git:** `main` with existing uncommitted GUI/headless/news/GNews/history-dedupe changes; this entry covers only daily-news body rendering, prompt wording, image prompt compatibility, docs, and tests.
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| `src/workflow/create_post.py` | DONE | Split daily-news body handling into `_daily_news_body_to_fields(...)` and `_render_daily_news_body_fields(...)`; `_finalize_daily_news_body(...)` now returns readable five-field text instead of raw JSON. Updated prompt so `body` is directly publishable text, not nested JSON. | Verify on next live XHS upload that the textarea shows rendered text. |
+| `src/images/auto_image.py` | DONE | Image prompt snippets now read `内容/评价` from rendered daily-news bodies, avoiding `原文标题/日期/来源` field noise. | None. |
+| `tests/test_daily_news.py` / `tests/test_auto_image.py` | DONE | Added red/green regressions for JSON input being rendered into publishable text and rendered body snippets being clean for AI images. | None. |
+| `README.md` / `docs/使用说明-自动新闻生成与草稿发布.md` / `docs/每日新闻正文JSON结构稳定化-2026-06-20.md` / `docs/每日新闻正文渲染修复-2026-06-21.md` | DONE | Updated docs to state that final `post.body`/XHS正文 is rendered text; JSON is only tolerated as an internal/input format. | None. |
+
+**2026-06-21 follow-up**
+- Refined `_render_daily_news_body_fields(...)` so `原文标题` / `内容` / `评价` / `日期` / `来源` are all separate sections with blank lines between every section, including `日期` and `来源`.
+- Updated `_daily_news_prompt(...)` to teach the same blank-line layout to the LLM.
+- Added `_html_for_contenteditable_text(...)` and rich-text fallback HTML insertion in `src/publish/playwright_steps.py`, so XHS contenteditable/ProseMirror/Quill editors preserve visible blank lines instead of receiving a single `textContent` blob.
+- Expanded URL cleanup to remove protocol-relative links such as `//images.china.cn/...` from正文.
+- Verification: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py tests\test_playwright_profile_config.py tests\test_auto_image.py -q` -> 94 passed; `.\.venv\Scripts\python.exe -m pytest -q` -> 168 passed.
+
+**Notes**
+- Root cause: the previous JSON-stability change made `_finalize_daily_news_body()` return the internal JSON representation, and the upload layer correctly wrote `post.body` verbatim.
+- Targeted verification: `.\.venv\Scripts\python.exe -m pytest tests\test_daily_news.py -q` -> 58 passed; `.\.venv\Scripts\python.exe -m pytest tests\test_auto_image.py -q` -> 19 passed.
+- Full verification: `.\.venv\Scripts\python.exe -m pytest -q` -> 165 passed; `git diff --check` -> no patch errors, only existing CRLF normalization warnings.
+- Safety: no API-key files were printed or edited.

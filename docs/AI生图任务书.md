@@ -68,6 +68,7 @@ Key 配置（二选一）：
 
 支持模型（文生图，模型名以百炼控制台为准，均使用同一把 API Key）：
 - 通义万相 2.7：`wan2.7-image` / `wan2.7-image-pro`（GUI 内置，默认 `wan2.7-image`）
+- Qwen Image：`qwen-image-2.0-pro-2026-04-22`（GUI 内置，可手动选择测试）
 - Qwen-Image：`qwen-image-plus-2026-01-09` / `qwen-image-max` / `qwen-image`
 - Z-Image：`z-image-turbo`
 - 通义万相：`wan2.6-t2i` / `wan2.6-image` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等

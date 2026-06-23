@@ -10,6 +10,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from src.config import LLMConfig
 
 
+DEFAULT_LLM_MAX_TOKENS = 25565
+
+
 def _truncate(text: str, max_len: int) -> str:
     return text if len(text) <= max_len else text[: max_len - 3] + "..."
 
@@ -56,6 +59,10 @@ def _coerce_text(value: Any) -> str:
         parts = [_coerce_text(v) for v in value if _coerce_text(v)]
         return "\n".join(p for p in parts if p)
     if isinstance(value, dict):
+        daily_news_keys = ("原文标题", "内容", "评价", "日期", "来源")
+        if any(key in value for key in daily_news_keys):
+            ordered = {key: value.get(key, "") for key in daily_news_keys}
+            return json.dumps(ordered, ensure_ascii=False, indent=2)
         for key in ("text", "body", "content", "summary"):
             if key in value:
                 return _coerce_text(value[key])
@@ -320,7 +327,7 @@ def generate_draft(
                     "Return strict JSON only: no Markdown, no code fences, no extra text. "
                     "JSON keys: title, body, topics (array of strings). "
                     "Optional JSON key: image_event (a short event-only description for image generation). "
-                    "The body must be plain text, not JSON or a list."
+                    "The body is normally plain text; if the user prompt explicitly requires body to be a JSON object text, follow that stricter body format."
                 ),
             ),
             (
@@ -350,7 +357,7 @@ def generate_draft(
                 base_url=llm_cfg.base_url,
                 api_key=llm_cfg.api_key,
                 temperature=0.4,
-                max_tokens=1200,
+                max_tokens=DEFAULT_LLM_MAX_TOKENS,
             )
             print(
                 f"[llm] provider={llm_cfg.provider} model={llm_cfg.model} base_url={llm_cfg.base_url}"

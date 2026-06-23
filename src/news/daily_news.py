@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 from pathlib import Path
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -11,9 +13,21 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-DEFAULT_PROVIDER = "gdelt"
+from .history import collect_used_news_url_keys, filter_used_news_items, news_history_dedupe_enabled
+
+DEFAULT_PROVIDER = "gnews"
 DEFAULT_TZ = "Asia/Shanghai"
-DEFAULT_QUERY = "china"
+DEFAULT_QUERY = "technology"
+DEFAULT_QUERY_POOL = (
+    "technology",
+    "world",
+    "science",
+    "business",
+    "health",
+    "climate",
+    "society",
+    "international",
+)
 DEFAULT_MAX_RECORDS = 50
 DEFAULT_TIMEOUT_S = 20.0
 CROSS_DOMAIN_SIM_THRESHOLD = 0.75
@@ -21,9 +35,31 @@ CROSS_DOMAIN_BONUS = 0.4
 NEWS_DEDUPE_SIM_THRESHOLD = 0.8
 DEFAULT_CHINA_RATIO = 0.6
 DEFAULT_CHINA_BONUS = 0.15
+LOW_QUALITY_NEWS_DOMAINS = {
+    "pypi.org",
+    "test.pypi.org",
+    "github.com",
+    "gitlab.com",
+    "npmjs.com",
+    "crates.io",
+    "rubygems.org",
+    "packagist.org",
+    "libraries.io",
+}
+LOW_QUALITY_NEWS_TITLE_PATTERNS = (
+    re.compile(r"^\s*watch\s*:", re.IGNORECASE),
+    re.compile(r"\bnews in brief\b", re.IGNORECASE),
+    re.compile(r"\badded to pypi\b", re.IGNORECASE),
+    re.compile(r"\bpublished to pypi\b", re.IGNORECASE),
+    re.compile(r"\bpackage\b.*\b(pypi|npm|crates\.io|rubygems)\b", re.IGNORECASE),
+    re.compile(r"\b(version|release|changelog|release notes)\s+v?\d", re.IGNORECASE),
+    re.compile(r"\bgithub (release|repository|repo)\b", re.IGNORECASE),
+)
 
-GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 NEWSAPI_BASE_URL = "https://newsapi.org"
+GNEWS_BASE_URL = "https://gnews.io/api/v4"
+JUHE_NEWS_BASE_URL = "https://v.juhe.cn/toutiao"
+JUHE_FINANCE_NEWS_BASE_URL = "https://apis.juhe.cn/fapigx/caijing"
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
 _CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
@@ -120,6 +156,14 @@ class NewsItem:
     sourcecountry: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class JuheConfig:
+    news_key: Optional[str]
+    finance_key: Optional[str]
+    news_base_url: str
+    finance_base_url: str
+
+
 def _resolve_tz(tz_name: str):
     tz_name = (tz_name or "").strip()
     if not tz_name:
@@ -200,6 +244,26 @@ def _domain_for_item(item: NewsItem) -> str:
         return urllib.parse.urlparse(item.url or "").netloc.strip().lower()
     except Exception:
         return ""
+
+
+def _canonical_domain(domain: str) -> str:
+    text = (domain or "").strip().lower()
+    return text[4:] if text.startswith("www.") else text
+
+
+def _is_low_quality_daily_news_candidate(item: NewsItem) -> bool:
+    domain = _canonical_domain(_domain_for_item(item))
+    if domain in LOW_QUALITY_NEWS_DOMAINS:
+        return True
+    title = item.title or ""
+    joined = " ".join(
+        part
+        for part in (item.title, item.description, item.content)
+        if part
+    )
+    if any(pattern.search(title) or pattern.search(joined) for pattern in LOW_QUALITY_NEWS_TITLE_PATTERNS):
+        return True
+    return False
 
 
 def _is_china_item(item: NewsItem) -> bool:
@@ -379,6 +443,7 @@ def _dedupe_by_story(items: list[NewsItem], *, max_count: int) -> list[NewsItem]
 
 
 def _dedupe_candidates(items: list[NewsItem]) -> list[NewsItem]:
+    items = [item for item in items if not _is_low_quality_daily_news_candidate(item)]
     seen: set[str] = set()
     unique: list[NewsItem] = []
     for item in items:
@@ -589,58 +654,6 @@ def pick_news_items(
     return _balance_china_foreign(deduped, count=count)
 
 
-def _gdelt_fetch_articles(
-    *,
-    query: str,
-    startdatetime: str,
-    enddatetime: str,
-    max_records: int,
-    timeout_s: float,
-) -> list[NewsItem]:
-    params = {
-        "query": query,
-        "mode": "ArtList",
-        "format": "json",
-        "maxrecords": str(max_records),
-        "startdatetime": startdatetime,
-        "enddatetime": enddatetime,
-        "sort": "HybridRel",
-    }
-    url = f"{GDELT_DOC_URL}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (redbook_workflow)"},
-        method="GET",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        raw = resp.read()
-    data = json.loads(raw.decode("utf-8", errors="replace"))
-    articles = data.get("articles", [])
-    items: list[NewsItem] = []
-    for a in articles:
-        if not isinstance(a, dict):
-            continue
-        title = (a.get("title") or "").strip()
-        url_item = (a.get("url") or "").strip()
-        if not title or not url_item:
-            continue
-        items.append(
-            NewsItem(
-                title=title,
-                url=url_item,
-                source=None,
-                description=None,
-                content=None,
-                domain=(a.get("domain") or "").strip() or None,
-                seendate=(a.get("seendate") or "").strip() or None,
-                language=(a.get("language") or "").strip() or None,
-                socialimage=(a.get("socialimage") or "").strip() or None,
-                sourcecountry=(a.get("sourcecountry") or "").strip() or None,
-            )
-        )
-    return items
-
-
 def _parse_kv_file(path: Path) -> dict[str, str]:
     """
     Parse a simple key file with lines like:
@@ -676,6 +689,111 @@ def _load_newsapi_config(
     if not api_key:
         raise RuntimeError("NewsAPI api_key missing: set NEWS_API_KEY env or docs/news_api-key.md")
     return api_key, base_url
+
+
+def _load_gnews_config(
+    *,
+    key_file: Path | str = Path("docs/gnews_api-key.md"),
+) -> tuple[str, str]:
+    env_key = os.getenv("GNEWS_API_KEY") or os.getenv("GNEWS_TOKEN")
+    env_base = os.getenv("GNEWS_BASE_URL")
+    file_cfg = _parse_kv_file(Path(key_file))
+
+    api_key = env_key or file_cfg.get("api_key") or file_cfg.get("apikey")
+    base_url = env_base or file_cfg.get("base_url") or GNEWS_BASE_URL
+    if not api_key:
+        raise RuntimeError("GNews api_key missing: set GNEWS_API_KEY env or docs/gnews_api-key.md")
+    return api_key.strip(), base_url.strip().rstrip("/")
+
+
+def _load_juhe_config(
+    *,
+    key_file: Path | str = Path("docs/juhe_api-key.md"),
+) -> JuheConfig:
+    file_cfg = _parse_kv_file(Path(key_file))
+
+    news_key = (
+        os.getenv("JUHE_NEWS_APPKEY")
+        or os.getenv("JUHE_NEWS_KEY")
+        or os.getenv("JUHE_TOUTIAO_APPKEY")
+        or os.getenv("JUHE_APPKEY")
+        or file_cfg.get("news_appkey")
+        or file_cfg.get("news_api_key")
+        or file_cfg.get("news_key")
+        or file_cfg.get("toutiao_appkey")
+        or file_cfg.get("api_key")
+        or file_cfg.get("appkey")
+    )
+    finance_key = (
+        os.getenv("JUHE_FINANCE_NEWS_APPKEY")
+        or os.getenv("JUHE_FINANCE_APPKEY")
+        or os.getenv("JUHE_CAIJING_APPKEY")
+        or file_cfg.get("finance_appkey")
+        or file_cfg.get("finance_api_key")
+        or file_cfg.get("finance_key")
+        or file_cfg.get("caijing_appkey")
+    )
+    news_base_url = (
+        os.getenv("JUHE_NEWS_BASE_URL")
+        or os.getenv("JUHE_TOUTIAO_BASE_URL")
+        or file_cfg.get("news_base_url")
+        or file_cfg.get("toutiao_base_url")
+        or file_cfg.get("base_url")
+        or JUHE_NEWS_BASE_URL
+    )
+    finance_base_url = (
+        os.getenv("JUHE_FINANCE_NEWS_BASE_URL")
+        or os.getenv("JUHE_FINANCE_BASE_URL")
+        or os.getenv("JUHE_CAIJING_BASE_URL")
+        or file_cfg.get("finance_base_url")
+        or file_cfg.get("caijing_base_url")
+        or JUHE_FINANCE_NEWS_BASE_URL
+    )
+    news_key = news_key.strip() if news_key else None
+    finance_key = finance_key.strip() if finance_key else None
+    if not news_key and not finance_key:
+        raise RuntimeError(
+            "Juhe appkey missing: set JUHE_NEWS_APPKEY or JUHE_FINANCE_NEWS_APPKEY, "
+            "or create local docs/juhe_api-key.md"
+        )
+    return JuheConfig(
+        news_key=news_key,
+        finance_key=finance_key,
+        news_base_url=news_base_url.strip().rstrip("/"),
+        finance_base_url=finance_base_url.strip().rstrip("/"),
+    )
+
+
+def _split_news_queries(value: str | None) -> list[str]:
+    text = (value or "").strip()
+    if not text:
+        return []
+    parts = re.split(r"[,，;；\n|]+", text)
+    queries: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        q = re.sub(r"\s+", " ", part).strip()
+        key = q.lower()
+        if not q or key in seen:
+            continue
+        queries.append(q)
+        seen.add(key)
+    return queries
+
+
+def _default_news_queries() -> list[str]:
+    """
+    Default broad queries for empty-prompt daily news.
+
+    `NEWS_QUERY_DEFAULT` remains an override. It may be a single query or a
+    comma/semicolon/newline separated list.
+    """
+    override = _split_news_queries(os.getenv("NEWS_QUERY_DEFAULT"))
+    if override:
+        return override
+    queries = list(DEFAULT_QUERY_POOL)
+    random.SystemRandom().shuffle(queries)
+    return queries
 
 
 def _newsapi_fetch_articles(
@@ -742,6 +860,418 @@ def _newsapi_fetch_articles(
     return items
 
 
+def _gnews_max_results(max_records: int) -> int:
+    raw = (os.getenv("GNEWS_MAX") or "").strip()
+    if raw:
+        try:
+            return max(1, min(100, int(raw)))
+        except ValueError:
+            pass
+    # GNews free tier allows up to 10 articles per request; paid users can raise
+    # this with GNEWS_MAX without changing code.
+    return max(1, min(10, max_records))
+
+
+def _gnews_fetch_articles(
+    *,
+    api_key: str,
+    base_url: str,
+    query: str,
+    from_iso: Optional[str] = None,
+    to_iso: Optional[str] = None,
+    max_records: int = DEFAULT_MAX_RECORDS,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> list[NewsItem]:
+    endpoint = f"{base_url.rstrip('/')}/search"
+    params: dict[str, str] = {
+        "q": query,
+        "apikey": api_key,
+        "max": str(_gnews_max_results(max_records)),
+        "sortby": "publishedAt",
+        "nullable": "description,content,image",
+    }
+    lang = (os.getenv("GNEWS_LANG") or "").strip()
+    country = (os.getenv("GNEWS_COUNTRY") or "").strip()
+    if lang:
+        params["lang"] = lang
+    if country:
+        params["country"] = country
+    if from_iso:
+        params["from"] = from_iso
+    if to_iso:
+        params["to"] = to_iso
+
+    url = f"{endpoint}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (redbook_workflow)"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read()
+    data = json.loads(raw.decode("utf-8", errors="replace"))
+    if isinstance(data, dict) and data.get("errors"):
+        raise RuntimeError(f"GNews error: {data.get('errors')}")
+
+    articles = data.get("articles", []) if isinstance(data, dict) else []
+    items: list[NewsItem] = []
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        title = (article.get("title") or "").strip()
+        url_item = (article.get("url") or "").strip()
+        if not title or not url_item:
+            continue
+        source = None
+        source_url = ""
+        source_raw = article.get("source")
+        if isinstance(source_raw, dict):
+            source = (source_raw.get("name") or "").strip() or None
+            source_url = (source_raw.get("url") or "").strip()
+        domain = urllib.parse.urlparse(source_url or url_item).netloc or None
+        items.append(
+            NewsItem(
+                title=title,
+                url=url_item,
+                source=source,
+                description=(article.get("description") or "").strip() or None,
+                content=(article.get("content") or "").strip() or None,
+                domain=domain,
+                seendate=(article.get("publishedAt") or "").strip() or None,
+                socialimage=(article.get("image") or "").strip() or None,
+            )
+        )
+    return items
+
+
+def _juhe_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _juhe_first_text(record: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = _juhe_text(record.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _juhe_image(record: dict[str, Any]) -> Optional[str]:
+    value = _juhe_first_text(
+        record,
+        (
+            "thumbnail_pic_s",
+            "thumbnail_pic_s02",
+            "thumbnail_pic_s03",
+            "picUrl",
+            "picurl",
+            "image",
+            "img",
+            "imgurl",
+            "urlToImage",
+        ),
+    )
+    return value or None
+
+
+def _juhe_records_from_data(data: Any) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+    result = data.get("result")
+    roots = [result, data]
+    for root in roots:
+        if isinstance(root, list):
+            return [row for row in root if isinstance(row, dict)]
+        if not isinstance(root, dict):
+            continue
+        for key in ("data", "list", "newslist", "items", "rows"):
+            value = root.get(key)
+            if isinstance(value, list):
+                return [row for row in value if isinstance(row, dict)]
+            if isinstance(value, dict):
+                nested = _juhe_records_from_data(value)
+                if nested:
+                    return nested
+    return []
+
+
+def _juhe_ensure_success(
+    data: Any,
+    *,
+    context: str,
+    allow_detail_missing: bool = False,
+) -> bool:
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Juhe {context} error: invalid response")
+    error_code = data.get("error_code")
+    result_code = data.get("resultcode")
+    code = error_code if error_code is not None else result_code
+    ok_error = error_code in (None, 0, "0")
+    ok_result = result_code in (None, 0, "0", 200, "200")
+    if ok_error and ok_result:
+        return True
+    if allow_detail_missing and str(code) == "223502":
+        return False
+    reason = _juhe_text(data.get("reason") or data.get("msg") or data.get("message") or "unknown")
+    raise RuntimeError(f"Juhe {context} error: code={code}, reason={reason}")
+
+
+def _juhe_request_json(
+    *,
+    url: str,
+    params: dict[str, str],
+    timeout_s: float,
+) -> dict[str, Any]:
+    full_url = f"{url}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
+        full_url,
+        headers={"User-Agent": "Mozilla/5.0 (redbook_workflow)"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Juhe HTTP error {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        reason = _juhe_text(getattr(exc, "reason", "") or "network error")
+        raise RuntimeError(f"Juhe request failed: {reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("Juhe request timed out") from exc
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Juhe response is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Juhe response is not a JSON object")
+    return data
+
+
+def _juhe_query_is_finance(query: str) -> bool:
+    q = (query or "").strip().lower()
+    finance_terms = (
+        "finance",
+        "business",
+        "economy",
+        "economic",
+        "market",
+        "stock",
+        "securities",
+        "\u8d22\u7ecf",
+        "\u7ecf\u6d4e",
+        "\u91d1\u878d",
+        "\u80a1\u5e02",
+        "\u8bc1\u5238",
+        "\u516c\u53f8",
+    )
+    return any(term in q for term in finance_terms)
+
+
+def _juhe_toutiao_type_for_query(query: str) -> str:
+    override = (os.getenv("JUHE_NEWS_TYPE") or "").strip().lower()
+    if override:
+        return override
+    q = (query or "").strip().lower()
+    mappings: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("keji", ("technology", "tech", "science", "ai", "\u79d1\u6280", "\u79d1\u5b66", "\u4eba\u5de5\u667a\u80fd")),
+        ("caijing", ("finance", "business", "economy", "market", "stock", "\u8d22\u7ecf", "\u7ecf\u6d4e", "\u91d1\u878d")),
+        ("guoji", ("world", "international", "global", "foreign", "\u56fd\u9645", "\u6d77\u5916", "\u4e16\u754c")),
+        ("guonei", ("china", "domestic", "national", "\u4e2d\u56fd", "\u56fd\u5185", "\u5168\u56fd")),
+        ("shehui", ("society", "social", "health", "climate", "\u793e\u4f1a", "\u6c11\u751f", "\u5065\u5eb7", "\u6c14\u5019")),
+        ("tiyu", ("sports", "sport", "\u4f53\u80b2")),
+        ("yule", ("entertainment", "movie", "film", "\u5a31\u4e50", "\u7535\u5f71")),
+        ("junshi", ("military", "defense", "war", "\u519b\u4e8b", "\u56fd\u9632", "\u6218\u4e89")),
+        ("shishang", ("fashion", "\u65f6\u5c1a")),
+    )
+    for category, terms in mappings:
+        if any(term in q for term in terms):
+            return category
+    return "top"
+
+
+def _juhe_fetch_detail_enabled() -> bool:
+    raw = (os.getenv("JUHE_NEWS_FETCH_DETAIL") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _juhe_detail_limit(max_records: int) -> int:
+    raw = (os.getenv("JUHE_NEWS_DETAIL_LIMIT") or "").strip()
+    if raw:
+        try:
+            return max(0, min(int(raw), max_records))
+        except ValueError:
+            pass
+    return max(0, min(max_records, 10))
+
+
+def _juhe_toutiao_detail(
+    *,
+    api_key: str,
+    base_url: str,
+    uniquekey: str,
+    timeout_s: float,
+) -> dict[str, Any]:
+    data = _juhe_request_json(
+        url=f"{base_url.rstrip('/')}/content",
+        params={"key": api_key, "uniquekey": uniquekey},
+        timeout_s=timeout_s,
+    )
+    if not _juhe_ensure_success(data, context="detail", allow_detail_missing=True):
+        return {}
+    result = data.get("result") if isinstance(data, dict) else {}
+    merged: dict[str, Any] = {}
+    if isinstance(result, dict):
+        detail = result.get("detail")
+        if isinstance(detail, dict):
+            merged.update(detail)
+        for key in ("content", "title", "date", "url", "author_name", "thumbnail_pic_s"):
+            if result.get(key) is not None:
+                merged[key] = result.get(key)
+    return merged
+
+
+def _juhe_toutiao_fetch_articles(
+    *,
+    api_key: str,
+    base_url: str,
+    query: str,
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    news_type = _juhe_toutiao_type_for_query(query)
+    data = _juhe_request_json(
+        url=f"{base_url.rstrip('/')}/index",
+        params={"key": api_key, "type": news_type},
+        timeout_s=timeout_s,
+    )
+    _juhe_ensure_success(data, context="toutiao")
+    records = _juhe_records_from_data(data)[: max(1, max_records)]
+    detail_enabled = _juhe_fetch_detail_enabled()
+    detail_limit = _juhe_detail_limit(max_records)
+
+    items: list[NewsItem] = []
+    for idx, record in enumerate(records):
+        current = dict(record)
+        uniquekey = _juhe_first_text(current, ("uniquekey", "unique_key", "id"))
+        if detail_enabled and uniquekey and idx < detail_limit:
+            try:
+                detail = _juhe_toutiao_detail(
+                    api_key=api_key,
+                    base_url=base_url,
+                    uniquekey=uniquekey,
+                    timeout_s=timeout_s,
+                )
+                current.update({k: v for k, v in detail.items() if v not in (None, "")})
+            except Exception:
+                # Detail is a quality boost, not a hard requirement for the list item.
+                pass
+        title = _juhe_first_text(current, ("title", "news_title"))
+        url_item = _juhe_first_text(current, ("url", "link", "news_url", "share_url"))
+        if not title or not url_item:
+            continue
+        domain = urllib.parse.urlparse(url_item).netloc or None
+        description = _juhe_first_text(current, ("description", "desc", "digest", "summary", "abstract")) or None
+        content = _juhe_first_text(current, ("content", "body", "text")) or None
+        source = _juhe_first_text(
+            current,
+            ("author_name", "source", "source_name", "media_name", "channel"),
+        ) or None
+        seendate = _juhe_first_text(
+            current,
+            ("date", "ctime", "time", "publish_time", "pubDate", "published_at", "publishedAt"),
+        ) or None
+        items.append(
+            NewsItem(
+                title=title,
+                url=url_item,
+                source=source,
+                description=description,
+                content=content,
+                domain=domain,
+                seendate=seendate,
+                language="zh",
+                socialimage=_juhe_image(current),
+                sourcecountry="cn",
+            )
+        )
+    return items
+
+
+def _juhe_finance_fetch_articles(
+    *,
+    api_key: str,
+    base_url: str,
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    num = max(1, min(50, int(max_records)))
+    data = _juhe_request_json(
+        url=f"{base_url.rstrip('/')}/query",
+        params={"key": api_key, "num": str(num), "page": "1"},
+        timeout_s=timeout_s,
+    )
+    _juhe_ensure_success(data, context="finance")
+    records = _juhe_records_from_data(data)[:num]
+
+    items: list[NewsItem] = []
+    for record in records:
+        title = _juhe_first_text(record, ("title", "news_title"))
+        url_item = _juhe_first_text(record, ("url", "link", "news_url", "share_url"))
+        if not title or not url_item:
+            continue
+        domain = urllib.parse.urlparse(url_item).netloc or None
+        items.append(
+            NewsItem(
+                title=title,
+                url=url_item,
+                source=_juhe_first_text(record, ("source", "source_name", "author_name", "media_name")) or None,
+                description=_juhe_first_text(record, ("description", "desc", "digest", "summary", "abstract")) or None,
+                content=_juhe_first_text(record, ("content", "body", "text")) or None,
+                domain=domain,
+                seendate=_juhe_first_text(record, ("ctime", "date", "time", "publish_time", "pubDate")) or None,
+                language="zh",
+                socialimage=_juhe_image(record),
+                sourcecountry="cn",
+            )
+        )
+    return items
+
+
+def _juhe_fetch_articles(
+    *,
+    news_key: Optional[str],
+    finance_key: Optional[str],
+    news_base_url: str,
+    finance_base_url: str,
+    query: str,
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    if _juhe_query_is_finance(query) and finance_key:
+        return _juhe_finance_fetch_articles(
+            api_key=finance_key,
+            base_url=finance_base_url,
+            max_records=max_records,
+            timeout_s=timeout_s,
+        )
+    if news_key:
+        return _juhe_toutiao_fetch_articles(
+            api_key=news_key,
+            base_url=news_base_url,
+            query=query,
+            max_records=max_records,
+            timeout_s=timeout_s,
+        )
+    if finance_key:
+        return _juhe_finance_fetch_articles(
+            api_key=finance_key,
+            base_url=finance_base_url,
+            max_records=max_records,
+            timeout_s=timeout_s,
+        )
+    raise RuntimeError("Juhe appkey missing")
+
+
 def _file_fetch_articles(*, path: str, max_records: int) -> list[NewsItem]:
     file_path = Path(path)
     data = json.loads(file_path.read_text(encoding="utf-8"))
@@ -798,6 +1328,8 @@ def fetch_daily_news_candidates(
       - meta dict for persistence/audit (provider/query/time range/candidates)
     """
     provider_env = (os.getenv("NEWS_PROVIDER") or "").strip().lower()
+    if provider_env == "auto":
+        provider_env = ""
     tz_name = (tz_name or os.getenv("NEWS_TZ") or DEFAULT_TZ).strip()
     max_records = int(os.getenv("NEWS_MAX_RECORDS") or (max_records or DEFAULT_MAX_RECORDS))
     timeout_s = float(os.getenv("NEWS_TIMEOUT_S") or (timeout_s or DEFAULT_TIMEOUT_S))
@@ -816,34 +1348,61 @@ def fetch_daily_news_candidates(
         if file_path:
             provider_attempts = ["file"]
         else:
-            # Auto: prefer NewsAPI when a key is configured, then fall back to GDELT.
+            # Auto: prefer keyed APIs when configured. Do not fall back to
+            # scraper-like sources that only provide partial snippets.
+            provider_attempts = []
             try:
                 _load_newsapi_config()
-                provider_attempts = ["newsapi", DEFAULT_PROVIDER]
+                provider_attempts.append("newsapi")
             except Exception:
-                provider_attempts = [DEFAULT_PROVIDER]
+                pass
+            try:
+                _load_gnews_config()
+                provider_attempts.append("gnews")
+            except Exception:
+                pass
+            try:
+                _load_juhe_config()
+                provider_attempts.append("juhe")
+            except Exception:
+                pass
     provider_attempts = list(dict.fromkeys(provider_attempts))
 
-    supported_providers = ("gdelt", "newsapi", "file")
+    supported_providers = ("newsapi", "gnews", "juhe", "file")
     unsupported = [p for p in provider_attempts if p not in supported_providers]
     if unsupported:
         raise RuntimeError(
             f"unsupported NEWS_PROVIDER={unsupported[0]!r}; supported: {', '.join(supported_providers)}"
         )
+    if not provider_attempts:
+        raise RuntimeError(
+            "no news provider configured; set NEWS_PROVIDER=file with NEWS_CANDIDATES_FILE, "
+            "or configure NEWS_API_KEY / GNEWS_API_KEY / JUHE_NEWS_APPKEY"
+        )
 
-    default_query = (os.getenv("NEWS_QUERY_DEFAULT") or DEFAULT_QUERY).strip()
     hint_query = (prompt_hint or "").strip()
     hint_en = _maybe_translate_hint_to_en(hint_query) if hint_query else ""
-    queries = [q for q in (hint_query, hint_en, default_query) if q]
+    if hint_query:
+        default_queries = _split_news_queries(os.getenv("NEWS_QUERY_DEFAULT")) or [DEFAULT_QUERY]
+        queries = [q for q in (hint_query, hint_en, *default_queries) if q]
+    else:
+        queries = _default_news_queries()
+    aggregate_empty_prompt = not bool(hint_query)
+    history_dedupe_is_enabled = news_history_dedupe_enabled()
+    used_news_url_keys = collect_used_news_url_keys() if history_dedupe_is_enabled else set()
+    history_skipped: list[dict[str, str]] = []
 
     last_err: Optional[str] = None
     provider_errors: list[str] = []
-    chosen_query = default_query
+    chosen_query = queries[0] if queries else DEFAULT_QUERY
     chosen_provider = provider_attempts[0]
     candidates: list[NewsItem] = []
+    queries_used: list[str] = []
     used_time_range = False
     for provider in provider_attempts:
-        for q in queries:
+        provider_candidates: list[NewsItem] = []
+        provider_queries = queries[:1] if provider == "file" else queries
+        for q in provider_queries:
             chosen_provider = provider
             chosen_query = q
             try:
@@ -881,34 +1440,90 @@ def fetch_daily_news_candidates(
                     candidates = in_today or raw
                     used_time_range = bool(in_today)
                     # If user provided a hint and nothing matches it, try the next query variant.
-                    if hint_query and q != default_query and _best_relevance(candidates, q) <= 0.0:
+                    if hint_query and q not in default_queries and _best_relevance(candidates, q) <= 0.0:
                         candidates = []
-                else:
-                    if provider == "gdelt":
-                        candidates = _gdelt_fetch_articles(
+                elif provider == "gnews":
+                    api_key, base_url = _load_gnews_config()
+                    raw = _gnews_fetch_articles(
+                        api_key=api_key,
+                        base_url=base_url,
+                        query=q,
+                        from_iso=from_iso,
+                        to_iso=to_iso,
+                        max_records=max_records,
+                        timeout_s=timeout_s,
+                    )
+                    if not raw:
+                        raw = _gnews_fetch_articles(
+                            api_key=api_key,
+                            base_url=base_url,
                             query=q,
-                            startdatetime=startdatetime,
-                            enddatetime=enddatetime,
+                            from_iso=None,
+                            to_iso=None,
                             max_records=max_records,
                             timeout_s=timeout_s,
                         )
-                        used_time_range = True
-                    else:
-                        file_path = (os.getenv("NEWS_CANDIDATES_FILE") or "").strip()
-                        if not file_path:
-                            raise RuntimeError("NEWS_CANDIDATES_FILE is required when NEWS_PROVIDER=file")
-                        candidates = _file_fetch_articles(
-                            path=file_path,
-                            max_records=max_records,
-                        )
-                        used_time_range = False
+                    in_today = []
+                    for item in raw:
+                        seen = _parse_seendate_utc(item.seendate)
+                        if seen and start_dt <= seen <= end_dt:
+                            in_today.append(item)
+                    candidates = in_today or raw
+                    used_time_range = bool(in_today)
+                    if hint_query and q not in default_queries and _best_relevance(candidates, q) <= 0.0:
+                        candidates = []
+                elif provider == "juhe":
+                    cfg = _load_juhe_config()
+                    raw = _juhe_fetch_articles(
+                        news_key=cfg.news_key,
+                        finance_key=cfg.finance_key,
+                        news_base_url=cfg.news_base_url,
+                        finance_base_url=cfg.finance_base_url,
+                        query=q,
+                        max_records=max_records,
+                        timeout_s=timeout_s,
+                    )
+                    in_today = []
+                    for item in raw:
+                        seen = _parse_seendate_utc(item.seendate)
+                        if seen and start_dt <= seen <= end_dt:
+                            in_today.append(item)
+                    candidates = in_today or raw
+                    used_time_range = bool(in_today)
+                else:
+                    file_path = (os.getenv("NEWS_CANDIDATES_FILE") or "").strip()
+                    if not file_path:
+                        raise RuntimeError("NEWS_CANDIDATES_FILE is required when NEWS_PROVIDER=file")
+                    candidates = _file_fetch_articles(
+                        path=file_path,
+                        max_records=max_records,
+                    )
+                    used_time_range = False
                 if candidates:
                     candidates = _dedupe_candidates(candidates)
+                    candidates, skipped_used = filter_used_news_items(candidates, used_news_url_keys)
+                    if skipped_used:
+                        history_skipped.extend(skipped_used)
+                        if not candidates:
+                            last_err = "all candidates filtered by history URL dedupe"
+                    if not candidates:
+                        continue
+                    if aggregate_empty_prompt:
+                        provider_candidates.extend(candidates)
+                        queries_used.append(q)
+                        provider_candidates = _dedupe_candidates(provider_candidates)
+                        if len(provider_candidates) >= max_records:
+                            break
+                        candidates = []
+                        continue
                     break
             except Exception as exc:
                 last_err = f"{provider}/{q}: {exc}"
                 provider_errors.append(last_err)
                 candidates = []
+        if aggregate_empty_prompt and provider_candidates:
+            candidates = _dedupe_candidates(provider_candidates)[:max_records]
+            chosen_query = ",".join(queries_used) if queries_used else chosen_query
         if candidates:
             break
 
@@ -924,9 +1539,16 @@ def fetch_daily_news_candidates(
         "tz": tz_name,
         "query": chosen_query,
         "query_variants": queries,
+        "queries_used": queries_used or ([chosen_query] if candidates else []),
         "startdatetime": startdatetime,
         "enddatetime": enddatetime,
         "used_today_range": used_time_range,
+        "history_dedupe": {
+            "enabled": history_dedupe_is_enabled,
+            "used_count": len(used_news_url_keys),
+            "skipped_count": len(history_skipped),
+            "skipped": history_skipped[:10],
+        },
         "candidates": [asdict(c) for c in candidates[:10]],
     }
     return candidates, meta

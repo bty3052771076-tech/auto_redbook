@@ -27,6 +27,7 @@ The GUI exposes these Aliyun image models:
 ```text
 wan2.7-image
 wan2.7-image-pro
+qwen-image-2.0-pro-2026-04-22
 ```
 
 Default:
@@ -39,7 +40,7 @@ $env:ALIYUN_IMAGE_MODEL="wan2.7-image"
 If you want ordered fallback:
 
 ```powershell
-$env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro"
+$env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro,qwen-image-2.0-pro-2026-04-22"
 ```
 
 ## Size and quality options

@@ -5,19 +5,45 @@
 ## 免费运行说明（默认配置即可）
 - 文案生成：优先使用阿里云百炼（默认 `qwen3.7-plus`，OpenAI 兼容接口），可切换 ppinfra
 - 图片来源：默认使用阿里云百炼文生图（默认 `wan2.7-image`）；也可手动切换 Pexels 图片检索
-- 新闻来源：默认可使用 GDELT（无需 key 的免费新闻源）
+- 新闻来源：支持 NewsAPI / GNews / 聚合数据 Juhe / 已核验本地候选文件；不再使用 GDELT 回退
 - 费用说明：上述能力在**免费额度内可运行**；若超出平台免费额度会产生计费，请自行关注控制台余额/配额
 
 > ⚠️ 费用/额度风险提示：请务必在阿里云百炼控制台确认你的**免费额度**与**到期时间**。超出免费额度后将产生计费，建议在运行前检查余额/配额并设置合理的调用频率。
 
 ## 快速使用
-运行前请先准备好这三类环境：
+### 需要准备什么
+- 小红书账号：用于登录小红书创作服务平台。本项目只保存草稿，不绕过扫码、验证码或平台风控。首次使用请用可视浏览器登录一次。
+- 阿里云百炼 / DashScope 账号：默认用于 LLM 文案生成和 AI 生图。运行前请确认 API Key、免费额度、到期时间和是否已开通对应模型。
+- Python 环境：推荐 Python 3.10+。不要在 C 盘安装项目依赖；虚拟环境、pip 缓存和 Playwright 浏览器建议都放在当前工作区。
+- 新闻源账号：推荐至少准备 GNews、NewsAPI 或聚合数据 Juhe 中的一个。没有可用新闻源时，“每日新闻”可能无法获取候选新闻。
 
-- 小红书账号：用于登录小红书创作服务平台。本项目不会绕过登录/验证码，首次使用请在 GUI 中点击 `登录/检查Profile`，或运行时设置较长 `--login-hold` 完成扫码/验证。
-- 阿里云账号：用于阿里云百炼 / DashScope 免费额度，当前默认用于 LLM 文案生成和 VLM/图像生成能力。建议在百炼控制台确认 `qwen3.7-plus`、`wan2.7-image` 等模型的免费额度、到期时间和 API Key。
-- Python 环境：推荐 Python 3.10+。所有依赖、pip 缓存和 Playwright 浏览器都建议放在当前工作区，避免安装到 C 盘。
+### 需要编辑或创建什么文件
+- `README.md`：只看说明，不需要填写密钥。
+- `.env.gui`：可选。通过 GUI “配置”页保存本机配置；该文件已被 `.gitignore` 忽略，不会上传 GitHub。
+- `docs/aliyun_image_api-key.md`：可选。由 `docs/aliyun_image_api-key.example.md` 复制而来，填写阿里云生图 Key；真实文件已被忽略。
+- `docs/llm_api-key.md`：可选。由 `docs/llm_api-key.example.md` 复制而来，填写 ppinfra/OpenAI-compatible 备用 LLM Key；真实文件已被忽略。
+- `docs/news_api-key.md`：可选。由 `docs/news_api-key.example.md` 复制而来，填写 NewsAPI Key；真实文件已被忽略。
+- `docs/gnews_api-key.md`：可选。由 `docs/gnews_api-key.example.md` 复制而来，填写 GNews Key；真实文件已被忽略。
+- `docs/juhe_api-key.md`：可选。由 `docs/juhe_api-key.example.md` 复制而来，填写聚合数据新闻头条/财经新闻 Key；真实文件已被忽略。
+- `assets/pics/`：可选。本地图片素材目录。若使用 `assets/empty/*` 且无本地图片，会触发自动配图。
 
-首次初始化（PowerShell）：
+建议优先使用 PowerShell 环境变量配置密钥，不把真实 Key 写入仓库文件：
+
+```powershell
+$env:LLM_PROVIDER="aliyun"
+$env:ALIYUN_LLM_API_KEY="YOUR_DASHSCOPE_KEY"
+$env:ALIYUN_LLM_MODEL="qwen3.7-plus"
+
+$env:IMAGE_PROVIDER="aliyun"
+$env:ALIYUN_IMAGE_API_KEY="YOUR_DASHSCOPE_KEY"
+$env:ALIYUN_IMAGE_MODEL="wan2.7-image"
+
+$env:NEWS_PROVIDER="gnews"
+$env:GNEWS_API_KEY="YOUR_GNEWS_API_KEY"
+```
+
+### 首次初始化
+PowerShell 中运行：
 
 ```powershell
 python -m venv .venv
@@ -28,28 +54,29 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-配置阿里云 Key（推荐只在当前 PowerShell 会话里设置，不写入仓库）：
-
-```powershell
-$env:ALIYUN_LLM_API_KEY="YOUR_DASHSCOPE_KEY"
-$env:ALIYUN_IMAGE_API_KEY="YOUR_DASHSCOPE_KEY"
-$env:LLM_PROVIDER="aliyun"
-$env:IMAGE_PROVIDER="aliyun"
-$env:ALIYUN_LLM_MODEL="qwen3.7-plus"
-$env:ALIYUN_IMAGE_MODEL="wan2.7-image"
-```
-
+### 最短启动方式
 启动 GUI：
 
 ```powershell
 .\AutoRedbookGUI-Launcher.exe
 ```
 
-命令行生成并保存 1 条新闻草稿：
+命令行生成并保存 1 条每日新闻草稿：
 
 ```powershell
-.\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --prompt "选择适合小红书图文的科技、社会或国际新闻，摘要约50字，正文约200字，内容必须严谨真实。" --assets-glob "assets/empty/*" --count 1 --login-hold 600 --wait-timeout 300 --force
+.\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --evaluation-viewpoint "无视角评价" --assets-glob "assets/empty/*" --count 1 --login-hold 600 --wait-timeout 600 --force
 ```
+
+如果已经在工作区 Chrome profile 登录过小红书，可改用无界面上传，并在终端查看上传进度：
+
+```powershell
+.\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --evaluation-viewpoint "无视角评价" --assets-glob "assets/empty/*" --count 1 --login-hold 0 --wait-timeout 600 --force --headless
+```
+
+### 上传安全
+- 不要提交真实 API Key、`.env.gui`、浏览器 profile、草稿记录或测试截图。
+- `.gitignore` 已忽略 `.env*`、`docs/*api-key.md`、`data/`、`output/`、`.venv/` 和本地 GUI exe。
+- `data/posts/` 是本地新闻草稿记录，会保留在本机，不会上传 GitHub。
 
 ## 功能一览
 - 普通图文：`标题 + 提示词（可选） + 图片（可选）` → 生成草稿并保存到草稿箱
@@ -58,6 +85,7 @@ $env:ALIYUN_IMAGE_MODEL="wan2.7-image"
 - 批量生成：使用 `--count` 控制单次生成条数（默认 1）
 - 图形界面（GUI）：在窗口中选择模型/参数并一键执行常用命令
 - 自动配图：当未提供图片时，默认用阿里云百炼生成 1 张相关图片用于上传，也可切换 Pexels 检索下载
+- 无界面上传：`run` / `auto` / `retry` / `delete-drafts` 支持 `--headless`，终端会实时显示上传步骤和 `uploaded=x/y` 进度
 - 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
 - 落盘与可追溯：`data/posts/<post_id>/` 保存 post / revision / execution / evidence
 
@@ -100,7 +128,13 @@ python -m playwright install chromium
 ```powershell
 .\Start-GUI.cmd
 ```
-GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、配图来源（默认阿里云，也可选 Pexels）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，并在独立时间框显示北京时间，便于确认每个帖子的标题后再审核或上传。
+GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、图片来源（`local` 本地 assets / `aliyun` AI 生图 / `pexels` 搜图）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，并在独立时间框显示北京时间，便于确认每个帖子的标题后再审核或上传。
+
+图片来源说明：选择 `local` 时使用本地 `assets glob`；选择 `aliyun` 或 `pexels` 时 GUI 会自动使用 `assets/empty/*` 触发自动配图，避免本地旧图片覆盖你选择的图片来源。
+
+`自动发帖`、`草稿处理` 和 `删除草稿` 页提供“无界面上传/运行”选项。首次登录或遇到验证码时不要勾选；确认 `data/browser/chrome-profile` 已登录后再勾选，上传进度会显示在 GUI 日志区。
+
+长任务运行时，GUI 日志区会定期输出“仍在运行”心跳，并在右侧显示 `空闲` / `运行中` / `正在停止` 状态。如果心跳持续很久，通常是在等待新闻 API、LLM、VLM 生图或小红书页面响应，不等同于窗口冻结。
 
 更多说明见：`docs/模型与GUI供应商配置.md`。
 
@@ -121,6 +155,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
   - `XHS_CHROME_PATH=<chrome.exe 路径>`（可选；找不到 Chrome 时使用）
   - `XHS_CHROME_USER_DATA_DIR=<profile 目录>`
   - `XHS_CHROME_PROFILE=Default`（或 `Profile 1` 等）
+- 无界面上传可通过 CLI `--headless` 或环境变量 `XHS_HEADLESS=1` 开启；必须复用已登录 profile，首次登录、扫码和验证码仍需使用可视浏览器或 GUI 的 `登录/检查Profile`。
 
 查看草稿（默认 profile）：
 ```powershell
@@ -162,11 +197,15 @@ LLM（生成文案）：
 - 可选：`LLM_PROVIDER=auto|aliyun|ppinfra`。`auto` 表示阿里云优先；当出现额度/限流/模型不可用等错误时自动回退到 ppinfra。
 - 阿里云免费模型完整列表见：`docs/模型与GUI供应商配置.md`
 
-NewsAPI（“每日新闻”）：
+新闻源（“每日新闻”）：
 - 环境变量：`NEWS_API_KEY`（或 `NEWSAPI_API_KEY`），可选 `NEWS_BASE_URL`
 - 或本机文件：复制 `docs/news_api-key.example.md` 为 `docs/news_api-key.md` 并填写
-- 无需 key 的免费新闻源：`GDELT`（设置 `NEWS_PROVIDER=gdelt` 或不配置 key 时自动回退）
-- 已核验候选文件：`NEWS_PROVIDER=file` + `NEWS_CANDIDATES_FILE=data/news/xxx.json`，适合 NewsAPI/GDELT 临时不可用、但仍需要使用真实来源新闻完成自动生成与草稿保存时使用
+- GNews 备用源：环境变量 `GNEWS_API_KEY`（或 `GNEWS_TOKEN`），可选 `GNEWS_LANG` / `GNEWS_COUNTRY` / `GNEWS_MAX` / `GNEWS_BASE_URL`
+- 或本机文件：复制 `docs/gnews_api-key.example.md` 为 `docs/gnews_api-key.md` 并填写
+- 聚合数据 Juhe 国内源：环境变量 `JUHE_NEWS_APPKEY`（新闻头条）和/或 `JUHE_FINANCE_NEWS_APPKEY`（财经新闻），可选 `JUHE_NEWS_TYPE` / `JUHE_NEWS_FETCH_DETAIL` / `JUHE_NEWS_DETAIL_LIMIT`
+- 或本机文件：复制 `docs/juhe_api-key.example.md` 为 `docs/juhe_api-key.md` 并填写；该文件已被 `.gitignore` 忽略，不能提交
+- 已核验候选文件：`NEWS_PROVIDER=file` + `NEWS_CANDIDATES_FILE=data/news/xxx.json`，适合在线 API 临时不可用、但仍需要使用真实来源新闻完成自动生成与草稿保存时使用
+- 注意：`GDELT` 已从自动新闻源中移除；`NEWS_PROVIDER=gdelt` 会直接报不支持，避免仅凭低质量摘录生成草稿
 - 中国/海外新闻比例：默认偏向中国新闻，约 6:4（可用 `NEWS_CHINA_RATIO=0.6` 调整；仅影响“每日新闻”候选排序/挑选）
 
 Pexels（自动配图：当未提供图片素材时）：
@@ -228,7 +267,7 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 .\.venv\Scripts\python -m apps.cli auto --title "冬日穿搭" --prompt "通勤简约风，给我3套搭配思路" --assets-glob "assets/pics/*" --login-hold 600
 ```
 
-### 2) 标题为“每日新闻” → NewsAPI 获取当日新闻并按提示词挑选 → 保存草稿
+### 2) 标题为“每日新闻” → 新闻 API 获取当日新闻并按提示词挑选 → 保存草稿
 ```powershell
 $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 $env:NEWS_API_KEY="YOUR_NEWS_API_KEY"
@@ -245,6 +284,27 @@ $env:NEWS_PROVIDER="newsapi"
 $env:NEWS_PROVIDER="file"
 $env:NEWS_CANDIDATES_FILE="data/news/manual_candidates_20260619.json"
 .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "科技、社会或国际新闻" --assets-glob "assets/empty/*" --count 5 --login-hold 0 --wait-timeout 300 --force
+```
+
+### 2.1) 使用 GNews 作为新闻源
+```powershell
+$env:GNEWS_API_KEY="YOUR_GNEWS_API_KEY"
+$env:NEWS_PROVIDER="gnews"
+$env:GNEWS_LANG="en"
+$env:GNEWS_COUNTRY="us"
+
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*" --count 2 --login-hold 600 --wait-timeout 600
+```
+
+### 2.2) 使用聚合数据 Juhe 作为新闻源
+```powershell
+$env:NEWS_PROVIDER="juhe"
+$env:JUHE_NEWS_APPKEY="YOUR_JUHE_NEWS_APPKEY"
+$env:JUHE_FINANCE_NEWS_APPKEY="YOUR_JUHE_FINANCE_NEWS_APPKEY"
+
+# 科技/社会/国际等主题会走“新闻头条”；财经、business、economy 等主题优先走“财经新闻”
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*" --count 2 --login-hold 600 --wait-timeout 600
+.\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --prompt "财经" --assets-glob "assets/empty/*" --count 2 --login-hold 600 --wait-timeout 600
 ```
 
 ### 3) 无图片上传 → 阿里云生图（默认）→ 保存草稿
@@ -275,35 +335,52 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 ## auto 参数说明
 - `--title`：标题（必填）
 - `--prompt`：提示词（可选）
+- `--evaluation-viewpoint`：每日新闻评价视角，默认 `无视角评价`；默认不预设国家、行业、投资者或平台立场
 - `--count`：生成草稿数量（默认 1）
 - `--assets-glob`：素材路径（glob），默认 `assets/pics/*`
 - `--no-copy`：不复制素材到 `data/posts/<id>/assets`（默认会复制，便于隔离）
-- `--login-hold`：等待手动登录的秒数（仅用于登录，不用于等待上传），默认 0
+- `--login-hold`：登录完成检测的最长等待秒数；若已登录并进入编辑器会立刻继续，不再固定等待整段时间，默认 0
 - `--wait-timeout`：等待发布页秒数，默认 300
 - `--dry-run`：只抓取证据，不上传/不保存
 - `--force`：忽略校验失败继续执行（仅排查用）
 
 ## create/run 常用参数
-- `create`：`--assets-glob` / `--no-copy` / `--count`
+- `create`：`--assets-glob` / `--no-copy` / `--count` / `--evaluation-viewpoint`（仅每日新闻使用）
 - `run`：`--assets-glob` / `--login-hold` / `--wait-timeout` / `--dry-run` / `--force`
 
 ## 每日新闻（特殊标题）
 - 当 `--title "每日新闻"`：会先拉取新闻候选，再生成草稿。
   - 生成条数由 `--count` 控制（默认 1）
   - 提供 `--prompt`：按提示词相关性排序后取前 N 条
-  - 不提供 `--prompt`：按候选顺序取前 N 条
-  - 正文会明确写出发布时间（提升时效性）
-  - 正文开头新增“要点摘要：”20-40 字，概括新闻最重要部分（不评价）
-  - 标题会被规范为 20 字以内的中文总结标题，不再自动添加“每日新闻｜”前缀，并会清理日文假名
-  - 当候选新闻摘要/正文不足或被截断时，会尝试读取原新闻页面摘录，再交给 LLM 评价；若仍不足，则要求保守表达、不得推测
+  - 不提供 `--prompt`：从默认通用主题池中随机排序并抓取候选，再取前 N 条
+  - 可用 `--evaluation-viewpoint` 指定 `评价` 部分的分析视角，默认 `无视角评价`；无视角评价只基于已给事实和原文摘录客观分析，信息不足时评价可为空
+  - 正文最终保存为可直接发布的中文文本，按 `原文标题` / `内容` / `评价` / `日期` / `来源` 五段渲染，五段之间保留空行，不会把 JSON 原文写入正文
+  - `评价` 可为空；有可核验事实时才输出具体客观点，信息不足时不硬凑点评
+  - 正文不输出 URL；原始链接只保存在本地 metadata
+  - 标题会被 LLM 和兜底逻辑规范为 12-18 字中文总结标题，理想约 15 字，不再自动添加“每日新闻｜”前缀，不得直接照搬 `原文标题`，并会清理日文假名
+  - `内容` 字段会压缩到 150 字以内，并清理浏览器升级提示、栏目导航、素材地址、站内推荐标题和空泛模板句
+  - 最终成稿前会兜底过滤与新闻主题无关的评价模板，例如文化新闻误写成 AI/版权评价、外交新闻误写成经贸供应链评价
+  - 默认会尝试抓取原新闻正文后再交给 LLM 总结；若原文仍不足，则要求保守表达、不得推测
 
 可选配置（环境变量）：
-- `NEWS_PROVIDER`：`newsapi` / `gdelt`（默认自动；有 `NEWS_API_KEY` 时优先 `newsapi`）
+- `NEWS_PROVIDER`：`auto` / `newsapi` / `gnews` / `juhe` / `file`（默认自动；顺序为已配置的 NewsAPI -> 已配置的 GNews -> 已配置的 Juhe，已设置 `NEWS_CANDIDATES_FILE` 时优先 file；没有可用 key 时会明确报错）
+- `GNEWS_API_KEY` / `GNEWS_TOKEN`：GNews key。推荐使用环境变量；也可创建本机私密文件 `docs/gnews_api-key.md`，该文件已被 `.gitignore` 忽略
+- `GNEWS_LANG`：GNews 语言过滤，例如 `en` / `zh`
+- `GNEWS_COUNTRY`：GNews 国家过滤，例如 `us` / `cn`
+- `GNEWS_MAX`：GNews 单次请求返回条数；免费额度建议保持默认 10
+- `GNEWS_BASE_URL`：默认 `https://gnews.io/api/v4`
+- `JUHE_NEWS_APPKEY` / `JUHE_NEWS_KEY` / `JUHE_TOUTIAO_APPKEY`：聚合数据新闻头条 key，用于国内、国际、科技、社会等分类新闻
+- `JUHE_FINANCE_NEWS_APPKEY` / `JUHE_FINANCE_APPKEY` / `JUHE_CAIJING_APPKEY`：聚合数据财经新闻 key；当 query 包含 `财经` / `business` / `economy` / `finance` 等词时优先使用
+- `JUHE_NEWS_TYPE`：强制指定新闻头条分类，例如 `top` / `shehui` / `guonei` / `guoji` / `keji` / `caijing`
+- `JUHE_NEWS_FETCH_DETAIL`：默认 `1`，会用新闻头条的 `uniquekey` 尝试拉取详情正文；设为 `0` 可关闭
+- `JUHE_NEWS_DETAIL_LIMIT`：默认最多对前 10 条候选拉详情，避免一次请求过多消耗额度
 - `NEWS_TZ`：默认 `Asia/Shanghai`
-- `NEWS_QUERY_DEFAULT`：提示词无结果时的回退 query（默认 `china`）
-- `NEWS_SOURCE_LOOKUP`：默认 `1`，候选内容不足时尝试抓取原新闻摘录；设为 `0` 可关闭
+- `NEWS_QUERY_DEFAULT`：自定义默认 query；可写单个 query，也可用逗号/分号分隔多个 query。未设置时使用通用主题池（technology/world/science/business/health/climate/society/international），不再默认固定为 `china`
+- `NEWS_SOURCE_LOOKUP`：默认 `1`，会尝试抓取原新闻正文辅助总结；设为 `0` 可关闭
 - `NEWS_SOURCE_LOOKUP_TIMEOUT_S`：原新闻摘录抓取超时，默认 `8`
+- `NEWS_SOURCE_LOOKUP_MAX_CHARS`：原新闻正文保留字符数，默认 `5000`
 - `NEWS_SOURCE_CONTEXT_MIN_CHARS`：判断候选内容是否不足的阈值，默认 `120`
+- `NEWS_HISTORY_DEDUPE`：默认 `1`，会跳过本地历史草稿中已经使用过的新闻 URL；设为 `0` 可关闭
 
 ## 每日假新闻（特殊标题）
 - 当 `--title "每日假新闻"`：使用 LLM 生成一条幽默、明显虚构的娱乐新闻，并保存草稿。
@@ -315,8 +392,10 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 - 普通图文（标题/正文/topics 的 LLM 结构化输出）：`src/llm/generate.py` → `generate_draft()` → `ChatPromptTemplate.from_messages(...)`
   - `system`：整体写作风格、字数要求、JSON 输出要求等
   - `user`：把 `prompt_hint/title_hint/assets` 注入模型
+  - 默认 `max_tokens=25565`；实际可用输出长度仍受供应商、模型上下文窗口和账号额度限制
 - 每日新闻（给 LLM 的“新闻写作提示词”）：`src/workflow/create_post.py` → `_daily_news_prompt(...)`
-  - 同文件：`_daily_news_offline_body(...)` / `_ensure_daily_news_sections(...)`（离线兜底与段落结构修正）
+  - 同文件：`_daily_news_offline_body(...)` / `_ensure_daily_news_sections(...)` / `_daily_news_body_to_fields(...)` / `_render_daily_news_body_fields(...)`（离线兜底、旧结构兼容、五字段提取与最终正文渲染）
+  - `body` 最终固定渲染为 5 段可读正文；`评价` 可为空，避免空泛模板句；原始 URL 只进入本地 metadata
 - 每日假新闻（给 LLM 的“虚构新闻提示词”）：`src/workflow/create_post.py` → `_fake_news_prompt(...)`
   - 同文件：`_fake_news_offline_body(...)`（离线兜底）
 - 阿里云百炼文生图（把主题/要点拼成生图提示词）：`src/images/auto_image.py` → `_build_aliyun_image_prompt(...)`
@@ -341,6 +420,7 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 
 支持模型（文生图，模型名以百炼控制台为准，均使用同一把 API Key）：
 - 通义万相 2.7：`wan2.7-image` / `wan2.7-image-pro`（GUI 内置，默认 `wan2.7-image`）
+- Qwen Image：`qwen-image-2.0-pro-2026-04-22`（GUI 内置，可手动选择测试）
 - 兼容旧模型：`qwen-image-plus-2026-01-09` / `qwen-image-max` / `qwen-image` / `z-image-turbo` / `wan2.6-t2i` / `wan2.6-image` / `wan2.5-t2i-preview` / `wanx2.1-t2i-turbo` 等
 - 说明：本流程仅使用“文生图”模型；`i2v`/`t2v`/`edit`/`mt-image` 会被自动跳过
 
@@ -363,8 +443,12 @@ $env:LLM_API_KEY="YOUR_LLM_API_KEY"
 - 阿里云生图模型列表：支持 `ALIYUN_IMAGE_MODELS` 按顺序尝试与回退
 - 生图事件摘要：LLM 输出 `image_event`（约 30 字）用于降低“新闻海报感/文字”概率
 - 生图提示词收敛：仅用事件描述生成插画，避免“报道/海报/采访”等语义
+- 在线新闻源：支持 `NEWS_PROVIDER=newsapi` / `gnews` / `juhe` / `file`，自动模式只尝试已配置 key 的来源，不再回退到 GDELT
+- 每日新闻历史 URL 查重：新候选若与 `data/posts/*/post.json` 中已用新闻链接重复，会自动跳过并选择其他新闻
+- 终端阶段化报错：失败时会输出 `stage=获取新闻` / `stage=LLM` / `stage=VLM生图` / `stage=上传`，方便快速定位链路断点
 - 元数据完整落盘：每条 post 保存 news/image/attempt 等字段，便于追踪与复盘
 - 每日新闻要点摘要：正文首行输出 20-40 字关键摘要，突出新闻要点
+- 小红书登录态检测：`--login-hold` 现在只在未登录/页面未就绪时等待，已登录会立即进入上传链路
 
 ## 一键快速使用（免费额度版本）
 ```powershell
@@ -373,9 +457,9 @@ $env:ALIYUN_LLM_API_KEY="YOUR_DASHSCOPE_KEY"
 # 可选：按顺序尝试多个文本模型（优先于 ALIYUN_LLM_MODEL）
 $env:ALIYUN_LLM_MODELS="qwen3.7-plus,deepseek-v4-flash,qwen3.6-flash"
 $env:ALIYUN_IMAGE_API_KEY="YOUR_DASHSCOPE_KEY"
-$env:NEWS_PROVIDER="gdelt"
+$env:NEWS_PROVIDER="gnews"
 $env:IMAGE_PROVIDER="aliyun"
-$env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro"
+$env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro,qwen-image-2.0-pro-2026-04-22"
 
 .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 10 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
@@ -383,12 +467,12 @@ $env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro"
 
 **每日新闻一行版（无本地图片 → 阿里云生图 → 保存草稿）**
 ```powershell
-$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
+$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro,qwen-image-2.0-pro-2026-04-22"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日新闻" --count 3 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
 
 **每日假新闻一行版（无本地图片 → 阿里云生图 → 保存草稿）**
 ```powershell
-$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
+$env:IMAGE_PROVIDER="aliyun"; $env:ALIYUN_IMAGE_MODELS="wan2.7-image,wan2.7-image-pro,qwen-image-2.0-pro-2026-04-22"; $env:ALIYUN_IMAGE_SIZE="1104*1472"; $env:ALIYUN_IMAGE_TIMEOUT_S="180"; $env:ALIYUN_IMAGE_DOWNLOAD_TIMEOUT_S="60"; $env:ALIYUN_IMAGE_MAX_ATTEMPTS="3"; .\.venv\Scripts\python -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --count 1 --assets-glob "empty/pics/*" --login-hold 600 --wait-timeout 600
 ```
 
 ## 删除草稿（危险操作）
@@ -428,6 +512,8 @@ E2E 测试（需要已配置阿里云百炼 key；可选 `--cdp` 复用你已打
 ```
 
 ## 常见问题
+- PowerShell 弹出 `Invoke-WebRequest` 安全提醒：关闭旧 GUI 窗口后重新运行 `.\Start-GUI.cmd`。当前启动脚本已在 PowerShell 5.1 下启用 `UseBasicParsing`，如果仍弹出，通常是外部脚本或旧进程触发。
+- GUI 看起来卡住：新版 GUI 会每 20 秒输出一次“仍在运行”心跳，并显示当前状态；若持续很久没有步骤输出，可点击“停止当前任务”后用同一条 CLI 命令复现。
 - 草稿箱为空：确认打开的是保存草稿时用的同一个 profile（不同 profile 草稿互不可见）。
 - 没看到“图文笔记”：只运行了 `create` 不会出现在网页草稿箱；需要 `auto` 或 `approve + run`。
 - Playwright 启动失败：关闭所有 Chrome 窗口，避免 profile 被占用。
@@ -435,7 +521,29 @@ E2E 测试（需要已配置阿里云百炼 key；可选 `--cdp` 复用你已打
 - 阿里云生图报错 `AllocationQuota.FreeTierOnly`：说明免费额度已耗尽；请改用本地图片/PEXELS，或在百炼控制台开通计费/提升配额后重试。
 
 ## 相关文档（docs）
+- `docs/GUI启动与运行稳定性修复-2026-06-22.md`
+- `docs/GUI运行流畅度与心跳修复-2026-06-23.md`
+- `docs/每日新闻图文不符修复-2026-06-23.md`
+- `docs/每日新闻评价半句截断修复-2026-06-23.md`
+- `docs/每日新闻原文标题泛化修复-2026-06-23.md`
+- `docs/LLM输出token上限调整-2026-06-23.md`
+- `docs/每日新闻评价视角参数-2026-06-23.md`
+- `docs/每日新闻英文泄漏闸门与两条草稿实测-2026-06-22.md`
+- `docs/GUI每日新闻数量不足修复-2026-06-22.md`
+- `docs/每日新闻三条草稿最终实测-2026-06-22.md`
 - `docs/使用说明-自动新闻生成与草稿发布.md`
+- `docs/聚合数据新闻源接入-2026-06-21.md`
+- `docs/每日新闻质量闸门与GDELT移除-2026-06-21.md`
+- `docs/新闻质量闸门与终端GUI实测-2026-06-20.md`
+- `docs/每日新闻正文渲染修复-2026-06-21.md`
+- `docs/每日新闻正文JSON结构稳定化-2026-06-20.md`
+- `docs/每日新闻点评与正文通顺优化-2026-06-20.md`
+- `docs/每日新闻兜底正文与两条草稿实测-2026-06-20.md`
+- `docs/每日新闻历史URL查重-2026-06-20.md`
+- `docs/工程性全面检测与每日新闻AI配图实测-2026-06-20.md`
+- `docs/GUI删除草稿total0诊断-2026-06-21.md`
+- `docs/GUI删除草稿验证与提示优化-2026-06-20.md`
+- `docs/小红书登录态检测与每日新闻链路实测-2026-06-20.md`
 - `docs/新闻中文化与GUI草稿状态修复-2026-06-19.md`
 - `docs/模型与GUI供应商配置.md`
 - `docs/工作流新闻任务书.md`

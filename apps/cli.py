@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,11 @@ from src.publish.playwright_steps import run_delete_drafts_sync, run_save_draft_
 from src.storage.files import list_executions, list_posts, load_post, save_post
 from src.storage.models import Execution, PostStatus, PostType, now_iso
 from src.validation import validate_post
-from src.workflow.create_post import create_daily_news_posts, create_post_with_draft
+from src.workflow.create_post import (
+    DEFAULT_EVALUATION_VIEWPOINT,
+    create_daily_news_posts,
+    create_post_with_draft,
+)
 
 app = typer.Typer(help="小红书自动发帖（生成并保存草稿）CLI")
 
@@ -64,10 +69,80 @@ def _emit_validation(result) -> None:
         typer.echo(f"warn: {warn}")
 
 
+def _format_stage_error(stage: str, error) -> str:
+    return f"error: stage={stage} | {error}"
+
+
+def _stage_from_create_exception(exc: Exception) -> str:
+    message = str(exc).lower()
+    if (
+        "no news returned" in message
+        or "newsapi" in message
+        or "gnews" in message
+        or "news_candidates_file" in message
+        or "daily news fetch" in message
+    ):
+        return "获取新闻"
+    if (
+        "image" in message
+        or "aliyun" in message
+        or "vlm" in message
+        or "auto-image" in message
+        or "dashscope image" in message
+    ):
+        return "VLM生图"
+    if (
+        "llm" in message
+        or "llm api_key missing" in message
+        or "dashscope" in message
+        or "openai" in message
+    ):
+        return "LLM"
+    return "生成草稿"
+
+
+def _upload_progress(post_id: str):
+    def _emit(message: str) -> None:
+        typer.echo(f"{message} | post_id={post_id}")
+
+    return _emit
+
+
+def _headless_env_enabled() -> bool:
+    return (os.getenv("XHS_HEADLESS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def _headless_option_value(headless: bool):
+    return True if headless else None
+
+
+def _headless_requested(headless: bool) -> bool:
+    return bool(headless or _headless_env_enabled())
+
+
+def _warn_headless_login_hold(headless: bool, login_hold: int) -> None:
+    if _headless_requested(headless) and login_hold > 0:
+        typer.echo(
+            "warn: --headless requires an already logged-in Chrome profile; "
+            "login-hold cannot display QR/captcha windows"
+        )
+
+
 @app.command()
 def create(
     title: str = typer.Option(..., help="初始标题/题目"),
     prompt: str = typer.Option("", help="提示词/要点（可选）"),
+    evaluation_viewpoint: str = typer.Option(
+        DEFAULT_EVALUATION_VIEWPOINT,
+        "--evaluation-viewpoint",
+        help="每日新闻评价视角；默认无视角评价",
+    ),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
     count: int = typer.Option(1, help="生成草稿数量（>=1）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
@@ -92,9 +167,10 @@ def create(
                 copy_assets=not no_copy,
                 count=count,
                 auto_image=True,
+                evaluation_viewpoint=evaluation_viewpoint,
             )
         except Exception as exc:
-            typer.echo(f"error: daily news create failed: {exc}")
+            typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
             posts = []
     else:
         used_image_ids: set[str] = set()
@@ -112,7 +188,7 @@ def create(
                     )
                 )
             except Exception as exc:
-                typer.echo(f"error: create failed ({idx + 1}/{count}): {exc}")
+                typer.echo(_format_stage_error(_stage_from_create_exception(exc), f"create failed ({idx + 1}/{count}): {exc}"))
                 continue
 
     if not posts:
@@ -206,6 +282,11 @@ def run(
     dry_run: bool = typer.Option(
         False, help="open page and capture evidence only; skip upload/fill/save"
     ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="run Chrome without a visible window; requires an already logged-in profile",
+    ),
     login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
     wait_timeout: int = typer.Option(300, help="seconds to wait for publish UI"),
     force: bool = typer.Option(False, help="run even if not approved or validation fails"),
@@ -231,6 +312,7 @@ def run(
         typer.echo("未找到素材文件，请检查 assets_glob 或 data/posts/<id>/assets")
         raise typer.Exit(code=1)
 
+    _warn_headless_login_hold(headless, login_hold)
     attempt = _next_attempt(post_id)
     exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
     exec_rec = run_save_draft_sync(
@@ -240,6 +322,8 @@ def run(
         login_hold=login_hold,
         wait_timeout_ms=wait_timeout * 1000,
         execution=exec_rec,
+        headless=_headless_option_value(headless),
+        progress_callback=_upload_progress(post.id),
     )
 
     post.status = _apply_execution_status(post.status, exec_rec.result)
@@ -252,18 +336,28 @@ def run(
         detail = f" | {s.detail}" if s.detail else ""
         typer.echo(f"- {s.name}: {s.status}{detail}")
     if exec_rec.error:
-        typer.echo(f"error: {exec_rec.error}")
+        typer.echo(_format_stage_error("上传", exec_rec.error))
 
 
 @app.command()
 def auto(
     title: str = typer.Option(..., help="初始标题/题目"),
     prompt: str = typer.Option("", help="提示词要点（可选）"),
+    evaluation_viewpoint: str = typer.Option(
+        DEFAULT_EVALUATION_VIEWPOINT,
+        "--evaluation-viewpoint",
+        help="每日新闻评价视角；默认无视角评价",
+    ),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
     count: int = typer.Option(1, help="生成草稿数量（>=1）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
     dry_run: bool = typer.Option(
         False, help="open page and capture evidence only; skip upload/fill/save"
+    ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="run Chrome without a visible window; requires an already logged-in profile",
     ),
     login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
     wait_timeout: int = typer.Option(300, help="seconds to wait for publish UI"),
@@ -281,6 +375,7 @@ def auto(
         typer.echo("count 必须 >= 1")
         raise typer.Exit(code=1)
 
+    _warn_headless_login_hold(headless, login_hold)
     if title_norm == "每日新闻":
         try:
             posts = create_daily_news_posts(
@@ -289,9 +384,10 @@ def auto(
                 copy_assets=not no_copy,
                 count=count,
                 auto_image=True,
+                evaluation_viewpoint=evaluation_viewpoint,
             )
         except Exception as exc:
-            typer.echo(f"error: daily news create failed: {exc}")
+            typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
             posts = []
     else:
         used_image_ids: set[str] = set()
@@ -309,7 +405,7 @@ def auto(
                     )
                 )
             except Exception as exc:
-                typer.echo(f"error: create failed ({idx + 1}/{count}): {exc}")
+                typer.echo(_format_stage_error(_stage_from_create_exception(exc), f"create failed ({idx + 1}/{count}): {exc}"))
                 continue
 
     typer.echo(f"创建完成：posts={len(posts)}")
@@ -356,6 +452,8 @@ def auto(
                 login_hold=login_hold,
                 wait_timeout_ms=wait_timeout * 1000,
                 execution=exec_rec,
+                headless=_headless_option_value(headless),
+                progress_callback=_upload_progress(post.id),
             )
         except Exception as exc:
             # Defensive: run_save_draft_sync catches most exceptions, but avoid aborting the batch
@@ -364,7 +462,7 @@ def auto(
             post.updated_at = now_iso()
             save_post(post)
             upload_failed += 1
-            typer.echo(f"error: post_id={post.id} upload exception: {exc}")
+            typer.echo(_format_stage_error("上传", f"post_id={post.id} upload exception: {exc}"))
             continue
 
         post.status = _apply_execution_status(post.status, exec_rec.result)
@@ -377,7 +475,7 @@ def auto(
             detail = f" | {s.detail}" if s.detail else ""
             typer.echo(f"- {s.name}: {s.status}{detail}")
         if exec_rec.error:
-            typer.echo(f"error: {exec_rec.error}")
+            typer.echo(_format_stage_error("上传", exec_rec.error))
         if exec_rec.result == "saved_draft":
             uploaded += 1
         elif not dry_run:
@@ -403,6 +501,11 @@ def delete_drafts(
     all_types: bool = typer.Option(False, "--all", help="删除所有类型草稿"),
     limit: int = typer.Option(0, help="最多删除 N 条（0 表示不限制）"),
     dry_run: bool = typer.Option(False, help="只预览将删除的草稿"),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="run Chrome without a visible window; requires an already logged-in profile",
+    ),
     yes: bool = typer.Option(False, help="跳过确认"),
     login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
     wait_timeout: int = typer.Option(300, help="seconds to wait for publish UI"),
@@ -420,6 +523,8 @@ def delete_drafts(
     if all_types:
         types = ["image", "video", "article"]
 
+    _warn_headless_login_hold(headless, login_hold)
+
     def _print_preview(res: dict) -> None:
         typer.echo(f"type={res.get('draft_type')} total={res.get('total')}")
         for item in res.get("items", [])[:5]:
@@ -428,6 +533,8 @@ def delete_drafts(
             typer.echo(f"- {title} {saved_at}".rstrip())
         if res.get("total", 0) > 5:
             typer.echo("... (仅显示前 5 条)")
+        if res.get("errors"):
+            typer.echo(f"errors: {res['errors']}")
 
     previews: list[dict] = []
     for t in types:
@@ -439,9 +546,15 @@ def delete_drafts(
             dry_run=True,
             login_hold=login_hold,
             wait_timeout_ms=wait_timeout * 1000,
+            headless=_headless_option_value(headless),
         )
         previews.append(preview)
         _print_preview(preview)
+
+    preview_errors = [err for p in previews for err in (p.get("errors") or [])]
+    if preview_errors:
+        typer.echo("预览草稿失败，未执行删除")
+        raise typer.Exit(code=1)
 
     if dry_run:
         return
@@ -466,6 +579,7 @@ def delete_drafts(
             dry_run=False,
             login_hold=login_hold,
             wait_timeout_ms=wait_timeout * 1000,
+            headless=_headless_option_value(headless),
         )
         typer.echo(
             f"deleted {res.get('deleted', 0)}/{res.get('total', 0)} drafts "
@@ -488,6 +602,11 @@ def retry(
     dry_run: bool = typer.Option(
         False, help="open page and capture evidence only; skip upload/fill/save"
     ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="run Chrome without a visible window; requires an already logged-in profile",
+    ),
     login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
     wait_timeout: int = typer.Option(300, help="seconds to wait for publish UI"),
     force: bool = typer.Option(False, help="retry even if last run was not failed"),
@@ -506,6 +625,7 @@ def retry(
         post_id=post_id,
         assets_glob=assets_glob,
         dry_run=dry_run,
+        headless=headless,
         login_hold=login_hold,
         wait_timeout=wait_timeout,
         force=True,

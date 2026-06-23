@@ -1,5 +1,9 @@
 $ErrorActionPreference = "Stop"
 
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $PSDefaultParameterValues["Invoke-WebRequest:UseBasicParsing"] = $true
+}
+
 $Root = Split-Path -Parent $PSScriptRoot
 $Url = "https://creator.xiaohongshu.com/publish/publish?target=image"
 $ProfileDir = if ($env:XHS_CHROME_USER_DATA_DIR) {
