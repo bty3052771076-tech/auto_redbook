@@ -683,6 +683,7 @@ def update_metrics(
     typer.echo(f"metrics: fetched={len(metrics)} saved={saved['count']}")
     typer.echo(f"metrics-jsonl: {saved['jsonl']}")
     typer.echo(f"metrics-csv: {saved['csv']}")
+    typer.echo(f"metrics-latest-csv: {saved['latest_csv']}")
     for metric in metrics[:10]:
         typer.echo(
             f"- {metric.title or '(无标题)'} | 点赞={metric.likes} 评论={metric.comments} 收藏={metric.favorites}"

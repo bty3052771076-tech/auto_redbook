@@ -105,6 +105,32 @@ def test_save_published_metrics_snapshot_writes_jsonl_and_csv():
         assert loaded[0].favorites == 4
 
 
+def test_save_published_metrics_snapshot_updates_latest_csv_without_duplicates():
+    with TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        first = PublishedMetric(
+            title="同一笔记",
+            published_at="2026-06-27",
+            likes=1,
+            comments=0,
+            favorites=0,
+        )
+        second = PublishedMetric(
+            title="同一笔记",
+            published_at="2026-06-27",
+            likes=5,
+            comments=2,
+            favorites=1,
+        )
+
+        save_published_metrics_snapshot([first], base=base)
+        result = save_published_metrics_snapshot([second], base=base)
+
+        latest_text = result["latest_csv"].read_text(encoding="utf-8-sig")
+        assert latest_text.count("同一笔记") == 1
+        assert ",5,2,1," in latest_text
+
+
 def test_append_run_record_writes_table_and_jsonl():
     with TemporaryDirectory() as tmp:
         base = Path(tmp)

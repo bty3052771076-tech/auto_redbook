@@ -53,6 +53,17 @@ def _append_csv_row(path: Path, fieldnames: list[str], row: dict[str, Any]) -> N
         writer.writerow({key: _csv_value(row.get(key)) for key in fieldnames})
 
 
+def _write_csv_rows_atomic(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: _csv_value(row.get(key)) for key in fieldnames})
+    os.replace(tmp, path)
+
+
 def post_dir(post_id: str, base: Path = DATA_ROOT) -> Path:
     return base / "posts" / post_id
 
@@ -181,6 +192,7 @@ def published_metrics_paths(base: Path = DATA_ROOT) -> dict[str, Path]:
     return {
         "jsonl": base / "analytics" / "published_metrics.jsonl",
         "csv": base / "analytics" / "published_metrics.csv",
+        "latest_csv": base / "analytics" / "published_metrics_latest.csv",
     }
 
 
@@ -204,6 +216,7 @@ def save_published_metrics_snapshot(
         _append_jsonl(paths["jsonl"], data)
         _append_csv_row(paths["csv"], PUBLISHED_METRIC_FIELDS, data)
         count += 1
+    _write_latest_published_metrics_csv(base)
     return {"count": count, **paths}
 
 
@@ -220,6 +233,26 @@ def list_published_metrics(base: Path = DATA_ROOT) -> list[PublishedMetric]:
         except Exception:
             continue
     return out
+
+
+def _published_metric_key(metric: PublishedMetric) -> str:
+    if metric.url:
+        return f"url:{metric.url}"
+    return f"title:{metric.title}|date:{metric.published_at}"
+
+
+def _write_latest_published_metrics_csv(base: Path = DATA_ROOT) -> Path:
+    paths = published_metrics_paths(base)
+    latest: dict[str, PublishedMetric] = {}
+    for metric in list_published_metrics(base=base):
+        key = _published_metric_key(metric)
+        if key.strip() in {"title:|date:", "url:"}:
+            key = metric.id
+        latest[key] = metric
+    rows = [metric.model_dump() for metric in latest.values()]
+    rows.sort(key=lambda row: str(row.get("captured_at") or ""), reverse=True)
+    _write_csv_rows_atomic(paths["latest_csv"], PUBLISHED_METRIC_FIELDS, rows)
+    return paths["latest_csv"]
 
 
 def append_run_record(record: RunRecord | dict[str, Any], base: Path = DATA_ROOT) -> dict[str, Path]:

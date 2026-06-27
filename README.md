@@ -91,7 +91,7 @@ python -m playwright install chromium
 - 不要提交真实 API Key、`.env.gui`、浏览器 profile、草稿记录或测试截图。
 - `.gitignore` 已忽略 `.env*`、`docs/*api-key.md`、`data/`、`output/`、`.venv/` 和本地 GUI exe。
 - `data/posts/` 是本地新闻草稿记录，会保留在本机，不会上传 GitHub。
-- `data/analytics/published_metrics.csv` 保存已发布笔记互动数据；`data/runs/run_records.csv` 保存每次生成/上传运行记录。两者都在 `data/` 下，仅本地保存。
+- `data/analytics/published_metrics_latest.csv` 保存去重后的最新互动数据，适合直接分析；`published_metrics.csv/jsonl` 保留每次同步快照；`data/runs/run_records.csv` 保存每次生成/上传运行记录。它们都在 `data/` 下，仅本地保存。
 
 ## 功能一览
 - 普通图文：`标题 + 提示词（可选） + 图片（可选）` → 生成草稿并保存到草稿箱
@@ -101,7 +101,7 @@ python -m playwright install chromium
 - 图形界面（GUI）：在窗口中选择模型/参数并一键执行常用命令
 - 自动配图：当未提供图片时，默认用阿里云百炼生成 1 张相关图片用于上传，也可切换 Pexels 检索下载
 - 无界面上传：`run` / `auto` / `retry` / `delete-drafts` 支持 `--headless`，终端会实时显示上传步骤和 `uploaded=x/y` 进度
-- 已发布数据同步：`update-metrics` 可抓取已发布稿件的点赞、评论、收藏，并写入 `data/analytics/published_metrics.csv/jsonl`
+- 已发布数据同步：`update-metrics` 可抓取已发布稿件的点赞、评论、收藏，并写入 `data/analytics/published_metrics_latest.csv` 与快照文件 `published_metrics.csv/jsonl`
 - 运行记录：`create` / `auto` 会记录本次生成条数、上传条数、失败条数、LLM/VLM/新闻源等信息到 `data/runs/run_records.csv/jsonl`
 - 部分成功保护：批量每日新闻如果中途遇到额度不足、候选不足或生图失败，已经生成的草稿不会丢弃，`auto` 会继续上传已生成部分并汇报 generated/uploaded/failed
 - 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
