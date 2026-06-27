@@ -384,11 +384,35 @@ def _published_url_candidates() -> list[str]:
     return list(PUBLISHED_URL_CANDIDATES)
 
 
+def _published_metrics_collect_cap() -> int:
+    raw = (os.getenv("XHS_METRICS_MAX_ITEMS") or "").strip()
+    try:
+        value = int(raw) if raw else 1000
+    except ValueError:
+        value = 1000
+    return max(1, value)
+
+
+def _parse_published_total_text(text: str) -> int:
+    match = re.search(r"全部\s*(\d+)", text or "")
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return 0
+
+
+def _extract_published_note_total(page) -> int:
+    return _parse_published_total_text(_read_page_body_text(page, timeout_ms=2000, max_chars=4000))
+
+
 def _collect_published_metric_cards(page) -> list[dict[str, str]]:
+    max_items = _published_metrics_collect_cap()
     try:
         data = page.evaluate(
             r"""
-            () => {
+            (maxItems) => {
               const selectors = [
                 'article',
                 'li',
@@ -422,11 +446,12 @@ def _collect_published_metric_cards(page) -> list[dict[str, str]]:
                 if (seen.has(key)) continue;
                 seen.add(key);
                 out.push({ text, href });
-                if (out.length >= 300) break;
+                if (out.length >= maxItems) break;
               }
               return out;
             }
-            """
+            """,
+            max_items,
         )
     except Exception:
         return []
@@ -471,6 +496,47 @@ def _merge_published_metric_cards(cards: list[dict[str, str]], *, limit: int = 0
         if limit and len(items) >= limit:
             break
     return items
+
+
+def _scroll_published_metrics_page(page) -> dict[str, Any]:
+    try:
+        return page.evaluate(
+            """
+            () => {
+              const candidates = Array.from(document.querySelectorAll('.content, .microapp-container, [class*="content"], [class*="list"], [class*="pane"]'))
+                .filter((el) => {
+                  const style = window.getComputedStyle(el);
+                  const canScroll = el.scrollHeight > el.clientHeight + 20;
+                  const overflow = `${style.overflowY} ${style.overflow}`.toLowerCase();
+                  return canScroll && /auto|scroll/.test(overflow);
+                })
+                .sort((a, b) => {
+                  const aCards = a.querySelectorAll('.note-card').length;
+                  const bCards = b.querySelectorAll('.note-card').length;
+                  return (bCards - aCards) || ((b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+                });
+              let target = candidates[0] || document.scrollingElement || document.documentElement;
+              const beforeTop = target.scrollTop || 0;
+              const step = Math.max(300, Math.floor((target.clientHeight || window.innerHeight || 600) * 0.85));
+              target.scrollTop = Math.min(beforeTop + step, Math.max(0, target.scrollHeight - target.clientHeight));
+              if (!candidates.length) {
+                const beforeY = window.scrollY || 0;
+                window.scrollTo(0, beforeY + step);
+              }
+              const afterTop = target.scrollTop || 0;
+              return {
+                scrolled: afterTop !== beforeTop,
+                selector: target.className || target.id || target.tagName || 'window',
+                scrollTop: afterTop,
+                scrollHeight: target.scrollHeight || document.body.scrollHeight,
+                clientHeight: target.clientHeight || window.innerHeight,
+                noteCards: document.querySelectorAll('.note-card').length
+              };
+            }
+            """
+        )
+    except Exception as exc:
+        return {"scrolled": False, "error": str(exc)}
 
 
 def _classify_xhs_page_state(url: str, title: str, body_text: str) -> str:
@@ -2553,7 +2619,7 @@ def run_collect_published_metrics_sync(
     profile_dir, channel, args = _resolve_profile_config()
     profile_dir.mkdir(parents=True, exist_ok=True)
     headless_value = _resolve_headless(headless)
-    max_scrolls = max(1, int(os.getenv("XHS_METRICS_MAX_SCROLLS") or "30"))
+    max_scrolls = max(1, int(os.getenv("XHS_METRICS_MAX_SCROLLS") or "240"))
 
     try:
         with sync_playwright() as p:
@@ -2584,7 +2650,9 @@ def run_collect_published_metrics_sync(
                         # Some creator pages render metrics without the exact Chinese labels above.
                         pass
 
-                    previous_height = 0
+                    target_total = _extract_published_note_total(page)
+                    previous_unique_count = 0
+                    stagnant_rounds = 0
                     for scroll_idx in range(max_scrolls):
                         cards = _collect_published_metric_cards(page)
                         if cards:
@@ -2594,19 +2662,26 @@ def run_collect_published_metrics_sync(
                                 progress_callback,
                                 "collect_metrics",
                                 "in_progress",
-                                f"items={len(metrics)} scroll={scroll_idx + 1}/{max_scrolls}",
+                                f"items={len(metrics)} target={target_total or 'unknown'} scroll={scroll_idx + 1}/{max_scrolls}",
                             )
                             if limit and len(metrics) >= limit:
                                 break
-                        try:
-                            current_height = int(page.evaluate("() => document.body.scrollHeight") or 0)
-                            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-                            if current_height and current_height == previous_height and scroll_idx >= 2:
+                            if not limit and target_total and len(metrics) >= target_total:
                                 break
-                            previous_height = current_height
-                        except Exception:
+                            if len(metrics) > previous_unique_count:
+                                stagnant_rounds = 0
+                                previous_unique_count = len(metrics)
+                            else:
+                                stagnant_rounds += 1
+                        else:
+                            stagnant_rounds += 1
+
+                        scroll_state = _scroll_published_metrics_page(page)
+                        if not scroll_state.get("scrolled"):
+                            stagnant_rounds += 1
+                        if stagnant_rounds >= 18:
                             break
-                        time.sleep(1)
+                        time.sleep(0.75)
 
                     metrics = _merge_published_metric_cards(collected_cards, limit=limit)
                     if metrics:

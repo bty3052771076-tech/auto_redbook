@@ -1,4 +1,10 @@
-from src.publish.playwright_steps import _parse_metric_number, _parse_published_metric_text
+from src.publish.playwright_steps import (
+    _parse_metric_number,
+    _parse_published_metric_text,
+    _parse_published_total_text,
+    _published_metrics_collect_cap,
+    _published_url_candidates,
+)
 
 
 def test_parse_metric_number_supports_chinese_and_short_units():
@@ -28,3 +34,20 @@ def test_parse_published_metric_text_extracts_note_manager_stats_row():
     assert parsed["likes"] == 1
     assert parsed["comments"] == 2
     assert parsed["favorites"] == 3
+
+
+def test_published_metrics_defaults_prefer_current_note_manager_route():
+    assert _published_url_candidates()[0] == "https://creator.xiaohongshu.com/new/note-manager"
+
+
+def test_published_metrics_collect_cap_is_configurable(monkeypatch):
+    assert _published_metrics_collect_cap() >= 1000
+
+    monkeypatch.setenv("XHS_METRICS_MAX_ITEMS", "25")
+
+    assert _published_metrics_collect_cap() == 25
+
+
+def test_parse_published_total_text():
+    assert _parse_published_total_text("全部 297\n已发布\n审核中") == 297
+    assert _parse_published_total_text("没有总数") == 0
