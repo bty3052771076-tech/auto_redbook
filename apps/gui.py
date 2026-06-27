@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import os
 import json
 import queue
@@ -21,7 +22,7 @@ from src.config import (
     DEFAULT_LLM_BASE_URL,
     DEFAULT_LLM_MODEL,
 )
-from src.storage.files import latest_execution
+from src.storage.files import latest_execution, published_metrics_paths
 from src.workflow.create_post import DEFAULT_EVALUATION_VIEWPOINT
 
 
@@ -117,6 +118,20 @@ class RecentPostSummary:
     latest_execution_started_at: str = ""
     latest_execution_ended_at: str = ""
     latest_execution_evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PublishedMetricTableRow:
+    title: str = ""
+    published_at: str = ""
+    likes: int = 0
+    comments: int = 0
+    favorites: int = 0
+    views: int = 0
+    shares: int = 0
+    captured_at: str = ""
+    url: str = ""
+    id: str = ""
 
 
 def _looks_like_post_id(name: str) -> bool:
@@ -251,6 +266,85 @@ def list_recent_posts(*, project_root: Path = PROJECT_ROOT, limit: int = 50) -> 
             continue
     items.sort(key=lambda t: t[0], reverse=True)
     return [summary for _, summary in items[: max(0, int(limit or 0) or 50)]]
+
+
+def _metric_int(value: object) -> int:
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return 0
+    try:
+        return int(text)
+    except ValueError:
+        try:
+            return int(float(text))
+        except ValueError:
+            return 0
+
+
+def _metric_raw_dict(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _published_metric_table_csv_path(*, project_root: Path = PROJECT_ROOT) -> Path:
+    paths = published_metrics_paths(project_root / "data")
+    if paths["latest_csv"].exists():
+        return paths["latest_csv"]
+    return paths["csv"]
+
+
+def list_published_metric_table_rows(
+    *,
+    project_root: Path = PROJECT_ROOT,
+    limit: int = 1000,
+) -> list[PublishedMetricTableRow]:
+    path = _published_metric_table_csv_path(project_root=project_root)
+    if not path.exists():
+        return []
+
+    rows: list[PublishedMetricTableRow] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        for item in csv.DictReader(f):
+            raw = _metric_raw_dict(item.get("raw"))
+            rows.append(
+                PublishedMetricTableRow(
+                    id=str(item.get("id") or ""),
+                    captured_at=str(item.get("captured_at") or ""),
+                    title=str(item.get("title") or "").strip() or "(无标题)",
+                    url=str(item.get("url") or ""),
+                    published_at=str(item.get("published_at") or ""),
+                    likes=_metric_int(item.get("likes")),
+                    comments=_metric_int(item.get("comments")),
+                    favorites=_metric_int(item.get("favorites")),
+                    views=_metric_int(raw.get("views")),
+                    shares=_metric_int(raw.get("shares")),
+                )
+            )
+            if limit and len(rows) >= limit:
+                break
+    return rows
+
+
+def sort_published_metric_table_rows(
+    rows: list[PublishedMetricTableRow],
+    field: str,
+    *,
+    descending: bool = True,
+) -> list[PublishedMetricTableRow]:
+    numeric_fields = {"likes", "comments", "favorites", "views", "shares"}
+    if field in numeric_fields:
+        key = lambda row: getattr(row, field, 0)
+    else:
+        key = lambda row: str(getattr(row, field, "") or "").lower()
+    return sorted(rows, key=key, reverse=descending)
 
 
 def format_post_choice(post: RecentPostSummary) -> str:
@@ -938,6 +1032,15 @@ def main() -> None:
     style.configure("PanelSection.TLabel", font=section_font, background=palette["panel"], foreground=palette["ink"])
     style.configure("Panel.TCheckbutton", background=palette["panel"], foreground=palette["ink"], padding=(0, 2))
     style.map("Panel.TCheckbutton", background=[("active", palette["panel"])])
+    style.configure(
+        "Metrics.Treeview",
+        background=palette["panel"],
+        fieldbackground=palette["panel"],
+        foreground=palette["ink"],
+        rowheight=28,
+        bordercolor=palette["line"],
+    )
+    style.configure("Metrics.Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
     style.configure("Accent.TButton", foreground="#ffffff", background=palette["accent"], padding=(14, 7))
     style.map("Accent.TButton", background=[("active", palette["accent_dark"])])
     style.configure("TNotebook", background=palette["paper"], borderwidth=0)
@@ -1002,8 +1105,15 @@ def main() -> None:
     def log_line(s: str) -> None:
         ui_events.put(_append_log, s)
 
+    post_command_success_callbacks: list[Callable[[], None]] = []
+
     def log_exit(code: int) -> None:
         ui_events.put(_append_exit, code)
+        callbacks = list(post_command_success_callbacks)
+        post_command_success_callbacks.clear()
+        if code == 0:
+            for callback in callbacks:
+                ui_events.put(callback)
 
     status_var = tk.StringVar(value="状态：空闲")
 
@@ -1668,7 +1778,130 @@ def main() -> None:
         row=3, column=2, sticky="w", pady=(5, 0)
     )
 
+    metrics_table_panel = ttk.Frame(tab_metrics, style="Panel.TFrame", padding=(12, 10))
+    metrics_table_panel.pack(fill="both", expand=True, padx=4, pady=(0, 10))
+    metrics_table_panel.columnconfigure(0, weight=1)
+    metrics_table_panel.rowconfigure(2, weight=1)
+
+    metrics_table_header = ttk.Frame(metrics_table_panel, style="Panel.TFrame")
+    metrics_table_header.grid(row=0, column=0, columnspan=2, sticky="we")
+    metrics_table_header.columnconfigure(0, weight=1)
+    ttk.Label(
+        metrics_table_header,
+        text="本地已发布数据表",
+        style="PanelSection.TLabel",
+    ).grid(row=0, column=0, sticky="w")
+
+    metric_status_var = tk.StringVar(value="点击“刷新本地表格”读取 data/analytics/published_metrics_latest.csv。")
+    ttk.Label(
+        metrics_table_panel,
+        textvariable=metric_status_var,
+        style="PanelMuted.TLabel",
+        wraplength=720,
+    ).grid(row=1, column=0, columnspan=2, sticky="we", pady=(4, 8))
+
+    metric_columns = [
+        ("title", "标题", 230, "w"),
+        ("published_at", "发布时间", 96, "center"),
+        ("views", "浏览", 64, "e"),
+        ("likes", "点赞", 64, "e"),
+        ("comments", "评论", 64, "e"),
+        ("favorites", "收藏", 64, "e"),
+        ("shares", "分享", 64, "e"),
+        ("captured_at", "同步时间", 172, "w"),
+    ]
+    metric_column_ids = [column[0] for column in metric_columns]
+    metrics_tree = ttk.Treeview(
+        metrics_table_panel,
+        columns=metric_column_ids,
+        show="headings",
+        height=12,
+        style="Metrics.Treeview",
+    )
+    metrics_tree.grid(row=2, column=0, sticky="nsew")
+    metrics_tree_y = ttk.Scrollbar(metrics_table_panel, orient="vertical", command=metrics_tree.yview)
+    metrics_tree_y.grid(row=2, column=1, sticky="ns")
+    metrics_tree_x = ttk.Scrollbar(metrics_table_panel, orient="horizontal", command=metrics_tree.xview)
+    metrics_tree_x.grid(row=3, column=0, sticky="we")
+    metrics_tree.configure(yscrollcommand=metrics_tree_y.set, xscrollcommand=metrics_tree_x.set)
+
+    metric_sort_state = {"field": "captured_at", "descending": True}
+    metric_table_rows: list[PublishedMetricTableRow] = []
+
+    def _metric_table_display_path(path: Path) -> str:
+        try:
+            return str(path.relative_to(PROJECT_ROOT))
+        except ValueError:
+            return str(path)
+
+    def _metric_table_values(row: PublishedMetricTableRow) -> tuple[object, ...]:
+        captured = _format_display_time(row.captured_at) or row.captured_at
+        return (
+            row.title,
+            row.published_at,
+            row.views,
+            row.likes,
+            row.comments,
+            row.favorites,
+            row.shares,
+            captured,
+        )
+
+    def _configure_metric_table_headings() -> None:
+        for field, label, width, anchor in metric_columns:
+            arrow = ""
+            if metric_sort_state["field"] == field:
+                arrow = " ↓" if metric_sort_state["descending"] else " ↑"
+            metrics_tree.heading(field, text=f"{label}{arrow}", command=lambda col=field: _sort_metric_table(col))
+            metrics_tree.column(field, width=width, minwidth=52, anchor=anchor, stretch=(field == "title"))
+
+    def _render_metric_table(rows: list[PublishedMetricTableRow]) -> None:
+        metrics_tree.delete(*metrics_tree.get_children())
+        for idx, row in enumerate(rows):
+            tag = "odd" if idx % 2 else "even"
+            metrics_tree.insert("", "end", values=_metric_table_values(row), tags=(tag,))
+        metrics_tree.tag_configure("even", background=palette["panel"])
+        metrics_tree.tag_configure("odd", background=palette["soft"])
+
+    def _refresh_metric_table() -> None:
+        nonlocal metric_table_rows
+        metric_table_rows = list_published_metric_table_rows(project_root=PROJECT_ROOT, limit=2000)
+        metric_table_rows = sort_published_metric_table_rows(
+            metric_table_rows,
+            str(metric_sort_state["field"]),
+            descending=bool(metric_sort_state["descending"]),
+        )
+        _render_metric_table(metric_table_rows)
+        _configure_metric_table_headings()
+        path = _published_metric_table_csv_path(project_root=PROJECT_ROOT)
+        if metric_table_rows:
+            metric_status_var.set(
+                f"已载入 {len(metric_table_rows)} 条本地已发布数据，来源：{_metric_table_display_path(path)}。点击列头可按点赞、评论、收藏等排序。"
+            )
+        else:
+            metric_status_var.set(
+                f"暂未找到本地已发布数据。请先点击上方“更新已发布数据”，或确认文件存在：{_metric_table_display_path(path)}。"
+            )
+
+    def _sort_metric_table(field: str) -> None:
+        if metric_sort_state["field"] == field:
+            metric_sort_state["descending"] = not bool(metric_sort_state["descending"])
+        else:
+            metric_sort_state["field"] = field
+            metric_sort_state["descending"] = field in {"views", "likes", "comments", "favorites", "shares", "captured_at"}
+        metric_table_rows[:] = sort_published_metric_table_rows(
+            metric_table_rows,
+            str(metric_sort_state["field"]),
+            descending=bool(metric_sort_state["descending"]),
+        )
+        _render_metric_table(metric_table_rows)
+        _configure_metric_table_headings()
+
+    _configure_metric_table_headings()
+
     def _run_update_metrics() -> None:
+        if not runner.is_running():
+            post_command_success_callbacks.append(_refresh_metric_table)
         _run_command(
             "update-metrics",
             {
@@ -1681,11 +1914,17 @@ def main() -> None:
         )
 
     ttk.Button(
-        tab_metrics,
+        metrics_table_header,
         text="更新已发布数据：点赞 / 评论 / 收藏",
         command=_run_update_metrics,
         style="Accent.TButton",
-    ).pack(anchor="w", padx=4, pady=(0, 10))
+    ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+    ttk.Button(
+        metrics_table_header,
+        text="刷新本地表格",
+        command=_refresh_metric_table,
+    ).grid(row=0, column=2, sticky="e", padx=(8, 0))
+    _refresh_metric_table()
 
     # --- Delete drafts tab ---
     tab_delete = ttk.Frame(nb)

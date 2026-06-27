@@ -19,6 +19,7 @@ from apps.gui import (
     DEFAULT_IMAGE_PROVIDER,
     IMAGE_SOURCE_OPTIONS,
     LLM_PROVIDER_OPTIONS,
+    PublishedMetricTableRow,
     RecentPostSummary,
     UiEventQueue,
     build_xhs_login_launch_args,
@@ -33,12 +34,14 @@ from apps.gui import (
     format_post_choice,
     format_post_detail,
     format_post_time_detail,
+    list_published_metric_table_rows,
     list_recent_posts,
     load_env_file,
     open_xhs_creator,
     resolve_assets_glob_for_image_source,
     resolve_delete_mode_flags,
     save_env_file,
+    sort_published_metric_table_rows,
 )
 
 
@@ -463,6 +466,43 @@ def test_format_post_detail_shows_upload_state_time_and_body_preview():
     assert "要点摘要" in detail
 
 
+def test_list_published_metric_table_rows_reads_latest_csv_and_raw_counts(tmp_path: Path):
+    analytics = tmp_path / "data" / "analytics"
+    analytics.mkdir(parents=True)
+    (analytics / "published_metrics_latest.csv").write_text(
+        "\n".join(
+            [
+                "id,captured_at,title,url,published_at,likes,comments,favorites,raw",
+                'm1,2026-06-27T01:00:00Z,high engagement news,,2026-06-27,12,3,5,"{""views"":88,""shares"":2}"',
+            ]
+        ),
+        encoding="utf-8-sig",
+    )
+
+    rows = list_published_metric_table_rows(project_root=tmp_path)
+
+    assert len(rows) == 1
+    assert rows[0].title == "high engagement news"
+    assert rows[0].likes == 12
+    assert rows[0].comments == 3
+    assert rows[0].favorites == 5
+    assert rows[0].views == 88
+    assert rows[0].shares == 2
+
+
+def test_sort_published_metric_table_rows_sorts_numeric_columns():
+    rows = [
+        PublishedMetricTableRow(title="low likes", likes=1, comments=7, favorites=2),
+        PublishedMetricTableRow(title="high likes", likes=9, comments=1, favorites=5),
+    ]
+
+    by_likes = sort_published_metric_table_rows(rows, "likes", descending=True)
+    by_comments = sort_published_metric_table_rows(rows, "comments", descending=False)
+
+    assert [row.title for row in by_likes] == ["high likes", "low likes"]
+    assert [row.title for row in by_comments] == ["high likes", "low likes"]
+
+
 def test_xhs_creator_quick_launch_target_uses_image_publish_url():
     assert DEFAULT_DRAFT_URL == "https://creator.xiaohongshu.com/publish/publish?target=image"
     assert DEFAULT_LOGIN_URL == "https://creator.xiaohongshu.com"
@@ -567,6 +607,16 @@ def test_start_gui_script_prefers_hidden_pythonw():
     assert ".venv\\Scripts\\pythonw.exe" in source
     assert "Start-Process" in source
     assert "-WindowStyle Hidden" in source
+
+
+def test_metrics_tab_has_local_table_and_sortable_headings():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "metrics_tree = ttk.Treeview" in source
+    assert "刷新本地表格" in source
+    assert "_sort_metric_table" in source
+    assert "list_published_metric_table_rows" in source
 
 
 def test_build_cli_args_auto():
