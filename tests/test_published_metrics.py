@@ -16,3 +16,15 @@ def test_parse_published_metric_text_extracts_title_and_counts():
     assert parsed["likes"] == 12
     assert parsed["comments"] == 3
     assert parsed["favorites"] == 4
+
+
+def test_parse_published_metric_text_extracts_note_manager_stats_row():
+    parsed = _parse_published_metric_text(
+        "七孩父亲在妻产四胞胎后离奇去世\n2026-06-27 08:19\n33\n1\n2\n3\n4"
+    )
+
+    assert parsed["title"] == "七孩父亲在妻产四胞胎后离奇去世"
+    assert parsed["published_at"] == "2026-06-27"
+    assert parsed["likes"] == 1
+    assert parsed["comments"] == 2
+    assert parsed["favorites"] == 3

@@ -120,6 +120,7 @@ PUBLISHED_PAGE_TEXTS = [
     "\u6536\u85cf",
 ]
 PUBLISHED_URL_CANDIDATES = [
+    "https://creator.xiaohongshu.com/new/note-manager",
     "https://creator.xiaohongshu.com/creator/notes",
     "https://creator.xiaohongshu.com/creator/notes?source=publish",
     "https://creator.xiaohongshu.com/publish/publish?target=image",
@@ -317,10 +318,44 @@ def _is_published_metric_title_line(line: str) -> bool:
     return True
 
 
+def _parse_note_manager_stats_row(lines: list[str]) -> dict[str, Any]:
+    for idx, line in enumerate(lines):
+        if not re.fullmatch(r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}(?:\s+\d{1,2}:\d{2})?", line):
+            continue
+        title = ""
+        for prev in reversed(lines[:idx]):
+            if _is_published_metric_title_line(prev):
+                title = prev
+                break
+        stats: list[int] = []
+        for candidate in lines[idx + 1 :]:
+            parsed = _parse_metric_number(candidate)
+            if parsed is None:
+                if stats:
+                    break
+                continue
+            stats.append(parsed)
+            if len(stats) >= 5:
+                break
+        if title and len(stats) >= 4:
+            return {
+                "title": title,
+                "published_at": line[:10].replace("/", "-").replace(".", "-"),
+                "views": stats[0] if len(stats) > 0 else None,
+                "likes": stats[1] if len(stats) > 1 else None,
+                "comments": stats[2] if len(stats) > 2 else None,
+                "favorites": stats[3] if len(stats) > 3 else None,
+                "shares": stats[4] if len(stats) > 4 else None,
+                "stats": stats,
+            }
+    return {}
+
+
 def _parse_published_metric_text(text: str) -> dict[str, Any]:
     normalized = re.sub(r"\r\n?", "\n", text or "")
     compact = re.sub(r"[ \t]+", " ", normalized)
     lines = [line.strip() for line in compact.splitlines() if line.strip()]
+    stats_row = _parse_note_manager_stats_row(lines)
     title = ""
     for line in lines:
         if _is_published_metric_title_line(line):
@@ -329,11 +364,15 @@ def _parse_published_metric_text(text: str) -> dict[str, Any]:
     full_text = "\n".join(lines)
     date_match = re.search(r"(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})", full_text)
     return {
-        "title": title,
-        "published_at": date_match.group(1).replace("/", "-").replace(".", "-") if date_match else "",
-        "likes": _parse_metric_from_text(full_text, ["点赞", "赞", "赞数"]),
-        "comments": _parse_metric_from_text(full_text, ["评论", "评论数"]),
-        "favorites": _parse_metric_from_text(full_text, ["收藏", "收藏数"]),
+        "title": stats_row.get("title") or title,
+        "published_at": stats_row.get("published_at")
+        or (date_match.group(1).replace("/", "-").replace(".", "-") if date_match else ""),
+        "likes": stats_row.get("likes") if stats_row else _parse_metric_from_text(full_text, ["点赞", "赞", "赞数"]),
+        "comments": stats_row.get("comments") if stats_row else _parse_metric_from_text(full_text, ["评论", "评论数"]),
+        "favorites": stats_row.get("favorites") if stats_row else _parse_metric_from_text(full_text, ["收藏", "收藏数"]),
+        "stats": stats_row.get("stats", []),
+        "views": stats_row.get("views"),
+        "shares": stats_row.get("shares"),
         "raw_text": full_text,
     }
 
@@ -375,8 +414,10 @@ def _collect_published_metric_cards(page) -> list[dict[str, str]]:
                 const link = node.querySelector('a[href]');
                 const href = link ? link.href : '';
                 const hasMetric = /点赞|赞数|评论|收藏/.test(text);
-                const looksLikeNote = /xiaohongshu\\.com\\/(explore|discovery|user\/profile)/.test(href || '');
-                if (!hasMetric && !looksLikeNote) continue;
+                const looksLikeNote = /xiaohongshu\.com\/(explore|discovery|user\/profile)/.test(href || '');
+                const className = String(node.className || '');
+                const looksLikeNoteManagerCard = /note-card/.test(className) && /20\d{2}-\d{2}-\d{2}/.test(text);
+                if (!hasMetric && !looksLikeNote && !looksLikeNoteManagerCard) continue;
                 const key = (href || '') + '|' + text.slice(0, 120);
                 if (seen.has(key)) continue;
                 seen.add(key);
@@ -419,7 +460,12 @@ def _merge_published_metric_cards(cards: list[dict[str, str]], *, limit: int = 0
                 likes=likes,
                 comments=comments,
                 favorites=favorites,
-                raw={"text": parsed.get("raw_text") or text},
+                raw={
+                    "text": parsed.get("raw_text") or text,
+                    "stats": parsed.get("stats") or [],
+                    "views": parsed.get("views"),
+                    "shares": parsed.get("shares"),
+                },
             )
         )
         if limit and len(items) >= limit:
