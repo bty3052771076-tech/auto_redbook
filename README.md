@@ -16,6 +16,7 @@
 - 阿里云百炼 / DashScope 账号：默认用于 LLM 文案生成和 AI 生图。运行前请确认 API Key、免费额度、到期时间和是否已开通对应模型。
 - Python 环境：推荐 Python 3.10+。不要在 C 盘安装项目依赖；虚拟环境、pip 缓存和 Playwright 浏览器建议都放在当前工作区。
 - 新闻源账号：推荐至少准备 GNews、NewsAPI 或聚合数据 Juhe 中的一个。没有可用新闻源时，“每日新闻”可能无法获取候选新闻。
+- Chrome / 小红书登录态：默认使用本项目工作区内的 `data/browser/chrome-profile`。请用 GUI 顶部“登录/检查Profile”或 `Open-XHS-Creator.cmd` 登录，避免误用系统默认 Chrome 账号。
 
 ### 需要编辑或创建什么文件
 - `README.md`：只看说明，不需要填写密钥。
@@ -26,6 +27,7 @@
 - `docs/gnews_api-key.md`：可选。由 `docs/gnews_api-key.example.md` 复制而来，填写 GNews Key；真实文件已被忽略。
 - `docs/juhe_api-key.md`：可选。由 `docs/juhe_api-key.example.md` 复制而来，填写聚合数据新闻头条/财经新闻 Key；真实文件已被忽略。
 - `assets/pics/`：可选。本地图片素材目录。若使用 `assets/empty/*` 且无本地图片，会触发自动配图。
+- `XHS_PUBLISHED_URL`：可选。若小红书后台“已发布/笔记管理”页面路径变化，可在 `.env.gui` 或 PowerShell 环境变量中设置该 URL，供互动数据同步使用。
 
 建议优先使用 PowerShell 环境变量配置密钥，不把真实 Key 写入仓库文件：
 
@@ -73,10 +75,23 @@ python -m playwright install chromium
 .\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --evaluation-viewpoint "无视角评价" --assets-glob "assets/empty/*" --count 1 --login-hold 0 --wait-timeout 600 --force --headless
 ```
 
+同步已发布笔记的点赞、评论、收藏到本地表格：
+
+```powershell
+.\.venv\Scripts\python.exe -m apps.cli update-metrics --limit 50 --login-hold 600 --wait-timeout 600
+```
+
+如果 profile 已登录，可无界面同步：
+
+```powershell
+.\.venv\Scripts\python.exe -m apps.cli update-metrics --limit 50 --headless --login-hold 0 --wait-timeout 600
+```
+
 ### 上传安全
 - 不要提交真实 API Key、`.env.gui`、浏览器 profile、草稿记录或测试截图。
 - `.gitignore` 已忽略 `.env*`、`docs/*api-key.md`、`data/`、`output/`、`.venv/` 和本地 GUI exe。
 - `data/posts/` 是本地新闻草稿记录，会保留在本机，不会上传 GitHub。
+- `data/analytics/published_metrics.csv` 保存已发布笔记互动数据；`data/runs/run_records.csv` 保存每次生成/上传运行记录。两者都在 `data/` 下，仅本地保存。
 
 ## 功能一览
 - 普通图文：`标题 + 提示词（可选） + 图片（可选）` → 生成草稿并保存到草稿箱
@@ -86,6 +101,9 @@ python -m playwright install chromium
 - 图形界面（GUI）：在窗口中选择模型/参数并一键执行常用命令
 - 自动配图：当未提供图片时，默认用阿里云百炼生成 1 张相关图片用于上传，也可切换 Pexels 检索下载
 - 无界面上传：`run` / `auto` / `retry` / `delete-drafts` 支持 `--headless`，终端会实时显示上传步骤和 `uploaded=x/y` 进度
+- 已发布数据同步：`update-metrics` 可抓取已发布稿件的点赞、评论、收藏，并写入 `data/analytics/published_metrics.csv/jsonl`
+- 运行记录：`create` / `auto` 会记录本次生成条数、上传条数、失败条数、LLM/VLM/新闻源等信息到 `data/runs/run_records.csv/jsonl`
+- 部分成功保护：批量每日新闻如果中途遇到额度不足、候选不足或生图失败，已经生成的草稿不会丢弃，`auto` 会继续上传已生成部分并汇报 generated/uploaded/failed
 - 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
 - 落盘与可追溯：`data/posts/<post_id>/` 保存 post / revision / execution / evidence
 
@@ -105,7 +123,7 @@ python -m playwright install chromium
 #   - ALIYUN_LLM_API_KEY：生成文案（推荐，Aliyun qwen3.7-plus）
 #   - LLM_API_KEY：生成文案（可选：作为阿里云无额度时的备用）
 #   - ALIYUN_IMAGE_API_KEY：生图（可与 LLM 共用同一把 DashScope Key）
-#   - NEWS_API_KEY：每日新闻（可选；不配则回退到无需 key 的新闻源）
+#   - NEWS_API_KEY / GNEWS_API_KEY / JUHE_NEWS_APPKEY：每日新闻（至少配置一个在线新闻源，或使用 NEWS_PROVIDER=file）
 #   - PEXELS_API_KEY：Pexels 备用配图（可选；默认配图走阿里云生图）
 # 例如（PowerShell）：
 #   $env:ALIYUN_LLM_API_KEY="..."
@@ -128,7 +146,7 @@ python -m playwright install chromium
 ```powershell
 .\Start-GUI.cmd
 ```
-GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、图片来源（`local` 本地 assets / `aliyun` AI 生图 / `pexels` 搜图）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，并在独立时间框显示北京时间，便于确认每个帖子的标题后再审核或上传。
+GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `已发布数据` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、图片来源（`local` 本地 assets / `aliyun` AI 生图 / `pexels` 搜图）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，并在独立时间框显示北京时间，便于确认每个帖子的标题后再审核或上传；`已发布数据` 页可一键同步点赞、评论、收藏到本地表格。
 
 图片来源说明：选择 `local` 时使用本地 `assets glob`；选择 `aliyun` 或 `pexels` 时 GUI 会自动使用 `assets/empty/*` 触发自动配图，避免本地旧图片覆盖你选择的图片来源。
 
@@ -138,6 +156,8 @@ GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` 
 
 更多说明见：`docs/模型与GUI供应商配置.md`。
 
+已发布互动数据同步、运行记录和部分成功保护说明见：`docs/发布数据同步与运行记录-2026-06-27.md`。
+
 ### 生成快速启动 exe（可选）
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
@@ -145,6 +165,8 @@ powershell -ExecutionPolicy Bypass -File scripts/build_gui_exe.ps1
 生成：`AutoRedbookGUI-Launcher.exe`（放在仓库根目录，双击后调用 `.\.venv\Scripts\pythonw.exe -m apps.gui`）。
 
 旧的 `AutoRedbookGUI.exe` 是历史打包产物，不再推荐使用。
+
+为避免空终端窗口，当前启动器只使用 `pythonw.exe`；如果 `.venv\Scripts\pythonw.exe` 不存在，会弹窗提示修复虚拟环境，不再回退到会显示控制台的 `python.exe`。`Start-GUI.cmd` 也会优先隐藏启动 `pythonw.exe`。
 
 ## 草稿与浏览器 Profile
 - 草稿箱数据保存在浏览器本地 profile 中，不同 profile 互不可见。
@@ -257,6 +279,7 @@ $post_id = ($out | Select-String -Pattern "post_id=([0-9a-f]{32})" | Select-Obje
 - `approve <post_id>`：校验并标记为 `approved`
 - `run <post_id>`：用 Playwright 上传图片/填写标题正文/保存草稿
 - `auto`：一键完成 `create -> approve -> run`
+- `update-metrics`：同步已发布稿件点赞、评论、收藏到本地表格
 - `retry <post_id>`：对失败的 run 进行重试
 - `delete-drafts`：删除草稿箱草稿（默认图文）
 

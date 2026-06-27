@@ -90,6 +90,23 @@ _NEWS_TITLE_PROMPT_SOFT_MARKERS = (
     "用户关注点",
     "新闻信息",
 )
+
+
+class PartialDailyNewsError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        posts: list[Post],
+        requested_count: int,
+        failed_count: int = 0,
+        skipped_quality_count: int = 0,
+    ):
+        super().__init__(message)
+        self.posts = posts
+        self.requested_count = requested_count
+        self.failed_count = failed_count
+        self.skipped_quality_count = skipped_quality_count
 _NEWS_GENERIC_BODY_MARKERS = (
     "一项科技议题出现新进展",
     "一项社会议题出现新进展",
@@ -3246,12 +3263,18 @@ def create_daily_news_posts(
             news_prompt = f"（第 {success_idx + 1}/{target_count} 条）\n{news_prompt}"
 
         seed_title = "每日新闻"
-        draft = generate_draft(
-            cfgs,
-            title_hint=seed_title,
-            prompt_hint=news_prompt,
-            asset_paths=asset_paths,
-        )
+        try:
+            draft = generate_draft(
+                cfgs,
+                title_hint=seed_title,
+                prompt_hint=news_prompt,
+                asset_paths=asset_paths,
+            )
+        except Exception:
+            failed_count += 1
+            if posts:
+                break
+            raise
         embedded = _extract_embedded_json_from_daily_news_body(draft.get("body", ""))
         if embedded:
             embedded_title = embedded.get("title")
@@ -3392,6 +3415,12 @@ def create_daily_news_posts(
                     )
                     break
                 continue
+            except Exception as exc:
+                failed_count += 1
+                print(f"[auto-image] failed post_id={post.id} err={exc}")
+                if posts:
+                    break
+                raise
             post.platform.setdefault("image", image_metas[0])
             post.platform["images"] = image_metas
             _merge_image_ids(used_image_ids, image_metas)
@@ -3416,8 +3445,16 @@ def create_daily_news_posts(
             f"candidates_tried={len(picks)}/{len(candidates)}, "
             f"failed={failed_count}, skipped_quality={skipped_quality_count}. "
             "Increase NEWS_MAX_RECORDS or configure another news provider/query; "
-            "partial drafts were not returned for upload."
+            "partial drafts will be returned for upload."
         )
         print(f"[daily_news] {message}")
+        if posts:
+            raise PartialDailyNewsError(
+                message,
+                posts=posts,
+                requested_count=target_count,
+                failed_count=max(failed_count, target_count - len(posts)),
+                skipped_quality_count=skipped_quality_count,
+            )
         raise RuntimeError(message)
     return posts

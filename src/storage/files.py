@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import shutil
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .models import Execution, Post, Revision
+from .models import Execution, Post, PublishedMetric, Revision, RunRecord
 
 DATA_ROOT = Path("data")
 
@@ -15,6 +16,8 @@ def ensure_dirs(base: Path = DATA_ROOT) -> None:
     (base / "posts").mkdir(parents=True, exist_ok=True)
     (base / "indexes").mkdir(parents=True, exist_ok=True)
     (base / "events").mkdir(parents=True, exist_ok=True)
+    (base / "analytics").mkdir(parents=True, exist_ok=True)
+    (base / "runs").mkdir(parents=True, exist_ok=True)
 
 
 def _write_json_atomic(path: Path, obj: Any) -> None:
@@ -26,6 +29,28 @@ def _write_json_atomic(path: Path, obj: Any) -> None:
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _append_jsonl(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _csv_value(value: Any) -> Any:
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return value
+
+
+def _append_csv_row(path: Path, fieldnames: list[str], row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerow({key: _csv_value(row.get(key)) for key in fieldnames})
 
 
 def post_dir(post_id: str, base: Path = DATA_ROOT) -> Path:
@@ -115,3 +140,108 @@ def copy_assets_into_post(post_id: str, asset_paths: list[Path], base: Path = DA
         shutil.copy2(src, target)
         copied.append(target)
     return copied
+
+
+PUBLISHED_METRIC_FIELDS = [
+    "id",
+    "captured_at",
+    "title",
+    "url",
+    "published_at",
+    "likes",
+    "comments",
+    "favorites",
+    "raw",
+]
+
+
+RUN_RECORD_FIELDS = [
+    "id",
+    "command",
+    "title",
+    "prompt",
+    "requested_count",
+    "generated_count",
+    "uploaded_count",
+    "failed_count",
+    "started_at",
+    "ended_at",
+    "llm_provider",
+    "llm_models",
+    "image_provider",
+    "image_models",
+    "news_provider",
+    "post_ids",
+    "errors",
+    "extra",
+]
+
+
+def published_metrics_paths(base: Path = DATA_ROOT) -> dict[str, Path]:
+    return {
+        "jsonl": base / "analytics" / "published_metrics.jsonl",
+        "csv": base / "analytics" / "published_metrics.csv",
+    }
+
+
+def run_records_paths(base: Path = DATA_ROOT) -> dict[str, Path]:
+    return {
+        "jsonl": base / "runs" / "run_records.jsonl",
+        "csv": base / "runs" / "run_records.csv",
+    }
+
+
+def save_published_metrics_snapshot(
+    metrics: Iterable[PublishedMetric | dict[str, Any]],
+    base: Path = DATA_ROOT,
+) -> dict[str, Any]:
+    ensure_dirs(base)
+    paths = published_metrics_paths(base)
+    count = 0
+    for metric in metrics:
+        item = metric if isinstance(metric, PublishedMetric) else PublishedMetric.model_validate(metric)
+        data = item.model_dump()
+        _append_jsonl(paths["jsonl"], data)
+        _append_csv_row(paths["csv"], PUBLISHED_METRIC_FIELDS, data)
+        count += 1
+    return {"count": count, **paths}
+
+
+def list_published_metrics(base: Path = DATA_ROOT) -> list[PublishedMetric]:
+    path = published_metrics_paths(base)["jsonl"]
+    if not path.exists():
+        return []
+    out: list[PublishedMetric] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            out.append(PublishedMetric.model_validate(json.loads(raw)))
+        except Exception:
+            continue
+    return out
+
+
+def append_run_record(record: RunRecord | dict[str, Any], base: Path = DATA_ROOT) -> dict[str, Path]:
+    ensure_dirs(base)
+    item = record if isinstance(record, RunRecord) else RunRecord.model_validate(record)
+    data = item.model_dump()
+    paths = run_records_paths(base)
+    _append_jsonl(paths["jsonl"], data)
+    _append_csv_row(paths["csv"], RUN_RECORD_FIELDS, data)
+    return paths
+
+
+def list_run_records(base: Path = DATA_ROOT) -> list[RunRecord]:
+    path = run_records_paths(base)["jsonl"]
+    if not path.exists():
+        return []
+    out: list[RunRecord] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            out.append(RunRecord.model_validate(json.loads(raw)))
+        except Exception:
+            continue
+    return out

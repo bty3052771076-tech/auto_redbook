@@ -612,6 +612,19 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         args.extend(["--wait-timeout", str(wait_timeout)])
         return args
 
+    if subcommand == "update-metrics":
+        limit = int(params.get("limit") or 0)
+        headless = bool(params.get("headless") or False)
+        login_hold = int(params.get("login_hold") or 0)
+        wait_timeout = int(params.get("wait_timeout") or 300)
+
+        args.extend(["--limit", str(limit)])
+        if headless:
+            args.append("--headless")
+        args.extend(["--login-hold", str(login_hold)])
+        args.extend(["--wait-timeout", str(wait_timeout)])
+        return args
+
     raise ValueError(f"unsupported subcommand: {subcommand}")
 
 
@@ -1597,6 +1610,83 @@ def main() -> None:
     )
     _refresh_post_ids()
 
+    # --- Published metrics tab ---
+    tab_metrics = ttk.Frame(nb)
+    nb.add(tab_metrics, text="已发布数据")
+    metrics_intro = ttk.Frame(tab_metrics)
+    metrics_intro.pack(fill="x", padx=4, pady=(10, 8))
+    ttk.Label(metrics_intro, text="已发布稿件互动数据", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(
+        metrics_intro,
+        text="同步已发布笔记的点赞、评论、收藏，并保存到 data/analytics/published_metrics.csv 与 .jsonl。",
+        style="Muted.TLabel",
+        wraplength=720,
+    ).pack(anchor="w", pady=(2, 0))
+
+    metrics_grid = ttk.Frame(tab_metrics)
+    metrics_grid.pack(fill="x", padx=4, pady=12)
+    metrics_grid.columnconfigure(1, weight=1)
+
+    metrics_limit_var = tk.IntVar(value=0)
+    metrics_headless_var = tk.BooleanVar(value=False)
+    metrics_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
+    metrics_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
+
+    ttk.Label(metrics_grid, text="同步数量 limit").grid(row=0, column=0, sticky="w", pady=5)
+    ttk.Spinbox(metrics_grid, from_=0, to=500, textvariable=metrics_limit_var, width=8).grid(
+        row=0, column=1, sticky="w", padx=(10, 0), pady=5
+    )
+    ttk.Label(metrics_grid, text="0 表示按页面滚动上限尽量同步", style="Muted.TLabel").grid(
+        row=0, column=2, sticky="w", padx=(10, 0), pady=5
+    )
+
+    metrics_options = ttk.Frame(tab_metrics, style="Panel.TFrame", padding=(12, 10))
+    metrics_options.pack(fill="x", padx=4, pady=(8, 10))
+    ttk.Label(metrics_options, text="同步选项", style="PanelSection.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        metrics_options,
+        text="无界面同步需要该工作区 Profile 已登录；首次登录请先点击顶部“登录/检查Profile”。",
+        style="PanelMuted.TLabel",
+        wraplength=620,
+    ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 8))
+    ttk.Checkbutton(
+        metrics_options,
+        text="无界面同步",
+        variable=metrics_headless_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=2, column=0, sticky="w")
+    ttk.Label(metrics_options, text="登录等待（秒）", style="Panel.TLabel").grid(
+        row=2, column=1, sticky="e", padx=(24, 8)
+    )
+    ttk.Spinbox(metrics_options, from_=0, to=3600, textvariable=metrics_login_hold_var, width=8).grid(
+        row=2, column=2, sticky="w"
+    )
+    ttk.Label(metrics_options, text="页面等待（秒）", style="Panel.TLabel").grid(
+        row=3, column=1, sticky="e", padx=(24, 8), pady=(5, 0)
+    )
+    ttk.Spinbox(metrics_options, from_=30, to=3600, textvariable=metrics_wait_timeout_var, width=8).grid(
+        row=3, column=2, sticky="w", pady=(5, 0)
+    )
+
+    def _run_update_metrics() -> None:
+        _run_command(
+            "update-metrics",
+            {
+                "limit": metrics_limit_var.get(),
+                "headless": metrics_headless_var.get(),
+                "login_hold": metrics_login_hold_var.get(),
+                "wait_timeout": metrics_wait_timeout_var.get(),
+            },
+            _collect_env_overrides(),
+        )
+
+    ttk.Button(
+        tab_metrics,
+        text="更新已发布数据：点赞 / 评论 / 收藏",
+        command=_run_update_metrics,
+        style="Accent.TButton",
+    ).pack(anchor="w", padx=4, pady=(0, 10))
+
     # --- Delete drafts tab ---
     tab_delete = ttk.Frame(nb)
     nb.add(tab_delete, text="删除草稿")
@@ -1727,6 +1817,7 @@ def main() -> None:
         ("ppinfra Base URL", "LLM_BASE_URL", DEFAULT_LLM_BASE_URL, False),
         ("Aliyun Image Size", "ALIYUN_IMAGE_SIZE", DEFAULT_ALIYUN_IMAGE_SIZE, False),
         ("Aliyun Negative Prompt", "ALIYUN_IMAGE_NEGATIVE_PROMPT", DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT, False),
+        ("XHS Published URL", "XHS_PUBLISHED_URL", "", False),
         ("NEWS_CHINA_RATIO", "NEWS_CHINA_RATIO", DEFAULT_NEWS_CHINA_RATIO, False),
         ("NEWS_CHINA_BONUS", "NEWS_CHINA_BONUS", DEFAULT_NEWS_CHINA_BONUS, False),
     ]:

@@ -551,6 +551,24 @@ def test_quick_launch_scripts_are_workspace_local():
     assert (root / "Open-XHS-Creator.cmd").exists()
 
 
+def test_gui_launcher_uses_pythonw_without_python_console_fallback():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "scripts" / "AutoRedbookGuiLauncher.cs").read_text(encoding="utf-8")
+
+    assert 'Path.Combine(scriptsDir, "pythonw.exe")' in source
+    assert 'Path.Combine(scriptsDir, "python.exe")' not in source
+    assert "WindowStyle = ProcessWindowStyle.Hidden" in source
+
+
+def test_start_gui_script_prefers_hidden_pythonw():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "scripts" / "start_gui.ps1").read_text(encoding="utf-8")
+
+    assert ".venv\\Scripts\\pythonw.exe" in source
+    assert "Start-Process" in source
+    assert "-WindowStyle Hidden" in source
+
+
 def test_build_cli_args_auto():
     args = build_cli_args(
         "auto",
@@ -632,6 +650,24 @@ def test_build_cli_args_delete_drafts():
     assert "--dry-run" in args
     assert "--headless" in args
     assert "--yes" in args
+
+
+def test_build_cli_args_update_metrics():
+    args = build_cli_args(
+        "update-metrics",
+        params={
+            "limit": 25,
+            "headless": True,
+            "login_hold": 0,
+            "wait_timeout": 300,
+        },
+    )
+
+    assert args[1:4] == ["-m", "apps.cli", "update-metrics"]
+    assert "--limit" in args and "25" in args
+    assert "--headless" in args
+    assert "--login-hold" in args and "0" in args
+    assert "--wait-timeout" in args and "300" in args
 
 
 def test_delete_mode_labels_are_explicit_and_non_symbolic():

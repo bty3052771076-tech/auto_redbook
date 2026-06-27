@@ -7,12 +7,24 @@ from pathlib import Path
 
 import typer
 
-from src.publish.playwright_steps import run_delete_drafts_sync, run_save_draft_sync
-from src.storage.files import list_executions, list_posts, load_post, save_post
-from src.storage.models import Execution, PostStatus, PostType, now_iso
+from src.publish.playwright_steps import (
+    run_collect_published_metrics_sync,
+    run_delete_drafts_sync,
+    run_save_draft_sync,
+)
+from src.storage.files import (
+    append_run_record,
+    list_executions,
+    list_posts,
+    load_post,
+    save_post,
+    save_published_metrics_snapshot,
+)
+from src.storage.models import Execution, PostStatus, PostType, PublishedMetric, RunRecord, now_iso
 from src.validation import validate_post
 from src.workflow.create_post import (
     DEFAULT_EVALUATION_VIEWPOINT,
+    PartialDailyNewsError,
     create_daily_news_posts,
     create_post_with_draft,
 )
@@ -108,6 +120,53 @@ def _upload_progress(post_id: str):
     return _emit
 
 
+def _env_first(*names: str) -> str:
+    for name in names:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _record_generation_run(
+    *,
+    command: str,
+    title: str,
+    prompt: str,
+    requested_count: int,
+    generated_count: int,
+    uploaded_count: int,
+    failed_count: int,
+    started_at: str,
+    post_ids: list[str],
+    errors: list[str],
+) -> None:
+    record = RunRecord(
+        command=command,
+        title=title,
+        prompt=prompt,
+        requested_count=requested_count,
+        generated_count=generated_count,
+        uploaded_count=uploaded_count,
+        failed_count=failed_count,
+        started_at=started_at,
+        ended_at=now_iso(),
+        llm_provider=_env_first("LLM_PROVIDER") or "auto",
+        llm_models=_env_first("ALIYUN_LLM_MODELS", "ALIYUN_LLM_MODEL", "LLM_MODEL"),
+        image_provider=_env_first("IMAGE_PROVIDER") or "local/auto",
+        image_models=_env_first("ALIYUN_IMAGE_MODELS", "ALIYUN_IMAGE_MODEL"),
+        news_provider=_env_first("NEWS_PROVIDER") or "auto",
+        post_ids=post_ids,
+        errors=errors,
+        extra={
+            "auto_image": _env_first("AUTO_IMAGE"),
+            "news_candidates_file": _env_first("NEWS_CANDIDATES_FILE"),
+        },
+    )
+    paths = append_run_record(record)
+    typer.echo(f"run-record: {paths['csv']}")
+
+
 def _headless_env_enabled() -> bool:
     return (os.getenv("XHS_HEADLESS") or "").strip().lower() in {
         "1",
@@ -159,6 +218,10 @@ def create(
         typer.echo("count 必须 >= 1")
         raise typer.Exit(code=1)
 
+    started_at = now_iso()
+    run_errors: list[str] = []
+    generation_failed_count = 0
+
     if title_norm == "每日新闻":
         try:
             posts = create_daily_news_posts(
@@ -169,9 +232,16 @@ def create(
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
             )
+        except PartialDailyNewsError as exc:
+            typer.echo(f"partial daily news: generated={len(exc.posts)}/{exc.requested_count}; {exc}")
+            posts = exc.posts
+            generation_failed_count = max(0, exc.requested_count - len(posts), exc.failed_count)
+            run_errors.append(str(exc))
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
             posts = []
+            generation_failed_count = count
+            run_errors.append(str(exc))
     else:
         used_image_ids: set[str] = set()
         posts = []
@@ -189,11 +259,38 @@ def create(
                 )
             except Exception as exc:
                 typer.echo(_format_stage_error(_stage_from_create_exception(exc), f"create failed ({idx + 1}/{count}): {exc}"))
+                generation_failed_count += 1
+                run_errors.append(str(exc))
                 continue
 
     if not posts:
+        _record_generation_run(
+            command="create",
+            title=title_norm,
+            prompt=prompt_norm,
+            requested_count=count,
+            generated_count=0,
+            uploaded_count=0,
+            failed_count=max(generation_failed_count, count),
+            started_at=started_at,
+            post_ids=[],
+            errors=run_errors,
+        )
         typer.echo("error: no posts created")
         raise typer.Exit(code=1)
+
+    _record_generation_run(
+        command="create",
+        title=title_norm,
+        prompt=prompt_norm,
+        requested_count=count,
+        generated_count=len(posts),
+        uploaded_count=0,
+        failed_count=max(generation_failed_count, count - len(posts)),
+        started_at=started_at,
+        post_ids=[p.id for p in posts],
+        errors=run_errors,
+    )
 
     if len(posts) == 1:
         post = posts[0]
@@ -375,6 +472,10 @@ def auto(
         typer.echo("count 必须 >= 1")
         raise typer.Exit(code=1)
 
+    started_at = now_iso()
+    run_errors: list[str] = []
+    generation_failed_count = 0
+
     _warn_headless_login_hold(headless, login_hold)
     if title_norm == "每日新闻":
         try:
@@ -386,9 +487,16 @@ def auto(
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
             )
+        except PartialDailyNewsError as exc:
+            typer.echo(f"partial daily news: generated={len(exc.posts)}/{exc.requested_count}; {exc}")
+            posts = exc.posts
+            generation_failed_count = max(0, exc.requested_count - len(posts), exc.failed_count)
+            run_errors.append(str(exc))
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
             posts = []
+            generation_failed_count = count
+            run_errors.append(str(exc))
     else:
         used_image_ids: set[str] = set()
         posts = []
@@ -406,12 +514,26 @@ def auto(
                 )
             except Exception as exc:
                 typer.echo(_format_stage_error(_stage_from_create_exception(exc), f"create failed ({idx + 1}/{count}): {exc}"))
+                generation_failed_count += 1
+                run_errors.append(str(exc))
                 continue
 
     typer.echo(f"创建完成：posts={len(posts)}")
     for p in posts:
         typer.echo(f"- post_id={p.id} | 标题：{p.title}")
     if not posts:
+        _record_generation_run(
+            command="auto",
+            title=title_norm,
+            prompt=prompt_norm,
+            requested_count=count,
+            generated_count=0,
+            uploaded_count=0,
+            failed_count=max(generation_failed_count, count),
+            started_at=started_at,
+            post_ids=[],
+            errors=run_errors,
+        )
         typer.echo("error: no posts created")
         raise typer.Exit(code=1)
 
@@ -425,6 +547,32 @@ def auto(
         _emit_validation(result)
         if result.errors and not force:
             if not continue_on_invalid:
+                skipped_invalid += 1
+                post.status = PostStatus.failed
+                post.platform["validation"] = {
+                    "errors": list(result.errors),
+                    "warnings": list(result.warnings),
+                }
+                post.updated_at = now_iso()
+                save_post(post)
+                run_errors.append(f"validation failed post_id={post.id}: {result.errors}")
+                _record_generation_run(
+                    command="auto",
+                    title=title_norm,
+                    prompt=prompt_norm,
+                    requested_count=count,
+                    generated_count=len(posts),
+                    uploaded_count=uploaded,
+                    failed_count=max(generation_failed_count + skipped_invalid, count - uploaded),
+                    started_at=started_at,
+                    post_ids=[p.id for p in posts],
+                    errors=run_errors,
+                )
+                typer.echo(
+                    f"summary: generated={len(posts)} uploaded={uploaded} "
+                    f"failed={max(generation_failed_count + skipped_invalid, count - uploaded)} "
+                    f"skipped_invalid={skipped_invalid} upload_failed={upload_failed} requested={count}"
+                )
                 raise typer.Exit(code=1)
             skipped_invalid += 1
             post.status = PostStatus.failed
@@ -435,6 +583,7 @@ def auto(
             post.updated_at = now_iso()
             save_post(post)
             typer.echo(f"skip invalid post_id={post.id}")
+            run_errors.append(f"validation failed post_id={post.id}: {result.errors}")
             continue
 
         post.status = PostStatus.approved
@@ -462,6 +611,7 @@ def auto(
             post.updated_at = now_iso()
             save_post(post)
             upload_failed += 1
+            run_errors.append(f"upload exception post_id={post.id}: {exc}")
             typer.echo(_format_stage_error("上传", f"post_id={post.id} upload exception: {exc}"))
             continue
 
@@ -476,15 +626,73 @@ def auto(
             typer.echo(f"- {s.name}: {s.status}{detail}")
         if exec_rec.error:
             typer.echo(_format_stage_error("上传", exec_rec.error))
+            run_errors.append(f"upload failed post_id={post.id}: {exec_rec.error}")
         if exec_rec.result == "saved_draft":
             uploaded += 1
         elif not dry_run:
             upload_failed += 1
 
-    if skipped_invalid or upload_failed:
+    failed_total = max(
+        generation_failed_count + skipped_invalid + upload_failed,
+        0 if dry_run else count - uploaded,
+    )
+    _record_generation_run(
+        command="auto",
+        title=title_norm,
+        prompt=prompt_norm,
+        requested_count=count,
+        generated_count=len(posts),
+        uploaded_count=uploaded,
+        failed_count=failed_total,
+        started_at=started_at,
+        post_ids=[p.id for p in posts],
+        errors=run_errors,
+    )
+    typer.echo(
+        f"summary: generated={len(posts)} uploaded={uploaded} failed={failed_total} "
+        f"skipped_invalid={skipped_invalid} upload_failed={upload_failed} requested={count}"
+    )
+
+
+@app.command("update-metrics")
+def update_metrics(
+    limit: int = typer.Option(0, help="最多同步 N 条已发布笔记；0 表示按页面滚动上限尽量同步"),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="run Chrome without a visible window; requires an already logged-in profile",
+    ),
+    login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
+    wait_timeout: int = typer.Option(300, help="seconds to wait for metrics UI"),
+):
+    """同步已发布稿件的点赞、评论、收藏到本地表格。"""
+    _warn_headless_login_hold(headless, login_hold)
+
+    def _progress(message: str) -> None:
+        typer.echo(message)
+
+    result = run_collect_published_metrics_sync(
+        limit=limit,
+        login_hold=login_hold,
+        wait_timeout_ms=wait_timeout * 1000,
+        headless=_headless_option_value(headless),
+        progress_callback=_progress,
+    )
+    metrics = [PublishedMetric.model_validate(item) for item in result.get("items", [])]
+    saved = save_published_metrics_snapshot(metrics)
+    typer.echo(f"metrics: fetched={len(metrics)} saved={saved['count']}")
+    typer.echo(f"metrics-jsonl: {saved['jsonl']}")
+    typer.echo(f"metrics-csv: {saved['csv']}")
+    for metric in metrics[:10]:
         typer.echo(
-            f"summary: uploaded={uploaded} skipped_invalid={skipped_invalid} upload_failed={upload_failed} total={len(posts)}"
+            f"- {metric.title or '(无标题)'} | 点赞={metric.likes} 评论={metric.comments} 收藏={metric.favorites}"
         )
+    if result.get("event_path"):
+        typer.echo(f"event: {result['event_path']}")
+    if result.get("errors"):
+        typer.echo(f"errors: {result['errors']}")
+        if not metrics:
+            raise typer.Exit(code=1)
 
 
 @app.command("delete-drafts")

@@ -7,14 +7,14 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from src.storage.events import save_event
 from src.storage.files import evidence_dir, save_execution
-from src.storage.models import Execution, Post, StepResult
+from src.storage.models import Execution, Post, PublishedMetric, StepResult
 
 TARGET_URL = "https://creator.xiaohongshu.com/publish/publish?target=image"
 WAIT_TEXTS = [
@@ -110,6 +110,19 @@ LOGIN_PAGE_HINTS = [
     "\u8bf7\u5148\u767b\u5f55",
     "\u767b\u5f55\u540e",
     "\u8bf7\u5b8c\u6210\u5b89\u5168\u9a8c\u8bc1",
+]
+PUBLISHED_PAGE_TEXTS = [
+    "\u7b14\u8bb0\u7ba1\u7406",
+    "\u5df2\u53d1\u5e03",
+    "\u53d1\u5e03\u65f6\u95f4",
+    "\u70b9\u8d5e",
+    "\u8bc4\u8bba",
+    "\u6536\u85cf",
+]
+PUBLISHED_URL_CANDIDATES = [
+    "https://creator.xiaohongshu.com/creator/notes",
+    "https://creator.xiaohongshu.com/creator/notes?source=publish",
+    "https://creator.xiaohongshu.com/publish/publish?target=image",
 ]
 EDITOR_READY_SELECTORS = (
     UPLOAD_BUTTON_SELECTORS
@@ -256,6 +269,162 @@ def _read_page_body_text(page, *, timeout_ms: int = 1000, max_chars: int = 8000)
     except Exception:
         return ""
     return str(text or "")[:max_chars]
+
+
+def _parse_metric_number(value: str) -> Optional[int]:
+    text = (value or "").strip().replace(",", "")
+    if not text:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([万wWkK]?)", text)
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit in {"万", "w"}:
+        number *= 10000
+    elif unit == "k":
+        number *= 1000
+    return int(round(number))
+
+
+def _parse_metric_from_text(text: str, labels: list[str]) -> Optional[int]:
+    label_re = "|".join(re.escape(label) for label in labels)
+    number_re = r"([0-9][0-9,]*(?:\.[0-9]+)?\s*(?:万|w|W|k|K)?)"
+    patterns = [
+        rf"(?:{label_re})\s*[:：]?\s*{number_re}",
+        rf"{number_re}\s*(?:{label_re})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            number_text = match.group(1)
+            parsed = _parse_metric_number(number_text)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _is_published_metric_title_line(line: str) -> bool:
+    text = re.sub(r"\s+", " ", line or "").strip()
+    if not text:
+        return False
+    if len(text) > 80:
+        return False
+    if re.search(r"(点赞|评论|收藏|浏览|分享|发布时间|发布于|编辑|删除|置顶)", text):
+        return False
+    if re.fullmatch(r"[\d\s:：/\-.,万wWkK]+", text):
+        return False
+    return True
+
+
+def _parse_published_metric_text(text: str) -> dict[str, Any]:
+    normalized = re.sub(r"\r\n?", "\n", text or "")
+    compact = re.sub(r"[ \t]+", " ", normalized)
+    lines = [line.strip() for line in compact.splitlines() if line.strip()]
+    title = ""
+    for line in lines:
+        if _is_published_metric_title_line(line):
+            title = line
+            break
+    full_text = "\n".join(lines)
+    date_match = re.search(r"(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})", full_text)
+    return {
+        "title": title,
+        "published_at": date_match.group(1).replace("/", "-").replace(".", "-") if date_match else "",
+        "likes": _parse_metric_from_text(full_text, ["点赞", "赞", "赞数"]),
+        "comments": _parse_metric_from_text(full_text, ["评论", "评论数"]),
+        "favorites": _parse_metric_from_text(full_text, ["收藏", "收藏数"]),
+        "raw_text": full_text,
+    }
+
+
+def _published_url_candidates() -> list[str]:
+    raw = (os.getenv("XHS_PUBLISHED_URL") or "").strip()
+    if raw:
+        return [raw]
+    return list(PUBLISHED_URL_CANDIDATES)
+
+
+def _collect_published_metric_cards(page) -> list[dict[str, str]]:
+    try:
+        data = page.evaluate(
+            r"""
+            () => {
+              const selectors = [
+                'article',
+                'li',
+                'tr',
+                '[class*="note"]',
+                '[class*="card"]',
+                '[class*="item"]',
+                '[class*="list"] > div'
+              ];
+              const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
+              const seen = new Set();
+              const out = [];
+              const visible = (el) => {
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 20 && rect.height > 10;
+              };
+              for (const node of nodes) {
+                if (!visible(node)) continue;
+                const text = (node.innerText || node.textContent || '').trim();
+                if (!text || text.length < 4) continue;
+                const link = node.querySelector('a[href]');
+                const href = link ? link.href : '';
+                const hasMetric = /点赞|赞数|评论|收藏/.test(text);
+                const looksLikeNote = /xiaohongshu\\.com\\/(explore|discovery|user\/profile)/.test(href || '');
+                if (!hasMetric && !looksLikeNote) continue;
+                const key = (href || '') + '|' + text.slice(0, 120);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push({ text, href });
+                if (out.length >= 300) break;
+              }
+              return out;
+            }
+            """
+        )
+    except Exception:
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _merge_published_metric_cards(cards: list[dict[str, str]], *, limit: int = 0) -> list[PublishedMetric]:
+    items: list[PublishedMetric] = []
+    seen: set[str] = set()
+    for card in cards:
+        text = str(card.get("text") or "")
+        href = str(card.get("href") or "")
+        parsed = _parse_published_metric_text(text)
+        title = str(parsed.get("title") or "").strip()
+        likes = parsed.get("likes")
+        comments = parsed.get("comments")
+        favorites = parsed.get("favorites")
+        if not title and not href:
+            continue
+        if likes is None and comments is None and favorites is None:
+            continue
+        key = href or title
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(
+            PublishedMetric(
+                title=title,
+                url=href,
+                published_at=str(parsed.get("published_at") or ""),
+                likes=likes,
+                comments=comments,
+                favorites=favorites,
+                raw={"text": parsed.get("raw_text") or text},
+            )
+        )
+        if limit and len(items) >= limit:
+            break
+    return items
 
 
 def _classify_xhs_page_state(url: str, title: str, body_text: str) -> str:
@@ -2318,4 +2487,109 @@ def run_delete_drafts_sync(
             return result
     except Exception as exc:
         result["errors"].append(str(exc))
+        return result
+
+
+def run_collect_published_metrics_sync(
+    *,
+    limit: int = 0,
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    result: dict[str, Any] = {
+        "total": 0,
+        "items": [],
+        "errors": [],
+        "urls_tried": [],
+    }
+    profile_dir, channel, args = _resolve_profile_config()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    headless_value = _resolve_headless(headless)
+    max_scrolls = max(1, int(os.getenv("XHS_METRICS_MAX_SCROLLS") or "30"))
+
+    try:
+        with sync_playwright() as p:
+            launch_kwargs = {"headless": headless_value}
+            if channel:
+                launch_kwargs["channel"] = channel
+            if args:
+                launch_kwargs["args"] = args
+            context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
+            context.set_default_timeout(30000)
+            page = context.pages[0] if context.pages else context.new_page()
+            collected_cards: list[dict[str, str]] = []
+
+            try:
+                for url in _published_url_candidates():
+                    result["urls_tried"].append(url)
+                    _emit_progress(progress_callback, "open_metrics_page", "in_progress", url)
+                    page.goto(url, wait_until="domcontentloaded")
+                    _wait_for_xhs_ready(
+                        page,
+                        login_hold=login_hold,
+                        headless=headless_value,
+                        progress_callback=progress_callback,
+                    )
+                    try:
+                        _wait_for_any_text(page, PUBLISHED_PAGE_TEXTS, min(wait_timeout_ms, 30000))
+                    except PlaywrightTimeoutError:
+                        # Some creator pages render metrics without the exact Chinese labels above.
+                        pass
+
+                    previous_height = 0
+                    for scroll_idx in range(max_scrolls):
+                        cards = _collect_published_metric_cards(page)
+                        if cards:
+                            collected_cards.extend(cards)
+                            metrics = _merge_published_metric_cards(collected_cards, limit=limit)
+                            _emit_progress(
+                                progress_callback,
+                                "collect_metrics",
+                                "in_progress",
+                                f"items={len(metrics)} scroll={scroll_idx + 1}/{max_scrolls}",
+                            )
+                            if limit and len(metrics) >= limit:
+                                break
+                        try:
+                            current_height = int(page.evaluate("() => document.body.scrollHeight") or 0)
+                            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                            if current_height and current_height == previous_height and scroll_idx >= 2:
+                                break
+                            previous_height = current_height
+                        except Exception:
+                            break
+                        time.sleep(1)
+
+                    metrics = _merge_published_metric_cards(collected_cards, limit=limit)
+                    if metrics:
+                        result["items"] = [metric.model_dump() for metric in metrics]
+                        result["total"] = len(metrics)
+                        break
+
+                if not result["items"]:
+                    result["errors"].append(
+                        "no published metrics found; check login profile or set XHS_PUBLISHED_URL to the note management page"
+                    )
+                event_path = save_event(
+                    {
+                        "type": "published_metrics",
+                        "profile_dir": str(profile_dir),
+                        "headless": headless_value,
+                        "summary": {
+                            "total": result["total"],
+                            "urls_tried": result["urls_tried"],
+                            "errors": result["errors"],
+                        },
+                    }
+                )
+                result["event_path"] = str(event_path)
+                _emit_progress(progress_callback, "collect_metrics", "success", f"total={result['total']}")
+                return result
+            finally:
+                context.close()
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        _emit_progress(progress_callback, "collect_metrics", "failed", str(exc))
         return result

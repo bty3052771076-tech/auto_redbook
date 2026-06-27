@@ -4,14 +4,18 @@ from tempfile import TemporaryDirectory
 import json
 
 from src.storage.files import (
+    append_run_record,
     copy_assets_into_post,
     ensure_dirs,
     load_post,
+    list_published_metrics,
+    list_run_records,
+    save_published_metrics_snapshot,
     save_execution,
     save_post,
     save_revision,
 )
-from src.storage.models import Execution, Post, PostStatus, Revision
+from src.storage.models import Execution, Post, PostStatus, PublishedMetric, Revision, RunRecord
 
 
 def test_save_and_load_post_roundtrip():
@@ -74,3 +78,60 @@ def test_copy_assets_and_execution():
         save_execution(exec_rec, base=base)
         exec_path = base / "posts" / post.id / "executions" / f"{exec_rec.id}.json"
         assert exec_path.exists()
+
+
+def test_save_published_metrics_snapshot_writes_jsonl_and_csv():
+    with TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        metric = PublishedMetric(
+            title="测试已发布笔记",
+            url="https://www.xiaohongshu.com/explore/abc",
+            likes=12,
+            comments=3,
+            favorites=4,
+            raw={"source": "unit"},
+        )
+
+        result = save_published_metrics_snapshot([metric], base=base)
+
+        assert result["count"] == 1
+        assert (base / "analytics" / "published_metrics.jsonl").exists()
+        csv_text = (base / "analytics" / "published_metrics.csv").read_text(encoding="utf-8-sig")
+        assert "测试已发布笔记" in csv_text
+        assert "likes" in csv_text
+        loaded = list_published_metrics(base=base)
+        assert len(loaded) == 1
+        assert loaded[0].likes == 12
+        assert loaded[0].favorites == 4
+
+
+def test_append_run_record_writes_table_and_jsonl():
+    with TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        record = RunRecord(
+            command="auto",
+            title="每日新闻",
+            requested_count=3,
+            generated_count=2,
+            uploaded_count=1,
+            failed_count=2,
+            llm_provider="aliyun",
+            llm_models="qwen3.7-plus",
+            image_provider="aliyun",
+            image_models="wan2.7-image",
+            news_provider="gnews",
+            post_ids=["p1", "p2"],
+            errors=["quota exhausted"],
+        )
+
+        paths = append_run_record(record, base=base)
+
+        assert paths["jsonl"].exists()
+        assert paths["csv"].exists()
+        csv_text = paths["csv"].read_text(encoding="utf-8-sig")
+        assert "qwen3.7-plus" in csv_text
+        assert "wan2.7-image" in csv_text
+        loaded = list_run_records(base=base)
+        assert len(loaded) == 1
+        assert loaded[0].generated_count == 2
+        assert loaded[0].post_ids == ["p1", "p2"]

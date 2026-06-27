@@ -98,3 +98,36 @@ class Execution(BaseModel):
     steps: List[StepResult] = Field(default_factory=list)
     evidence: List[str] = Field(default_factory=list)
 
+
+class PublishedMetric(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    captured_at: str = Field(default_factory=now_iso)
+    title: str = ""
+    url: str = ""
+    published_at: str = ""
+    likes: Optional[int] = None
+    comments: Optional[int] = None
+    favorites: Optional[int] = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunRecord(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    command: str = ""
+    title: str = ""
+    prompt: str = ""
+    requested_count: int = 0
+    generated_count: int = 0
+    uploaded_count: int = 0
+    failed_count: int = 0
+    started_at: str = Field(default_factory=now_iso)
+    ended_at: Optional[str] = None
+    llm_provider: str = ""
+    llm_models: str = ""
+    image_provider: str = ""
+    image_models: str = ""
+    news_provider: str = ""
+    post_ids: List[str] = Field(default_factory=list)
+    errors: List[str] = Field(default_factory=list)
+    extra: dict[str, Any] = Field(default_factory=dict)
+
