@@ -96,7 +96,7 @@ GUI 查看方式：打开 `已发布数据` 页签，点击 `更新已发布数�
 .\.venv\Scripts\python.exe -m apps.cli analyze-metrics --save
 ```
 
-GUI 中可在 `已发布数据` 页点击 `分析发布方向`，软件会直接读取本地互动表，输出建议发布比例、分类表现和代表标题，不需要 Codex 参与。
+GUI 中可在 `已发布数据` 页点击 `分析发布方向`，软件会读取本地互动表，输出建议发布比例、分类表现和代表标题。当前版本使用本地规则分析器作为兜底算法，不会自动调用外部 LLM，也不会自动执行上传；后续可以在此基础上接入外部 LLM 做更细的选题策略分析，本地规则结果可作为兜底和校验。
 
 ### 上传安全
 - 不要提交真实 API Key、`.env.gui`、浏览器 profile、草稿记录或测试截图。
@@ -112,7 +112,7 @@ GUI 中可在 `已发布数据` 页点击 `分析发布方向`，软件会直接
 - 图形界面（GUI）：在窗口中选择模型/参数并一键执行常用命令
 - 自动配图：当未提供图片时，默认用阿里云百炼生成 1 张相关图片用于上传，也可切换 Pexels 检索下载
 - 无界面上传：`run` / `auto` / `retry` / `delete-drafts` 支持 `--headless`，终端会实时显示上传步骤和 `uploaded=x/y` 进度
-- 已发布数据同步与分析：`update-metrics` 可抓取已发布稿件的点赞、评论、收藏，并写入 `data/analytics/published_metrics_latest.csv` 与快照文件 `published_metrics.csv/jsonl`；`analyze-metrics` 和 GUI 的 `分析发布方向` 会基于本地数据生成后续新闻方向建议
+- 已发布数据同步与分析：`update-metrics` 可抓取已发布稿件的点赞、评论、收藏，并写入 `data/analytics/published_metrics_latest.csv` 与快照文件 `published_metrics.csv/jsonl`；`analyze-metrics` 和 GUI 的 `分析发布方向` 会基于本地数据生成后续新闻方向建议。当前分析器是本地规则兜底实现，未来可扩展为“外部 LLM 分析 + 本地规则兜底”。
 - 运行记录：`create` / `auto` 会记录本次生成条数、上传条数、失败条数、LLM/VLM/新闻源等信息到 `data/runs/run_records.csv/jsonl`
 - 部分成功保护：批量每日新闻如果中途遇到额度不足、候选不足或生图失败，已经生成的草稿不会丢弃，`auto` 会继续上传已生成部分并汇报 generated/uploaded/failed
 - 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
