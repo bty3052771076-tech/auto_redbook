@@ -89,6 +89,15 @@ python -m playwright install chromium
 
 GUI 查看方式：打开 `已发布数据` 页签，点击 `更新已发布数据：点赞 / 评论 / 收藏` 同步平台数据；下方表格会读取 `data/analytics/published_metrics_latest.csv`，点击 `点赞`、`评论`、`收藏`、`浏览` 等列头可切换升序/降序排序。
 
+软件内置发布方向分析：
+
+```powershell
+.\.venv\Scripts\python.exe -m apps.cli analyze-metrics
+.\.venv\Scripts\python.exe -m apps.cli analyze-metrics --save
+```
+
+GUI 中可在 `已发布数据` 页点击 `分析发布方向`，软件会直接读取本地互动表，输出建议发布比例、分类表现和代表标题，不需要 Codex 参与。
+
 ### 上传安全
 - 不要提交真实 API Key、`.env.gui`、浏览器 profile、草稿记录或测试截图。
 - `.gitignore` 已忽略 `.env*`、`docs/*api-key.md`、`data/`、`output/`、`.venv/` 和本地 GUI exe。
@@ -103,7 +112,7 @@ GUI 查看方式：打开 `已发布数据` 页签，点击 `更新已发布数�
 - 图形界面（GUI）：在窗口中选择模型/参数并一键执行常用命令
 - 自动配图：当未提供图片时，默认用阿里云百炼生成 1 张相关图片用于上传，也可切换 Pexels 检索下载
 - 无界面上传：`run` / `auto` / `retry` / `delete-drafts` 支持 `--headless`，终端会实时显示上传步骤和 `uploaded=x/y` 进度
-- 已发布数据同步：`update-metrics` 可抓取已发布稿件的点赞、评论、收藏，并写入 `data/analytics/published_metrics_latest.csv` 与快照文件 `published_metrics.csv/jsonl`；GUI 的 `已发布数据` 页可用表格查看并按点赞、评论、收藏、浏览等列排序
+- 已发布数据同步与分析：`update-metrics` 可抓取已发布稿件的点赞、评论、收藏，并写入 `data/analytics/published_metrics_latest.csv` 与快照文件 `published_metrics.csv/jsonl`；`analyze-metrics` 和 GUI 的 `分析发布方向` 会基于本地数据生成后续新闻方向建议
 - 运行记录：`create` / `auto` 会记录本次生成条数、上传条数、失败条数、LLM/VLM/新闻源等信息到 `data/runs/run_records.csv/jsonl`
 - 部分成功保护：批量每日新闻如果中途遇到额度不足、候选不足或生图失败，已经生成的草稿不会丢弃，`auto` 会继续上传已生成部分并汇报 generated/uploaded/failed
 - 删除草稿：清理草稿箱（图文/视频/长文），支持预览/限量/全量删除
@@ -148,7 +157,7 @@ python -m playwright install chromium
 ```powershell
 .\Start-GUI.cmd
 ```
-GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `已发布数据` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、图片来源（`local` 本地 assets / `aliyun` AI 生图 / `pexels` 搜图）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，并在独立时间框显示北京时间，便于确认每个帖子的标题后再审核或上传；`已发布数据` 页可一键同步点赞、评论、收藏到本地表格，并直接查看本地最新数据，点击列头按点赞、评论、收藏、浏览、分享或同步时间排序。
+GUI 内置常用工作流页签：`自动发帖` / `仅生成` / `草稿处理` / `已发布数据` / `删除草稿` / `配置`。自动发帖页可直接选择 LLM 供应商（阿里云 / ppinfra / auto）、LLM 模型、图片来源（`local` 本地 assets / `aliyun` AI 生图 / `pexels` 搜图）和阿里云生图模型；`草稿处理` 页会按“标题 + 状态 + post_id”列出最近帖子，并在独立时间框显示北京时间，便于确认每个帖子的标题后再审核或上传；`已发布数据` 页可一键同步点赞、评论、收藏到本地表格，并直接查看本地最新数据，点击列头按点赞、评论、收藏、浏览、分享或同步时间排序，也可点击 `分析发布方向` 让软件自动给出下一批新闻选题比例建议。
 
 图片来源说明：选择 `local` 时使用本地 `assets glob`；选择 `aliyun` 或 `pexels` 时 GUI 会自动使用 `assets/empty/*` 触发自动配图，避免本地旧图片覆盖你选择的图片来源。
 
@@ -282,6 +291,7 @@ $post_id = ($out | Select-String -Pattern "post_id=([0-9a-f]{32})" | Select-Obje
 - `run <post_id>`：用 Playwright 上传图片/填写标题正文/保存草稿
 - `auto`：一键完成 `create -> approve -> run`
 - `update-metrics`：同步已发布稿件点赞、评论、收藏到本地表格
+- `analyze-metrics`：分析本地已发布互动数据，输出后续新闻方向建议
 - `retry <post_id>`：对失败的 run 进行重试
 - `delete-drafts`：删除草稿箱草稿（默认图文）
 

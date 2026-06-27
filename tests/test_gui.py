@@ -615,6 +615,8 @@ def test_metrics_tab_has_local_table_and_sortable_headings():
 
     assert "metrics_tree = ttk.Treeview" in source
     assert "刷新本地表格" in source
+    assert "分析发布方向" in source
+    assert "render_published_metrics_analysis" in source
     assert "_sort_metric_table" in source
     assert "list_published_metric_table_rows" in source
 

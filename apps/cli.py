@@ -7,6 +7,7 @@ from pathlib import Path
 
 import typer
 
+from src.analytics.published_metrics import analyze_published_metrics, render_published_metrics_analysis
 from src.publish.playwright_steps import (
     run_collect_published_metrics_sync,
     run_delete_drafts_sync,
@@ -694,6 +695,22 @@ def update_metrics(
         typer.echo(f"errors: {result['errors']}")
         if not metrics:
             raise typer.Exit(code=1)
+
+
+@app.command("analyze-metrics")
+def analyze_metrics(
+    top_n: int = typer.Option(6, help="最多输出 N 个发布方向建议"),
+    save: bool = typer.Option(False, "--save", help="保存分析结果到 data/analytics/published_metrics_analysis.md"),
+):
+    """分析本地已发布互动数据，给出后续新闻选题方向建议。"""
+    report = analyze_published_metrics(top_n=top_n)
+    text = render_published_metrics_analysis(report)
+    typer.echo(text)
+    if save:
+        path = Path("data") / "analytics" / "published_metrics_analysis.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
+        typer.echo(f"\nanalysis-report: {path}")
 
 
 @app.command("delete-drafts")

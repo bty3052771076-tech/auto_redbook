@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
+from src.analytics.published_metrics import analyze_published_metrics, render_published_metrics_analysis
 from src.config import (
     ALIYUN_FREE_LLM_MODELS,
     DEFAULT_ALIYUN_LLM_BASE_URL,
@@ -1897,6 +1898,34 @@ def main() -> None:
         _render_metric_table(metric_table_rows)
         _configure_metric_table_headings()
 
+    metric_analysis_frame = ttk.Frame(metrics_table_panel, style="Panel.TFrame")
+    metric_analysis_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+    metric_analysis_frame.columnconfigure(0, weight=1)
+    ttk.Label(metric_analysis_frame, text="发布方向分析", style="PanelSection.TLabel").grid(row=0, column=0, sticky="w")
+    metric_analysis_text = ScrolledText(
+        metric_analysis_frame,
+        height=12,
+        bg="#fffaf0",
+        fg=palette["ink"],
+        insertbackground=palette["ink"],
+        relief="solid",
+        bd=1,
+        font=base_font,
+        wrap="word",
+    )
+    metric_analysis_text.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+
+    def _set_metric_analysis(text: str) -> None:
+        metric_analysis_text.configure(state="normal")
+        metric_analysis_text.delete("1.0", "end")
+        metric_analysis_text.insert("1.0", text)
+        metric_analysis_text.configure(state="disabled")
+
+    def _analyze_metric_table() -> None:
+        report = analyze_published_metrics(base=PROJECT_ROOT / "data")
+        _set_metric_analysis(render_published_metrics_analysis(report))
+        metric_status_var.set("已根据本地已发布数据生成发布方向分析；如刚同步完平台数据，可再次点击分析刷新结论。")
+
     _configure_metric_table_headings()
 
     def _run_update_metrics() -> None:
@@ -1921,10 +1950,16 @@ def main() -> None:
     ).grid(row=0, column=1, sticky="e", padx=(8, 0))
     ttk.Button(
         metrics_table_header,
+        text="分析发布方向",
+        command=_analyze_metric_table,
+    ).grid(row=0, column=2, sticky="e", padx=(8, 0))
+    ttk.Button(
+        metrics_table_header,
         text="刷新本地表格",
         command=_refresh_metric_table,
-    ).grid(row=0, column=2, sticky="e", padx=(8, 0))
+    ).grid(row=0, column=3, sticky="e", padx=(8, 0))
     _refresh_metric_table()
+    _analyze_metric_table()
 
     # --- Delete drafts tab ---
     tab_delete = ttk.Frame(nb)
