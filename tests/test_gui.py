@@ -34,7 +34,10 @@ from apps.gui import (
     format_post_choice,
     format_post_detail,
     format_post_time_detail,
+    format_shared_draft_preview,
+    find_local_post_for_metric_row,
     list_published_metric_table_rows,
+    list_publishable_drafts,
     list_recent_posts,
     load_env_file,
     open_xhs_creator,
@@ -380,6 +383,37 @@ def test_list_recent_posts_includes_titles_and_status(tmp_path: Path):
     assert second_item.asset_count == 1
 
 
+def test_list_publishable_drafts_filters_uploaded_posts_by_beijing_date(tmp_path: Path):
+    posts = tmp_path / "data" / "posts"
+    posts.mkdir(parents=True)
+    matching = posts / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    not_uploaded = posts / "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    other_day = posts / "cccccccccccccccccccccccccccccccc"
+    matching.mkdir()
+    not_uploaded.mkdir()
+    other_day.mkdir()
+    (matching / "post.json").write_text(
+        '{"title":"可发布草稿","status":"saved_as_draft","uploaded":true,'
+        '"uploaded_at":"2026-06-28T16:30:00.000000Z","body":"正文"}',
+        encoding="utf-8",
+    )
+    (not_uploaded / "post.json").write_text(
+        '{"title":"未上传草稿","status":"draft","uploaded":false,'
+        '"updated_at":"2026-06-28T16:30:00.000000Z","body":"正文"}',
+        encoding="utf-8",
+    )
+    (other_day / "post.json").write_text(
+        '{"title":"其他日期草稿","status":"saved_as_draft","uploaded":true,'
+        '"uploaded_at":"2026-06-27T15:30:00.000000Z","body":"正文"}',
+        encoding="utf-8",
+    )
+
+    items = list_publishable_drafts(project_root=tmp_path, date="2026-06-29")
+
+    assert [item.post_id for item in items] == ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    assert items[0].title == "可发布草稿"
+
+
 def test_format_post_choice_strips_symbolic_status_marks_from_title():
     post = RecentPostSummary(
         post_id="0123456789abcdef0123456789abcdef",
@@ -464,6 +498,96 @@ def test_format_post_detail_shows_upload_state_time_and_body_preview():
     assert "saved_draft" in detail
     assert "素材数量：1" in detail
     assert "要点摘要" in detail
+
+
+def test_format_shared_draft_preview_reads_full_post_json(tmp_path: Path):
+    post_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    post_dir = tmp_path / "data" / "posts" / post_id
+    post_dir.mkdir(parents=True)
+    (post_dir / "post.json").write_text(
+        """
+        {
+          "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "type": "image",
+          "status": "published",
+          "uploaded": true,
+          "uploaded_at": "2026-06-28T16:30:00.000000Z",
+          "title": "Local draft title",
+          "body": "Full local body line one\\n\\nFull local body line two",
+          "topics": ["daily", "news"],
+          "assets": [{"path": "data/posts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/assets/a.png", "kind": "image"}],
+          "platform": {
+            "news": {
+              "api_source": "hotnews",
+              "source_api": {
+                "provider": "hotnews",
+                "item_source": "hotnews:jinritoutiao",
+                "item_domain": "example.com",
+                "item_url": "https://example.com/news"
+              }
+            },
+            "publish": {
+              "result": "published",
+              "published_at": "2026-06-29T01:02:03.000000Z",
+              "actual_title": "Actual platform title",
+              "actual_body": "Actual platform body from editor"
+            }
+          },
+          "created_at": "2026-06-28T16:00:00.000000Z",
+          "updated_at": "2026-06-29T01:02:03.000000Z"
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    preview = format_shared_draft_preview(post_id=post_id, project_root=tmp_path)
+
+    assert "Actual platform title" in preview
+    assert "Actual platform body from editor" in preview
+    assert "hotnews" in preview
+    assert "hotnews:jinritoutiao" in preview
+    assert "https://example.com/news" in preview
+    assert "data/posts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/assets/a.png" in preview
+    assert "2026-06-29 09:02:03" in preview
+
+
+def test_find_local_post_for_metric_row_prefers_url_then_title(tmp_path: Path):
+    post_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    post_dir = tmp_path / "data" / "posts" / post_id
+    post_dir.mkdir(parents=True)
+    (post_dir / "post.json").write_text(
+        """
+        {
+          "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "type": "image",
+          "status": "saved_as_draft",
+          "uploaded": true,
+          "title": "Original local title",
+          "body": "Local body",
+          "topics": [],
+          "assets": [],
+          "platform": {
+            "publish": {
+              "url": "https://www.xiaohongshu.com/explore/abc123"
+            }
+          },
+          "created_at": "2026-06-29T00:00:00.000000Z",
+          "updated_at": "2026-06-29T00:00:00.000000Z"
+        }
+        """,
+        encoding="utf-8",
+    )
+    metric = PublishedMetricTableRow(
+        title="Changed title on platform",
+        url="https://www.xiaohongshu.com/explore/abc123",
+        published_at="2026-06-29",
+        likes=3,
+    )
+
+    match = find_local_post_for_metric_row(metric, project_root=tmp_path)
+
+    assert match is not None
+    assert match.post_id == post_id
 
 
 def test_list_published_metric_table_rows_reads_latest_csv_and_raw_counts(tmp_path: Path):
@@ -621,6 +745,43 @@ def test_metrics_tab_has_local_table_and_sortable_headings():
     assert "list_published_metric_table_rows" in source
 
 
+def test_gui_has_publish_drafts_preview_and_confirmation():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "发布草稿" in source
+    assert "publish_tree = ttk.Treeview" in source
+    assert "list_publishable_drafts" in source
+    assert "messagebox.askyesno" in source
+    assert "publish-drafts" in source
+
+
+def test_gui_has_daily_ai_digest_quick_title_button():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "每日AI讯息" in source
+    assert 'title_var.set("每日AI讯息")' in source
+
+
+def test_build_cli_args_auto_daily_ai_digest_keeps_special_title():
+    args = build_cli_args(
+        "auto",
+        params={
+            "title": "每日AI讯息",
+            "prompt": "",
+            "assets_glob": "assets/empty/*",
+            "image_source": "aliyun",
+            "count": 5,
+        },
+    )
+
+    assert "--title" in args and "每日AI讯息" in args
+    assert "--count" in args and "5" in args
+    idx = args.index("--assets-glob")
+    assert args[idx + 1] == AUTO_IMAGE_ASSETS_GLOB
+
+
 def test_build_cli_args_auto():
     args = build_cli_args(
         "auto",
@@ -704,6 +865,35 @@ def test_build_cli_args_delete_drafts():
     assert "--yes" in args
 
 
+def test_build_cli_args_publish_drafts_by_date_and_post_ids():
+    args = build_cli_args(
+        "publish-drafts",
+        params={
+            "date": "2026-06-29",
+            "post_ids": [
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ],
+            "limit": 2,
+            "dry_run": True,
+            "headless": True,
+            "yes": True,
+            "login_hold": 0,
+            "wait_timeout": 600,
+        },
+    )
+
+    assert args[1:4] == ["-m", "apps.cli", "publish-drafts"]
+    assert "--date" in args and "2026-06-29" in args
+    assert args.count("--post-id") == 2
+    assert "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in args
+    assert "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in args
+    assert "--limit" in args and "2" in args
+    assert "--dry-run" in args
+    assert "--headless" in args
+    assert "--yes" in args
+
+
 def test_build_cli_args_update_metrics():
     args = build_cli_args(
         "update-metrics",
@@ -720,6 +910,34 @@ def test_build_cli_args_update_metrics():
     assert "--headless" in args
     assert "--login-hold" in args and "0" in args
     assert "--wait-timeout" in args and "300" in args
+
+
+def test_build_cli_args_aliyun_quota():
+    args = build_cli_args(
+        "aliyun-quota",
+        params={
+            "models": ["qwen3.7-plus", "wan2.7-image"],
+            "headless": True,
+            "login_hold": 0,
+            "wait_timeout": 120,
+        },
+    )
+
+    assert args[1:4] == ["-m", "apps.cli", "aliyun-quota"]
+    assert args.count("--model") == 2
+    assert "qwen3.7-plus" in args
+    assert "wan2.7-image" in args
+    assert "--headless" in args
+    assert "--login-hold" in args and "0" in args
+    assert "--wait-timeout" in args and "120" in args
+
+
+def test_gui_has_aliyun_quota_panel():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "aliyun-quota" in source
+    assert "Aliyun Bailian quota" in source
 
 
 def test_delete_mode_labels_are_explicit_and_non_symbolic():

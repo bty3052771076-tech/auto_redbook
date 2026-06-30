@@ -1,9 +1,12 @@
 from src.publish.playwright_steps import (
     _bottom_draft_click_point,
+    _draft_item_matches_post,
     _draft_title_matches_expected,
     _pick_draft_click_candidate,
+    _read_editor_draft_snapshot,
     _title_match_terms,
 )
+from src.storage.models import Post
 
 
 def test_bottom_draft_click_point_targets_left_bottom_action():
@@ -47,3 +50,25 @@ def test_draft_title_match_requires_specific_title_not_generic_prefix():
     assert _draft_title_matches_expected("每日新闻｜The Korean Tele", "每日新闻｜Inside the figh") is False
     assert _draft_title_matches_expected("暂无笔记标题", "每日新闻｜Inside the figh") is False
     assert _draft_title_matches_expected("每日新闻｜Inside the figh", "每日新闻｜Inside the figh") is True
+
+
+def test_draft_item_matches_post_uses_specific_local_title():
+    post = Post(id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", title="AI chip factory expands")
+
+    assert _draft_item_matches_post({"title": "AI chip factory expands"}, post) is True
+    assert _draft_item_matches_post({"title": "Different daily news"}, post) is False
+    assert _draft_item_matches_post({"title": ""}, post) is False
+
+
+def test_read_editor_draft_snapshot_returns_actual_title_and_body():
+    class FakePage:
+        def evaluate(self, _script):
+            return {
+                "actual_title": "Edited title before publish",
+                "actual_body": "Edited body before publish",
+            }
+
+    assert _read_editor_draft_snapshot(FakePage()) == {
+        "actual_title": "Edited title before publish",
+        "actual_body": "Edited body before publish",
+    }

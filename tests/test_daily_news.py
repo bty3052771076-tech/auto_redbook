@@ -1108,7 +1108,7 @@ def test_create_daily_news_single_stores_url_locally_but_not_in_body(monkeypatch
     monkeypatch.setattr(
         create_post,
         "fetch_and_pick_daily_news",
-        lambda _prompt: (picked, {"provider": "fake-news"}),
+        lambda _prompt: (picked, {"provider": "hotnews", "provider_attempts": ["hotnews"]}),
     )
 
     def fake_generate_draft(*_args, **_kwargs):
@@ -1145,6 +1145,9 @@ def test_create_daily_news_single_stores_url_locally_but_not_in_body(monkeypatch
     assert data["日期"] == "2026-06-19"
     assert post.platform["news"]["source_url"] == "https://example.com/source"
     assert post.platform["news"]["picked"]["url"] == "https://example.com/source"
+    assert post.platform["news"]["api_source"] == "hotnews"
+    assert post.platform["news"]["source_api"]["provider"] == "hotnews"
+    assert post.platform["news"]["source_api"]["item_source"] == "Example News"
 
 
 def test_create_daily_news_single_outputs_fixed_body_fields(monkeypatch, tmp_path):
@@ -1223,7 +1226,7 @@ def test_create_daily_news_posts_scrubs_url_and_persists_source_url(monkeypatch,
     monkeypatch.setattr(
         create_post,
         "fetch_daily_news_candidates",
-        lambda _prompt: ([picked], {"provider": "fake-news"}),
+        lambda _prompt: ([picked], {"provider": "hotnews", "provider_attempts": ["hotnews"]}),
     )
 
     def fake_generate_draft(*_args, **_kwargs):
@@ -1260,6 +1263,9 @@ def test_create_daily_news_posts_scrubs_url_and_persists_source_url(monkeypatch,
     assert data["日期"] == "2026-06-19"
     assert posts[0].platform["news"]["source_url"] == "https://example.com/eu-tech"
     assert posts[0].platform["news"]["picked"]["url"] == "https://example.com/eu-tech"
+    assert posts[0].platform["news"]["api_source"] == "hotnews"
+    assert posts[0].platform["news"]["source_api"]["provider"] == "hotnews"
+    assert posts[0].platform["news"]["source_api"]["item_source"] == "Example Wire"
 
 
 def test_create_daily_news_posts_replaces_cross_candidate_title_and_image_event(monkeypatch, tmp_path):
@@ -1745,12 +1751,136 @@ def test_fetch_daily_news_candidates_auto_tries_configured_gnews_when_newsapi_ti
     assert gnews_calls
 
 
+def test_hotnews_provider_maps_platform_items(monkeypatch):
+    calls = []
+
+    def fake_hotnews_request_json(*, base_url, platform, timeout_s):
+        calls.append((base_url, platform, timeout_s))
+        return {
+            "status": 200,
+            "data": [
+                {
+                    "title": "AI产业链融资升温",
+                    "url": "https://www.toutiao.com/article/123",
+                    "desc": "多家AI产业链企业披露新一轮融资。",
+                    "score": "9876",
+                },
+                {"title": "缺少链接的热榜项", "url": "", "desc": "应跳过"},
+            ],
+        }
+
+    monkeypatch.setattr(daily_news, "_hotnews_request_json", fake_hotnews_request_json, raising=False)
+
+    items = daily_news._hotnews_fetch_articles(
+        base_url="https://orz.ai/api/v1/dailynews",
+        platforms=["jinritoutiao"],
+        max_records=5,
+        timeout_s=2,
+    )
+
+    assert calls == [("https://orz.ai/api/v1/dailynews", "jinritoutiao", 2)]
+    assert len(items) == 1
+    assert items[0].title == "AI产业链融资升温"
+    assert items[0].url == "https://www.toutiao.com/article/123"
+    assert items[0].source == "hotnews:jinritoutiao"
+    assert items[0].domain == "www.toutiao.com"
+    assert items[0].description == "多家AI产业链企业披露新一轮融资。"
+    assert items[0].content == "多家AI产业链企业披露新一轮融资。"
+    assert items[0].language == "zh"
+    assert items[0].sourcecountry == "cn"
+
+
+def test_fetch_daily_news_candidates_auto_uses_hotnews_when_no_keyed_provider(monkeypatch):
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.delenv("NEWS_CANDIDATES_FILE", raising=False)
+    monkeypatch.delenv("NEWS_API_KEY", raising=False)
+    monkeypatch.delenv("NEWSAPI_API_KEY", raising=False)
+    monkeypatch.delenv("GNEWS_API_KEY", raising=False)
+    monkeypatch.delenv("GNEWS_TOKEN", raising=False)
+    monkeypatch.delenv("JUHE_NEWS_APPKEY", raising=False)
+    monkeypatch.delenv("JUHE_FINANCE_NEWS_APPKEY", raising=False)
+    monkeypatch.setattr(daily_news, "_load_newsapi_config", lambda: (_ for _ in ()).throw(RuntimeError("missing newsapi")))
+    monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing gnews")))
+    monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing juhe")))
+    monkeypatch.setattr(daily_news, "_default_news_queries", lambda: ["technology", "world"])
+    calls = []
+
+    def fake_hotnews_fetch_articles(**kwargs):
+        calls.append(kwargs)
+        return [
+            NewsItem(
+                title="国内AI治理规则更新",
+                url="https://example.cn/ai-governance",
+                source="hotnews:jinritoutiao",
+                domain="example.cn",
+                seendate="2026-06-29T08:00:00Z",
+                description="相关部门披露AI治理规则更新。",
+                language="zh",
+                sourcecountry="cn",
+            )
+        ]
+
+    monkeypatch.setattr(daily_news, "_hotnews_fetch_articles", fake_hotnews_fetch_articles, raising=False)
+
+    candidates, meta = daily_news.fetch_daily_news_candidates("", max_records=5)
+
+    assert candidates[0].title == "国内AI治理规则更新"
+    assert meta["provider"] == "hotnews"
+    assert meta["api_source"] == "hotnews"
+    assert meta["provider_plan"] == ["hotnews"]
+    assert meta["provider_attempts"] == ["hotnews"]
+    assert meta["source_api"]["provider"] == "hotnews"
+    assert meta["source_api"]["base_url"] == "https://orz.ai/api/v1/dailynews"
+    assert calls[0]["platforms"]
+    assert len(calls) == 1
+
+
+def test_fetch_daily_news_candidates_auto_uses_hotnews_after_keyed_provider_failure(monkeypatch):
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.delenv("NEWS_CANDIDATES_FILE", raising=False)
+    monkeypatch.setenv("NEWS_API_KEY", "fake-newsapi-key")
+    monkeypatch.delenv("GNEWS_API_KEY", raising=False)
+    monkeypatch.delenv("GNEWS_TOKEN", raising=False)
+    monkeypatch.delenv("JUHE_NEWS_APPKEY", raising=False)
+    monkeypatch.delenv("JUHE_FINANCE_NEWS_APPKEY", raising=False)
+    monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing gnews")))
+    monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing juhe")))
+
+    def fake_newsapi_fetch_articles(**_kwargs):
+        raise TimeoutError("newsapi timed out")
+
+    def fake_hotnews_fetch_articles(**_kwargs):
+        return [
+            NewsItem(
+                title="国际科技企业发布新服务",
+                url="https://example.com/tech-service",
+                source="hotnews:hackernews",
+                domain="example.com",
+                seendate="2026-06-29T09:00:00Z",
+                description="一家科技企业发布新服务。",
+                language="en",
+            )
+        ]
+
+    monkeypatch.setattr(daily_news, "_newsapi_fetch_articles", fake_newsapi_fetch_articles)
+    monkeypatch.setattr(daily_news, "_hotnews_fetch_articles", fake_hotnews_fetch_articles, raising=False)
+
+    candidates, meta = daily_news.fetch_daily_news_candidates("technology", max_records=5, timeout_s=1)
+
+    assert candidates[0].title == "国际科技企业发布新服务"
+    assert meta["provider"] == "hotnews"
+    assert meta["provider_plan"] == ["newsapi", "hotnews"]
+    assert meta["provider_attempts"] == ["newsapi", "hotnews"]
+    assert any("newsapi timed out" in err for err in meta["provider_errors"])
+
+
 def test_fetch_daily_news_candidates_auto_does_not_fallback_to_gdelt(monkeypatch):
     monkeypatch.delenv("NEWS_PROVIDER", raising=False)
     monkeypatch.setenv("NEWS_API_KEY", "fake-newsapi-key")
     monkeypatch.delenv("GNEWS_API_KEY", raising=False)
     monkeypatch.delenv("GNEWS_TOKEN", raising=False)
     monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing gnews")))
+    monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing juhe")))
 
     def fake_newsapi_fetch_articles(**_kwargs):
         raise RuntimeError("newsapi timeout")
@@ -1758,15 +1888,27 @@ def test_fetch_daily_news_candidates_auto_does_not_fallback_to_gdelt(monkeypatch
     def fake_gdelt_fetch_articles(**_kwargs):
         raise AssertionError("gdelt should not be called")
 
+    def fake_hotnews_fetch_articles(**_kwargs):
+        return [
+            NewsItem(
+                title="Hot fallback headline",
+                url="https://example.com/hot-fallback",
+                source="hotnews:jinritoutiao",
+                domain="example.com",
+                description="HotNews fallback item.",
+            )
+        ]
+
     monkeypatch.setattr(daily_news, "_newsapi_fetch_articles", fake_newsapi_fetch_articles)
     monkeypatch.setattr(daily_news, "_gdelt_fetch_articles", fake_gdelt_fetch_articles, raising=False)
+    monkeypatch.setattr(daily_news, "_hotnews_fetch_articles", fake_hotnews_fetch_articles, raising=False)
 
-    with pytest.raises(RuntimeError) as exc:
-        daily_news.fetch_daily_news_candidates("technology", max_records=5)
+    candidates, meta = daily_news.fetch_daily_news_candidates("technology", max_records=5)
 
-    message = str(exc.value).lower()
-    assert "newsapi" in message
-    assert "gdelt" not in message
+    assert candidates[0].title == "Hot fallback headline"
+    assert meta["provider"] == "hotnews"
+    assert "gdelt" not in meta["provider_plan"]
+    assert "gdelt" not in meta["provider_attempts"]
 
 
 def test_news_provider_gdelt_is_no_longer_supported(monkeypatch):

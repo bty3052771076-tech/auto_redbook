@@ -3,14 +3,24 @@ from __future__ import annotations
 import glob
 import os
 import sys
+import webbrowser
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import typer
 
+from src.aliyun.quota import (
+    BAILIAN_FREE_QUOTA_URL,
+    format_aliyun_quota_records,
+    run_collect_aliyun_quota_sync,
+)
+from src.analytics.post_sync import sync_published_metrics_to_posts
 from src.analytics.published_metrics import analyze_published_metrics, render_published_metrics_analysis
 from src.publish.playwright_steps import (
     run_collect_published_metrics_sync,
     run_delete_drafts_sync,
+    run_publish_drafts_sync,
     run_save_draft_sync,
 )
 from src.storage.files import (
@@ -21,16 +31,18 @@ from src.storage.files import (
     save_post,
     save_published_metrics_snapshot,
 )
-from src.storage.models import Execution, PostStatus, PostType, PublishedMetric, RunRecord, now_iso
+from src.storage.models import Execution, Post, PostStatus, PostType, PublishedMetric, RunRecord, now_iso
 from src.validation import validate_post
 from src.workflow.create_post import (
     DEFAULT_EVALUATION_VIEWPOINT,
     PartialDailyNewsError,
+    create_daily_ai_digest_posts,
     create_daily_news_posts,
     create_post_with_draft,
 )
 
 app = typer.Typer(help="小红书自动发帖（生成并保存草稿）CLI")
+DAILY_AI_DIGEST_TITLE = "每日AI讯息"
 
 
 def _ensure_utf8_output() -> None:
@@ -88,6 +100,8 @@ def _format_stage_error(stage: str, error) -> str:
 
 def _stage_from_create_exception(exc: Exception) -> str:
     message = str(exc).lower()
+    if "daily ai digest" in message or "ai digest" in message or "ai updates" in message:
+        return "获取AI讯息"
     if (
         "no news returned" in message
         or "newsapi" in message
@@ -112,6 +126,10 @@ def _stage_from_create_exception(exc: Exception) -> str:
     ):
         return "LLM"
     return "生成草稿"
+
+
+def _is_daily_ai_digest_title(title: str) -> bool:
+    return (title or "").strip().replace(" ", "") == DAILY_AI_DIGEST_TITLE
 
 
 def _upload_progress(post_id: str):
@@ -194,6 +212,111 @@ def _warn_headless_login_hold(headless: bool, login_hold: int) -> None:
         )
 
 
+BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
+
+
+def _parse_post_time(value: str) -> Optional[datetime]:
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            dt = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ")
+            return dt.replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def _post_publishable_date(post: Post) -> str:
+    raw = post.uploaded_at or post.updated_at or post.created_at
+    dt = _parse_post_time(raw or "")
+    if not dt:
+        return ""
+    return dt.astimezone(BEIJING_TZ).strftime("%Y-%m-%d")
+
+
+def _is_publishable_uploaded_post(post: Post) -> bool:
+    if not post.uploaded:
+        return False
+    return post.status not in {PostStatus.published, PostStatus.failed, PostStatus.canceled}
+
+
+def _select_publishable_posts(
+    *,
+    date: str = "",
+    post_ids: list[str],
+    include_all: bool = False,
+    limit: int = 0,
+) -> list[Post]:
+    date_norm = (date or "").strip()
+    post_id_set = {p.strip().lower() for p in post_ids if p and p.strip()}
+    if post_id_set:
+        candidates: list[Post] = []
+        for post_id in post_id_set:
+            try:
+                candidates.append(load_post(post_id))
+            except FileNotFoundError:
+                continue
+    else:
+        candidates = list(list_posts())
+
+    selected: list[Post] = []
+    for post in candidates:
+        if not _is_publishable_uploaded_post(post):
+            continue
+        if date_norm and _post_publishable_date(post) != date_norm:
+            continue
+        if not (include_all or date_norm or post_id_set):
+            continue
+        selected.append(post)
+        if limit and len(selected) >= limit:
+            break
+    return selected
+
+
+def _mark_posts_published(posts: list[Post], result: dict) -> None:
+    published_ids = {str(p).strip().lower() for p in result.get("published_post_ids", []) if str(p).strip()}
+    if not published_ids and result.get("published", 0) == len(posts):
+        published_ids = {post.id.lower() for post in posts}
+    result_items: dict[str, dict] = {}
+    for item in result.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        item_post_id = str(item.get("post_id") or "").strip().lower()
+        if item_post_id:
+            result_items[item_post_id] = item
+    now = now_iso()
+    for post in posts:
+        if post.id.lower() not in published_ids:
+            continue
+        item = result_items.get(post.id.lower(), {})
+        post.status = PostStatus.published
+        post.updated_at = now
+        post.platform.setdefault("publish", {})
+        publish_update = {
+            "result": "published",
+            "published_at": now,
+            "source": "creator_center_draft",
+        }
+        for source_key, target_key in (
+            ("actual_title", "actual_title"),
+            ("actual_body", "actual_body"),
+            ("title", "draft_list_title"),
+            ("saved_at", "draft_saved_at"),
+            ("url", "url"),
+            ("note_url", "url"),
+        ):
+            value = str(item.get(source_key) or "").strip()
+            if value:
+                publish_update[target_key] = value
+        post.platform["publish"].update(publish_update)
+        save_post(post)
+
+
 @app.command()
 def create(
     title: str = typer.Option(..., help="初始标题/题目"),
@@ -219,11 +342,30 @@ def create(
         typer.echo("count 必须 >= 1")
         raise typer.Exit(code=1)
 
+    requested_count = 1 if _is_daily_ai_digest_title(title_norm) else count
+    if requested_count != count:
+        typer.echo("note: 每日AI讯息会生成 1 条简报草稿；动态数量请用 AI_DIGEST_TARGET_ITEMS 控制。")
+
     started_at = now_iso()
     run_errors: list[str] = []
     generation_failed_count = 0
 
-    if title_norm == "每日新闻":
+    if _is_daily_ai_digest_title(title_norm):
+        try:
+            posts = create_daily_ai_digest_posts(
+                prompt_hint=prompt_norm,
+                asset_paths=asset_paths,
+                copy_assets=not no_copy,
+                count=1,
+                auto_image=True,
+                evaluation_viewpoint=evaluation_viewpoint,
+            )
+        except Exception as exc:
+            typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
+            posts = []
+            generation_failed_count = requested_count
+            run_errors.append(str(exc))
+    elif title_norm == "每日新闻":
         try:
             posts = create_daily_news_posts(
                 prompt_hint=prompt_norm,
@@ -241,7 +383,7 @@ def create(
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
             posts = []
-            generation_failed_count = count
+            generation_failed_count = requested_count
             run_errors.append(str(exc))
     else:
         used_image_ids: set[str] = set()
@@ -269,10 +411,10 @@ def create(
             command="create",
             title=title_norm,
             prompt=prompt_norm,
-            requested_count=count,
+            requested_count=requested_count,
             generated_count=0,
             uploaded_count=0,
-            failed_count=max(generation_failed_count, count),
+            failed_count=max(generation_failed_count, requested_count),
             started_at=started_at,
             post_ids=[],
             errors=run_errors,
@@ -284,10 +426,10 @@ def create(
         command="create",
         title=title_norm,
         prompt=prompt_norm,
-        requested_count=count,
+        requested_count=requested_count,
         generated_count=len(posts),
         uploaded_count=0,
-        failed_count=max(generation_failed_count, count - len(posts)),
+        failed_count=max(generation_failed_count, requested_count - len(posts)),
         started_at=started_at,
         post_ids=[p.id for p in posts],
         errors=run_errors,
@@ -473,12 +615,31 @@ def auto(
         typer.echo("count 必须 >= 1")
         raise typer.Exit(code=1)
 
+    requested_count = 1 if _is_daily_ai_digest_title(title_norm) else count
+    if requested_count != count:
+        typer.echo("note: 每日AI讯息会生成 1 条简报草稿；动态数量请用 AI_DIGEST_TARGET_ITEMS 控制。")
+
     started_at = now_iso()
     run_errors: list[str] = []
     generation_failed_count = 0
 
     _warn_headless_login_hold(headless, login_hold)
-    if title_norm == "每日新闻":
+    if _is_daily_ai_digest_title(title_norm):
+        try:
+            posts = create_daily_ai_digest_posts(
+                prompt_hint=prompt_norm,
+                asset_paths=asset_paths,
+                copy_assets=not no_copy,
+                count=1,
+                auto_image=True,
+                evaluation_viewpoint=evaluation_viewpoint,
+            )
+        except Exception as exc:
+            typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
+            posts = []
+            generation_failed_count = requested_count
+            run_errors.append(str(exc))
+    elif title_norm == "每日新闻":
         try:
             posts = create_daily_news_posts(
                 prompt_hint=prompt_norm,
@@ -496,7 +657,7 @@ def auto(
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
             posts = []
-            generation_failed_count = count
+            generation_failed_count = requested_count
             run_errors.append(str(exc))
     else:
         used_image_ids: set[str] = set()
@@ -527,10 +688,10 @@ def auto(
             command="auto",
             title=title_norm,
             prompt=prompt_norm,
-            requested_count=count,
+            requested_count=requested_count,
             generated_count=0,
             uploaded_count=0,
-            failed_count=max(generation_failed_count, count),
+            failed_count=max(generation_failed_count, requested_count),
             started_at=started_at,
             post_ids=[],
             errors=run_errors,
@@ -538,7 +699,7 @@ def auto(
         typer.echo("error: no posts created")
         raise typer.Exit(code=1)
 
-    continue_on_invalid = count > 1
+    continue_on_invalid = requested_count > 1
     skipped_invalid = 0
     uploaded = 0
     upload_failed = 0
@@ -561,18 +722,18 @@ def auto(
                     command="auto",
                     title=title_norm,
                     prompt=prompt_norm,
-                    requested_count=count,
+                    requested_count=requested_count,
                     generated_count=len(posts),
                     uploaded_count=uploaded,
-                    failed_count=max(generation_failed_count + skipped_invalid, count - uploaded),
+                    failed_count=max(generation_failed_count + skipped_invalid, requested_count - uploaded),
                     started_at=started_at,
                     post_ids=[p.id for p in posts],
                     errors=run_errors,
                 )
                 typer.echo(
                     f"summary: generated={len(posts)} uploaded={uploaded} "
-                    f"failed={max(generation_failed_count + skipped_invalid, count - uploaded)} "
-                    f"skipped_invalid={skipped_invalid} upload_failed={upload_failed} requested={count}"
+                    f"failed={max(generation_failed_count + skipped_invalid, requested_count - uploaded)} "
+                    f"skipped_invalid={skipped_invalid} upload_failed={upload_failed} requested={requested_count}"
                 )
                 raise typer.Exit(code=1)
             skipped_invalid += 1
@@ -635,13 +796,13 @@ def auto(
 
     failed_total = max(
         generation_failed_count + skipped_invalid + upload_failed,
-        0 if dry_run else count - uploaded,
+        0 if dry_run else requested_count - uploaded,
     )
     _record_generation_run(
         command="auto",
         title=title_norm,
         prompt=prompt_norm,
-        requested_count=count,
+        requested_count=requested_count,
         generated_count=len(posts),
         uploaded_count=uploaded,
         failed_count=failed_total,
@@ -651,8 +812,63 @@ def auto(
     )
     typer.echo(
         f"summary: generated={len(posts)} uploaded={uploaded} failed={failed_total} "
-        f"skipped_invalid={skipped_invalid} upload_failed={upload_failed} requested={count}"
+        f"skipped_invalid={skipped_invalid} upload_failed={upload_failed} requested={requested_count}"
     )
+
+
+@app.command("aliyun-quota")
+def aliyun_quota(
+    model: Optional[list[str]] = typer.Option(
+        None,
+        "--model",
+        help="Filter specific Bailian models; may be repeated. Defaults to configured Aliyun LLM/image models.",
+    ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="read the Bailian console without a visible window; requires a logged-in workspace profile",
+    ),
+    login_hold: int = typer.Option(0, help="seconds to keep the visible browser open for Aliyun console login"),
+    wait_timeout: int = typer.Option(120, help="seconds to wait for the Bailian quota table"),
+    open_only: bool = typer.Option(False, "--open-only", help="only open the official Bailian free-quota page"),
+):
+    """Read Aliyun Bailian free quota from the official console page."""
+    typer.echo("Aliyun Bailian quota")
+    typer.echo(f"official-free-quota-url: {BAILIAN_FREE_QUOTA_URL}")
+    typer.echo(
+        "note: DashScope does not expose a stable public API-key balance endpoint in the project docs; "
+        "this command reads the official Bailian console page and does not call billable models."
+    )
+
+    if open_only:
+        webbrowser.open(BAILIAN_FREE_QUOTA_URL)
+        typer.echo("opened official Bailian free-quota page")
+        return
+
+    if headless and login_hold > 0:
+        typer.echo(
+            "warn: --headless requires an already logged-in Aliyun console profile; "
+            "login-hold cannot display QR/captcha windows"
+        )
+
+    def _progress(message: str) -> None:
+        typer.echo(message)
+
+    result = run_collect_aliyun_quota_sync(
+        models=[m.strip() for m in (model or []) if m and m.strip()] or None,
+        login_hold=login_hold,
+        wait_timeout_ms=wait_timeout * 1000,
+        headless=True if headless else None,
+        progress_callback=_progress,
+    )
+
+    typer.echo(format_aliyun_quota_records(result.get("records", [])))
+    if result.get("usage_url"):
+        typer.echo(f"usage-statistics-url: {result['usage_url']}")
+        typer.echo("usage-statistics-note: Aliyun usage statistics may be delayed; use it as a reference, not a real-time balance.")
+    if result.get("errors"):
+        typer.echo(f"errors: {result['errors']}")
+        raise typer.Exit(code=1)
 
 
 @app.command("update-metrics")
@@ -681,7 +897,12 @@ def update_metrics(
     )
     metrics = [PublishedMetric.model_validate(item) for item in result.get("items", [])]
     saved = save_published_metrics_snapshot(metrics)
+    synced = sync_published_metrics_to_posts(metrics)
     typer.echo(f"metrics: fetched={len(metrics)} saved={saved['count']}")
+    typer.echo(
+        f"posts-synced: matched={synced.get('matched', 0)} "
+        f"unmatched={len(synced.get('unmatched', []))}"
+    )
     typer.echo(f"metrics-jsonl: {saved['jsonl']}")
     typer.echo(f"metrics-csv: {saved['csv']}")
     typer.echo(f"metrics-latest-csv: {saved['latest_csv']}")
@@ -711,6 +932,92 @@ def analyze_metrics(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text + "\n", encoding="utf-8")
         typer.echo(f"\nanalysis-report: {path}")
+
+
+@app.command("publish-drafts")
+def publish_drafts(
+    draft_type: str = typer.Option(
+        "image", help="草稿类型：image/video/article", show_default=True
+    ),
+    date: str = typer.Option(
+        "", "--date", help="按本地上传日期筛选（北京时间，YYYY-MM-DD）"
+    ),
+    post_id: Optional[list[str]] = typer.Option(
+        None, "--post-id", help="指定本地 post_id；可重复传入"
+    ),
+    all_posts: bool = typer.Option(False, "--all", help="选择全部已上传且未发布的本地草稿"),
+    limit: int = typer.Option(0, help="最多发布 N 条（0 表示不限制）"),
+    dry_run: bool = typer.Option(False, help="只预览将发布的草稿，不点击发布"),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="run Chrome without a visible window; requires an already logged-in profile",
+    ),
+    yes: bool = typer.Option(False, help="跳过确认"),
+    login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
+    wait_timeout: int = typer.Option(300, help="seconds to wait for publish UI"),
+):
+    """从小红书创作者中心草稿箱打开并发布已选择的草稿。"""
+    ids = [p.strip() for p in (post_id or []) if p and p.strip()]
+    if not (date or ids or all_posts):
+        typer.echo("请至少选择发布日期、post_id 或 --all")
+        raise typer.Exit(code=1)
+
+    _warn_headless_login_hold(headless, login_hold)
+    posts = _select_publishable_posts(
+        date=date,
+        post_ids=ids,
+        include_all=all_posts,
+        limit=limit,
+    )
+    if not posts:
+        typer.echo("未找到匹配的本地已上传草稿")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"selected local drafts={len(posts)}")
+    for post in posts:
+        typer.echo(f"- {post.id} | {post.title} | uploaded_at={post.uploaded_at or ''}")
+
+    if not dry_run and not yes:
+        confirm = typer.confirm(f"将发布 {len(posts)} 条小红书草稿，确认继续？")
+        if not confirm:
+            typer.echo("已取消")
+            return
+
+    def _progress(message: str) -> None:
+        typer.echo(message)
+
+    result = run_publish_drafts_sync(
+        posts=posts,
+        draft_type=draft_type,
+        dry_run=dry_run,
+        login_hold=login_hold,
+        wait_timeout_ms=wait_timeout * 1000,
+        headless=_headless_option_value(headless),
+        progress_callback=_progress,
+    )
+
+    typer.echo(f"type={result.get('draft_type', draft_type)} total={result.get('total', 0)}")
+    for item in result.get("items", [])[:10]:
+        title = item.get("title") or "(无标题)"
+        saved_at = item.get("saved_at") or ""
+        item_post_id = item.get("post_id") or ""
+        typer.echo(f"- {item_post_id} {title} {saved_at}".strip())
+    if result.get("event_path"):
+        typer.echo(f"event: {result['event_path']}")
+    if result.get("errors"):
+        typer.echo(f"errors: {result['errors']}")
+
+    if dry_run:
+        return
+
+    _mark_posts_published(posts, result)
+    typer.echo(
+        f"published {result.get('published', 0)}/{len(posts)} drafts "
+        f"({result.get('draft_type', draft_type)})"
+    )
+    if result.get("errors"):
+        raise typer.Exit(code=1)
 
 
 @app.command("delete-drafts")

@@ -11,9 +11,12 @@ from dataclasses import replace
 from datetime import datetime
 from html import unescape
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 
 from src.config import load_llm_configs
+from src.ai_digest.collect import collect_ai_digest_updates
+from src.ai_digest.generate import build_fallback_brief, render_ai_digest_body
+from src.ai_digest.render import render_ai_digest_cards
 from src.images.auto_image import (
     ImageGenerationAbandoned,
     fetch_and_download_related_images,
@@ -3008,6 +3011,106 @@ def _fake_news_offline_body(prompt_norm: str) -> str:
     )
 
 
+def _daily_news_source_trace(news_meta: dict[str, Any], picked) -> dict[str, Any]:
+    meta = dict(news_meta or {})
+    existing = meta.get("source_api")
+    trace = dict(existing) if isinstance(existing, dict) else {}
+    provider = (
+        str(trace.get("provider") or meta.get("api_source") or meta.get("provider") or "").strip()
+        or "unknown"
+    )
+    trace["provider"] = provider
+    for key in ("query", "queries_used", "provider_plan", "provider_attempts"):
+        if key in meta and key not in trace:
+            trace[key] = meta[key]
+    if picked is not None:
+        trace.setdefault("item_source", (getattr(picked, "source", "") or "").strip() or None)
+        trace.setdefault("item_domain", (getattr(picked, "domain", "") or "").strip() or None)
+        trace.setdefault("item_url", (getattr(picked, "url", "") or "").strip() or None)
+        trace.setdefault("item_title", (getattr(picked, "title", "") or "").strip() or None)
+    return {k: v for k, v in trace.items() if v not in ("", None)}
+
+
+def _daily_news_meta_with_trace(news_meta: dict[str, Any], picked) -> dict[str, Any]:
+    meta = dict(news_meta or {})
+    trace = _daily_news_source_trace(meta, picked)
+    meta["api_source"] = trace.get("provider") or meta.get("provider") or "unknown"
+    meta["source_api"] = trace
+    return meta
+
+
+def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int | None = None) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def create_daily_ai_digest_posts(
+    *,
+    asset_paths: list[str],
+    copy_assets: bool = True,
+    count: int = 1,
+    auto_image: bool = True,
+    prompt_hint: str = "",
+    evaluation_viewpoint: str = DEFAULT_EVALUATION_VIEWPOINT,
+) -> list[Post]:
+    target_count = _env_int("AI_DIGEST_TARGET_ITEMS", 10, min_value=4, max_value=18)
+    min_official_count = _env_int("AI_DIGEST_MIN_OFFICIAL_ITEMS", 6, min_value=1, max_value=18)
+    items, source_meta = collect_ai_digest_updates(
+        target_count=target_count,
+        min_official_count=min_official_count,
+        allow_social_backfill=True,
+    )
+    if not items:
+        errors = source_meta.get("errors") if isinstance(source_meta, dict) else []
+        detail = f"; errors={errors}" if errors else ""
+        raise RuntimeError(f"daily ai digest create failed: no AI updates returned{detail}")
+
+    brief = build_fallback_brief(items, target_count=target_count)
+    post = Post(
+        type="image",
+        status=PostStatus.draft,
+        title="每日AI讯息",
+        body=render_ai_digest_body(brief),
+        topics=["每日AI讯息", "AI动态", "人工智能"],
+        platform={
+            "ai_digest": {
+                "mode": "daily_ai_digest",
+                "target_items": target_count,
+                "min_official_items": min_official_count,
+                "prompt_hint": (prompt_hint or "").strip(),
+                "source_meta": source_meta,
+                "brief": brief.model_dump(),
+                "items": [item.model_dump() for item in brief.items],
+            }
+        },
+    )
+
+    dest_dir = post_dir(post.id) / "assets"
+    image_paths = render_ai_digest_cards(brief, dest_dir)
+    post.assets = _build_asset_infos(image_paths)
+
+    rev = Revision(
+        post_id=post.id,
+        source=RevisionSource.llm,
+        content={
+            "title": post.title,
+            "body": post.body,
+            "topics": post.topics,
+            "ai_digest": post.platform["ai_digest"],
+        },
+    )
+    save_post(post)
+    save_revision(rev)
+    return [post]
+
+
 def create_post_with_draft(
     *,
     title_hint: str,
@@ -3021,8 +3124,17 @@ def create_post_with_draft(
     """
     Generate a draft with LLM and persist post + revision.
     """
-    cfgs = load_llm_configs()
     title_norm = (title_hint or "").strip()
+    if title_norm == "每日AI讯息":
+        return create_daily_ai_digest_posts(
+            prompt_hint=prompt_hint,
+            asset_paths=asset_paths,
+            copy_assets=copy_assets,
+            auto_image=auto_image,
+            evaluation_viewpoint=evaluation_viewpoint,
+        )[0]
+
+    cfgs = load_llm_configs()
     platform_meta: dict = {}
 
     if title_norm == "每日新闻":
@@ -3030,9 +3142,9 @@ def create_post_with_draft(
         try:
             picked, news_meta = fetch_and_pick_daily_news(prompt_hint or "")
             picked, lookup_meta = _enrich_daily_news_item(picked)
+            traced_news_meta = _daily_news_meta_with_trace({**news_meta, **lookup_meta}, picked)
             platform_meta["news"] = {
-                **news_meta,
-                **lookup_meta,
+                **traced_news_meta,
                 "picked": asdict(picked),
                 "source_url": picked.url,
                 "mode": "daily_news",
@@ -3258,6 +3370,7 @@ def create_daily_news_posts(
         if len(posts) >= target_count:
             break
         picked, lookup_meta = _enrich_daily_news_item(picked)
+        traced_news_meta = _daily_news_meta_with_trace({**base_meta, **lookup_meta}, picked)
         news_prompt = _daily_news_prompt(picked, prompt_norm, viewpoint_norm)
         if target_count > 1:
             news_prompt = f"（第 {success_idx + 1}/{target_count} 条）\n{news_prompt}"
@@ -3359,8 +3472,7 @@ def create_daily_news_posts(
             topics=draft.get("topics", []),
             platform={
                 "news": {
-                    **base_meta,
-                    **lookup_meta,
+                    **traced_news_meta,
                     "picked": asdict(picked),
                     "source_url": picked.url,
                     "mode": "daily_news_multi" if target_count > 1 else "daily_news",

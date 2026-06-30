@@ -13,8 +13,9 @@ import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
+from src.analytics.post_sync import find_post_for_published_metric
 from src.analytics.published_metrics import analyze_published_metrics, render_published_metrics_analysis
 from src.config import (
     ALIYUN_FREE_LLM_MODELS,
@@ -269,6 +270,41 @@ def list_recent_posts(*, project_root: Path = PROJECT_ROOT, limit: int = 50) -> 
     return [summary for _, summary in items[: max(0, int(limit or 0) or 50)]]
 
 
+def _post_publishable_date(post: RecentPostSummary) -> str:
+    raw = post.uploaded_at or post.updated_at or post.created_at
+    dt = _parse_stored_time(raw)
+    if not dt:
+        return ""
+    return dt.astimezone(BEIJING_TZ).strftime("%Y-%m-%d")
+
+
+def list_publishable_drafts(
+    *,
+    project_root: Path = PROJECT_ROOT,
+    date: str = "",
+    limit: int = 200,
+) -> list[RecentPostSummary]:
+    """
+    Local preview of creator-center drafts that were already uploaded by this tool.
+
+    The date filter uses Beijing time because the GUI shows upload times in UTC+8.
+    """
+    date_norm = (date or "").strip()
+    items: list[RecentPostSummary] = []
+    for post in list_recent_posts(project_root=project_root, limit=max(limit, 200)):
+        status = (post.status or "").strip()
+        if not post.uploaded:
+            continue
+        if status in {"published", "failed", "canceled"}:
+            continue
+        if date_norm and _post_publishable_date(post) != date_norm:
+            continue
+        items.append(post)
+        if limit and len(items) >= limit:
+            break
+    return items
+
+
 def _metric_int(value: object) -> int:
     text = str(value or "").strip().replace(",", "")
     if not text:
@@ -396,6 +432,162 @@ def format_post_time_detail(post: RecentPostSummary) -> str:
     if len(rows) == 1:
         rows.append(("时间", "暂无记录"))
     return "\n".join(f"{label}：{value}" for label, value in rows)
+
+
+def _read_post_json_for_preview(*, project_root: Path, post_id: str) -> dict[str, Any]:
+    post_file = project_root / "data" / "posts" / post_id / "post.json"
+    if not post_file.exists():
+        return {}
+    try:
+        data = json.loads(post_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _metric_row_to_dict(row: PublishedMetricTableRow | dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, PublishedMetricTableRow):
+        return {
+            "id": row.id,
+            "title": row.title,
+            "url": row.url,
+            "published_at": row.published_at,
+            "likes": row.likes,
+            "comments": row.comments,
+            "favorites": row.favorites,
+            "captured_at": row.captured_at,
+            "raw": {"views": row.views, "shares": row.shares},
+        }
+    return dict(row) if isinstance(row, dict) else {}
+
+
+def find_local_post_for_metric_row(
+    row: PublishedMetricTableRow | dict[str, Any],
+    *,
+    project_root: Path = PROJECT_ROOT,
+) -> RecentPostSummary | None:
+    post, _reason = find_post_for_published_metric(
+        _metric_row_to_dict(row),
+        base=project_root / "data",
+    )
+    if post is None:
+        return None
+    post_dir_path = project_root / "data" / "posts" / post.id
+    return _read_post_summary(post_dir_path) if post_dir_path.exists() else None
+
+
+def _preview_line(label: str, value: object) -> str:
+    text = str(value if value is not None else "").strip()
+    return f"{label}: {text}" if text else ""
+
+
+def _preview_metric_lines(metric: dict[str, Any]) -> list[str]:
+    raw = metric.get("raw") if isinstance(metric.get("raw"), dict) else {}
+    rows = [
+        ("published_at", metric.get("published_at")),
+        ("captured_at", _format_display_time(str(metric.get("captured_at") or "")) or metric.get("captured_at")),
+        ("views", raw.get("views")),
+        ("likes", metric.get("likes")),
+        ("comments", metric.get("comments")),
+        ("favorites", metric.get("favorites")),
+        ("shares", raw.get("shares")),
+        ("url", metric.get("url")),
+    ]
+    return [line for label, value in rows if (line := _preview_line(label, value))]
+
+
+def format_shared_draft_preview(
+    *,
+    post_id: str = "",
+    post: RecentPostSummary | None = None,
+    metric_row: PublishedMetricTableRow | dict[str, Any] | None = None,
+    project_root: Path = PROJECT_ROOT,
+) -> str:
+    metric = _metric_row_to_dict(metric_row)
+    if not post_id and post is not None:
+        post_id = post.post_id
+    if not post_id and metric:
+        matched = find_local_post_for_metric_row(metric, project_root=project_root)
+        if matched is not None:
+            post = matched
+            post_id = matched.post_id
+
+    data = _read_post_json_for_preview(project_root=project_root, post_id=post_id) if post_id else {}
+    if not data and post is None and not metric:
+        return "请选择左侧草稿或已发布数据行查看完整预览。"
+    if not data and post is None:
+        lines = ["已发布数据预览", "未匹配到本地草稿，以下为平台同步到的公开数据。", ""]
+        lines.extend(_preview_metric_lines(metric))
+        return "\n".join(line for line in lines if line != "")
+
+    platform = data.get("platform") if isinstance(data.get("platform"), dict) else {}
+    publish = platform.get("publish") if isinstance(platform.get("publish"), dict) else {}
+    news = platform.get("news") if isinstance(platform.get("news"), dict) else {}
+    source_api = news.get("source_api") if isinstance(news.get("source_api"), dict) else {}
+    assets = data.get("assets") if isinstance(data.get("assets"), list) else []
+    topics = data.get("topics") if isinstance(data.get("topics"), list) else []
+    actual_title = str(publish.get("actual_title") or "").strip()
+    actual_body = str(publish.get("actual_body") or "").strip()
+    title = actual_title or str(data.get("title") or (post.title if post else "") or "").strip()
+    body = actual_body or str(data.get("body") or (post.body_preview if post else "") or "").strip()
+
+    lines = [
+        "草稿预览",
+        _preview_line("title", title),
+        _preview_line("post_id", data.get("id") or post_id),
+        _preview_line("local_status", data.get("status") or (post.status if post else "")),
+        _preview_line("uploaded", "yes" if data.get("uploaded") or (post and post.uploaded) else "no"),
+        _preview_line("uploaded_at", _format_display_time(str(data.get("uploaded_at") or ""))),
+        _preview_line("updated_at", _format_display_time(str(data.get("updated_at") or ""))),
+        "",
+        "发布同步",
+        _preview_line("result", publish.get("result")),
+        _preview_line("source", publish.get("source")),
+        _preview_line("match_reason", publish.get("match_reason")),
+        _preview_line("published_at", _format_display_time(str(publish.get("published_at") or "")) or publish.get("published_at")),
+        _preview_line("url", publish.get("url")),
+    ]
+    publish_metrics = publish.get("metrics") if isinstance(publish.get("metrics"), dict) else {}
+    if publish_metrics:
+        lines.append(_preview_line("metrics", json.dumps(publish_metrics, ensure_ascii=False, separators=(",", ":"))))
+    if metric:
+        lines.append("")
+        lines.append("平台已发布数据")
+        lines.extend(_preview_metric_lines(metric))
+
+    lines.extend(
+        [
+            "",
+            "新闻来源",
+            _preview_line("api_source", news.get("api_source") or news.get("provider")),
+            _preview_line("provider", source_api.get("provider")),
+            _preview_line("item_source", source_api.get("item_source")),
+            _preview_line("item_domain", source_api.get("item_domain")),
+            _preview_line("item_url", source_api.get("item_url")),
+            "",
+            "素材",
+        ]
+    )
+    if assets:
+        for idx, asset in enumerate(assets, 1):
+            if isinstance(asset, dict):
+                lines.append(f"{idx}. {asset.get('kind', 'asset')}: {asset.get('path', '')}")
+            else:
+                lines.append(f"{idx}. {asset}")
+    else:
+        lines.append("无素材记录")
+    lines.extend(
+        [
+            "",
+            _preview_line("topics", ", ".join(str(t) for t in topics if str(t).strip())),
+            "",
+            "正文",
+            body or "无正文记录",
+        ]
+    )
+    return "\n".join(line for line in lines if line is not None)
 
 
 def extract_post_id_from_choice(value: str) -> str:
@@ -707,6 +899,41 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         args.extend(["--wait-timeout", str(wait_timeout)])
         return args
 
+    if subcommand == "publish-drafts":
+        draft_type = str(params.get("draft_type") or "image").strip()
+        date = str(params.get("date") or "").strip()
+        post_ids_raw = params.get("post_ids") or []
+        if isinstance(post_ids_raw, str):
+            post_ids = [p.strip() for p in re.split(r"[,;\s]+", post_ids_raw) if p.strip()]
+        else:
+            post_ids = [str(p).strip() for p in post_ids_raw if str(p).strip()]
+        limit = int(params.get("limit") or 0)
+        all_selected = bool(params.get("all") or False)
+        dry_run = bool(params.get("dry_run") or False)
+        headless = bool(params.get("headless") or False)
+        yes = bool(params.get("yes") or False)
+        login_hold = int(params.get("login_hold") or 0)
+        wait_timeout = int(params.get("wait_timeout") or 300)
+
+        args.extend(["--draft-type", draft_type])
+        if date:
+            args.extend(["--date", date])
+        for post_id in post_ids:
+            args.extend(["--post-id", post_id])
+        if limit:
+            args.extend(["--limit", str(limit)])
+        if all_selected:
+            args.append("--all")
+        if dry_run:
+            args.append("--dry-run")
+        if headless:
+            args.append("--headless")
+        if yes:
+            args.append("--yes")
+        args.extend(["--login-hold", str(login_hold)])
+        args.extend(["--wait-timeout", str(wait_timeout)])
+        return args
+
     if subcommand == "update-metrics":
         limit = int(params.get("limit") or 0)
         headless = bool(params.get("headless") or False)
@@ -714,6 +941,24 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         wait_timeout = int(params.get("wait_timeout") or 300)
 
         args.extend(["--limit", str(limit)])
+        if headless:
+            args.append("--headless")
+        args.extend(["--login-hold", str(login_hold)])
+        args.extend(["--wait-timeout", str(wait_timeout)])
+        return args
+
+    if subcommand == "aliyun-quota":
+        raw_models = params.get("models") or []
+        if isinstance(raw_models, str):
+            models = [m.strip() for m in re.split(r"[,;\s]+", raw_models) if m.strip()]
+        else:
+            models = [str(m).strip() for m in raw_models if str(m).strip()]
+        headless = bool(params.get("headless") or False)
+        login_hold = int(params.get("login_hold") or 0)
+        wait_timeout = int(params.get("wait_timeout") or 120)
+
+        for model in models:
+            args.extend(["--model", model])
         if headless:
             args.append("--headless")
         args.extend(["--login-hold", str(login_hold)])
@@ -994,7 +1239,7 @@ class CommandRunner:
 def main() -> None:
     # Import tkinter lazily so tests can import this module without GUI dependencies.
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import messagebox, ttk
     from tkinter.scrolledtext import ScrolledText
 
     root = tk.Tk()
@@ -1073,14 +1318,21 @@ def main() -> None:
     body.add(left, weight=3)
     body.add(right, weight=2)
 
-    log_header = ttk.Frame(right)
+    right_stack = ttk.PanedWindow(right, orient="vertical")
+    right_stack.pack(fill="both", expand=True)
+    log_panel = ttk.Frame(right_stack)
+    preview_panel = ttk.Frame(right_stack, style="Panel.TFrame")
+    right_stack.add(log_panel, weight=3)
+    right_stack.add(preview_panel, weight=2)
+
+    log_header = ttk.Frame(log_panel)
     log_header.pack(fill="x", pady=(0, 8))
     ttk.Label(log_header, text="运行日志", style="Section.TLabel").pack(side="left")
     ttk.Label(log_header, text="实时输出 CLI 子进程", style="Muted.TLabel").pack(side="left", padx=(10, 0))
 
     log = ScrolledText(
-        right,
-        height=28,
+        log_panel,
+        height=16,
         bg="#171411",
         fg="#f6eadb",
         insertbackground="#f6eadb",
@@ -1089,6 +1341,35 @@ def main() -> None:
         wrap="word",
     )
     log.pack(fill="both", expand=True)
+
+    preview_header = ttk.Frame(preview_panel, style="Panel.TFrame")
+    preview_header.pack(fill="x", padx=10, pady=(10, 6))
+    ttk.Label(preview_header, text="草稿预览", style="PanelSection.TLabel").pack(side="left")
+    ttk.Label(
+        preview_header,
+        text="选中草稿处理 / 发布草稿 / 已发布数据中的记录后在这里查看完整信息",
+        style="PanelMuted.TLabel",
+    ).pack(side="left", padx=(10, 0))
+
+    shared_preview = ScrolledText(
+        preview_panel,
+        height=16,
+        bg="#fffaf0",
+        fg=palette["ink"],
+        insertbackground=palette["ink"],
+        relief="flat",
+        font=base_font,
+        wrap="word",
+    )
+    shared_preview.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _set_shared_preview(text: str) -> None:
+        shared_preview.configure(state="normal")
+        shared_preview.delete("1.0", "end")
+        shared_preview.insert("1.0", text)
+        shared_preview.configure(state="disabled")
+
+    _set_shared_preview("请选择左侧草稿或已发布数据行查看完整预览。")
 
     ui_events = UiEventQueue()
 
@@ -1128,7 +1409,7 @@ def main() -> None:
 
     runner = CommandRunner(on_line=log_line, on_exit=log_exit, on_status=log_status)
 
-    log_actions = ttk.Frame(right)
+    log_actions = ttk.Frame(log_panel)
     log_actions.pack(fill="x", pady=(8, 0))
     ttk.Button(log_actions, text="停止当前任务", command=runner.stop).pack(side="left")
     ttk.Button(log_actions, text="清空日志", command=lambda: log.delete("1.0", "end")).pack(
@@ -1328,6 +1609,9 @@ def main() -> None:
     quick_titles = ttk.Frame(auto_grid)
     quick_titles.grid(row=1, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
     ttk.Button(quick_titles, text="每日新闻", command=lambda: title_var.set("每日新闻")).pack(side="left")
+    ttk.Button(quick_titles, text="每日AI讯息", command=lambda: title_var.set("每日AI讯息")).pack(
+        side="left", padx=(8, 0)
+    )
     ttk.Button(quick_titles, text="每日假新闻", command=lambda: title_var.set("每日假新闻")).pack(
         side="left", padx=(8, 0)
     )
@@ -1652,12 +1936,14 @@ def main() -> None:
         else:
             _set_post_time_detail("暂无本地草稿时间记录。")
             _set_post_detail("暂无本地草稿。")
+            _set_shared_preview("暂无本地草稿。")
 
     def _on_post_id_change(*_args) -> None:
         pid = extract_post_id_from_choice(post_id_var.get())
         if not pid:
             _set_post_time_detail("请选择一个本地草稿以查看北京时间。")
             _set_post_detail("请选择一个本地草稿。")
+            _set_shared_preview("请选择一个本地草稿。")
             return
         cur_assets = assets_glob_var.get().strip()
         if not cur_assets or cur_assets.startswith("data/posts/"):
@@ -1666,9 +1952,17 @@ def main() -> None:
         if summary:
             _set_post_time_detail(format_post_time_detail(summary))
             _set_post_detail(format_post_detail(summary))
+            _set_shared_preview(
+                format_shared_draft_preview(
+                    post_id=pid,
+                    post=summary,
+                    project_root=PROJECT_ROOT,
+                )
+            )
         else:
             _set_post_time_detail("未找到本地草稿时间记录。")
             _set_post_detail(f"未找到本地草稿：{pid}")
+            _set_shared_preview(f"未找到本地草稿：{pid}")
 
     post_id_var.trace_add("write", _on_post_id_change)
     ttk.Button(run_grid, text="刷新", command=_refresh_post_ids).grid(
@@ -1720,6 +2014,221 @@ def main() -> None:
         side="left", padx=(8, 0)
     )
     _refresh_post_ids()
+
+    # --- Publish creator-center drafts tab ---
+    tab_publish = ttk.Frame(nb)
+    nb.add(tab_publish, text="发布草稿")
+    publish_intro = ttk.Frame(tab_publish)
+    publish_intro.pack(fill="x", padx=4, pady=(10, 8))
+    ttk.Label(publish_intro, text="从小红书创作者中心草稿箱发布", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(
+        publish_intro,
+        text="先在表格里预览本地已上传草稿；可按北京时间日期筛选，也可多选具体草稿。正式发布前会再次确认。",
+        style="Muted.TLabel",
+        wraplength=720,
+    ).pack(anchor="w", pady=(2, 0))
+
+    publish_filter = ttk.Frame(tab_publish, style="Panel.TFrame", padding=(12, 10))
+    publish_filter.pack(fill="x", padx=4, pady=(0, 10))
+    publish_filter.columnconfigure(3, weight=1)
+    publish_date_var = tk.StringVar(value=datetime.now(BEIJING_TZ).strftime("%Y-%m-%d"))
+    publish_limit_var = tk.IntVar(value=0)
+    publish_dry_var = tk.BooleanVar(value=True)
+    publish_headless_var = tk.BooleanVar(value=False)
+    publish_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
+    publish_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
+    publish_status_var = tk.StringVar(value="点击刷新读取本地已上传草稿。")
+
+    ttk.Label(publish_filter, text="发布日期（北京时间）", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Entry(publish_filter, textvariable=publish_date_var, width=16).grid(row=0, column=1, sticky="w", padx=(8, 18))
+    ttk.Label(publish_filter, text="limit", style="Panel.TLabel").grid(row=0, column=2, sticky="e")
+    ttk.Spinbox(publish_filter, from_=0, to=500, textvariable=publish_limit_var, width=8).grid(
+        row=0, column=3, sticky="w", padx=(8, 0)
+    )
+    ttk.Label(
+        publish_filter,
+        text="日期留空则显示全部本地已上传且未发布的草稿；limit=0 表示不限制。",
+        style="PanelMuted.TLabel",
+    ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+    publish_options = ttk.Frame(tab_publish, style="Panel.TFrame", padding=(12, 10))
+    publish_options.pack(fill="x", padx=4, pady=(0, 10))
+    ttk.Checkbutton(
+        publish_options,
+        text="只预览，不发布（推荐先运行）",
+        variable=publish_dry_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=0, column=0, sticky="w")
+    ttk.Checkbutton(
+        publish_options,
+        text="无界面发布（需要已登录 Profile）",
+        variable=publish_headless_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=0, column=1, sticky="w", padx=(18, 0))
+    ttk.Label(publish_options, text="登录等待（秒）", style="Panel.TLabel").grid(row=0, column=2, sticky="e", padx=(18, 8))
+    ttk.Spinbox(publish_options, from_=0, to=3600, textvariable=publish_login_hold_var, width=8).grid(
+        row=0, column=3, sticky="w"
+    )
+    ttk.Label(publish_options, text="页面等待（秒）", style="Panel.TLabel").grid(row=1, column=2, sticky="e", padx=(18, 8), pady=(6, 0))
+    ttk.Spinbox(publish_options, from_=30, to=3600, textvariable=publish_wait_timeout_var, width=8).grid(
+        row=1, column=3, sticky="w", pady=(6, 0)
+    )
+
+    publish_panel = ttk.Frame(tab_publish, style="Panel.TFrame", padding=(12, 10))
+    publish_panel.pack(fill="both", expand=True, padx=4, pady=(0, 10))
+    publish_panel.columnconfigure(0, weight=1)
+    publish_panel.rowconfigure(2, weight=1)
+    ttk.Label(publish_panel, textvariable=publish_status_var, style="PanelMuted.TLabel", wraplength=720).grid(
+        row=0, column=0, columnspan=2, sticky="we"
+    )
+
+    publish_columns = [
+        ("title", "标题", 220, "w"),
+        ("uploaded_at", "上传时间（北京时间）", 178, "w"),
+        ("status", "本地状态", 90, "center"),
+        ("assets", "素材", 54, "e"),
+        ("post_id", "post_id", 230, "w"),
+    ]
+    publish_tree = ttk.Treeview(
+        publish_panel,
+        columns=[c[0] for c in publish_columns],
+        show="headings",
+        height=10,
+        selectmode="extended",
+    )
+    publish_tree.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+    publish_tree_y = ttk.Scrollbar(publish_panel, orient="vertical", command=publish_tree.yview)
+    publish_tree_y.grid(row=2, column=1, sticky="ns", pady=(8, 0))
+    publish_tree.configure(yscrollcommand=publish_tree_y.set)
+    for field, label, width, anchor in publish_columns:
+        publish_tree.heading(field, text=label)
+        publish_tree.column(field, width=width, minwidth=48, anchor=anchor, stretch=(field == "title"))
+
+    publish_preview = ScrolledText(
+        publish_panel,
+        height=9,
+        bg="#fffaf0",
+        fg=palette["ink"],
+        insertbackground=palette["ink"],
+        relief="solid",
+        bd=1,
+        font=base_font,
+        wrap="word",
+    )
+    publish_preview.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+    publish_rows: dict[str, RecentPostSummary] = {}
+
+    def _set_publish_preview(text: str) -> None:
+        publish_preview.configure(state="normal")
+        publish_preview.delete("1.0", "end")
+        publish_preview.insert("1.0", text)
+        publish_preview.configure(state="disabled")
+
+    def _publish_tree_values(post: RecentPostSummary) -> tuple[object, ...]:
+        return (
+            _clean_display_title(post.title),
+            _format_display_time(post.uploaded_at or post.updated_at or post.created_at),
+            post.status,
+            post.asset_count,
+            post.post_id,
+        )
+
+    def _selected_publish_post_ids() -> list[str]:
+        return [str(item) for item in publish_tree.selection() if str(item) in publish_rows]
+
+    def _refresh_publish_drafts() -> None:
+        publish_tree.delete(*publish_tree.get_children())
+        publish_rows.clear()
+        items = list_publishable_drafts(
+            project_root=PROJECT_ROOT,
+            date=publish_date_var.get().strip(),
+            limit=publish_limit_var.get() or 200,
+        )
+        for idx, post in enumerate(items):
+            publish_rows[post.post_id] = post
+            tag = "odd" if idx % 2 else "even"
+            publish_tree.insert("", "end", iid=post.post_id, values=_publish_tree_values(post), tags=(tag,))
+        publish_tree.tag_configure("even", background=palette["panel"])
+        publish_tree.tag_configure("odd", background=palette["soft"])
+        if items:
+            publish_status_var.set(f"已加载 {len(items)} 条可发布草稿。选中一条或多条可只发布选中项；不选中则按当前日期筛选结果发布。")
+        else:
+            publish_status_var.set("未找到匹配的本地已上传草稿。请先用自动发帖/草稿处理上传到小红书草稿箱。")
+        _on_publish_selection_change()
+
+    def _on_publish_selection_change(_evt=None) -> None:
+        selected_ids = _selected_publish_post_ids()
+        if selected_ids:
+            selected = [publish_rows[pid] for pid in selected_ids]
+            lines = [f"已选择 {len(selected)} 条草稿："]
+        else:
+            selected = list(publish_rows.values())
+            lines = [f"未单独选择草稿；将按当前筛选结果处理 {len(selected)} 条。"]
+        for post in selected[:8]:
+            lines.append("")
+            lines.append(format_post_detail(post))
+        if len(selected) > 8:
+            lines.append(f"\n... 还有 {len(selected) - 8} 条未显示")
+        _set_publish_preview("\n".join(lines) if selected else "暂无可预览草稿。")
+        if selected:
+            shared = format_shared_draft_preview(
+                post_id=selected[0].post_id,
+                post=selected[0],
+                project_root=PROJECT_ROOT,
+            )
+            if len(selected) > 1:
+                shared += f"\n\n---\n当前共选择 {len(selected)} 条草稿，右侧预览显示第一条。"
+            _set_shared_preview(shared)
+        else:
+            _set_shared_preview("暂无可预览草稿。")
+
+    publish_tree.bind("<<TreeviewSelect>>", _on_publish_selection_change)
+
+    publish_buttons = ttk.Frame(tab_publish)
+    publish_buttons.pack(fill="x", padx=4, pady=(0, 12))
+
+    def _run_publish_drafts() -> None:
+        selected_ids = _selected_publish_post_ids()
+        target_count = len(selected_ids) if selected_ids else len(publish_rows)
+        if target_count <= 0:
+            log_line("[gui] 没有可发布的草稿。\n")
+            return
+        dry_run = publish_dry_var.get()
+        if not dry_run:
+            ok = messagebox.askyesno(
+                "确认发布草稿",
+                f"将从小红书创作者中心发布 {target_count} 条草稿。\n\n确认继续吗？",
+            )
+            if not ok:
+                log_line("[gui] 已取消发布草稿。\n")
+                return
+        if not runner.is_running():
+            post_command_success_callbacks.append(_refresh_publish_drafts)
+            post_command_success_callbacks.append(_refresh_post_ids)
+        _run_command(
+            "publish-drafts",
+            {
+                "draft_type": "image",
+                "date": publish_date_var.get().strip(),
+                "post_ids": selected_ids,
+                "limit": publish_limit_var.get(),
+                "dry_run": dry_run,
+                "headless": publish_headless_var.get(),
+                "yes": not dry_run,
+                "login_hold": publish_login_hold_var.get(),
+                "wait_timeout": publish_wait_timeout_var.get(),
+            },
+            _collect_env_overrides(),
+        )
+
+    ttk.Button(publish_buttons, text="刷新可发布草稿", command=_refresh_publish_drafts).pack(side="left")
+    ttk.Button(
+        publish_buttons,
+        text="发布/预览选中的草稿",
+        command=_run_publish_drafts,
+        style="Accent.TButton",
+    ).pack(side="left", padx=(8, 0))
+    _refresh_publish_drafts()
 
     # --- Published metrics tab ---
     tab_metrics = ttk.Frame(nb)
@@ -1828,6 +2337,7 @@ def main() -> None:
 
     metric_sort_state = {"field": "captured_at", "descending": True}
     metric_table_rows: list[PublishedMetricTableRow] = []
+    metric_row_lookup: dict[str, PublishedMetricTableRow] = {}
 
     def _metric_table_display_path(path: Path) -> str:
         try:
@@ -1858,11 +2368,23 @@ def main() -> None:
 
     def _render_metric_table(rows: list[PublishedMetricTableRow]) -> None:
         metrics_tree.delete(*metrics_tree.get_children())
+        metric_row_lookup.clear()
         for idx, row in enumerate(rows):
             tag = "odd" if idx % 2 else "even"
-            metrics_tree.insert("", "end", values=_metric_table_values(row), tags=(tag,))
+            iid = f"metric-{idx}"
+            metric_row_lookup[iid] = row
+            metrics_tree.insert("", "end", iid=iid, values=_metric_table_values(row), tags=(tag,))
         metrics_tree.tag_configure("even", background=palette["panel"])
         metrics_tree.tag_configure("odd", background=palette["soft"])
+
+    def _on_metric_selection_change(_evt=None) -> None:
+        selected = metrics_tree.selection()
+        if not selected:
+            return
+        row = metric_row_lookup.get(str(selected[0]))
+        if row is None:
+            return
+        _set_shared_preview(format_shared_draft_preview(metric_row=row, project_root=PROJECT_ROOT))
 
     def _refresh_metric_table() -> None:
         nonlocal metric_table_rows
@@ -1927,10 +2449,13 @@ def main() -> None:
         metric_status_var.set("已根据本地已发布数据生成发布方向分析；如刚同步完平台数据，可再次点击分析刷新结论。")
 
     _configure_metric_table_headings()
+    metrics_tree.bind("<<TreeviewSelect>>", _on_metric_selection_change)
 
     def _run_update_metrics() -> None:
         if not runner.is_running():
             post_command_success_callbacks.append(_refresh_metric_table)
+            post_command_success_callbacks.append(_refresh_post_ids)
+            post_command_success_callbacks.append(_refresh_publish_drafts)
         _run_command(
             "update-metrics",
             {
@@ -2114,6 +2639,66 @@ def main() -> None:
 
     ttk.Button(cfg_buttons, text="保存 .env.gui", command=_save_env_gui, style="Accent.TButton").pack(side="left")
     ttk.Button(cfg_buttons, text="重新加载 .env.gui", command=_reload_env_gui).pack(side="left", padx=(8, 0))
+
+    quota_panel = ttk.Frame(tab_cfg, style="Panel.TFrame", padding=(12, 10))
+    quota_panel.pack(fill="x", padx=4, pady=(14, 10))
+    quota_panel.columnconfigure(1, weight=1)
+    ttk.Label(quota_panel, text="阿里云百炼额度查询", style="PanelSection.TLabel").grid(
+        row=0, column=0, columnspan=4, sticky="w"
+    )
+    ttk.Label(
+        quota_panel,
+        text="Aliyun Bailian quota: 读取官方免费额度页；首次使用请用可视浏览器登录，之后可尝试无界面查询。",
+        style="PanelMuted.TLabel",
+        wraplength=720,
+    ).grid(row=1, column=0, columnspan=4, sticky="we", pady=(2, 8))
+
+    quota_models_var = tk.StringVar(value="qwen3.7-plus,wan2.7-image,wan2.7-image-pro")
+    quota_headless_var = tk.BooleanVar(value=False)
+    quota_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
+    quota_wait_timeout_var = tk.IntVar(value=120)
+
+    ttk.Label(quota_panel, text="模型筛选", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=5)
+    ttk.Entry(quota_panel, textvariable=quota_models_var, width=52).grid(
+        row=2, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=5
+    )
+    ttk.Checkbutton(
+        quota_panel,
+        text="无界面查询",
+        variable=quota_headless_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=3, column=0, sticky="w", pady=5)
+    ttk.Label(quota_panel, text="登录等待（秒）", style="Panel.TLabel").grid(
+        row=3, column=1, sticky="e", padx=(10, 8), pady=5
+    )
+    ttk.Spinbox(quota_panel, from_=0, to=3600, textvariable=quota_login_hold_var, width=8).grid(
+        row=3, column=2, sticky="w", pady=5
+    )
+    ttk.Label(quota_panel, text="页面等待（秒）", style="Panel.TLabel").grid(
+        row=4, column=1, sticky="e", padx=(10, 8), pady=5
+    )
+    ttk.Spinbox(quota_panel, from_=30, to=3600, textvariable=quota_wait_timeout_var, width=8).grid(
+        row=4, column=2, sticky="w", pady=5
+    )
+
+    def _run_aliyun_quota() -> None:
+        _run_command(
+            "aliyun-quota",
+            {
+                "models": quota_models_var.get(),
+                "headless": quota_headless_var.get(),
+                "login_hold": quota_login_hold_var.get(),
+                "wait_timeout": quota_wait_timeout_var.get(),
+            },
+            _collect_env_overrides(),
+        )
+
+    ttk.Button(
+        quota_panel,
+        text="查询阿里云百炼额度",
+        command=_run_aliyun_quota,
+        style="Accent.TButton",
+    ).grid(row=5, column=0, sticky="w", pady=(10, 0))
 
     root.mainloop()
 

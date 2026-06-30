@@ -60,6 +60,22 @@ NEWSAPI_BASE_URL = "https://newsapi.org"
 GNEWS_BASE_URL = "https://gnews.io/api/v4"
 JUHE_NEWS_BASE_URL = "https://v.juhe.cn/toutiao"
 JUHE_FINANCE_NEWS_BASE_URL = "https://apis.juhe.cn/fapigx/caijing"
+HOTNEWS_BASE_URL = "https://orz.ai/api/v1/dailynews"
+HOTNEWS_DEFAULT_PLATFORMS = (
+    "jinritoutiao",
+    "sina_finance",
+    "cls",
+    "baidu",
+    "weibo",
+    "hackernews",
+)
+HOTNEWS_CHINA_PLATFORMS = {
+    "baidu",
+    "weibo",
+    "jinritoutiao",
+    "sina_finance",
+    "cls",
+}
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
 _CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
@@ -1272,6 +1288,132 @@ def _juhe_fetch_articles(
     raise RuntimeError("Juhe appkey missing")
 
 
+def _hotnews_base_url() -> str:
+    return (os.getenv("HOTNEWS_BASE_URL") or HOTNEWS_BASE_URL).strip().rstrip("/")
+
+
+def _hotnews_platforms(value: Optional[str] = None) -> list[str]:
+    raw = os.getenv("HOTNEWS_PLATFORMS") if value is None else value
+    platforms = _split_news_queries(raw)
+    if not platforms:
+        platforms = list(HOTNEWS_DEFAULT_PLATFORMS)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for platform in platforms:
+        key = platform.strip().lower()
+        if not key or key in seen:
+            continue
+        deduped.append(key)
+        seen.add(key)
+    return deduped
+
+
+def _hotnews_request_json(
+    *,
+    base_url: str,
+    platform: str,
+    timeout_s: float,
+) -> dict[str, Any]:
+    url = f"{base_url.rstrip('/')}?{urllib.parse.urlencode({'platform': platform})}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (redbook_workflow)"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HotNews HTTP error {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        reason = _juhe_text(getattr(exc, "reason", "") or "network error")
+        raise RuntimeError(f"HotNews request failed: {reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("HotNews request timed out") from exc
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("HotNews response is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("HotNews response is not an object")
+    status = data.get("status")
+    if str(status) not in ("", "200") and status is not None:
+        reason = _juhe_text(data.get("msg") or data.get("message") or "unknown")
+        raise RuntimeError(f"HotNews error: status={status}, reason={reason}")
+    return data
+
+
+def _hotnews_records_from_data(data: dict[str, Any]) -> list[Any]:
+    records = data.get("data")
+    if isinstance(records, dict):
+        records = records.get("items") or records.get("list") or records.get("news") or []
+    if not isinstance(records, list):
+        return []
+    return records
+
+
+def _hotnews_fetch_articles(
+    *,
+    base_url: str,
+    platforms: list[str],
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    limit = max(1, int(max_records))
+    items: list[NewsItem] = []
+    seen: set[str] = set()
+    platform_errors: list[str] = []
+    for platform in platforms:
+        try:
+            data = _hotnews_request_json(
+                base_url=base_url,
+                platform=platform,
+                timeout_s=timeout_s,
+            )
+        except Exception as exc:
+            platform_errors.append(f"{platform}: {exc}")
+            continue
+        for record in _hotnews_records_from_data(data):
+            if not isinstance(record, dict):
+                continue
+            title = _juhe_first_text(record, ("title", "name"))
+            url_item = _juhe_first_text(record, ("url", "link", "mobile_url", "share_url"))
+            if not title or not url_item:
+                continue
+            key = url_item or f"{platform}:{title}"
+            if key in seen:
+                continue
+            seen.add(key)
+            domain = urllib.parse.urlparse(url_item).netloc.strip().lower() or None
+            description = _juhe_first_text(
+                record,
+                ("desc", "description", "summary", "abstract", "digest", "content"),
+            ) or None
+            seendate = _juhe_first_text(
+                record,
+                ("published_at", "publishedAt", "pubDate", "date", "time", "created_at"),
+            ) or None
+            items.append(
+                NewsItem(
+                    title=title,
+                    url=url_item,
+                    source=f"hotnews:{platform}",
+                    description=description,
+                    content=description,
+                    domain=domain,
+                    seendate=seendate,
+                    language="en" if platform == "hackernews" else "zh",
+                    socialimage=_juhe_first_text(record, ("image", "cover", "pic", "picUrl")) or None,
+                    sourcecountry="cn" if platform in HOTNEWS_CHINA_PLATFORMS else None,
+                )
+            )
+            if len(items) >= limit:
+                return items
+    if not items and platform_errors:
+        raise RuntimeError("; ".join(platform_errors[-3:]))
+    return items
+
+
 def _file_fetch_articles(*, path: str, max_records: int) -> list[NewsItem]:
     file_path = Path(path)
     data = json.loads(file_path.read_text(encoding="utf-8"))
@@ -1340,44 +1482,45 @@ def fetch_daily_news_candidates(
     from_iso = start_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
     to_iso = end_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    provider_attempts: list[str]
+    provider_plan: list[str]
     if provider_env:
-        provider_attempts = [provider_env]
+        provider_plan = [provider_env]
     else:
         file_path = (os.getenv("NEWS_CANDIDATES_FILE") or "").strip()
         if file_path:
-            provider_attempts = ["file"]
+            provider_plan = ["file"]
         else:
             # Auto: prefer keyed APIs when configured. Do not fall back to
-            # scraper-like sources that only provide partial snippets.
-            provider_attempts = []
+            # GDELT-like snippet sources; hot_news is kept as the final hot-list fallback.
+            provider_plan = []
             try:
                 _load_newsapi_config()
-                provider_attempts.append("newsapi")
+                provider_plan.append("newsapi")
             except Exception:
                 pass
             try:
                 _load_gnews_config()
-                provider_attempts.append("gnews")
+                provider_plan.append("gnews")
             except Exception:
                 pass
             try:
                 _load_juhe_config()
-                provider_attempts.append("juhe")
+                provider_plan.append("juhe")
             except Exception:
                 pass
-    provider_attempts = list(dict.fromkeys(provider_attempts))
+            provider_plan.append("hotnews")
+    provider_plan = list(dict.fromkeys(provider_plan))
 
-    supported_providers = ("newsapi", "gnews", "juhe", "file")
-    unsupported = [p for p in provider_attempts if p not in supported_providers]
+    supported_providers = ("newsapi", "gnews", "juhe", "hotnews", "file")
+    unsupported = [p for p in provider_plan if p not in supported_providers]
     if unsupported:
         raise RuntimeError(
             f"unsupported NEWS_PROVIDER={unsupported[0]!r}; supported: {', '.join(supported_providers)}"
         )
-    if not provider_attempts:
+    if not provider_plan:
         raise RuntimeError(
             "no news provider configured; set NEWS_PROVIDER=file with NEWS_CANDIDATES_FILE, "
-            "or configure NEWS_API_KEY / GNEWS_API_KEY / JUHE_NEWS_APPKEY"
+            "configure NEWS_API_KEY / GNEWS_API_KEY / JUHE_NEWS_APPKEY, or use NEWS_PROVIDER=hotnews"
         )
 
     hint_query = (prompt_hint or "").strip()
@@ -1395,19 +1538,24 @@ def fetch_daily_news_candidates(
     last_err: Optional[str] = None
     provider_errors: list[str] = []
     chosen_query = queries[0] if queries else DEFAULT_QUERY
-    chosen_provider = provider_attempts[0]
+    chosen_provider = provider_plan[0]
+    chosen_source_api: dict[str, Any] = {"provider": chosen_provider}
     candidates: list[NewsItem] = []
     queries_used: list[str] = []
     used_time_range = False
-    for provider in provider_attempts:
+    provider_attempts: list[str] = []
+    for provider in provider_plan:
+        if provider not in provider_attempts:
+            provider_attempts.append(provider)
         provider_candidates: list[NewsItem] = []
-        provider_queries = queries[:1] if provider == "file" else queries
+        provider_queries = queries[:1] if provider in ("file", "hotnews") else queries
         for q in provider_queries:
             chosen_provider = provider
             chosen_query = q
             try:
                 if provider == "newsapi":
                     api_key, base_url = _load_newsapi_config()
+                    chosen_source_api = {"provider": "newsapi", "base_url": base_url}
                     sort_by = "relevancy" if q in (hint_query, hint_en) and q else "publishedAt"
                     raw = _newsapi_fetch_articles(
                         api_key=api_key,
@@ -1444,6 +1592,7 @@ def fetch_daily_news_candidates(
                         candidates = []
                 elif provider == "gnews":
                     api_key, base_url = _load_gnews_config()
+                    chosen_source_api = {"provider": "gnews", "base_url": base_url}
                     raw = _gnews_fetch_articles(
                         api_key=api_key,
                         base_url=base_url,
@@ -1474,6 +1623,11 @@ def fetch_daily_news_candidates(
                         candidates = []
                 elif provider == "juhe":
                     cfg = _load_juhe_config()
+                    chosen_source_api = {
+                        "provider": "juhe",
+                        "news_base_url": cfg.news_base_url,
+                        "finance_base_url": cfg.finance_base_url,
+                    }
                     raw = _juhe_fetch_articles(
                         news_key=cfg.news_key,
                         finance_key=cfg.finance_key,
@@ -1490,10 +1644,26 @@ def fetch_daily_news_candidates(
                             in_today.append(item)
                     candidates = in_today or raw
                     used_time_range = bool(in_today)
+                elif provider == "hotnews":
+                    base_url = _hotnews_base_url()
+                    platforms = _hotnews_platforms()
+                    chosen_source_api = {
+                        "provider": "hotnews",
+                        "base_url": base_url,
+                        "platforms": platforms,
+                    }
+                    candidates = _hotnews_fetch_articles(
+                        base_url=base_url,
+                        platforms=platforms,
+                        max_records=max_records,
+                        timeout_s=timeout_s,
+                    )
+                    used_time_range = False
                 else:
                     file_path = (os.getenv("NEWS_CANDIDATES_FILE") or "").strip()
                     if not file_path:
                         raise RuntimeError("NEWS_CANDIDATES_FILE is required when NEWS_PROVIDER=file")
+                    chosen_source_api = {"provider": "file", "file_path": file_path}
                     candidates = _file_fetch_articles(
                         path=file_path,
                         max_records=max_records,
@@ -1531,9 +1701,19 @@ def fetch_daily_news_candidates(
         raise RuntimeError(
             f"no news returned (providers={','.join(provider_attempts)}, query={chosen_query}, err={last_err})"
         )
+    chosen_source_api = {
+        **chosen_source_api,
+        "provider": chosen_provider,
+        "query": chosen_query,
+        "provider_plan": provider_plan,
+        "provider_attempts": provider_attempts,
+    }
 
     meta: dict[str, Any] = {
         "provider": chosen_provider,
+        "api_source": chosen_provider,
+        "source_api": chosen_source_api,
+        "provider_plan": provider_plan,
         "provider_attempts": provider_attempts,
         "provider_errors": provider_errors[-10:],
         "tz": tz_name,

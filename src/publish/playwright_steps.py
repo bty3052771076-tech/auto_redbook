@@ -1457,7 +1457,7 @@ def _collect_draft_items(page, *, limit: Optional[int] = None) -> list[dict[str,
             saved_at = (item.locator(".draft-time").first.text_content() or "").strip()
         except Exception:
             saved_at = ""
-        items.append({"title": title, "saved_at": saved_at})
+        items.append({"index": str(i), "title": title, "saved_at": saved_at})
     return items
 
 
@@ -1616,6 +1616,14 @@ def _draft_title_matches_expected(actual: str, expected: str) -> bool:
     if not terms:
         return expected_text[:6] in actual_text
     return any(term and term in actual_text for term in terms)
+
+
+def _draft_item_matches_post(item: dict[str, str], post: Post) -> bool:
+    title = str(item.get("title") or "").strip()
+    expected = str(getattr(post, "title", "") or "").strip()
+    if not title or not expected:
+        return False
+    return _draft_title_matches_expected(title, expected)
 
 
 def _count_uploaded_images(page) -> int:
@@ -1922,6 +1930,75 @@ def _read_target_value(target) -> str:
             return ""
 
 
+def _read_editor_draft_snapshot(page) -> dict[str, str]:
+    try:
+        data = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 1 && rect.height > 1 &&
+                  style.visibility !== 'hidden' && style.display !== 'none';
+              };
+              const textOf = (el) => {
+                if (!el) return '';
+                const tag = (el.tagName || '').toLowerCase();
+                if (tag === 'input' || tag === 'textarea') return (el.value || '').trim();
+                return (el.innerText || el.textContent || '').trim();
+              };
+              const titleSelectors = [
+                "input[placeholder*='标题']",
+                "input[aria-label*='标题']",
+                "input[type='text']"
+              ];
+              let title = '';
+              for (const sel of titleSelectors) {
+                const nodes = Array.from(document.querySelectorAll(sel)).filter(visible);
+                const hit = nodes.find(el => textOf(el));
+                if (hit) {
+                  title = textOf(hit);
+                  break;
+                }
+              }
+              const bodySelectors = [
+                "textarea[placeholder*='正文']",
+                "textarea[placeholder*='内容']",
+                "[contenteditable='true']",
+                "[role='textbox']",
+                ".ProseMirror",
+                ".ql-editor"
+              ];
+              const bodies = [];
+              for (const sel of bodySelectors) {
+                for (const el of Array.from(document.querySelectorAll(sel)).filter(visible)) {
+                  const text = textOf(el);
+                  if (!text || text === title) continue;
+                  if (text.length < 2) continue;
+                  bodies.push(text);
+                }
+              }
+              bodies.sort((a, b) => b.length - a.length);
+              return {
+                actual_title: title,
+                actual_body: bodies[0] || ''
+              };
+            }
+            """
+        )
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in ("actual_title", "actual_body"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            out[key] = value
+    return out
+
+
 def _matches_value(actual: str, expected: str) -> bool:
     if not actual:
         return False
@@ -2041,6 +2118,323 @@ def _wait_for_upload_settle(
                 return True
         time.sleep(1)
     return False
+
+
+def _target_url_for_draft_type(draft_type: str) -> str:
+    dtype = (draft_type or "image").strip().lower()
+    if dtype == "video":
+        return "https://creator.xiaohongshu.com/publish/publish?target=video"
+    if dtype in ("article", "long"):
+        return "https://creator.xiaohongshu.com/publish/publish?target=article"
+    return TARGET_URL
+
+
+def _open_platform_draft_list(
+    page,
+    *,
+    draft_type: str,
+    login_hold: int,
+    wait_timeout_ms: int,
+    headless: bool,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> None:
+    url = _target_url_for_draft_type(draft_type)
+    _emit_progress(progress_callback, "open_publish_page", "in_progress", url)
+    page.goto(url, wait_until="domcontentloaded")
+    _wait_for_xhs_ready(
+        page,
+        login_hold=login_hold,
+        headless=headless,
+        progress_callback=progress_callback,
+    )
+    _wait_for_any_text(page, WAIT_TEXTS, wait_timeout_ms)
+    if not _open_draft_box(page):
+        raise RuntimeError("draft box not found")
+    if not _open_draft_tab(page, draft_type):
+        raise RuntimeError(f"draft tab not found for type={draft_type}")
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if page.locator(DRAFT_ITEM_SELECTOR).count() > 0:
+            break
+        time.sleep(1)
+    _emit_progress(progress_callback, "open_draft_list", "success", f"type={draft_type}")
+
+
+def _find_platform_draft_index_for_post(page, post: Post) -> tuple[Optional[int], dict[str, str]]:
+    items = _collect_draft_items(page, limit=None)
+    for item in items:
+        if not _draft_item_matches_post(item, post):
+            continue
+        try:
+            return int(item.get("index", "0")), item
+        except ValueError:
+            return 0, item
+    return None, {}
+
+
+def _open_draft_editor_for_post(page, post: Post) -> dict[str, str]:
+    idx, item_data = _find_platform_draft_index_for_post(page, post)
+    if idx is None:
+        raise RuntimeError(f"draft not found for post_id={post.id} title={post.title}")
+    item = page.locator(DRAFT_ITEM_SELECTOR).nth(idx)
+    try:
+        item.scroll_into_view_if_needed()
+        item.hover()
+    except Exception:
+        pass
+
+    click_error = None
+    for selector in (
+        ".draft-actions .btn:has-text('编辑')",
+        ".draft-actions button:has-text('编辑')",
+        ".draft-actions .btn:has-text('继续编辑')",
+        ".draft-actions button:has-text('继续编辑')",
+        ".draft-cover",
+        ".draft-title-text",
+    ):
+        try:
+            target = item.locator(selector)
+            if target.count() > 0:
+                target.first.scroll_into_view_if_needed()
+                target.first.click(force=True)
+                break
+        except Exception as exc:
+            click_error = exc
+    else:
+        try:
+            item.click(force=True)
+        except Exception as exc:
+            raise RuntimeError(f"open draft failed: {click_error or exc}") from exc
+
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:
+        pass
+    try:
+        _wait_for_any_text(page, WAIT_TEXTS, 30000)
+    except Exception:
+        pass
+    return item_data
+
+
+def _click_publish_button(page) -> str:
+    detail = page.evaluate(
+        """
+        () => {
+          const labels = ['发布', '立即发布', '发布笔记'];
+          const nodes = Array.from(document.querySelectorAll(
+            'button,[role="button"],.btn,.d-button,.publish,.publish-btn'
+          ));
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 1 && rect.height > 1 &&
+              style.visibility !== 'hidden' && style.display !== 'none' &&
+              !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+          };
+          const candidates = nodes
+            .map((el) => {
+              const text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
+              const rect = el.getBoundingClientRect();
+              return {el, text, rect};
+            })
+            .filter((it) => visible(it.el))
+            .filter((it) => labels.some((label) => it.text === label || it.text.includes(label)))
+            .filter((it) => !it.text.includes('暂存') && !it.text.includes('草稿'));
+          if (!candidates.length) return '';
+          candidates.sort((a, b) => {
+            const bottom = b.rect.bottom - a.rect.bottom;
+            if (Math.abs(bottom) > 2) return bottom;
+            return b.rect.right - a.rect.right;
+          });
+          const picked = candidates[0];
+          picked.el.click();
+          return `${picked.text}@${Math.round(picked.rect.left)},${Math.round(picked.rect.top)}`;
+        }
+        """
+    )
+    if not detail:
+        raise RuntimeError("publish button not found")
+    return str(detail)
+
+
+def _confirm_publish_dialog(page, timeout_s: float = 5.0) -> bool:
+    deadline = time.time() + max(0.0, timeout_s)
+    while time.time() < deadline:
+        try:
+            clicked = page.evaluate(
+                """
+                () => {
+                  const roots = Array.from(document.querySelectorAll(
+                    '[role="dialog"],[aria-modal="true"],.el-dialog,.d-dialog,.modal,.d-popover,.el-popover,.el-popper'
+                  )).filter((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 1 && rect.height > 1 &&
+                      style.visibility !== 'hidden' && style.display !== 'none';
+                  });
+                  const labels = ['确认发布', '确定发布', '立即发布', '确定', '确认'];
+                  for (const root of roots) {
+                    const nodes = Array.from(root.querySelectorAll('button,[role="button"],.btn,.d-button,span'));
+                    const target = nodes.find((el) => {
+                      const text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
+                      if (!labels.some((label) => text === label || text.includes(label))) return false;
+                      const rect = el.getBoundingClientRect();
+                      const style = window.getComputedStyle(el);
+                      return rect.width > 1 && rect.height > 1 &&
+                        style.visibility !== 'hidden' && style.display !== 'none' &&
+                        !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+                    });
+                    if (target) {
+                      target.click();
+                      return true;
+                    }
+                  }
+                  return false;
+                }
+                """
+            )
+            if clicked:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def run_publish_drafts_sync(
+    *,
+    posts: list[Post],
+    draft_type: str = "image",
+    dry_run: bool = False,
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    result = {
+        "draft_type": draft_type,
+        "total": len(posts),
+        "published": 0,
+        "items": [],
+        "published_post_ids": [],
+        "errors": [],
+    }
+    if not posts:
+        return result
+
+    profile_dir, channel, args = _resolve_profile_config()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    headless_value = _resolve_headless(headless)
+    context = None
+    browser = None
+    should_close_context = True
+
+    try:
+        with sync_playwright() as p:
+            cdp_url = _resolve_cdp_url()
+            if cdp_url:
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                should_close_context = False
+            else:
+                launch_kwargs = {"headless": headless_value}
+                if channel:
+                    launch_kwargs["channel"] = channel
+                if args:
+                    launch_kwargs["args"] = args
+                context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
+            context.set_default_timeout(30000)
+            page = context.new_page() if not should_close_context else (context.pages[0] if context.pages else context.new_page())
+
+            _open_platform_draft_list(
+                page,
+                draft_type=draft_type,
+                login_hold=login_hold,
+                wait_timeout_ms=wait_timeout_ms,
+                headless=headless_value,
+                progress_callback=progress_callback,
+            )
+
+            for post in posts:
+                try:
+                    idx, item_data = _find_platform_draft_index_for_post(page, post)
+                    if idx is None:
+                        raise RuntimeError(f"draft not found for post_id={post.id} title={post.title}")
+                    item_data = {**item_data, "post_id": post.id}
+                    result["items"].append(item_data)
+                    _emit_progress(progress_callback, "match_draft", "success", f"post_id={post.id} title={item_data.get('title', '')}")
+                    if dry_run:
+                        continue
+
+                    _open_draft_editor_for_post(page, post)
+                    snapshot = _read_editor_draft_snapshot(page)
+                    if snapshot:
+                        item_data.update(snapshot)
+                    detail = _click_publish_button(page)
+                    _emit_progress(progress_callback, "click_publish", "success", detail)
+                    confirmed = _confirm_publish_dialog(page, timeout_s=5.0)
+                    if confirmed:
+                        _emit_progress(progress_callback, "confirm_publish", "success", "")
+                    time.sleep(2)
+
+                    # Re-open the draft list to verify the draft is no longer available and to process the next one.
+                    _open_platform_draft_list(
+                        page,
+                        draft_type=draft_type,
+                        login_hold=0,
+                        wait_timeout_ms=wait_timeout_ms,
+                        headless=headless_value,
+                        progress_callback=progress_callback,
+                    )
+                    if _draft_item_exists(page, post.title):
+                        raise RuntimeError(f"publish verification failed; draft still exists for post_id={post.id}")
+                    result["published"] += 1
+                    result["published_post_ids"].append(post.id)
+                    _emit_progress(progress_callback, "verify_published", "success", f"post_id={post.id}")
+                except Exception as exc:
+                    msg = str(exc)
+                    result["errors"].append(msg)
+                    _emit_progress(progress_callback, "publish_draft", "failed", msg)
+                    if not dry_run:
+                        try:
+                            _open_platform_draft_list(
+                                page,
+                                draft_type=draft_type,
+                                login_hold=0,
+                                wait_timeout_ms=wait_timeout_ms,
+                                headless=headless_value,
+                                progress_callback=progress_callback,
+                            )
+                        except Exception:
+                            pass
+
+            event_path = save_event(
+                {
+                    "type": "publish_drafts",
+                    "draft_type": draft_type,
+                    "dry_run": dry_run,
+                    "profile_dir": str(profile_dir),
+                    "post_ids": [post.id for post in posts],
+                    "summary": result,
+                }
+            )
+            result["event_path"] = str(event_path)
+            return result
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        return result
+    finally:
+        try:
+            if context is not None and should_close_context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None and not should_close_context:
+                browser.close()
+        except Exception:
+            pass
 
 
 def run_save_draft_sync(

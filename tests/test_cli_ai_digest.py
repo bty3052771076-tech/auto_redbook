@@ -1,0 +1,99 @@
+from pathlib import Path
+
+from typer.testing import CliRunner
+
+import apps.cli as cli
+from src.storage.models import AssetInfo, Execution, Post
+
+
+def _digest_post(asset: Path) -> Post:
+    return Post(
+        title="每日AI讯息",
+        body="今日AI简报：10条官方动态已汇总，适合快速浏览。",
+        topics=["每日AI讯息", "AI动态"],
+        assets=[AssetInfo(path=str(asset), kind="image")],
+        platform={"ai_digest": {"mode": "daily_ai_digest", "target_items": 10}},
+    )
+
+
+def test_create_daily_ai_digest_title_creates_one_digest_post(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "digest.png"
+    asset.write_bytes(b"fake image")
+    calls: list[dict] = []
+
+    def fake_create_daily_ai_digest_posts(**kwargs):
+        calls.append(kwargs)
+        return [_digest_post(asset)]
+
+    def fail_regular_create(**_kwargs):
+        raise AssertionError("每日AI讯息 should not use the generic create flow")
+
+    monkeypatch.setattr(cli, "create_daily_ai_digest_posts", fake_create_daily_ai_digest_posts, raising=False)
+    monkeypatch.setattr(cli, "create_post_with_draft", fail_regular_create)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "create",
+            "--title",
+            "每日AI讯息",
+            "--count",
+            "5",
+            "--assets-glob",
+            str(asset),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["count"] == 1
+    assert "posts=1" in result.output or "post_id=" in result.output
+
+
+def test_auto_daily_ai_digest_title_uploads_one_digest_post(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "digest.png"
+    asset.write_bytes(b"fake image")
+    post = _digest_post(asset)
+    calls: list[dict] = []
+    uploaded: list[str] = []
+
+    def fake_create_daily_ai_digest_posts(**kwargs):
+        calls.append(kwargs)
+        return [post]
+
+    def fail_regular_create(**_kwargs):
+        raise AssertionError("每日AI讯息 should not use the generic create flow")
+
+    def fake_run_save_draft_sync(post_arg, **_kwargs):
+        uploaded.append(post_arg.id)
+        return Execution(post_id=post_arg.id, result="saved_draft")
+
+    monkeypatch.setattr(cli, "create_daily_ai_digest_posts", fake_create_daily_ai_digest_posts, raising=False)
+    monkeypatch.setattr(cli, "create_post_with_draft", fail_regular_create)
+    monkeypatch.setattr(cli, "run_save_draft_sync", fake_run_save_draft_sync)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "auto",
+            "--title",
+            "每日AI讯息",
+            "--count",
+            "5",
+            "--assets-glob",
+            str(asset),
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["count"] == 1
+    assert uploaded == [post.id]
+    assert "uploaded=1" in result.output
+    assert "requested=1" in result.output
