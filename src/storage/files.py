@@ -210,13 +210,15 @@ def save_published_metrics_snapshot(
     ensure_dirs(base)
     paths = published_metrics_paths(base)
     count = 0
+    current_snapshot: list[PublishedMetric] = []
     for metric in metrics:
         item = metric if isinstance(metric, PublishedMetric) else PublishedMetric.model_validate(metric)
         data = item.model_dump()
         _append_jsonl(paths["jsonl"], data)
         _append_csv_row(paths["csv"], PUBLISHED_METRIC_FIELDS, data)
+        current_snapshot.append(item)
         count += 1
-    _write_latest_published_metrics_csv(base)
+    _write_latest_published_metrics_csv(base, metrics=current_snapshot)
     return {"count": count, **paths}
 
 
@@ -241,10 +243,15 @@ def _published_metric_key(metric: PublishedMetric) -> str:
     return f"title:{metric.title}|date:{metric.published_at}"
 
 
-def _write_latest_published_metrics_csv(base: Path = DATA_ROOT) -> Path:
+def _write_latest_published_metrics_csv(
+    base: Path = DATA_ROOT,
+    *,
+    metrics: Iterable[PublishedMetric] | None = None,
+) -> Path:
     paths = published_metrics_paths(base)
     latest: dict[str, PublishedMetric] = {}
-    for metric in list_published_metrics(base=base):
+    source_metrics = list(metrics) if metrics is not None else list_published_metrics(base=base)
+    for metric in source_metrics:
         key = _published_metric_key(metric)
         if key.strip() in {"title:|date:", "url:"}:
             key = metric.id

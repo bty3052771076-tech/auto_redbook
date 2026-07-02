@@ -92,6 +92,10 @@ DRAFT_ITEM_SELECTOR = ".draft-item"
 WAIT_TIMEOUT_MS = 300000
 
 
+class XHSPageUnavailableError(RuntimeError):
+    pass
+
+
 def _context_default_timeout_ms(wait_timeout_ms: int) -> int:
     return max(30000, int(wait_timeout_ms or 0))
 UPLOAD_COUNT_PATTERN = re.compile(r"(\d+)\s*/\s*18")
@@ -115,6 +119,13 @@ LOGIN_PAGE_HINTS = [
     "\u767b\u5f55\u540e",
     "\u8bf7\u5b8c\u6210\u5b89\u5168\u9a8c\u8bc1",
 ]
+UNAVAILABLE_PAGE_HINTS = [
+    "\u4f60\u8bbf\u95ee\u7684\u9875\u9762\u4e0d\u89c1\u4e86",
+    "\u9875\u9762\u4e0d\u89c1\u4e86",
+    "\u9875\u9762\u4e0d\u5b58\u5728",
+    "\u8bbf\u95ee\u7684\u9875\u9762\u4e0d\u5b58\u5728",
+    "404",
+]
 PUBLISHED_PAGE_TEXTS = [
     "\u7b14\u8bb0\u7ba1\u7406",
     "\u5df2\u53d1\u5e03",
@@ -125,9 +136,6 @@ PUBLISHED_PAGE_TEXTS = [
 ]
 PUBLISHED_URL_CANDIDATES = [
     "https://creator.xiaohongshu.com/new/note-manager",
-    "https://creator.xiaohongshu.com/creator/notes",
-    "https://creator.xiaohongshu.com/creator/notes?source=publish",
-    "https://creator.xiaohongshu.com/publish/publish?target=image",
 ]
 EDITOR_READY_SELECTORS = (
     UPLOAD_BUTTON_SELECTORS
@@ -315,7 +323,24 @@ def _is_published_metric_title_line(line: str) -> bool:
         return False
     if len(text) > 80:
         return False
-    if re.search(r"(点赞|评论|收藏|浏览|分享|发布时间|发布于|编辑|删除|置顶)", text):
+    excluded_lines = {
+        "已发布",
+        "审核中",
+        "未通过",
+        "查看修改建议",
+        "编辑",
+        "删除",
+        "置顶",
+    }
+    if text in excluded_lines:
+        return False
+    metric_labels = r"点赞|赞数|评论|评论数|收藏|收藏数|浏览|浏览量|分享|分享数"
+    number_re = r"[0-9][0-9,]*(?:\.[0-9]+)?\s*(?:万|w|W|k|K)?"
+    if re.fullmatch(rf"(?:{metric_labels})\s*[:：]?\s*{number_re}", text):
+        return False
+    if re.fullmatch(rf"{number_re}\s*(?:{metric_labels})", text):
+        return False
+    if re.fullmatch(r"(发布时间|发布于)\s*[:：]?.*", text):
         return False
     if re.fullmatch(r"[\d\s:：/\-.,万wWkK]+", text):
         return False
@@ -406,9 +431,9 @@ def _published_metrics_collection_status(*, collected: int, target_total: int, l
     elif target_count:
         required_total = target_count
     else:
-        required_total = collected_count
+        required_total = 0
     missing_count = max(0, required_total - collected_count)
-    complete = missing_count == 0
+    complete = missing_count == 0 and (bool(limit_count) or bool(target_count))
     message = (
         f"fetched={collected_count} target={target_count or 'unknown'} "
         f"missing={missing_count} required={required_total}"
@@ -434,6 +459,15 @@ def _parse_published_total_text(text: str) -> int:
 
 def _extract_published_note_total(page) -> int:
     return _parse_published_total_text(_read_page_body_text(page, timeout_ms=2000, max_chars=4000))
+
+
+def _remember_published_note_target(result: dict[str, Any], observed_total: int) -> int:
+    current = max(0, int(result.get("target_total") or 0))
+    observed = max(0, int(observed_total or 0))
+    target = max(current, observed)
+    if target:
+        result["target_total"] = target
+    return target
 
 
 def _collect_published_metric_cards(page) -> list[dict[str, str]]:
@@ -502,7 +536,9 @@ def _merge_published_metric_cards(cards: list[dict[str, str]], *, limit: int = 0
             continue
         if likes is None and comments is None and favorites is None:
             continue
-        key = href or title
+        stats_key = ",".join(str(value) for value in (parsed.get("stats") or []))
+        published_at = str(parsed.get("published_at") or "")
+        key = href or "|".join(part for part in (title, published_at, stats_key) if part)
         if key in seen:
             continue
         seen.add(key)
@@ -576,6 +612,8 @@ def _classify_xhs_page_state(url: str, title: str, body_text: str) -> str:
     hints deliberately win over ready hints.
     """
     haystack = "\n".join([url or "", title or "", body_text or ""]).lower()
+    if any(hint.lower() in haystack for hint in UNAVAILABLE_PAGE_HINTS):
+        return "not_found"
     if "login" in haystack or any(hint in haystack for hint in LOGIN_PAGE_HINTS):
         return "login"
     if any(hint in (body_text or "") for hint in READY_PAGE_HINTS):
@@ -598,7 +636,7 @@ def _detect_xhs_page_state(page) -> tuple[str, str]:
         pass
     body_text = _read_page_body_text(page)
     state = _classify_xhs_page_state(url, title, body_text)
-    if state != "login" and _page_has_ready_selector(page):
+    if state not in {"login", "not_found"} and _page_has_ready_selector(page):
         state = "ready"
     detail = f"state={state} url={url or 'unknown'} title={title or 'unknown'}"
     return state, detail
@@ -623,6 +661,8 @@ def _wait_for_xhs_ready(
     """
     reader = state_reader or _detect_xhs_page_state
     state, detail = reader(page)
+    if state == "not_found":
+        raise XHSPageUnavailableError(f"xiaohongshu creator page unavailable; {detail}")
     if state == "ready":
         _emit_progress(progress_callback, "login_check", "success", detail)
         return detail
@@ -648,6 +688,8 @@ def _wait_for_xhs_ready(
         sleep_fn(1)
         state, detail = reader(page)
         last_detail = detail
+        if state == "not_found":
+            raise XHSPageUnavailableError(f"xiaohongshu creator page unavailable; {detail}")
         if state == "ready":
             _emit_progress(progress_callback, "login_check", "success", detail)
             return detail
@@ -671,6 +713,8 @@ def _wait_for_xhs_ready(
         raise RuntimeError(
             f"xiaohongshu login not completed within {login_hold}s; {last_detail}"
         )
+    if state == "not_found":
+        raise XHSPageUnavailableError(f"xiaohongshu creator page unavailable; {last_detail}")
     return last_detail
 
 
@@ -3123,25 +3167,34 @@ def run_collect_published_metrics_sync(
                 for url in _published_url_candidates():
                     result["urls_tried"].append(url)
                     _emit_progress(progress_callback, "open_metrics_page", "in_progress", url)
-                    page.goto(url, wait_until="domcontentloaded")
-                    _wait_for_xhs_ready(
-                        page,
-                        login_hold=login_hold,
-                        headless=headless_value,
-                        progress_callback=progress_callback,
-                    )
+                    try:
+                        page.goto(url, wait_until="domcontentloaded")
+                        _wait_for_xhs_ready(
+                            page,
+                            login_hold=login_hold,
+                            headless=headless_value,
+                            progress_callback=progress_callback,
+                        )
+                    except XHSPageUnavailableError as exc:
+                        detail = f"unavailable published metrics page: {url}; {exc}"
+                        result["errors"].append(detail)
+                        _emit_progress(progress_callback, "open_metrics_page", "skipped", detail)
+                        continue
                     try:
                         _wait_for_any_text(page, PUBLISHED_PAGE_TEXTS, min(wait_timeout_ms, 30000))
                     except PlaywrightTimeoutError:
                         # Some creator pages render metrics without the exact Chinese labels above.
                         pass
 
-                    target_total = _extract_published_note_total(page)
-                    if target_total:
-                        result["target_total"] = max(int(result.get("target_total") or 0), target_total)
+                    target_total = _remember_published_note_target(result, _extract_published_note_total(page))
                     previous_unique_count = 0
                     stagnant_rounds = 0
                     for scroll_idx in range(max_scrolls):
+                        if not target_total or scroll_idx % 10 == 0:
+                            target_total = _remember_published_note_target(
+                                result,
+                                _extract_published_note_total(page),
+                            )
                         cards = _collect_published_metric_cards(page)
                         if cards:
                             collected_cards.extend(cards)

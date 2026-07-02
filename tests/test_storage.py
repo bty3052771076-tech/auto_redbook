@@ -131,6 +131,33 @@ def test_save_published_metrics_snapshot_updates_latest_csv_without_duplicates()
         assert ",5,2,1," in latest_text
 
 
+def test_save_published_metrics_snapshot_latest_csv_uses_current_snapshot_only():
+    with TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        old = PublishedMetric(
+            title="旧快照脏数据",
+            published_at="2026-02-26",
+            likes=0,
+            comments=0,
+            favorites=0,
+        )
+        current = PublishedMetric(
+            title="最新同步笔记",
+            published_at="2026-07-02",
+            likes=7,
+            comments=1,
+            favorites=2,
+        )
+
+        save_published_metrics_snapshot([old], base=base)
+        result = save_published_metrics_snapshot([current], base=base)
+
+        latest_text = result["latest_csv"].read_text(encoding="utf-8-sig")
+        assert "最新同步笔记" in latest_text
+        assert "旧快照脏数据" not in latest_text
+        assert len(list_published_metrics(base=base)) == 2
+
+
 def test_append_run_record_writes_table_and_jsonl():
     with TemporaryDirectory() as tmp:
         base = Path(tmp)
