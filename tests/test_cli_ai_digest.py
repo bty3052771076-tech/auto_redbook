@@ -16,7 +16,7 @@ def _digest_post(asset: Path) -> Post:
     )
 
 
-def test_create_daily_ai_digest_title_creates_one_digest_post(monkeypatch, tmp_path: Path):
+def test_create_command_is_not_public(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     asset = tmp_path / "digest.png"
     asset.write_bytes(b"fake image")
@@ -45,10 +45,8 @@ def test_create_daily_ai_digest_title_creates_one_digest_post(monkeypatch, tmp_p
         ],
     )
 
-    assert result.exit_code == 0
-    assert len(calls) == 1
-    assert calls[0]["count"] == 1
-    assert "posts=1" in result.output or "post_id=" in result.output
+    assert result.exit_code != 0
+    assert not calls
 
 
 def test_auto_daily_ai_digest_title_uploads_one_digest_post(monkeypatch, tmp_path: Path):
@@ -97,3 +95,39 @@ def test_auto_daily_ai_digest_title_uploads_one_digest_post(monkeypatch, tmp_pat
     assert uploaded == [post.id]
     assert "uploaded=1" in result.output
     assert "requested=1" in result.output
+
+
+def test_auto_daily_ai_digest_missing_assets_explains_local_card_rendering(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "digest.png"
+    asset.write_bytes(b"fake image")
+    post = _digest_post(asset)
+
+    def fake_create_daily_ai_digest_posts(**_kwargs):
+        return [post]
+
+    def fake_run_save_draft_sync(post_arg, **_kwargs):
+        return Execution(post_id=post_arg.id, result="saved_draft")
+
+    monkeypatch.setattr(cli, "create_daily_ai_digest_posts", fake_create_daily_ai_digest_posts, raising=False)
+    monkeypatch.setattr(cli, "run_save_draft_sync", fake_run_save_draft_sync)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "auto",
+            "--title",
+            "每日AI讯息",
+            "--assets-glob",
+            str(tmp_path / "missing" / "*"),
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "未找到素材文件" not in result.output
+    assert "自动查找配图" not in result.output
+    assert "本地简报图" in result.output

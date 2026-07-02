@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
 import threading
 import time
 from pathlib import Path
+
+import pytest
 
 from apps.gui import (
     ALIYUN_IMAGE_MODEL_OPTIONS,
@@ -45,6 +49,8 @@ from apps.gui import (
     resolve_delete_mode_flags,
     save_env_file,
     sort_published_metric_table_rows,
+    VOLCENGINE_IMAGE_MODEL_OPTIONS,
+    VOLCENGINE_LLM_MODEL_OPTIONS,
 )
 
 
@@ -53,14 +59,21 @@ def test_gui_default_image_provider_prefers_ai_generation():
 
 
 def test_gui_exposes_llm_and_image_provider_model_options():
-    assert LLM_PROVIDER_OPTIONS == ["aliyun", "ppinfra", "auto"]
-    assert IMAGE_SOURCE_OPTIONS == ["local", "aliyun", "pexels"]
+    assert LLM_PROVIDER_OPTIONS == ["aliyun", "volcengine", "ppinfra", "auto"]
+    assert IMAGE_SOURCE_OPTIONS == ["local", "aliyun", "volcengine", "pexels"]
     assert "qwen3.7-plus" in ALIYUN_LLM_MODEL_OPTIONS
     assert "deepseek-v4-flash" in ALIYUN_LLM_MODEL_OPTIONS
+    assert "doubao-seed-2-1-turbo-260628" in VOLCENGINE_LLM_MODEL_OPTIONS
     assert ALIYUN_IMAGE_MODEL_OPTIONS == [
         "wan2.7-image",
         "wan2.7-image-pro",
         "qwen-image-2.0-pro-2026-04-22",
+    ]
+    assert VOLCENGINE_IMAGE_MODEL_OPTIONS == [
+        "doubao-seedream-5-0-lite-260128",
+        "doubao-seedream-5-0-260128",
+        "doubao-seedream-4-5-251128",
+        "doubao-seedream-4-0-250828",
     ]
 
 
@@ -257,6 +270,25 @@ def test_build_provider_env_overrides_for_ppinfra_model():
     assert "ALIYUN_IMAGE_MODEL" not in env
 
 
+def test_build_provider_env_overrides_for_volcengine_models():
+    env = build_provider_env_overrides(
+        {},
+        llm_provider="volcengine",
+        llm_model="doubao-seed-2-1-turbo-260628",
+        image_provider="volcengine",
+        image_model="doubao-seedream-5-0-lite-260128",
+    )
+
+    assert env["LLM_PROVIDER"] == "volcengine"
+    assert env["VOLCENGINE_LLM_MODEL"] == "doubao-seed-2-1-turbo-260628"
+    assert env["VOLCENGINE_LLM_MODELS"] == "doubao-seed-2-1-turbo-260628"
+    assert "ALIYUN_LLM_MODEL" not in env
+    assert env["IMAGE_PROVIDER"] == "volcengine"
+    assert env["VOLCENGINE_IMAGE_MODEL"] == "doubao-seedream-5-0-lite-260128"
+    assert env["VOLCENGINE_IMAGE_MODELS"] == "doubao-seedream-5-0-lite-260128"
+    assert "ALIYUN_IMAGE_MODEL" not in env
+
+
 def test_build_provider_env_overrides_invalid_image_provider_falls_back_to_aliyun():
     env = build_provider_env_overrides(
         {},
@@ -412,6 +444,50 @@ def test_list_publishable_drafts_filters_uploaded_posts_by_beijing_date(tmp_path
 
     assert [item.post_id for item in items] == ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
     assert items[0].title == "可发布草稿"
+
+
+def test_list_publishable_drafts_scans_beyond_recent_non_publishable_posts(tmp_path: Path):
+    posts = tmp_path / "data" / "posts"
+    posts.mkdir(parents=True)
+    old_publishable = posts / "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    old_publishable.mkdir()
+    (old_publishable / "post.json").write_text(
+        json.dumps(
+            {
+                "title": "历史可发布草稿",
+                "status": "saved_as_draft",
+                "uploaded": True,
+                "uploaded_at": "2026-06-20T08:00:00.000000Z",
+                "body": "正文",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    os.utime(old_publishable, (1000, 1000))
+
+    for idx in range(220):
+        post_id = f"{idx + 1:032x}"
+        post_dir = posts / post_id
+        post_dir.mkdir()
+        (post_dir / "post.json").write_text(
+            json.dumps(
+                {
+                    "title": f"最近失败草稿 {idx}",
+                    "status": "failed",
+                    "uploaded": False,
+                    "updated_at": "2026-06-30T08:00:00.000000Z",
+                    "body": "正文",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        os.utime(post_dir, (2000 + idx, 2000 + idx))
+
+    items = list_publishable_drafts(project_root=tmp_path, date="", limit=0)
+
+    assert [item.post_id for item in items] == ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
 
 
 def test_format_post_choice_strips_symbolic_status_marks_from_title():
@@ -826,21 +902,18 @@ def test_build_cli_args_auto_aliyun_image_source_ignores_local_assets():
     assert args[idx + 1] == AUTO_IMAGE_ASSETS_GLOB
 
 
-def test_build_cli_args_create():
-    args = build_cli_args(
-        "create",
-        params={
-            "title": "标题",
-            "prompt": "",
-            "evaluation_viewpoint": "无视角评价",
-            "assets_glob": "assets/pics/*",
-            "count": 1,
-        },
-    )
-    assert args[1:4] == ["-m", "apps.cli", "create"]
-    assert "--title" in args and "标题" in args
-    assert "--prompt" not in args  # empty prompt should be omitted
-    assert "--evaluation-viewpoint" in args and "无视角评价" in args
+def test_build_cli_args_rejects_create_only():
+    with pytest.raises(ValueError, match="unsupported subcommand"):
+        build_cli_args(
+            "create",
+            params={
+                "title": "标题",
+                "prompt": "",
+                "evaluation_viewpoint": "无视角评价",
+                "assets_glob": "assets/pics/*",
+                "count": 1,
+            },
+        )
 
 
 def test_build_cli_args_delete_drafts():
@@ -894,12 +967,40 @@ def test_build_cli_args_publish_drafts_by_date_and_post_ids():
     assert "--yes" in args
 
 
+def test_build_cli_args_publish_drafts_blank_filter_uses_all():
+    args = build_cli_args(
+        "publish-drafts",
+        params={
+            "date": "",
+            "post_ids": [],
+            "limit": 0,
+            "dry_run": True,
+            "headless": False,
+            "yes": False,
+            "login_hold": 0,
+            "wait_timeout": 600,
+        },
+    )
+
+    assert "--all" in args
+    assert "--date" not in args
+    assert "--post-id" not in args
+
+
+def test_publish_tab_defaults_to_show_all_local_uploaded_drafts():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert 'publish_date_var = tk.StringVar(value="")' in source
+
+
 def test_build_cli_args_update_metrics():
     args = build_cli_args(
         "update-metrics",
         params={
             "limit": 25,
             "headless": True,
+            "allow_partial": False,
             "login_hold": 0,
             "wait_timeout": 300,
         },
@@ -909,7 +1010,34 @@ def test_build_cli_args_update_metrics():
     assert "--limit" in args and "25" in args
     assert "--headless" in args
     assert "--login-hold" in args and "0" in args
-    assert "--wait-timeout" in args and "300" in args
+    assert "--wait-timeout" not in args
+    assert "--allow-partial" not in args
+
+
+def test_build_cli_args_update_metrics_allow_partial():
+    args = build_cli_args(
+        "update-metrics",
+        params={
+            "limit": 0,
+            "headless": False,
+            "allow_partial": True,
+            "login_hold": 0,
+            "wait_timeout": 600,
+        },
+    )
+
+    assert args[1:4] == ["-m", "apps.cli", "update-metrics"]
+    assert "--allow-partial" in args
+    assert "--wait-timeout" not in args
+
+
+def test_gui_exposes_full_metrics_sync_option():
+    source = (Path(__file__).resolve().parents[1] / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "必须全量同步" in source
+    assert "allow_partial" in source
+    assert "全量同步会持续滚动采集" in source
+    assert "metrics_wait_timeout_var" not in source
 
 
 def test_build_cli_args_aliyun_quota():
@@ -932,12 +1060,48 @@ def test_build_cli_args_aliyun_quota():
     assert "--wait-timeout" in args and "120" in args
 
 
+def test_build_cli_args_volcengine_quota():
+    args = build_cli_args(
+        "volcengine-quota",
+        params={
+            "models": ["doubao-seed-2-1-turbo-260628", "doubao-seedream-5-0-lite-260128"],
+            "headless": True,
+            "login_hold": 0,
+            "wait_timeout": 120,
+        },
+    )
+
+    assert args[1:4] == ["-m", "apps.cli", "volcengine-quota"]
+    assert args.count("--model") == 2
+    assert "doubao-seed-2-1-turbo-260628" in args
+    assert "doubao-seedream-5-0-lite-260128" in args
+    assert "--headless" in args
+    assert "--login-hold" in args and "0" in args
+    assert "--wait-timeout" in args and "120" in args
+
+
 def test_gui_has_aliyun_quota_panel():
     root = Path(__file__).resolve().parents[1]
     source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
 
     assert "aliyun-quota" in source
     assert "Aliyun Bailian quota" in source
+
+
+def test_gui_has_volcengine_quota_panel():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "volcengine-quota" in source
+    assert "Volcengine Ark quota" in source
+
+
+def test_gui_no_longer_exposes_create_only_tab():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert 'nb.add(tab_create, text="仅生成")' not in source
+    assert "运行 create：只生成本地草稿" not in source
 
 
 def test_delete_mode_labels_are_explicit_and_non_symbolic():

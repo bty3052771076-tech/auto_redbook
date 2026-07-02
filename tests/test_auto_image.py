@@ -10,6 +10,7 @@ from src.images.auto_image import (
     pick_best_image,
     pick_top_images,
 )
+from src.images.volcengine_images import VolcengineImageResult
 
 
 def test_is_auto_image_enabled_defaults_true(monkeypatch):
@@ -311,3 +312,37 @@ def test_build_aliyun_image_prompt_forbids_text():
     )
     assert "不要出现任何文字" in prompt
     assert "水印" in prompt
+
+
+def test_fetch_related_images_supports_volcengine_provider(monkeypatch, tmp_path):
+    from src.images import volcengine_images
+    from src.images.auto_image import fetch_and_download_related_images
+
+    calls: list[dict[str, object]] = []
+
+    def fake_generate_volcengine_image(*, post_id, prompt, dest_dir, **kwargs):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / "volc.png"
+        out.write_bytes(b"png")
+        calls.append({"post_id": post_id, "prompt": prompt, "kwargs": kwargs})
+        return VolcengineImageResult(
+            path=out,
+            meta={"mode": "volcengine_image", "provider": "volcengine"},
+        )
+
+    monkeypatch.setattr(volcengine_images, "generate_volcengine_image", fake_generate_volcengine_image)
+
+    paths, metas = fetch_and_download_related_images(
+        title="每日新闻｜新能源车销量创新高",
+        body="",
+        topics=[],
+        prompt_hint="新能源车销量创新高",
+        dest_dir=tmp_path / "post123" / "assets",
+        provider="volcengine",
+        count=1,
+    )
+
+    assert len(paths) == 1
+    assert paths[0].name == "volc.png"
+    assert metas[0]["provider"] == "volcengine"
+    assert calls[0]["post_id"] == "post123"

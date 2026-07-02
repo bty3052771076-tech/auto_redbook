@@ -33,6 +33,31 @@ def _write_uploaded_post(base: Path, post_id: str, *, title: str, uploaded_at: s
     )
 
 
+def _write_legacy_saved_draft_post(base: Path, post_id: str, *, title: str, uploaded_at: str) -> None:
+    post_dir = base / "data" / "posts" / post_id
+    post_dir.mkdir(parents=True)
+    (post_dir / "post.json").write_text(
+        json.dumps(
+            {
+                "id": post_id,
+                "type": "image",
+                "status": "saved_as_draft",
+                "uploaded": False,
+                "uploaded_at": uploaded_at,
+                "title": title,
+                "body": "正文预览",
+                "topics": ["每日新闻"],
+                "assets": [{"path": "assets/example.png", "kind": "image"}],
+                "platform": {},
+                "created_at": uploaded_at,
+                "updated_at": uploaded_at,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_publish_drafts_requires_a_selector(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
 
@@ -103,6 +128,46 @@ def test_publish_drafts_publishes_selected_uploaded_post_and_updates_local_statu
     assert stored["platform"]["publish"]["actual_body"] == "平台发布前实际正文"
 
 
+def test_publish_drafts_accepts_legacy_saved_draft_without_uploaded_flag(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    post_id = "dddddddddddddddddddddddddddddddd"
+    _write_legacy_saved_draft_post(
+        tmp_path,
+        post_id,
+        title="历史已上传草稿",
+        uploaded_at="2026-06-29T01:00:00.000000Z",
+    )
+    calls: list[dict] = []
+
+    def fake_run_publish_drafts_sync(**kwargs):
+        calls.append(kwargs)
+        return {
+            "draft_type": "image",
+            "total": 1,
+            "published": 0,
+            "items": [{"post_id": post_id, "title": "历史已上传草稿"}],
+            "errors": [],
+        }
+
+    monkeypatch.setattr(cli, "run_publish_drafts_sync", fake_run_publish_drafts_sync, raising=False)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "publish-drafts",
+            "--post-id",
+            post_id,
+            "--dry-run",
+            "--login-hold",
+            "0",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls
+    assert calls[0]["posts"][0].id == post_id
+
+
 def test_publish_drafts_dry_run_previews_without_updating_status(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     post_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -145,3 +210,51 @@ def test_publish_drafts_dry_run_previews_without_updating_status(monkeypatch, tm
     assert "type=image total=1" in result.output
     stored = json.loads((tmp_path / "data" / "posts" / post_id / "post.json").read_text(encoding="utf-8"))
     assert stored["status"] == "saved_as_draft"
+
+
+def test_publish_drafts_all_with_limit_prefers_latest_uploaded_post(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    old_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    latest_id = "ffffffffffffffffffffffffffffffff"
+    _write_uploaded_post(
+        tmp_path,
+        old_id,
+        title="旧草稿",
+        uploaded_at="2026-06-20T01:00:00.000000Z",
+    )
+    _write_uploaded_post(
+        tmp_path,
+        latest_id,
+        title="新草稿",
+        uploaded_at="2026-06-29T01:00:00.000000Z",
+    )
+    calls: list[dict] = []
+
+    def fake_run_publish_drafts_sync(**kwargs):
+        calls.append(kwargs)
+        return {
+            "draft_type": "image",
+            "total": 1,
+            "published": 0,
+            "items": [{"post_id": latest_id, "title": "新草稿"}],
+            "errors": [],
+        }
+
+    monkeypatch.setattr(cli, "run_publish_drafts_sync", fake_run_publish_drafts_sync, raising=False)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "publish-drafts",
+            "--all",
+            "--limit",
+            "1",
+            "--dry-run",
+            "--login-hold",
+            "0",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls
+    assert [post.id for post in calls[0]["posts"]] == [latest_id]

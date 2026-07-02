@@ -185,3 +185,89 @@ def test_update_metrics_cli_syncs_matching_local_posts(monkeypatch, tmp_path: Pa
     assert "posts-synced: matched=1" in result.output
     stored = json.loads((post_dir / "post.json").read_text(encoding="utf-8"))
     assert stored["status"] == "published"
+
+
+def test_update_metrics_requires_complete_collection_before_saving(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "run_collect_published_metrics_sync",
+        lambda **_kwargs: {
+            "items": [
+                {
+                    "title": "Only one visible post",
+                    "published_at": "2026-07-02",
+                    "likes": 1,
+                    "comments": 0,
+                    "favorites": 0,
+                    "raw": {},
+                }
+            ],
+            "target_total": 2,
+            "complete": False,
+            "missing_count": 1,
+            "errors": [],
+        },
+        raising=False,
+    )
+
+    result = CliRunner().invoke(cli.app, ["update-metrics", "--login-hold", "0"])
+
+    assert result.exit_code == 1
+    assert "incomplete published metrics" in result.output
+    assert "fetched=1 target=2 missing=1" in result.output
+    assert not (tmp_path / "data" / "analytics" / "published_metrics_latest.csv").exists()
+
+
+def test_update_metrics_refuses_empty_collection_before_saving(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "run_collect_published_metrics_sync",
+        lambda **_kwargs: {
+            "items": [],
+            "target_total": 2,
+            "required_total": 2,
+            "complete": False,
+            "missing_count": 2,
+            "errors": ["no published metrics found"],
+        },
+        raising=False,
+    )
+
+    result = CliRunner().invoke(cli.app, ["update-metrics", "--login-hold", "0"])
+
+    assert result.exit_code == 1
+    assert "no published metrics collected" in result.output
+    assert not (tmp_path / "data" / "analytics" / "published_metrics_latest.csv").exists()
+
+
+def test_update_metrics_allow_partial_saves_incomplete_collection(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "run_collect_published_metrics_sync",
+        lambda **_kwargs: {
+            "items": [
+                {
+                    "title": "Only one visible post",
+                    "published_at": "2026-07-02",
+                    "likes": 1,
+                    "comments": 0,
+                    "favorites": 0,
+                    "raw": {},
+                }
+            ],
+            "target_total": 2,
+            "complete": False,
+            "missing_count": 1,
+            "errors": [],
+        },
+        raising=False,
+    )
+
+    result = CliRunner().invoke(cli.app, ["update-metrics", "--login-hold", "0", "--allow-partial"])
+
+    assert result.exit_code == 0
+    assert "warning: saving partial published metrics" in result.output
+    assert (tmp_path / "data" / "analytics" / "published_metrics_latest.csv").exists()

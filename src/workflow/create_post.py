@@ -15,7 +15,13 @@ from typing import Any, Iterable, List, Optional
 
 from src.config import load_llm_configs
 from src.ai_digest.collect import collect_ai_digest_updates
-from src.ai_digest.generate import build_fallback_brief, render_ai_digest_body
+from src.ai_digest.generate import (
+    build_fallback_brief,
+    generate_ai_digest_brief_with_llm,
+    render_ai_digest_body,
+)
+from src.ai_digest.models import AIDigestBrief
+from src.ai_digest.rank import rank_ai_updates
 from src.ai_digest.render import render_ai_digest_cards
 from src.images.auto_image import (
     ImageGenerationAbandoned,
@@ -24,7 +30,6 @@ from src.images.auto_image import (
 )
 from src.llm.generate import generate_draft
 from src.news.daily_news import (
-    fetch_and_pick_daily_news,
     fetch_daily_news_candidates,
     pick_news_items,
 )
@@ -171,6 +176,59 @@ _COMMON_TRADITIONAL_TO_SIMPLIFIED = str.maketrans(
         "長": "长",
         "網": "网",
         "誌": "志",
+        "訊": "讯",
+        "聯": "联",
+        "聞": "闻",
+        "佈": "布",
+        "調": "调",
+        "點": "点",
+        "這": "这",
+        "項": "项",
+        "規": "规",
+        "則": "则",
+        "責": "责",
+        "務": "务",
+        "協": "协",
+        "後": "后",
+        "續": "续",
+        "觀": "观",
+        "關": "关",
+        "權": "权",
+        "護": "护",
+        "勞": "劳",
+        "動": "动",
+        "數": "数",
+        "據": "据",
+        "報": "报",
+        "導": "导",
+        "戰": "战",
+        "爭": "争",
+        "選": "选",
+        "舉": "举",
+        "類": "类",
+        "證": "证",
+        "華": "华",
+        "鐵": "铁",
+        "蘋": "苹",
+        "區": "区",
+        "風": "风",
+        "險": "险",
+        "響": "响",
+        "應": "应",
+        "醫": "医",
+        "藥": "药",
+        "監": "监",
+        "測": "测",
+        "檢": "检",
+        "機": "机",
+        "構": "构",
+        "專": "专",
+        "屬": "属",
+        "園": "园",
+        "車": "车",
+        "電": "电",
+        "錢": "钱",
+        "貿": "贸",
         "語": "语",
         "廣": "广",
         "東": "东",
@@ -237,6 +295,19 @@ def _has_japanese_kana(text: str | None) -> bool:
 
 def _to_simplified_common(text: str) -> str:
     return (text or "").translate(_COMMON_TRADITIONAL_TO_SIMPLIFIED)
+
+
+def _simplify_daily_news_draft(draft: dict[str, Any]) -> dict[str, Any]:
+    out = dict(draft)
+    for key in ("title", "body", "image_event"):
+        if key in out and isinstance(out.get(key), str):
+            out[key] = _to_simplified_common(str(out.get(key) or ""))
+    topics = out.get("topics")
+    if isinstance(topics, list):
+        out["topics"] = [_to_simplified_common(str(topic or "")) for topic in topics]
+    elif isinstance(topics, str):
+        out["topics"] = [_to_simplified_common(topics)]
+    return out
 
 
 def _cjk_count(text: str | None) -> int:
@@ -485,6 +556,196 @@ def _enrich_daily_news_item(picked):
     meta["source_lookup"]["ok"] = True
     meta["source_lookup"]["chars"] = len(excerpt)
     return replace(picked, content=content), meta
+
+
+def _daily_news_story_lines(value: str) -> list[str]:
+    text = _strip_urls(value or "")
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"(?m)^\s*(?:[-*•·]|\d{1,2}[.、])\s*", "", text)
+    lines: list[str] = []
+    for raw in text.split("\n"):
+        line = _clean_original_news_text(raw)
+        line = re.sub(r"\s+", " ", line).strip(" \t\r\n|｜")
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _daily_news_line_looks_like_story_headline(value: str) -> bool:
+    if re.search(r"[。！？]", value or ""):
+        return False
+    text = _clean_daily_news_title_candidate(value or "")
+    if len(text) < 6 or len(text) > 70:
+        return False
+    if any(marker in text for marker in ("来源", "发布时间", "原文摘录", "正文", "摘要")):
+        return False
+    cjk_count = len(_CJK_CHAR_RE.findall(text))
+    ascii_count = len(_ASCII_WORD_RE.findall(text))
+    if cjk_count < 4 and ascii_count < 2:
+        return False
+    return len(re.split(r"[，,；;]", text)) <= 3
+
+
+def _daily_news_line_relevance(value: str, context: str) -> float:
+    text = _clean_daily_news_title_candidate(value or "")
+    ctx = _clean_daily_news_title_candidate(context or "")
+    if not text or not ctx:
+        return 0.0
+    if text in ctx or ctx in text:
+        return 1.0
+    text_tokens = _daily_news_context_signal_tokens(text)
+    context_tokens = _daily_news_context_signal_tokens(ctx)
+    if not text_tokens or not context_tokens:
+        return 0.0
+    overlap = len(text_tokens & context_tokens) / max(1, min(len(text_tokens), len(context_tokens)))
+    return overlap
+
+
+def _daily_news_title_is_bundle_header(value: str) -> bool:
+    text = _clean_daily_news_title_candidate(value or "")
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return True
+    bundle_markers = (
+        "今日要闻",
+        "今日新闻",
+        "每日要闻",
+        "最新消息",
+        "热点新闻",
+        "新闻快讯",
+        "财经早报",
+        "早报",
+        "晚报",
+        "简讯",
+        "要闻",
+    )
+    return compact in bundle_markers or any(compact.endswith(marker) for marker in ("早报", "晚报", "快讯"))
+
+
+def _daily_news_story_importance_score(value: str) -> float:
+    text = _clean_daily_news_title_candidate(value or "")
+    if not text:
+        return 0.0
+    score = 0.0
+    markers: tuple[tuple[str, float], ...] = (
+        ("国务院", 3.0),
+        ("中央", 2.4),
+        ("全国", 1.4),
+        ("新规", 2.2),
+        ("施行", 1.6),
+        ("发布", 1.4),
+        ("宣布", 1.2),
+        ("监管", 2.0),
+        ("调查", 2.0),
+        ("处罚", 2.0),
+        ("事故", 2.0),
+        ("死亡", 2.0),
+        ("权益", 1.8),
+        ("保障", 1.5),
+        ("禁令", 1.8),
+        ("上市", 1.2),
+        ("收购", 1.2),
+        ("裁员", 1.2),
+        ("暴涨", 1.1),
+        ("暴跌", 1.1),
+        ("突破", 1.1),
+    )
+    for marker, weight in markers:
+        if marker in text:
+            score += weight
+    if re.search(r"\d|[一二三四五六七八九十两]", text):
+        score += 0.8
+    if any(marker in text for marker in ("花絮", "综艺", "夜市", "开幕", "趣闻")):
+        score -= 1.0
+    return score
+
+
+def _select_daily_news_story_line(lines: list[str], *, context: str) -> str:
+    if not lines:
+        return ""
+    if _daily_news_title_is_bundle_header(context):
+        scored = [(_daily_news_story_importance_score(line), -idx, line) for idx, line in enumerate(lines)]
+        scored.sort(reverse=True)
+        best_score, _neg_idx, best_line = scored[0]
+        return best_line if best_score > 0 else lines[0]
+    scored = [
+        (_daily_news_line_relevance(line, context), _daily_news_story_importance_score(line), -idx, line)
+        for idx, line in enumerate(lines)
+    ]
+    scored.sort(reverse=True)
+    best_score, _importance, _neg_idx, best_line = scored[0]
+    return best_line if best_score > 0 else lines[0]
+
+
+def _focus_daily_news_multistory_text(value: str, *, context: str) -> tuple[str, bool, str]:
+    lines = _daily_news_story_lines(value)
+    if len(lines) < 2:
+        return (value or "").strip(), False, ""
+
+    headline_like_count = sum(1 for line in lines if _daily_news_line_looks_like_story_headline(line))
+    if len(lines) < 3 and headline_like_count < 2:
+        return (value or "").strip(), False, ""
+    if len(lines) >= 3 and headline_like_count < 1:
+        return (value or "").strip(), False, ""
+
+    best_line = _select_daily_news_story_line(lines, context=context)
+    focused = _clean_original_news_text(best_line)
+    return focused, focused.strip() != (value or "").strip(), focused
+
+
+def _focus_daily_news_item(picked) -> tuple[Any, dict[str, Any]]:
+    """
+    Some hot-list APIs return one item whose description/content is actually a
+    stack of several unrelated headlines. Keep the story represented by the
+    candidate title before prompting the LLM or generating an image.
+    """
+    title = getattr(picked, "title", "") or ""
+    description = getattr(picked, "description", "") or ""
+    content = getattr(picked, "content", "") or ""
+
+    focused_description, desc_changed, desc_story = _focus_daily_news_multistory_text(
+        description,
+        context=title,
+    )
+    focused_content, content_changed, content_story = _focus_daily_news_multistory_text(
+        content,
+        context=f"{title} {focused_description or description}",
+    )
+    selected_story = desc_story or content_story
+
+    meta: dict[str, Any] = {
+        "multi_story_filter": {
+            "applied": bool(desc_changed or content_changed),
+        }
+    }
+    if selected_story:
+        meta["multi_story_filter"]["selected_title"] = selected_story
+    if desc_changed:
+        meta["multi_story_filter"]["description_before_chars"] = len(description)
+        meta["multi_story_filter"]["description_after_chars"] = len(focused_description)
+    if content_changed:
+        meta["multi_story_filter"]["content_before_chars"] = len(content)
+        meta["multi_story_filter"]["content_after_chars"] = len(focused_content)
+
+    title_changed = False
+    focused_title = title
+    if selected_story and _daily_news_title_is_bundle_header(title):
+        focused_title = selected_story
+        title_changed = True
+        meta["multi_story_filter"]["title_before"] = title
+        meta["multi_story_filter"]["title_after"] = focused_title
+
+    if not (desc_changed or content_changed or title_changed):
+        return picked, meta
+    return (
+        replace(
+            picked,
+            title=focused_title,
+            description=focused_description or None,
+            content=focused_content or None,
+        ),
+        meta,
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -1335,7 +1596,7 @@ def _daily_news_body_missing_required_fields(body: str) -> bool:
     if not has_structured_shape:
         return True
     fields = _daily_news_body_quality_fields(text)
-    required = ("原文标题", "内容", "日期", "来源")
+    required = ("内容", "日期", "来源")
     if any(not fields.get(key, "").strip() for key in required):
         return True
     content = fields.get("内容", "").strip()
@@ -2199,8 +2460,6 @@ def _render_daily_news_body_fields(data: dict[str, str]) -> str:
 
     def render(fields: dict[str, str]) -> str:
         chunks: list[str] = []
-        if fields.get("原文标题"):
-            chunks.append(f"原文标题：{fields['原文标题']}")
         if fields.get("内容"):
             chunks.append(f"内容：\n{fields['内容']}")
         if fields.get("评价"):
@@ -2215,7 +2474,7 @@ def _render_daily_news_body_fields(data: dict[str, str]) -> str:
     if len(text) <= MAX_IMAGE_BODY:
         return text
 
-    for key in ("内容", "评价", "原文标题"):
+    for key in ("内容", "评价"):
         while len(text) > MAX_IMAGE_BODY and normalized.get(key):
             overflow = len(text) - MAX_IMAGE_BODY
             value = normalized[key]
@@ -2414,6 +2673,37 @@ def normalize_evaluation_viewpoint(value: str | None) -> str:
     return _clip_text(text, limit=80)
 
 
+def _daily_news_candidate_fetch_limit(count: int) -> int:
+    raw_factor = (os.getenv("NEWS_SELECTION_POOL_FACTOR") or "").strip()
+    try:
+        factor = float(raw_factor) if raw_factor else 2.0
+    except ValueError:
+        factor = 2.0
+    factor = max(1.0, min(5.0, factor))
+    return max(1, int(round(max(1, count) * factor)))
+
+
+def _fetch_daily_news_candidates_for_upload(prompt_norm: str, *, count: int) -> tuple[list[Any], dict[str, Any]]:
+    target_fetch_count = _daily_news_candidate_fetch_limit(count)
+    try:
+        candidates, meta = fetch_daily_news_candidates(prompt_norm, max_records=target_fetch_count)
+    except TypeError as exc:
+        if "unexpected keyword" not in str(exc) and "positional" not in str(exc):
+            raise
+        # Backward compatibility for tests or local monkeypatches that still use
+        # the old one-argument callable shape.
+        candidates, meta = fetch_daily_news_candidates(prompt_norm)
+    meta = dict(meta)
+    meta["selection_pool"] = {
+        "requested_count": max(1, int(count or 1)),
+        "target_fetch_count": target_fetch_count,
+        "actual_candidate_count": len(candidates),
+        "selection_policy": "attention_recency_source_diversity",
+        "source_domain_max_ratio": os.getenv("NEWS_SOURCE_DOMAIN_MAX_RATIO") or "0.5",
+    }
+    return candidates, meta
+
+
 def _daily_news_evaluation_viewpoint_instruction(value: str | None) -> str:
     viewpoint = normalize_evaluation_viewpoint(value)
     if viewpoint == DEFAULT_EVALUATION_VIEWPOINT:
@@ -2455,9 +2745,8 @@ def _daily_news_prompt(
         f"- 链接：{picked.url}\n"
         f"- 用户关注点（可选）：{prompt_norm or '无'}\n\n"
         "JSON 字段要求：\n"
-        "title：标题必须是12-18字的简体中文总结标题，理想约15字；必须由你基于新闻标题/摘要/原文摘录重新概括，不得直接照抄新闻原始标题，不得与 body 里的“原文标题”完全一致；不得机械截断长标题；必须包含具体事件关键词；不要加“每日新闻｜”前缀，不得仅为“每日新闻”，不得出现日文假名；不得以“如/如果/若/一旦”等条件词开头，不能只写半句条件，必须写清新闻动作或结果。\n"
-        "body：正文必须通顺，必须严格使用下面 5 个中文字段标签，不得增加字段，不得使用旧标签“要点摘要/新闻内容/点评/发布时间”：\n"
-        "原文标题：<保留新闻来源原始标题；若原题为外文再翻译为中文；不要改写成草稿短标题，不写网址；不得写“科技议题出现进展/国际议题出现进展/某某受关注/某某出现变化”等概括兜底标题>\n\n"
+        "title：标题必须是12-18字的简体中文总结标题，理想约15字；必须由你基于新闻标题/摘要/原文摘录重新概括，不得直接照抄新闻原始标题；不得机械截断长标题；必须包含具体事件关键词；不要加“每日新闻｜”前缀，不得仅为“每日新闻”，不得出现日文假名；不得以“如/如果/若/一旦”等条件词开头，不能只写半句条件，必须写清新闻动作或结果。\n"
+        "body：正文必须通顺，必须严格使用下面 4 个中文字段标签，不得增加字段，不得使用旧标签“原文标题/要点摘要/新闻内容/点评/发布时间”：\n"
         "内容：\n"
         "<150字以内的完整中文段落，必须基于原文正文严谨总结事实；句子自然衔接，不堆砌网页导航、栏目名、浏览器升级提示、来源页噪声；不得写站内推荐/相关阅读/下一篇文章标题，例如“权威数读”“新华视点”“记者手记”“特色产业赋能”“中国摩托加速”；不写未经证实的细节，不写“目前可以确认的信息主要来自”等模板句>\n\n"
         "评价：\n"
@@ -3051,6 +3340,45 @@ def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int | No
     return value
 
 
+def _ai_digest_candidate_pool_target(target_count: int) -> tuple[int, int]:
+    factor = _env_int("AI_DIGEST_CANDIDATE_POOL_FACTOR", 3, min_value=1, max_value=10)
+    pool_target = min(100, max(target_count, target_count * factor))
+    return pool_target, factor
+
+
+def _with_ai_digest_items(brief: AIDigestBrief, items) -> AIDigestBrief:
+    data = brief.model_dump()
+    data["items"] = [item.model_dump() for item in items]
+    return AIDigestBrief.model_validate(data)
+
+
+def _rank_brief_ai_digest_items(
+    brief: AIDigestBrief,
+    *,
+    target_count: int,
+    min_official_count: int,
+    max_age_days: int,
+) -> AIDigestBrief:
+    ranked = rank_ai_updates(
+        list(brief.items or []),
+        target_count=target_count,
+        min_official_count=min_official_count,
+        allow_social_backfill=True,
+        max_age_days=max_age_days,
+    )
+    return _with_ai_digest_items(brief, ranked)
+
+
+def _fit_ai_digest_brief_to_body_limit(brief: AIDigestBrief) -> AIDigestBrief:
+    items = list(brief.items or [])
+    while len(items) > 1:
+        fitted = _with_ai_digest_items(brief, items)
+        if len(render_ai_digest_body(fitted)) <= MAX_IMAGE_BODY:
+            return fitted
+        items = items[:-1]
+    return _with_ai_digest_items(brief, items)
+
+
 def create_daily_ai_digest_posts(
     *,
     asset_paths: list[str],
@@ -3060,31 +3388,71 @@ def create_daily_ai_digest_posts(
     prompt_hint: str = "",
     evaluation_viewpoint: str = DEFAULT_EVALUATION_VIEWPOINT,
 ) -> list[Post]:
-    target_count = _env_int("AI_DIGEST_TARGET_ITEMS", 10, min_value=4, max_value=18)
-    min_official_count = _env_int("AI_DIGEST_MIN_OFFICIAL_ITEMS", 6, min_value=1, max_value=18)
+    target_count = _env_int("AI_DIGEST_TARGET_ITEMS", 20, min_value=1, max_value=20)
+    min_official_count = _env_int("AI_DIGEST_MIN_OFFICIAL_ITEMS", 6, min_value=1, max_value=20)
+    max_age_days = _env_int("AI_DIGEST_MAX_AGE_DAYS", 3, min_value=1, max_value=30)
+    candidate_pool_target, candidate_pool_factor = _ai_digest_candidate_pool_target(target_count)
     items, source_meta = collect_ai_digest_updates(
-        target_count=target_count,
+        target_count=candidate_pool_target,
         min_official_count=min_official_count,
         allow_social_backfill=True,
+        max_age_days=max_age_days,
     )
+    source_meta = dict(source_meta or {})
+    source_meta["candidate_pool_target"] = candidate_pool_target
+    source_meta["candidate_pool_factor"] = candidate_pool_factor
+    source_meta["selection_pool_items"] = len(items)
     if not items:
         errors = source_meta.get("errors") if isinstance(source_meta, dict) else []
         detail = f"; errors={errors}" if errors else ""
-        raise RuntimeError(f"daily ai digest create failed: no AI updates returned{detail}")
+        raise RuntimeError(
+            f"daily ai digest create failed: no AI updates within {max_age_days} days{detail}"
+        )
 
-    brief = build_fallback_brief(items, target_count=target_count)
+    generation_target = min(target_count, len(items))
+    generation_mode = "llm"
+    llm_error = ""
+    try:
+        brief = generate_ai_digest_brief_with_llm(
+            load_llm_configs(),
+            items,
+            target_count=generation_target,
+        )
+    except Exception as exc:
+        generation_mode = "fallback"
+        llm_error = str(exc)
+        brief = build_fallback_brief(items, target_count=generation_target)
+    brief = _rank_brief_ai_digest_items(
+        brief,
+        target_count=generation_target,
+        min_official_count=min_official_count,
+        max_age_days=max_age_days,
+    )
+    if not brief.items:
+        raise RuntimeError(f"daily ai digest create failed: no linked AI updates within {max_age_days} days")
+    selected_before_body_fit = len(brief.items)
+    brief = _fit_ai_digest_brief_to_body_limit(brief)
+    source_meta["selected_before_body_fit"] = selected_before_body_fit
+    source_meta["body_fit_dropped"] = max(0, selected_before_body_fit - len(brief.items))
     post = Post(
         type="image",
         status=PostStatus.draft,
         title="每日AI讯息",
-        body=render_ai_digest_body(brief),
+        body=render_ai_digest_body(brief, selection_meta=source_meta),
         topics=["每日AI讯息", "AI动态", "人工智能"],
         platform={
             "ai_digest": {
                 "mode": "daily_ai_digest",
                 "target_items": target_count,
+                "actual_items": len(brief.items),
+                "candidate_pool_target": candidate_pool_target,
+                "candidate_pool_factor": candidate_pool_factor,
+                "selection_pool_items": len(items),
                 "min_official_items": min_official_count,
+                "max_age_days": max_age_days,
                 "prompt_hint": (prompt_hint or "").strip(),
+                "generation_mode": generation_mode,
+                "llm_error": llm_error,
                 "source_meta": source_meta,
                 "brief": brief.model_dump(),
                 "items": [item.model_dump() for item in brief.items],
@@ -3140,9 +3508,18 @@ def create_post_with_draft(
     if title_norm == "每日新闻":
         viewpoint_norm = normalize_evaluation_viewpoint(evaluation_viewpoint)
         try:
-            picked, news_meta = fetch_and_pick_daily_news(prompt_hint or "")
+            prompt_norm = (prompt_hint or "").strip()
+            candidates, news_meta = _fetch_daily_news_candidates_for_upload(prompt_norm, count=1)
+            picks = pick_news_items(candidates, prompt_norm, count=1)
+            if not picks:
+                raise RuntimeError("no news candidates selected")
+            picked = picks[0]
             picked, lookup_meta = _enrich_daily_news_item(picked)
-            traced_news_meta = _daily_news_meta_with_trace({**news_meta, **lookup_meta}, picked)
+            picked, focus_meta = _focus_daily_news_item(picked)
+            traced_news_meta = _daily_news_meta_with_trace(
+                {**news_meta, **lookup_meta, **focus_meta},
+                picked,
+            )
             platform_meta["news"] = {
                 **traced_news_meta,
                 "picked": asdict(picked),
@@ -3151,7 +3528,6 @@ def create_post_with_draft(
                 "prompt_hint": (prompt_hint or "").strip(),
                 "evaluation_viewpoint": viewpoint_norm,
             }
-            prompt_norm = (prompt_hint or "").strip()
             news_prompt = _daily_news_prompt(picked, prompt_norm, viewpoint_norm)
             seed_title = "每日新闻"
             draft = generate_draft(
@@ -3206,12 +3582,7 @@ def create_post_with_draft(
                 prompt_norm,
                 title_hint=str(draft.get("title") or ""),
             )
-            draft["body"] = _finalize_daily_news_body(
-                draft.get("body", ""),
-                picked,
-                prompt_norm,
-                title_hint=str(draft.get("title") or ""),
-            )
+            draft = _simplify_daily_news_draft(draft)
             quality_issue = _daily_news_quality_issue(
                 draft.get("title", ""),
                 draft.get("body", ""),
@@ -3226,6 +3597,7 @@ def create_post_with_draft(
                 body=str(draft.get("body") or ""),
                 prompt_norm=prompt_norm,
             )
+            image_event = _to_simplified_common(image_event)
             platform_meta["news"]["image_event"] = image_event
             draft["image_event"] = image_event
         except Exception as exc:
@@ -3356,7 +3728,7 @@ def create_daily_news_posts(
             or "enable_interleave" in joined
         )
 
-    candidates, base_meta = fetch_daily_news_candidates(prompt_norm)
+    candidates, base_meta = _fetch_daily_news_candidates_for_upload(prompt_norm, count=count)
     # Pick far more than requested because strict quality gates can reject many
     # third-party news snippets. Count=3 should not silently degrade to 1 draft.
     pick_limit = min(len(candidates), max(count * 20, count + 30))
@@ -3370,7 +3742,11 @@ def create_daily_news_posts(
         if len(posts) >= target_count:
             break
         picked, lookup_meta = _enrich_daily_news_item(picked)
-        traced_news_meta = _daily_news_meta_with_trace({**base_meta, **lookup_meta}, picked)
+        picked, focus_meta = _focus_daily_news_item(picked)
+        traced_news_meta = _daily_news_meta_with_trace(
+            {**base_meta, **lookup_meta, **focus_meta},
+            picked,
+        )
         news_prompt = _daily_news_prompt(picked, prompt_norm, viewpoint_norm)
         if target_count > 1:
             news_prompt = f"（第 {success_idx + 1}/{target_count} 条）\n{news_prompt}"
@@ -3437,12 +3813,7 @@ def create_daily_news_posts(
             prompt_norm,
             title_hint=str(draft.get("title") or ""),
         )
-        draft["body"] = _finalize_daily_news_body(
-            draft.get("body", ""),
-            picked,
-            prompt_norm,
-            title_hint=str(draft.get("title") or ""),
-        )
+        draft = _simplify_daily_news_draft(draft)
         quality_issue = _daily_news_quality_issue(
             draft.get("title", ""),
             draft.get("body", ""),
@@ -3462,6 +3833,7 @@ def create_daily_news_posts(
             body=str(draft.get("body") or ""),
             prompt_norm=prompt_norm,
         )
+        image_event = _to_simplified_common(image_event)
         draft["image_event"] = image_event
 
         post = Post(

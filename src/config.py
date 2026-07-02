@@ -18,6 +18,7 @@ class LLMConfig:
 DEFAULT_LLM_BASE_URL = "https://api.ppinfra.com/openai"
 DEFAULT_LLM_MODEL = "deepseek/deepseek-v3-0324"
 DEFAULT_ALIYUN_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_VOLCENGINE_LLM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 ALIYUN_FREE_LLM_MODELS = [
     "qwen3.7-plus",
     "deepseek-v4-flash",
@@ -39,6 +40,33 @@ ALIYUN_FREE_LLM_MODELS = [
     "qwen3.6-flash",
 ]
 DEFAULT_ALIYUN_LLM_MODEL = ALIYUN_FREE_LLM_MODELS[0]
+VOLCENGINE_AVAILABLE_LLM_MODELS = [
+    "doubao-seed-2-1-turbo-260628",
+    "doubao-seed-2-1-pro-260628",
+    "doubao-seed-2-0-pro-260215",
+    "doubao-seed-2-0-lite-260428",
+    "doubao-seed-2-0-mini-260428",
+    "doubao-seed-1-8-251228",
+    "doubao-seed-1-6-251015",
+    "doubao-seed-1-6-250615",
+    "doubao-seed-1-6-flash-250828",
+    "doubao-seed-1-6-flash-250615",
+    "doubao-seed-code-preview-251028",
+    "doubao-seed-2-0-code-preview-260215",
+    "doubao-seed-character-260628",
+    "doubao-seed-character-251128",
+    "doubao-seed-translation-250915",
+    "deepseek-v4-flash-260425",
+    "deepseek-v4-pro-260425",
+    "deepseek-v3-2-251201",
+    "glm-4-7-251222",
+    "glm-4-5-air-20250728",
+    "qwen3-32b-20250429",
+    "qwen3-14b-20250429",
+    "qwen3-8b-20250429",
+    "qwen3-0-6b-20250429",
+]
+DEFAULT_VOLCENGINE_LLM_MODEL = VOLCENGINE_AVAILABLE_LLM_MODELS[0]
 
 
 def _parse_llm_key_file(path: Path) -> dict[str, str]:
@@ -150,6 +178,40 @@ def _load_aliyun_llm_configs() -> list[LLMConfig]:
     ]
 
 
+def _load_volcengine_llm_configs() -> list[LLMConfig]:
+    env_key = (
+        os.getenv("VOLCENGINE_LLM_API_KEY")
+        or os.getenv("VOLCENGINE_API_KEY")
+        or os.getenv("ARK_API_KEY")
+    )
+    env_base = os.getenv("VOLCENGINE_LLM_BASE_URL") or os.getenv("ARK_BASE_URL")
+    env_model = os.getenv("VOLCENGINE_LLM_MODEL") or os.getenv("ARK_LLM_MODEL")
+    env_models = os.getenv("VOLCENGINE_LLM_MODELS") or os.getenv("ARK_LLM_MODELS")
+
+    file_cfg = _parse_llm_key_file(Path("docs/volcengine_api-key.md"))
+
+    api_key = (env_key or file_cfg.get("api_key") or "").strip()
+    if not api_key:
+        return []
+
+    base_url = (env_base or file_cfg.get("base_url") or DEFAULT_VOLCENGINE_LLM_BASE_URL).strip().rstrip("/")
+    models = _split_models(env_models or "")
+    if not models:
+        single = (env_model or DEFAULT_VOLCENGINE_LLM_MODEL).strip()
+        models = [single] if single else []
+
+    return [
+        LLMConfig(
+            model=m,
+            api_key=api_key,
+            base_url=base_url,
+            provider="volcengine",
+        )
+        for m in models
+        if (m or "").strip()
+    ]
+
+
 def _normalize_llm_provider(value: str) -> str:
     raw = (value or "").strip().lower()
     if not raw:
@@ -161,12 +223,16 @@ def _normalize_llm_provider(value: str) -> str:
         "pp": "ppinfra",
         "fallback": "ppinfra",
         "openai": "ppinfra",
+        "ark": "volcengine",
+        "doubao": "volcengine",
+        "volcano": "volcengine",
+        "volc": "volcengine",
         "default": "auto",
     }
     raw = aliases.get(raw, raw)
-    if raw not in {"auto", "aliyun", "ppinfra"}:
+    if raw not in {"auto", "aliyun", "volcengine", "ppinfra"}:
         raise RuntimeError(
-            f"Unsupported LLM_PROVIDER={value!r}; supported: auto, aliyun, ppinfra"
+            f"Unsupported LLM_PROVIDER={value!r}; supported: auto, aliyun, volcengine, ppinfra"
         )
     return raw
 
@@ -180,6 +246,9 @@ def load_llm_configs(
 
     if provider in ("auto", "aliyun"):
         configs.extend(_load_aliyun_llm_configs())
+
+    if provider in ("auto", "volcengine"):
+        configs.extend(_load_volcengine_llm_configs())
 
     if provider in ("auto", "ppinfra"):
         fallback_cfg = _load_fallback_llm_config(llm_file=llm_file)
@@ -196,7 +265,8 @@ def load_llm_configs(
     if not configs:
         raise RuntimeError(
             "LLM api_key missing: set ALIYUN_LLM_API_KEY (or ALIYUN_IMAGE_API_KEY/DASHSCOPE_API_KEY) "
-            "or set LLM_API_KEY / docs/llm_api-key.md (see docs/llm_api-key.example.md)"
+            "or VOLCENGINE_API_KEY/ARK_API_KEY, or set LLM_API_KEY / docs/llm_api-key.md "
+            "(see README.md for configuration examples)"
         )
 
     return configs

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 import urllib.request
 from typing import Callable
 
@@ -7,7 +8,7 @@ import certifi
 
 from .fetchers import parse_github_releases_json, parse_official_html, parse_rss_feed, parse_social_search_html
 from .models import AIUpdateItem
-from .rank import rank_ai_updates
+from .rank import dedupe_ai_updates, filter_recent_ai_updates, rank_ai_updates
 from .sources import AIDigestSource, resolve_ai_digest_sources
 
 
@@ -52,6 +53,8 @@ def collect_ai_digest_updates(
     target_count: int = 10,
     min_official_count: int = 6,
     allow_social_backfill: bool = True,
+    max_age_days: int | None = None,
+    now: datetime | date | None = None,
 ) -> tuple[list[AIUpdateItem], dict]:
     resolved = sources if sources is not None else resolve_ai_digest_sources()
     fetcher = fetch_source or fetch_ai_digest_source
@@ -71,6 +74,8 @@ def collect_ai_digest_updates(
         target_count=target_count,
         min_official_count=min_official_count,
         allow_social_backfill=False,
+        max_age_days=max_age_days,
+        now=now,
     )
     official_count = len(official_ranked)
     social_backfill_used = False
@@ -88,10 +93,25 @@ def collect_ai_digest_updates(
         target_count=target_count,
         min_official_count=min_official_count,
         allow_social_backfill=allow_social_backfill,
+        max_age_days=max_age_days,
+        now=now,
     )
+    fresh_items = filter_recent_ai_updates(
+        fetched,
+        max_age_days=max_age_days,
+        now=now,
+        require_url=True,
+    )
+    deduped_items = dedupe_ai_updates(fresh_items)
     meta = {
         "target_count": target_count,
         "min_official_count": min_official_count,
+        "max_age_days": max_age_days,
+        "fetched_count": len(fetched),
+        "fresh_count": len(fresh_items),
+        "deduped_count": len(deduped_items),
+        "duplicate_removed_count": max(0, len(fresh_items) - len(deduped_items)),
+        "ranked_count": len(ranked),
         "official_count": official_count,
         "social_backfill_used": social_backfill_used,
         "sources": [source.name for source in resolved],

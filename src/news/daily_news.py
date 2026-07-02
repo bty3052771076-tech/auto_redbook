@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import math
 from pathlib import Path
 import urllib.error
 import urllib.parse
@@ -35,6 +36,7 @@ CROSS_DOMAIN_BONUS = 0.4
 NEWS_DEDUPE_SIM_THRESHOLD = 0.8
 DEFAULT_CHINA_RATIO = 0.6
 DEFAULT_CHINA_BONUS = 0.15
+DEFAULT_SOURCE_DOMAIN_MAX_RATIO = 0.5
 LOW_QUALITY_NEWS_DOMAINS = {
     "pypi.org",
     "test.pypi.org",
@@ -170,6 +172,7 @@ class NewsItem:
     language: Optional[str] = None
     socialimage: Optional[str] = None
     sourcecountry: Optional[str] = None
+    attention: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -313,6 +316,89 @@ def _china_bonus() -> float:
         return float(raw)
     except ValueError:
         return DEFAULT_CHINA_BONUS
+
+
+def _source_domain_max_ratio() -> float:
+    raw = (os.getenv("NEWS_SOURCE_DOMAIN_MAX_RATIO") or "").strip()
+    if not raw:
+        return DEFAULT_SOURCE_DOMAIN_MAX_RATIO
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_SOURCE_DOMAIN_MAX_RATIO
+    return max(0.2, min(1.0, value))
+
+
+def _attention_score(item: NewsItem) -> float:
+    explicit = getattr(item, "attention", None)
+    if explicit is not None:
+        try:
+            return max(0.0, float(explicit))
+        except (TypeError, ValueError):
+            pass
+    text = " ".join(part for part in (item.title, item.description, item.content) if part)
+    score = 0.0
+    weighted_markers: tuple[tuple[str, float], ...] = (
+        ("国务院", 2.0),
+        ("中央", 1.6),
+        ("监管", 1.5),
+        ("调查", 1.5),
+        ("新规", 1.5),
+        ("施行", 1.2),
+        ("发布", 1.0),
+        ("宣布", 1.0),
+        ("处罚", 1.5),
+        ("禁令", 1.5),
+        ("事故", 1.5),
+        ("死亡", 1.5),
+        ("上市", 1.0),
+        ("收购", 1.0),
+        ("裁员", 1.0),
+        ("暴涨", 1.0),
+        ("暴跌", 1.0),
+        ("突破", 1.0),
+        ("record", 0.8),
+        ("ban", 0.8),
+        ("probe", 0.8),
+        ("investigation", 0.8),
+        ("policy", 0.6),
+    )
+    lower = text.lower()
+    for marker, weight in weighted_markers:
+        if marker.lower() in lower:
+            score += weight
+    if re.search(r"\d|[一二三四五六七八九十两]", text):
+        score += 0.4
+    return score
+
+
+def _limit_single_domain(items: list[NewsItem], *, count: int) -> list[NewsItem]:
+    if count <= 1 or not items:
+        return items[:count] if count > 0 else []
+    domains = [_canonical_domain(_domain_for_item(item)) for item in items]
+    available_domains = {domain for domain in domains if domain}
+    if len(available_domains) <= 1:
+        return items[:count]
+    cap = max(1, int(math.ceil(count * _source_domain_max_ratio())))
+    picked: list[NewsItem] = []
+    overflow: list[NewsItem] = []
+    domain_counts: dict[str, int] = {}
+    for item, domain in zip(items, domains):
+        key = domain or f"unknown:{len(domain_counts)}"
+        current = domain_counts.get(key, 0)
+        if current < cap:
+            picked.append(item)
+            domain_counts[key] = current + 1
+        else:
+            overflow.append(item)
+        if len(picked) >= count:
+            break
+    if len(picked) < count:
+        for item in overflow:
+            picked.append(item)
+            if len(picked) >= count:
+                break
+    return picked
 
 
 def _balance_china_foreign(items: list[NewsItem], *, count: int) -> list[NewsItem]:
@@ -625,7 +711,7 @@ def pick_news_items(
     hint = (prompt_hint or "").strip()
     counts = _cross_domain_counts(items)
     if hint:
-        scored: list[tuple[float, datetime, int, NewsItem]] = []
+        scored: list[tuple[float, datetime, int, int, NewsItem]] = []
         seen: set[str] = set()
         china_bonus = _china_bonus()
         for idx, item in enumerate(items):
@@ -635,6 +721,7 @@ def pick_news_items(
             seen.add(key)
             score = _relevance_score(item, hint)
             score += max(0, counts[idx] - 1) * CROSS_DOMAIN_BONUS
+            score += _attention_score(item) * 0.2
             if _is_china_item(item):
                 score += china_bonus
             seen_at = _parse_seendate_utc(item.seendate) or datetime.min.replace(
@@ -644,20 +731,28 @@ def pick_news_items(
         scored.sort(reverse=True)
         order = [item for _, _, _, _, item in scored]
         deduped = _dedupe_by_story(order, max_count=len(order))
+        deduped = _limit_single_domain(deduped, count=count)
         return _balance_china_foreign(deduped, count=count)
 
     seen: set[str] = set()
     if any(c >= 2 for c in counts):
-        scored: list[tuple[int, datetime, int, NewsItem]] = []
+        scored: list[tuple[int, float, datetime, int, NewsItem]] = []
         for idx, item in enumerate(items):
             seen_at = _parse_seendate_utc(item.seendate) or datetime.min.replace(
                 tzinfo=timezone.utc
             )
-            scored.append((counts[idx], seen_at, -idx, item))
+            scored.append((counts[idx], _attention_score(item), seen_at, -idx, item))
+        scored.sort(reverse=True)
+        order = [item for _, _, _, _, item in scored]
+    else:
+        scored = []
+        for idx, item in enumerate(items):
+            seen_at = _parse_seendate_utc(item.seendate) or datetime.min.replace(
+                tzinfo=timezone.utc
+            )
+            scored.append((_attention_score(item), seen_at, -idx, item))
         scored.sort(reverse=True)
         order = [item for _, _, _, item in scored]
-    else:
-        order = items
 
     unique: list[NewsItem] = []
     for item in order:
@@ -667,6 +762,7 @@ def pick_news_items(
         seen.add(key)
         unique.append(item)
     deduped = _dedupe_by_story(unique, max_count=len(unique))
+    deduped = _limit_single_domain(deduped, count=count)
     return _balance_china_foreign(deduped, count=count)
 
 
@@ -871,6 +967,7 @@ def _newsapi_fetch_articles(
                 domain=domain,
                 seendate=(a.get("publishedAt") or "").strip() or None,
                 socialimage=(a.get("urlToImage") or "").strip() or None,
+                attention=_record_attention(a),
             )
         )
     return items
@@ -955,6 +1052,7 @@ def _gnews_fetch_articles(
                 domain=domain,
                 seendate=(article.get("publishedAt") or "").strip() or None,
                 socialimage=(article.get("image") or "").strip() or None,
+                attention=_record_attention(article),
             )
         )
     return items
@@ -962,6 +1060,32 @@ def _gnews_fetch_articles(
 
 def _juhe_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _numeric_value(value: Any) -> Optional[float]:
+    text = re.sub(r"[,\s]", "", str(value or "")).strip()
+    if not text:
+        return None
+    multiplier = 1.0
+    if text.endswith(("万", "w", "W")):
+        multiplier = 10000.0
+        text = text[:-1]
+    elif text.endswith("亿"):
+        multiplier = 100000000.0
+        text = text[:-1]
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        return None
+
+
+def _record_attention(record: dict[str, Any]) -> Optional[float]:
+    for key in ("score", "hot", "heat", "hot_score", "rank_score", "views", "view_count", "read_count"):
+        if key in record:
+            value = _numeric_value(record.get(key))
+            if value is not None:
+                return value
+    return None
 
 
 def _juhe_first_text(record: dict[str, Any], keys: tuple[str, ...]) -> str:
@@ -1208,6 +1332,7 @@ def _juhe_toutiao_fetch_articles(
                 language="zh",
                 socialimage=_juhe_image(current),
                 sourcecountry="cn",
+                attention=_record_attention(current),
             )
         )
     return items
@@ -1248,6 +1373,7 @@ def _juhe_finance_fetch_articles(
                 language="zh",
                 socialimage=_juhe_image(record),
                 sourcecountry="cn",
+                attention=_record_attention(record),
             )
         )
     return items
@@ -1405,6 +1531,7 @@ def _hotnews_fetch_articles(
                     language="en" if platform == "hackernews" else "zh",
                     socialimage=_juhe_first_text(record, ("image", "cover", "pic", "picUrl")) or None,
                     sourcecountry="cn" if platform in HOTNEWS_CHINA_PLATFORMS else None,
+                    attention=_record_attention(record),
                 )
             )
             if len(items) >= limit:
@@ -1450,6 +1577,7 @@ def _file_fetch_articles(*, path: str, max_records: int) -> list[NewsItem]:
                 language=(rec.get("language") or "").strip() or None,
                 socialimage=(rec.get("socialimage") or rec.get("image") or "").strip() or None,
                 sourcecountry=(rec.get("sourcecountry") or rec.get("country") or "").strip() or None,
+                attention=_record_attention(rec),
             )
         )
     return items

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import math
 import textwrap
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 from .models import AIDigestBrief, AIUpdateItem
+from .rank import ai_update_attention_score, ai_update_beijing_day_key, ai_update_category_priority
 
 
 CARD_SIZE = (1104, 1472)
@@ -25,7 +26,7 @@ def _font(size: int, *, bold: bool = False):
     return ImageFont.load_default()
 
 
-def _wrap_text(text: str, width: int) -> list[str]:
+def _wrap_text(text: str, width: int, *, max_lines: int | None = None) -> list[str]:
     value = (text or "").strip()
     if not value:
         return []
@@ -35,27 +36,29 @@ def _wrap_text(text: str, width: int) -> list[str]:
         if not paragraph:
             continue
         lines.extend(textwrap.wrap(paragraph, width=width, replace_whitespace=False, drop_whitespace=True))
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip("，,。；; ") + "…"
     return lines
 
 
-def _item_weight(item: AIUpdateItem) -> int:
-    return 120 + len(item.title or "") * 2 + len(item.summary or "") + len(item.vendor or "")
-
-
-def _paginate_items(items: list[AIUpdateItem], *, page_budget: int = 390) -> list[list[AIUpdateItem]]:
+def _paginate_items(items: list[AIUpdateItem], *, min_per_page: int = 2, max_per_page: int = 3) -> list[list[AIUpdateItem]]:
+    """Group updates into 2-3 item pages, avoiding lonely one-item pages."""
+    if not items:
+        return []
     pages: list[list[AIUpdateItem]] = []
-    current: list[AIUpdateItem] = []
-    current_weight = 0
-    for item in items:
-        weight = _item_weight(item)
-        if current and current_weight + weight > page_budget:
-            pages.append(current)
-            current = []
-            current_weight = 0
-        current.append(item)
-        current_weight += weight
-    if current:
-        pages.append(current)
+    index = 0
+    total = len(items)
+    while index < total:
+        remaining = total - index
+        if remaining <= max_per_page:
+            pages.append(items[index:total])
+            break
+        take = max_per_page
+        if remaining - take == 1 and take > min_per_page:
+            take -= 1
+        pages.append(items[index : index + take])
+        index += take
     return pages[: max(1, MAX_XHS_IMAGES - 1)]
 
 
@@ -69,13 +72,57 @@ def _new_card() -> tuple[Image.Image, ImageDraw.ImageDraw]:
     return img, draw
 
 
-def _draw_wrapped(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font, *, width: int, fill: str, line_gap: int = 10) -> int:
+def _draw_wrapped(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font,
+    *,
+    width: int,
+    fill: str,
+    line_gap: int = 10,
+    max_lines: int | None = None,
+) -> int:
     x, y = xy
     line_height = max(24, int(font.size * 1.35)) if hasattr(font, "size") else 28
-    for line in _wrap_text(text, width):
+    for line in _wrap_text(text, width, max_lines=max_lines):
         draw.text((x, y), line, font=font, fill=fill)
         y += line_height + line_gap
     return y
+
+
+def _format_published_at(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if "T" in text or ":" in text:
+            return dt.strftime("%Y-%m-%d %H:%M")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        return text[:16]
+
+
+def _source_priority(item: AIUpdateItem) -> int:
+    return {"official": 4, "github": 3, "search": 2, "social": 1}.get(item.source_type, 0)
+
+
+def _featured_item(brief: AIDigestBrief) -> AIUpdateItem | None:
+    items = list(brief.items or [])
+    if not items:
+        return None
+    return max(
+        items,
+        key=lambda item: (
+            ai_update_beijing_day_key(item),
+            ai_update_category_priority(item),
+            ai_update_attention_score(item),
+            item.timestamp_sort_key,
+            _source_priority(item),
+        ),
+    )
 
 
 def _render_cover(brief: AIDigestBrief, path: Path) -> None:
@@ -85,19 +132,39 @@ def _render_cover(brief: AIDigestBrief, path: Path) -> None:
     body_font = _font(30)
     small_font = _font(24)
 
-    draw.text((70, 42), "Auto Redbook AI Brief", font=small_font, fill="#f4dfbf")
+    draw.text((70, 42), "AI动态简报", font=small_font, fill="#f4dfbf")
     draw.text((96, 300), brief.title or "每日AI讯息", font=title_font, fill="#1f292e")
     draw.text((100, 402), brief.date or "", font=subtitle_font, fill="#b75f35")
     subtitle = brief.subtitle or "AI平台、模型、工具和开源动态简报"
     _draw_wrapped(draw, (100, 492), subtitle, subtitle_font, width=25, fill="#39454b", line_gap=12)
 
-    count_text = f"本期整理 {len(brief.items)} 条动态"
-    draw.rounded_rectangle([100, 710, 520, 792], radius=24, fill="#1f292e")
-    draw.text((132, 730), count_text, font=body_font, fill="#fff7e8")
+    featured = _featured_item(brief)
+    draw.rounded_rectangle([100, 690, CARD_SIZE[0] - 100, 920], radius=30, fill="#1f292e")
+    draw.text((132, 720), "今日重点", font=small_font, fill="#f4dfbf")
+    if featured:
+        _draw_wrapped(
+            draw,
+            (132, 764),
+            featured.title,
+            body_font,
+            width=27,
+            fill="#fff7e8",
+            line_gap=8,
+            max_lines=2,
+        )
+        meta = " · ".join(
+            part
+            for part in (
+                featured.source_name or featured.vendor,
+                _format_published_at(featured.published_at),
+            )
+            if part
+        )
+        if meta:
+            draw.text((132, 872), meta, font=small_font, fill="#d7c4a7")
 
     source = brief.source_summary or "官方源为主，社交源用于补充与验证。"
-    _draw_wrapped(draw, (100, 880), source, body_font, width=30, fill="#4e5a60", line_gap=12)
-    draw.text((82, CARD_SIZE[1] - 64), "来源链接已保存至本地 metadata", font=small_font, fill="#51483d")
+    _draw_wrapped(draw, (100, 990), source, body_font, width=30, fill="#4e5a60", line_gap=12)
     img.save(path, format="PNG")
 
 
@@ -109,23 +176,51 @@ def _render_items_page(brief: AIDigestBrief, page_items: list[AIUpdateItem], pat
     meta_font = _font(22)
 
     draw.text((70, 42), f"{brief.title or '每日AI讯息'}  {page_no}/{total_pages}", font=header_font, fill="#f4dfbf")
-    y = 226
+    top = 222
+    bottom = CARD_SIZE[1] - 146
+    gap = 26
+    count = max(1, len(page_items))
+    box_height = int((bottom - top - gap * (count - 1)) / count)
+    y = top
     for idx, item in enumerate(page_items, 1):
-        draw.rounded_rectangle([86, y - 18, CARD_SIZE[0] - 86, y + 252], radius=24, fill="#f2eadc")
+        box_bottom = y + box_height
+        draw.rounded_rectangle([86, y - 12, CARD_SIZE[0] - 86, box_bottom], radius=28, fill="#f2eadc")
         vendor = item.vendor or item.source_name or "AI"
-        draw.text((116, y), f"{vendor}", font=meta_font, fill="#b75f35")
-        y += 38
-        y = _draw_wrapped(draw, (116, y), item.title, title_font, width=24, fill="#1f292e", line_gap=6)
-        y += 4
-        y = _draw_wrapped(draw, (116, y), item.summary, body_font, width=31, fill="#334047", line_gap=6)
+        draw.text((116, y + 20), f"{vendor}", font=meta_font, fill="#b75f35")
+        text_y = y + 62
+        text_y = _draw_wrapped(
+            draw,
+            (116, text_y),
+            item.title,
+            title_font,
+            width=24,
+            fill="#1f292e",
+            line_gap=6,
+            max_lines=2,
+        )
+        text_y += 8
+        status_y = box_bottom - 38
+        line_height = max(24, int(body_font.size * 1.35)) + 6
+        max_summary_lines = max(3, int((status_y - text_y - 8) / line_height))
+        _draw_wrapped(
+            draw,
+            (116, text_y),
+            item.summary,
+            body_font,
+            width=31,
+            fill="#334047",
+            line_gap=6,
+            max_lines=max_summary_lines,
+        )
         status = "官方源"
         if item.verification_status == "social_confirmed":
             status = "官方源 + 社交验证"
         elif item.source_type == "social":
             status = "社交补充"
-        draw.text((116, y + 6), f"{status} / {item.source_name}", font=meta_font, fill="#756e62")
-        y += 292
-    draw.text((82, CARD_SIZE[1] - 64), "长链接不写入图片，完整来源保存在本地", font=meta_font, fill="#51483d")
+        published = _format_published_at(item.published_at) or brief.date or "待核验"
+        source_name = item.source_name or item.vendor or "公开来源"
+        draw.text((116, status_y), f"发布时间：{published}  来源：{source_name}  {status}", font=meta_font, fill="#756e62")
+        y = box_bottom + gap
     img.save(path, format="PNG")
 
 

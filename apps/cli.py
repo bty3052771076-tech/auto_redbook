@@ -15,6 +15,13 @@ from src.aliyun.quota import (
     format_aliyun_quota_records,
     run_collect_aliyun_quota_sync,
 )
+from src.volcengine.quota import (
+    VOLCENGINE_ARK_FREE_QUOTA_DOC_URL,
+    VOLCENGINE_ARK_MODEL_LIST_DOC_URL,
+    VOLCENGINE_ARK_USAGE_URL,
+    format_volcengine_quota_records,
+    run_collect_volcengine_quota_sync,
+)
 from src.analytics.post_sync import sync_published_metrics_to_posts
 from src.analytics.published_metrics import analyze_published_metrics, render_published_metrics_analysis
 from src.publish.playwright_steps import (
@@ -130,6 +137,14 @@ def _stage_from_create_exception(exc: Exception) -> str:
 
 def _is_daily_ai_digest_title(title: str) -> bool:
     return (title or "").strip().replace(" ", "") == DAILY_AI_DIGEST_TITLE
+
+
+def _emit_missing_assets_hint(title: str, *, dry_run: bool = False) -> None:
+    if _is_daily_ai_digest_title(title):
+        typer.echo("note: 每日AI讯息会自动渲染本地简报图，无需本地素材或 AI 生图。")
+        return
+    if not dry_run:
+        typer.echo("未找到素材文件，将自动查找配图（如已启用 AUTO_IMAGE 且配置了图片 API）。")
 
 
 def _upload_progress(post_id: str):
@@ -263,6 +278,11 @@ def _select_publishable_posts(
                 continue
     else:
         candidates = list(list_posts())
+        candidates.sort(
+            key=lambda post: _parse_post_time(post.uploaded_at or post.updated_at or post.created_at or "")
+            or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
 
     selected: list[Post] = []
     for post in candidates:
@@ -317,7 +337,6 @@ def _mark_posts_published(posts: list[Post], result: dict) -> None:
         save_post(post)
 
 
-@app.command()
 def create(
     title: str = typer.Option(..., help="初始标题/题目"),
     prompt: str = typer.Option("", help="提示词/要点（可选）"),
@@ -331,12 +350,11 @@ def create(
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
 ):
     """生成草稿并落盘（post.json + revision）。"""
-    asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
-    if not asset_paths:
-        typer.echo("未找到素材文件，将自动查找配图（如已启用 AUTO_IMAGE 且配置了图片 API）。")
-
     title_norm = (title or "").strip()
     prompt_norm = (prompt or "").strip()
+    asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
+    if not asset_paths:
+        _emit_missing_assets_hint(title_norm)
 
     if count <= 0:
         typer.echo("count 必须 >= 1")
@@ -604,12 +622,11 @@ def auto(
     force: bool = typer.Option(False, help="run even if validation fails"),
 ):
     """Generate content then save draft in one command."""
-    asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
-    if not asset_paths and not dry_run:
-        typer.echo("未找到素材文件，将自动查找配图（如已启用 AUTO_IMAGE 且配置了图片 API）。")
-
     title_norm = (title or "").strip()
     prompt_norm = (prompt or "").strip()
+    asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
+    if not asset_paths:
+        _emit_missing_assets_hint(title_norm, dry_run=dry_run)
 
     if count <= 0:
         typer.echo("count 必须 >= 1")
@@ -871,16 +888,80 @@ def aliyun_quota(
         raise typer.Exit(code=1)
 
 
+@app.command("volcengine-quota")
+def volcengine_quota(
+    model: Optional[list[str]] = typer.Option(
+        None,
+        "--model",
+        help="Filter specific Ark models; may be repeated. Defaults to configured Volcengine LLM/image models.",
+    ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="read the Ark console without a visible window; requires a logged-in workspace profile",
+    ),
+    login_hold: int = typer.Option(0, help="seconds to keep the visible browser open for Volcengine console login"),
+    wait_timeout: int = typer.Option(120, help="seconds to wait for the Ark usage/free-quota table"),
+    open_only: bool = typer.Option(False, "--open-only", help="only open the official Ark usage page"),
+):
+    """Read Volcengine Ark quota/usage from the official console page."""
+    typer.echo("Volcengine Ark quota")
+    typer.echo(f"official-usage-url: {VOLCENGINE_ARK_USAGE_URL}")
+    typer.echo(f"official-free-quota-doc-url: {VOLCENGINE_ARK_FREE_QUOTA_DOC_URL}")
+    typer.echo(f"official-model-list-doc-url: {VOLCENGINE_ARK_MODEL_LIST_DOC_URL}")
+    typer.echo(
+        "note: Ark model APIs list models and run inference, but remaining free quota is shown in the "
+        "Volcengine console; this command reads the official console page and does not call billable models."
+    )
+
+    if open_only:
+        webbrowser.open(VOLCENGINE_ARK_USAGE_URL)
+        typer.echo("opened official Volcengine Ark usage page")
+        return
+
+    if headless and login_hold > 0:
+        typer.echo(
+            "warn: --headless requires an already logged-in Volcengine console profile; "
+            "login-hold cannot display QR/captcha windows"
+        )
+
+    def _progress(message: str) -> None:
+        typer.echo(message)
+
+    result = run_collect_volcengine_quota_sync(
+        models=[m.strip() for m in (model or []) if m and m.strip()] or None,
+        login_hold=login_hold,
+        wait_timeout_ms=wait_timeout * 1000,
+        headless=True if headless else None,
+        progress_callback=_progress,
+    )
+
+    typer.echo(format_volcengine_quota_records(result.get("records", [])))
+    typer.echo(f"free-quota-doc-url: {result.get('free_quota_doc_url') or VOLCENGINE_ARK_FREE_QUOTA_DOC_URL}")
+    typer.echo(f"model-list-doc-url: {result.get('model_list_doc_url') or VOLCENGINE_ARK_MODEL_LIST_DOC_URL}")
+    if result.get("errors"):
+        typer.echo(f"errors: {result['errors']}")
+        raise typer.Exit(code=1)
+
+
 @app.command("update-metrics")
 def update_metrics(
-    limit: int = typer.Option(0, help="最多同步 N 条已发布笔记；0 表示按页面滚动上限尽量同步"),
+    limit: int = typer.Option(0, help="同步 N 条已发布笔记；0 表示按页面显示总数全量同步"),
     headless: bool = typer.Option(
         False,
         "--headless",
         help="run Chrome without a visible window; requires an already logged-in profile",
     ),
     login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
-    wait_timeout: int = typer.Option(300, help="seconds to wait for metrics UI"),
+    wait_timeout: int = typer.Option(
+        300,
+        help="advanced per-step UI wait seconds; not a full-sync deadline",
+    ),
+    allow_partial: bool = typer.Option(
+        False,
+        "--allow-partial",
+        help="save partial metrics even when the page reports more published notes than were collected",
+    ),
 ):
     """同步已发布稿件的点赞、评论、收藏到本地表格。"""
     _warn_headless_login_hold(headless, login_hold)
@@ -896,6 +977,37 @@ def update_metrics(
         progress_callback=_progress,
     )
     metrics = [PublishedMetric.model_validate(item) for item in result.get("items", [])]
+    target_total = int(result.get("target_total") or 0)
+    required_total = int(result.get("required_total") or (target_total if target_total else len(metrics)))
+    missing_count = int(result.get("missing_count") or max(0, required_total - len(metrics)))
+    complete = bool(result.get("complete", True))
+    typer.echo(
+        f"metrics-collection: fetched={len(metrics)} "
+        f"target={target_total or 'unknown'} required={required_total} "
+        f"missing={missing_count} complete={complete}"
+    )
+    if not metrics:
+        typer.echo("error: no published metrics collected; refusing to overwrite latest analytics.")
+        if result.get("event_path"):
+            typer.echo(f"event: {result['event_path']}")
+        if result.get("errors"):
+            typer.echo(f"errors: {result['errors']}")
+        raise typer.Exit(code=1)
+    if metrics and not complete and not allow_partial:
+        typer.echo(
+            "error: incomplete published metrics; refusing to overwrite latest analytics "
+            f"(fetched={len(metrics)} target={target_total or 'unknown'} missing={missing_count}). "
+            "Rerun after the page fully loads, increase XHS_METRICS_MAX_SCROLLS / XHS_METRICS_STAGNANT_ROUNDS, "
+            "or pass --allow-partial for a deliberate partial snapshot."
+        )
+        if result.get("event_path"):
+            typer.echo(f"event: {result['event_path']}")
+        raise typer.Exit(code=1)
+    if metrics and not complete and allow_partial:
+        typer.echo(
+            "warning: saving partial published metrics "
+            f"(fetched={len(metrics)} target={target_total or 'unknown'} missing={missing_count})"
+        )
     saved = save_published_metrics_snapshot(metrics)
     synced = sync_published_metrics_to_posts(metrics)
     typer.echo(f"metrics: fetched={len(metrics)} saved={saved['count']}")

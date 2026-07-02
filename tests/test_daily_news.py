@@ -19,10 +19,12 @@ from src.workflow.create_post import (
     _daily_news_prompt,
     _ensure_daily_news_sections,
     _finalize_daily_news_body,
+    _focus_daily_news_item,
     _has_japanese_kana,
     _limit_daily_news_content,
     _normalize_daily_news_title,
     _normalize_daily_news_topics,
+    _render_daily_news_body_fields,
 )
 
 
@@ -49,18 +51,16 @@ def _daily_news_body_fields(body: str) -> dict:
         value_end = min(stops) if stops else len(body)
         return body[value_start:value_end].strip()
 
-    original = re.search(r"^原文标题：(.+)$", body, flags=re.MULTILINE)
+    assert "原文标题：" not in body
     date = re.search(r"^日期：(.+)$", body, flags=re.MULTILINE)
     source = re.search(r"^来源：(.+)$", body, flags=re.MULTILINE)
     data = {
-        "原文标题": original.group(1).strip() if original else "",
         "内容": section("内容", ("评价", "日期", "来源")),
         "评价": section("评价", ("日期", "来源")),
         "日期": date.group(1).strip() if date else "",
         "来源": source.group(1).strip() if source else "",
     }
-    assert list(data.keys()) == ["原文标题", "内容", "评价", "日期", "来源"]
-    assert data["原文标题"]
+    assert list(data.keys()) == ["内容", "评价", "日期", "来源"]
     assert data["内容"]
     assert data["日期"]
     assert data["来源"]
@@ -248,8 +248,8 @@ def test_create_daily_news_falls_back_when_llm_echoes_prompt(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(
         create_post,
-        "fetch_and_pick_daily_news",
-        lambda _prompt: (picked, {"provider": "fake-news", "picked": {"title": picked.title}}),
+        "fetch_daily_news_candidates",
+        lambda _prompt, **_kwargs: ([picked], {"provider": "fake-news", "picked": {"title": picked.title}}),
     )
 
     def fake_generate_draft(*_args, **_kwargs):
@@ -313,16 +313,116 @@ def test_daily_news_prompt_requires_chinese_translation_no_url_and_target_length
     assert "必须全部使用简体中文" in prompt
     assert "英文新闻" in prompt and "翻译" in prompt
     assert "150字以内" in prompt
-    for key in ("原文标题", "内容", "评价", "日期", "来源"):
+    for key in ("内容", "评价", "日期", "来源"):
         assert key in prompt
     assert "不得输出 URL" in prompt
     assert "网址只保存在本地" in prompt
     assert "body 字符串内容本身必须是一个可被 json.loads 解析的 JSON 对象文本" not in prompt
-    assert "原文标题：" in prompt
+    assert "原文标题：" not in prompt
+    assert "不得使用旧标签“原文标题" in prompt
     assert "内容：" in prompt
     assert "日期：YYYY-MM-DD\n\n来源：来源名称" in prompt
     assert "12-18字" in prompt
     assert "理想约15字" in prompt
+
+
+def test_render_daily_news_body_fields_omits_original_title_from_publishable_body():
+    body = _render_daily_news_body_fields(
+        {
+            "原文标题": "原始新闻标题不应进入草稿正文",
+            "内容": "这是一条已经核验来源的新闻正文。",
+            "评价": "这条新闻的影响需要结合后续公开信息继续观察。",
+            "日期": "2026-07-02",
+            "来源": "Example News",
+        }
+    )
+
+    assert "原文标题" not in body
+    assert "原始新闻标题不应进入草稿正文" not in body
+    assert body.startswith("内容：\n")
+    assert "日期：2026-07-02" in body
+    assert "来源：Example News" in body
+
+
+def test_focus_daily_news_item_selects_important_story_from_generic_bundle():
+    picked = NewsItem(
+        title="今日要闻",
+        url="https://example.com/mixed",
+        source="Example Hot",
+        domain="example.com",
+        seendate="2026-07-02",
+        description=(
+            "明星综艺录制花絮曝光\n"
+            "国务院发布超龄劳动者权益保障新规\n"
+            "地方文旅夜市活动开幕"
+        ),
+        content=(
+            "明星综艺录制花絮曝光\n"
+            "国务院发布超龄劳动者权益保障新规\n"
+            "地方文旅夜市活动开幕"
+        ),
+    )
+
+    focused, meta = _focus_daily_news_item(picked)
+
+    assert focused.title == "国务院发布超龄劳动者权益保障新规"
+    assert focused.description == "国务院发布超龄劳动者权益保障新规"
+    assert focused.content == "国务院发布超龄劳动者权益保障新规"
+    assert meta["multi_story_filter"]["applied"] is True
+    assert meta["multi_story_filter"]["selected_title"] == "国务院发布超龄劳动者权益保障新规"
+
+
+def test_create_daily_news_posts_stores_simplified_body_without_original_title(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    picked = NewsItem(
+        title="臺灣AI產業發佈新規",
+        url="https://example.com/tw-ai",
+        source="聯合新聞網",
+        domain="example.com",
+        seendate="2026-07-02",
+        description="臺灣AI產業發佈新規，資訊服務與平台門戶同步調整。",
+        content="臺灣AI產業發佈新規，資訊服務與平台門戶同步調整。",
+    )
+    monkeypatch.setattr(
+        create_post,
+        "fetch_daily_news_candidates",
+        lambda _prompt, **_kwargs: ([picked], {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+
+    def fake_generate_draft(*_args, **_kwargs):
+        return {
+            "title": "臺灣AI產業發佈新規",
+            "body": _test_daily_news_body(
+                original_title="臺灣AI產業發佈新規",
+                content="臺灣AI產業發佈新規，資訊服務與平台門戶同步調整。",
+                comment="這項規則的重點在於資訊透明、平台責任與產業協同。",
+                date="2026-07-02",
+                source="聯合新聞網",
+            ),
+            "topics": ["每日新闻", "臺灣AI", "資訊服務"],
+            "image_event": "臺灣AI產業發佈新規",
+        }
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="科技产业",
+        asset_paths=[],
+        count=1,
+        auto_image=False,
+    )
+
+    post = posts[0]
+    assert "原文标题" not in post.body
+    assert all(ch not in f"{post.title}\n{post.body}\n{' '.join(post.topics)}" for ch in "臺灣發佈資訊聯門戶項規則責產業協")
+    assert "台湾AI产业发布新规" in post.title
+    assert "台湾AI产业发布新规" in post.body
 
 
 def test_daily_news_prompt_makes_comment_optional_and_forbids_generic_comment():
@@ -755,7 +855,9 @@ def test_daily_news_body_preserves_chinese_source_original_title():
     out = _finalize_daily_news_body(body, picked, "国际新闻")
     fields = _daily_news_body_fields(out)
 
-    assert fields["原文标题"] == "特朗普：如与伊朗不能达成协议 美或收取海峡通行费"
+    assert "原文标题：" not in out
+    assert "霍尔木兹" in fields["内容"]
+    assert fields["日期"] == "2026-06-21"
 
 
 def test_finalize_daily_news_body_replaces_unsupported_content_and_irrelevant_comment():
@@ -825,7 +927,7 @@ def test_finalize_daily_news_body_removes_recommendation_noise_and_ai_comment_fo
     out = _finalize_daily_news_body(body, picked, "文化新闻")
     fields = _daily_news_body_fields(out)
 
-    assert fields["原文标题"] == "香港故事丨在香江细读潮汕“情书”"
+    assert "原文标题：" not in out
     assert "权威数读" not in fields["内容"]
     assert "新华视点" not in fields["内容"]
     assert "特色产业赋能" not in fields["内容"]
@@ -1105,11 +1207,13 @@ def test_create_daily_news_single_stores_url_locally_but_not_in_body(monkeypatch
         description="The chip company said the product targets inference workloads.",
         content="The company described performance and energy-efficiency updates.",
     )
-    monkeypatch.setattr(
-        create_post,
-        "fetch_and_pick_daily_news",
-        lambda _prompt: (picked, {"provider": "hotnews", "provider_attempts": ["hotnews"]}),
-    )
+    fetch_kwargs: dict[str, object] = {}
+
+    def fake_fetch(_prompt, **kwargs):
+        fetch_kwargs.update(kwargs)
+        return [picked], {"provider": "hotnews", "provider_attempts": ["hotnews"]}
+
+    monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
 
     def fake_generate_draft(*_args, **_kwargs):
         return {
@@ -1148,6 +1252,8 @@ def test_create_daily_news_single_stores_url_locally_but_not_in_body(monkeypatch
     assert post.platform["news"]["api_source"] == "hotnews"
     assert post.platform["news"]["source_api"]["provider"] == "hotnews"
     assert post.platform["news"]["source_api"]["item_source"] == "Example News"
+    assert fetch_kwargs["max_records"] == 2
+    assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 2
 
 
 def test_create_daily_news_single_outputs_fixed_body_fields(monkeypatch, tmp_path):
@@ -1168,8 +1274,8 @@ def test_create_daily_news_single_outputs_fixed_body_fields(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(
         create_post,
-        "fetch_and_pick_daily_news",
-        lambda _prompt: (picked, {"provider": "fake-news"}),
+        "fetch_daily_news_candidates",
+        lambda _prompt, **_kwargs: ([picked], {"provider": "fake-news"}),
     )
 
     def fake_generate_draft(*_args, **_kwargs):
@@ -1198,7 +1304,8 @@ def test_create_daily_news_single_outputs_fixed_body_fields(monkeypatch, tmp_pat
     )
 
     data = _daily_news_body_fields(post.body)
-    assert data["原文标题"] == "AI芯片新品发布"
+    assert "原文标题：" not in post.body
+    assert post.title == "AI芯片新品发布"
     assert "AI芯片" in data["内容"]
     assert "算力供给" in data["评价"]
     assert data["日期"] == "2026-06-19"
@@ -1324,10 +1431,250 @@ def test_create_daily_news_posts_replaces_cross_candidate_title_and_image_event(
     fields = _daily_news_body_fields(post.body)
     image_event = post.platform["news"]["image_event"]
 
-    assert "锂提取" not in fields["原文标题"]
+    assert "锂提取" not in post.body
     assert "锂提取" not in image_event
-    assert any(token in fields["原文标题"] for token in ("LG", "OLED", "显示"))
+    assert any(token in f"{post.title} {fields['内容']}" for token in ("LG", "OLED", "显示"))
     assert any(token in image_event for token in ("LG", "OLED", "显示"))
+
+
+def test_create_daily_news_posts_trims_multi_story_source_before_llm_and_image(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    picked = NewsItem(
+        title="长鑫存储一季度暴赚合肥十年赌局翻盘",
+        url="https://example.com/mixed-hot-list",
+        source="Example Hot",
+        domain="example.com",
+        seendate="2026-06-30",
+        description=(
+            "长鑫存储一季度利润大增，合肥早期产业投资进入收获期。\n"
+            "苹果涨价英伟达返现OpenAI发芯片\n"
+            "泡泡玛特暴涨段永平赚十亿港元"
+        ),
+        content=(
+            "长鑫存储一季度暴赚合肥十年赌局翻盘\n"
+            "苹果涨价英伟达返现OpenAI发芯片\n"
+            "泡泡玛特暴涨段永平赚十亿港元\n"
+            "全球6.55亿人无电可用"
+        ),
+    )
+    monkeypatch.setattr(
+        create_post,
+        "fetch_daily_news_candidates",
+        lambda _prompt: ([picked], {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+
+    seen: dict[str, str] = {}
+
+    def fake_generate_draft(*_args, **kwargs):
+        seen["llm_prompt"] = kwargs["prompt_hint"]
+        return {
+            "title": "长鑫存储盈利翻盘",
+            "body": _test_daily_news_body(
+                original_title="长鑫存储一季度暴赚合肥十年赌局翻盘",
+                content="长鑫存储一季度利润大增，合肥早期产业投资进入收获期。",
+                comment="这条新闻的重点在于地方产业投资进入回报观察期。",
+                date="2026-06-30",
+                source="Example Hot",
+            ),
+            "topics": ["每日新闻", "芯片产业"],
+            "image_event": "长鑫存储一季度利润大增",
+        }
+
+    def fake_images(*, title, body, topics, prompt_hint, dest_dir, **_kwargs):
+        seen["image_title"] = title
+        seen["image_prompt"] = prompt_hint
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / "image.jpg"
+        out.write_bytes(b"image")
+        return [out], [{"provider": "fake", "query_original": prompt_hint}]
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+    monkeypatch.setattr(create_post, "fetch_and_download_related_images", fake_images)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="财经产业",
+        asset_paths=[],
+        count=1,
+        auto_image=True,
+    )
+
+    post = posts[0]
+    fields = _daily_news_body_fields(post.body)
+    blocked = ("苹果涨价", "OpenAI发芯片", "泡泡玛特", "全球6.55亿人无电")
+
+    assert "长鑫存储" in seen["llm_prompt"]
+    assert all(text not in seen["llm_prompt"] for text in blocked)
+    assert all(text not in fields["内容"] for text in blocked)
+    assert all(text not in post.platform["news"]["picked"]["content"] for text in blocked)
+    assert "长鑫存储" in seen["image_prompt"]
+    assert all(text not in seen["image_prompt"] for text in blocked)
+
+
+def test_create_daily_news_posts_keeps_normal_multi_paragraph_source(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    picked = NewsItem(
+        title="长鑫存储披露一季度盈利改善",
+        url="https://example.com/normal-article",
+        source="Example News",
+        domain="example.com",
+        seendate="2026-06-30",
+        description=(
+            "长鑫存储披露一季度盈利改善，产线利用率继续回升。\n"
+            "公司称产品结构调整带动毛利率改善。\n"
+            "业内人士认为国产存储供应链仍需观察需求周期。"
+        ),
+        content=(
+            "长鑫存储披露一季度盈利改善，产线利用率继续回升。\n"
+            "公司称产品结构调整带动毛利率改善。\n"
+            "业内人士认为国产存储供应链仍需观察需求周期。"
+        ),
+    )
+    monkeypatch.setattr(
+        create_post,
+        "fetch_daily_news_candidates",
+        lambda _prompt: ([picked], {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+
+    seen: dict[str, str] = {}
+
+    def fake_generate_draft(*_args, **kwargs):
+        seen["llm_prompt"] = kwargs["prompt_hint"]
+        return {
+            "title": "长鑫存储盈利改善",
+            "body": _test_daily_news_body(
+                original_title="长鑫存储披露一季度盈利改善",
+                content="长鑫存储一季度盈利改善，产品结构调整带动毛利率改善。",
+                comment="这条新闻的重点在于国产存储企业经营质量改善。",
+                date="2026-06-30",
+                source="Example News",
+            ),
+            "topics": ["每日新闻", "芯片产业"],
+            "image_event": "长鑫存储一季度盈利改善",
+        }
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="财经产业",
+        asset_paths=[],
+        count=1,
+        auto_image=False,
+    )
+
+    post = posts[0]
+    assert "产品结构调整带动毛利率改善" in seen["llm_prompt"]
+    assert "国产存储供应链仍需观察需求周期" in seen["llm_prompt"]
+    assert "产品结构调整带动毛利率改善" in post.platform["news"]["picked"]["content"]
+    assert "国产存储供应链仍需观察需求周期" in post.platform["news"]["picked"]["content"]
+    assert post.platform["news"]["multi_story_filter"]["applied"] is False
+
+
+def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    candidates = [
+        NewsItem(
+            title="36氪公司政策新闻一",
+            url="https://36kr.com/p/1",
+            source="36氪",
+            domain="36kr.com",
+            seendate="2026-07-02T09:00:00Z",
+            description="公司政策调整引发行业关注。",
+            content="公司政策调整引发行业关注。",
+            sourcecountry="cn",
+        ),
+        NewsItem(
+            title="36氪公司政策新闻二",
+            url="https://36kr.com/p/2",
+            source="36氪",
+            domain="36kr.com",
+            seendate="2026-07-02T08:50:00Z",
+            description="平台企业发布新举措。",
+            content="平台企业发布新举措。",
+            sourcecountry="cn",
+        ),
+        NewsItem(
+            title="新华社发布超龄劳动者权益新规",
+            url="https://news.cn/politics/1",
+            source="新华社",
+            domain="news.cn",
+            seendate="2026-07-02T08:40:00Z",
+            description="超龄劳动者权益保障新规施行。",
+            content="超龄劳动者权益保障新规施行。",
+            sourcecountry="cn",
+        ),
+        NewsItem(
+            title="央视关注暑运客流增长",
+            url="https://news.cctv.com/china/1",
+            source="央视新闻",
+            domain="news.cctv.com",
+            seendate="2026-07-02T08:30:00Z",
+            description="铁路暑运客流进入高峰。",
+            content="铁路暑运客流进入高峰。",
+            sourcecountry="cn",
+        ),
+    ]
+    fetch_kwargs: dict[str, object] = {}
+
+    def fake_fetch(_prompt, **kwargs):
+        fetch_kwargs.update(kwargs)
+        return candidates, {"provider": "fake-news"}
+
+    monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+
+    def fake_generate_draft(*_args, **kwargs):
+        prompt = kwargs["prompt_hint"]
+        match = re.search(r"- 新闻标题：(.+)", prompt)
+        source_match = re.search(r"- 来源名称：(.+)", prompt)
+        source_title = match.group(1).strip() if match else "候选新闻标题"
+        source = source_match.group(1).strip() if source_match else "Example"
+        return {
+            "title": source_title[:18],
+            "body": _test_daily_news_body(
+                original_title=source_title,
+                content=f"{source_title}，相关公开信息已经披露，后续影响仍需观察。",
+                comment="这条新闻的价值在于提供了清晰的公共议题入口。",
+                date="2026-07-02",
+                source=source,
+            ),
+            "topics": ["每日新闻"],
+            "image_event": source_title,
+        }
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="公司政策 市场变化",
+        asset_paths=[],
+        count=2,
+        auto_image=False,
+    )
+
+    picked_domains = [post.platform["news"]["picked"]["domain"] for post in posts]
+    assert fetch_kwargs["max_records"] == 4
+    assert len(posts) == 2
+    assert picked_domains.count("36kr.com") <= 1
+    assert len(set(picked_domains)) == 2
+    for post in posts:
+        assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 4
+        assert post.platform["news"]["selection_pool"]["requested_count"] == 2
 
 
 def test_create_daily_news_posts_replaces_generic_original_title_with_post_title(monkeypatch, tmp_path):
@@ -1381,9 +1728,11 @@ def test_create_daily_news_posts_replaces_generic_original_title_with_post_title
         auto_image=False,
     )
 
-    fields = _daily_news_body_fields(posts[0].body)
-    assert fields["原文标题"] == "男子光膀除草遭要求穿衣"
-    assert "出现进展" not in fields["原文标题"]
+    post = posts[0]
+    _daily_news_body_fields(post.body)
+    assert "原文标题：" not in post.body
+    assert post.title == "男子光膀除草遭要求穿衣"
+    assert "出现进展" not in post.body
 
 
 def test_create_daily_news_posts_prefers_post_title_over_mismatched_original_summary(monkeypatch, tmp_path):
@@ -1431,9 +1780,11 @@ def test_create_daily_news_posts_prefers_post_title_over_mismatched_original_sum
         auto_image=False,
     )
 
-    fields = _daily_news_body_fields(posts[0].body)
-    assert fields["原文标题"] == "思科与Island浏览器实现零信任"
-    assert "VPN" not in fields["原文标题"]
+    post = posts[0]
+    _daily_news_body_fields(post.body)
+    assert "原文标题：" not in post.body
+    assert post.title == "思科与Island浏览器实现零信任"
+    assert "VPN" not in post.body
 
 
 def test_create_daily_news_posts_keeps_trying_after_quality_skips(monkeypatch, tmp_path):
@@ -1607,8 +1958,8 @@ def test_create_daily_news_fallback_does_not_publish_prompt_as_topic(monkeypatch
     )
     monkeypatch.setattr(
         create_post,
-        "fetch_and_pick_daily_news",
-        lambda _prompt: (picked, {"provider": "fake-news", "picked": {"title": picked.title}}),
+        "fetch_daily_news_candidates",
+        lambda _prompt, **_kwargs: ([picked], {"provider": "fake-news", "picked": {"title": picked.title}}),
     )
 
     def fake_generate_draft(*_args, **_kwargs):
@@ -1650,8 +2001,8 @@ def test_create_daily_news_rejects_prompt_topic_title_and_generic_body(monkeypat
     )
     monkeypatch.setattr(
         create_post,
-        "fetch_and_pick_daily_news",
-        lambda _prompt: (picked, {"provider": "fake-news", "picked": {"title": picked.title}}),
+        "fetch_daily_news_candidates",
+        lambda _prompt, **_kwargs: ([picked], {"provider": "fake-news", "picked": {"title": picked.title}}),
     )
 
     def fake_generate_draft(*_args, **_kwargs):
@@ -2534,13 +2885,12 @@ def test_finalize_daily_news_body_renders_json_as_publishable_text():
     assert not out.lstrip().startswith("{")
     with pytest.raises(json.JSONDecodeError):
         json.loads(out)
-    assert "原文标题：AI芯片新品发布" in out
+    assert "原文标题：AI芯片新品发布" not in out
     assert "内容：\n这家芯片企业披露新一代人工智能加速器" in out
     assert "评价：\nAI芯片竞争会继续影响算力供给" in out
     assert (
         out
-        == "原文标题：AI芯片新品发布\n\n"
-        "内容：\n"
+        == "内容：\n"
         "这家芯片企业披露新一代人工智能加速器，重点面向推理计算场景。\n\n"
         "评价：\n"
         "AI芯片竞争会继续影响算力供给和应用成本。\n\n"
@@ -2571,7 +2921,7 @@ def test_finalize_daily_news_body_preserves_rendered_five_field_text():
     out = _finalize_daily_news_body(body, picked, "科技新闻")
     data = _daily_news_body_fields(out)
 
-    assert data["原文标题"] == "AI芯片新品发布"
+    assert "原文标题：" not in out
     assert data["内容"] == "这家芯片企业披露新一代人工智能加速器，重点面向推理计算场景。"
     assert data["评价"] == "AI芯片竞争会继续影响算力供给和应用成本。"
     assert data["日期"] == "2026-06-19"
@@ -3028,7 +3378,7 @@ def test_finalize_daily_news_body_cleans_ai_travel_excerpt_and_rewrites_comment(
     out = _finalize_daily_news_body(body, picked, "")
     data = _daily_news_body_fields(out)
 
-    assert data["原文标题"].endswith("）")
+    assert "原文标题：" not in out
     assert "周佳月摄" not in data["内容"]
     assert "路线规 AI伴你游" not in data["内容"]
     assert "AI 使用边界" not in data["评价"]
@@ -3412,3 +3762,43 @@ def test_pick_news_items_keeps_distinct_same_source_same_date_stories():
     picked = pick_news_items(items, "科技、社会或国际新闻", count=5)
 
     assert len(picked) == 5
+
+
+def test_pick_news_items_limits_single_domain_when_alternatives_exist():
+    items = [
+        NewsItem(
+            title=f"36氪公司政策新闻{i}",
+            url=f"https://36kr.com/p/{i}",
+            domain="36kr.com",
+            source="36氪",
+            seendate=f"2026-07-02T09:0{i}:00Z",
+            description="公司政策调整引发市场关注。",
+            sourcecountry="cn",
+        )
+        for i in range(4)
+    ] + [
+        NewsItem(
+            title="新华社发布劳动者权益新规",
+            url="https://news.cn/politics/1",
+            domain="news.cn",
+            source="新华社",
+            seendate="2026-07-02T08:50:00Z",
+            description="劳动者权益新规施行。",
+            sourcecountry="cn",
+        ),
+        NewsItem(
+            title="央视关注暑运客流增长",
+            url="https://news.cctv.com/china/1",
+            domain="news.cctv.com",
+            source="央视新闻",
+            seendate="2026-07-02T08:40:00Z",
+            description="铁路暑运客流进入高峰。",
+            sourcecountry="cn",
+        ),
+    ]
+
+    picked = pick_news_items(items, "", count=4)
+
+    domains = [item.domain for item in picked]
+    assert domains.count("36kr.com") <= 2
+    assert len(set(domains)) >= 3

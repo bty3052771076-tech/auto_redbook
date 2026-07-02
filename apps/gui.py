@@ -23,6 +23,9 @@ from src.config import (
     DEFAULT_ALIYUN_LLM_MODEL,
     DEFAULT_LLM_BASE_URL,
     DEFAULT_LLM_MODEL,
+    DEFAULT_VOLCENGINE_LLM_BASE_URL,
+    DEFAULT_VOLCENGINE_LLM_MODEL,
+    VOLCENGINE_AVAILABLE_LLM_MODELS,
 )
 from src.storage.files import latest_execution, published_metrics_paths
 from src.workflow.create_post import DEFAULT_EVALUATION_VIEWPOINT
@@ -64,14 +67,15 @@ DEFAULT_WAIT_TIMEOUT = 600
 DEFAULT_COMMAND_HEARTBEAT_S = 20.0
 COMMAND_OUTPUT_POLL_S = 0.2
 
-LLM_PROVIDER_OPTIONS = ["aliyun", "ppinfra", "auto"]
+LLM_PROVIDER_OPTIONS = ["aliyun", "volcengine", "ppinfra", "auto"]
 IMAGE_SOURCE_LOCAL = "local"
-IMAGE_PROVIDER_OPTIONS = ["aliyun", "pexels"]
+IMAGE_PROVIDER_OPTIONS = ["aliyun", "volcengine", "pexels"]
 IMAGE_SOURCE_OPTIONS = [IMAGE_SOURCE_LOCAL] + IMAGE_PROVIDER_OPTIONS
 
 ALIYUN_LLM_MODEL_OPTIONS = list(ALIYUN_FREE_LLM_MODELS)
+VOLCENGINE_LLM_MODEL_OPTIONS = list(VOLCENGINE_AVAILABLE_LLM_MODELS)
 PPINFRA_LLM_MODEL_OPTIONS = [DEFAULT_LLM_MODEL]
-AUTO_LLM_MODEL_OPTION = "阿里云免费模型列表（顺序回退）"
+AUTO_LLM_MODEL_OPTION = "自动模型列表（顺序回退）"
 
 DEFAULT_LLM_PROVIDER = "aliyun"
 DEFAULT_IMAGE_PROVIDER = "aliyun"
@@ -82,8 +86,16 @@ ALIYUN_IMAGE_MODEL_OPTIONS = [
     "wan2.7-image-pro",
     "qwen-image-2.0-pro-2026-04-22",
 ]
+VOLCENGINE_IMAGE_MODEL_OPTIONS = [
+    "doubao-seedream-5-0-lite-260128",
+    "doubao-seedream-5-0-260128",
+    "doubao-seedream-4-5-251128",
+    "doubao-seedream-4-0-250828",
+]
 DEFAULT_ALIYUN_IMAGE_MODELS = ALIYUN_IMAGE_MODEL_OPTIONS[0]
+DEFAULT_VOLCENGINE_IMAGE_MODELS = VOLCENGINE_IMAGE_MODEL_OPTIONS[0]
 DEFAULT_ALIYUN_IMAGE_SIZE = "1104*1472"
+DEFAULT_VOLCENGINE_IMAGE_SIZE = "1440x2560"
 DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT = (
     "no text, no words, no letters, no watermark, no logo, no caption, no subtitle, no signature, no UI"
 )
@@ -291,7 +303,21 @@ def list_publishable_drafts(
     """
     date_norm = (date or "").strip()
     items: list[RecentPostSummary] = []
-    for post in list_recent_posts(project_root=project_root, limit=max(limit, 200)):
+    posts_dir = project_root / "data" / "posts"
+    if not posts_dir.exists():
+        return []
+
+    summaries: list[tuple[float, RecentPostSummary]] = []
+    for p in posts_dir.iterdir():
+        if not p.is_dir() or not _looks_like_post_id(p.name):
+            continue
+        try:
+            summaries.append((p.stat().st_mtime, _read_post_summary(p)))
+        except Exception:
+            continue
+    summaries.sort(key=lambda t: t[0], reverse=True)
+
+    for _, post in summaries:
         status = (post.status or "").strip()
         if not post.uploaded:
             continue
@@ -794,7 +820,7 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
     """
     args: list[str] = [_python_for_cli(), "-m", "apps.cli", subcommand]
 
-    if subcommand in ("auto", "create"):
+    if subcommand == "auto":
         title = str(params.get("title") or "").strip()
         if not title:
             raise ValueError("title is required")
@@ -922,6 +948,8 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             args.extend(["--post-id", post_id])
         if limit:
             args.extend(["--limit", str(limit)])
+        if not date and not post_ids:
+            all_selected = True
         if all_selected:
             args.append("--all")
         if dry_run:
@@ -937,17 +965,18 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
     if subcommand == "update-metrics":
         limit = int(params.get("limit") or 0)
         headless = bool(params.get("headless") or False)
+        allow_partial = bool(params.get("allow_partial") or False)
         login_hold = int(params.get("login_hold") or 0)
-        wait_timeout = int(params.get("wait_timeout") or 300)
 
         args.extend(["--limit", str(limit)])
         if headless:
             args.append("--headless")
+        if allow_partial:
+            args.append("--allow-partial")
         args.extend(["--login-hold", str(login_hold)])
-        args.extend(["--wait-timeout", str(wait_timeout)])
         return args
 
-    if subcommand == "aliyun-quota":
+    if subcommand in ("aliyun-quota", "volcengine-quota"):
         raw_models = params.get("models") or []
         if isinstance(raw_models, str):
             models = [m.strip() for m in re.split(r"[,;\s]+", raw_models) if m.strip()]
@@ -1000,18 +1029,38 @@ def build_provider_env_overrides(
         env["ALIYUN_LLM_MODELS"] = selected
         env.setdefault("ALIYUN_LLM_BASE_URL", DEFAULT_ALIYUN_LLM_BASE_URL)
         env.pop("LLM_MODEL", None)
+        env.pop("VOLCENGINE_LLM_MODEL", None)
+        env.pop("VOLCENGINE_LLM_MODELS", None)
     elif provider == "ppinfra":
         selected = model if model and model != AUTO_LLM_MODEL_OPTION else DEFAULT_LLM_MODEL
         env["LLM_MODEL"] = selected
         env.setdefault("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
         env.pop("ALIYUN_LLM_MODEL", None)
         env.pop("ALIYUN_LLM_MODELS", None)
+        env.pop("VOLCENGINE_LLM_MODEL", None)
+        env.pop("VOLCENGINE_LLM_MODELS", None)
+    elif provider == "volcengine":
+        selected = model if model and model != AUTO_LLM_MODEL_OPTION else DEFAULT_VOLCENGINE_LLM_MODEL
+        env["VOLCENGINE_LLM_MODEL"] = selected
+        env["VOLCENGINE_LLM_MODELS"] = selected
+        env.setdefault("VOLCENGINE_LLM_BASE_URL", DEFAULT_VOLCENGINE_LLM_BASE_URL)
+        env.pop("LLM_MODEL", None)
+        env.pop("ALIYUN_LLM_MODEL", None)
+        env.pop("ALIYUN_LLM_MODELS", None)
     else:
         if model == AUTO_LLM_MODEL_OPTION or not model:
             env["ALIYUN_LLM_MODELS"] = ",".join(ALIYUN_LLM_MODEL_OPTIONS)
+            env["VOLCENGINE_LLM_MODELS"] = ",".join(VOLCENGINE_LLM_MODEL_OPTIONS)
         elif model in ALIYUN_LLM_MODEL_OPTIONS:
             env["ALIYUN_LLM_MODEL"] = model
             env["ALIYUN_LLM_MODELS"] = model
+            env.pop("VOLCENGINE_LLM_MODEL", None)
+            env.pop("VOLCENGINE_LLM_MODELS", None)
+        elif model in VOLCENGINE_LLM_MODEL_OPTIONS:
+            env["VOLCENGINE_LLM_MODEL"] = model
+            env["VOLCENGINE_LLM_MODELS"] = model
+            env.pop("ALIYUN_LLM_MODEL", None)
+            env.pop("ALIYUN_LLM_MODELS", None)
         elif model in PPINFRA_LLM_MODEL_OPTIONS:
             env["LLM_MODEL"] = model
 
@@ -1021,6 +1070,8 @@ def build_provider_env_overrides(
         env.pop("IMAGE_PROVIDER", None)
         env.pop("ALIYUN_IMAGE_MODEL", None)
         env.pop("ALIYUN_IMAGE_MODELS", None)
+        env.pop("VOLCENGINE_IMAGE_MODEL", None)
+        env.pop("VOLCENGINE_IMAGE_MODELS", None)
         return env
 
     if img_provider not in IMAGE_PROVIDER_OPTIONS:
@@ -1032,9 +1083,19 @@ def build_provider_env_overrides(
         selected_image = (image_model or DEFAULT_ALIYUN_IMAGE_MODELS).strip()
         env["ALIYUN_IMAGE_MODEL"] = selected_image
         env["ALIYUN_IMAGE_MODELS"] = selected_image
+        env.pop("VOLCENGINE_IMAGE_MODEL", None)
+        env.pop("VOLCENGINE_IMAGE_MODELS", None)
+    elif img_provider == "volcengine":
+        selected_image = (image_model or DEFAULT_VOLCENGINE_IMAGE_MODELS).strip()
+        env["VOLCENGINE_IMAGE_MODEL"] = selected_image
+        env["VOLCENGINE_IMAGE_MODELS"] = selected_image
+        env.pop("ALIYUN_IMAGE_MODEL", None)
+        env.pop("ALIYUN_IMAGE_MODELS", None)
     else:
         env.pop("ALIYUN_IMAGE_MODEL", None)
         env.pop("ALIYUN_IMAGE_MODELS", None)
+        env.pop("VOLCENGINE_IMAGE_MODEL", None)
+        env.pop("VOLCENGINE_IMAGE_MODELS", None)
 
     return env
 
@@ -1543,7 +1604,7 @@ def main() -> None:
         except Exception as exc:
             log_line(f"[gui] 参数错误：{exc}\n")
             return
-        if subcommand in ("auto", "create"):
+        if subcommand == "auto":
             env_overrides = ensure_daily_news_candidate_pool_env(
                 env_overrides,
                 title=str(params.get("title") or ""),
@@ -1660,6 +1721,7 @@ def main() -> None:
     llm_provider_var = tk.StringVar(value=_env_default("LLM_PROVIDER", DEFAULT_LLM_PROVIDER))
     initial_llm_model = (
         _env_default("ALIYUN_LLM_MODEL")
+        or _env_default("VOLCENGINE_LLM_MODEL")
         or _env_default("LLM_MODEL")
         or DEFAULT_ALIYUN_LLM_MODEL
     )
@@ -1673,7 +1735,11 @@ def main() -> None:
         initial_image_source = DEFAULT_IMAGE_SOURCE
     image_provider_var = tk.StringVar(value=initial_image_source)
     image_model_var = tk.StringVar(
-        value=_env_default("ALIYUN_IMAGE_MODEL", DEFAULT_ALIYUN_IMAGE_MODELS)
+        value=(
+            _env_default("ALIYUN_IMAGE_MODEL")
+            or _env_default("VOLCENGINE_IMAGE_MODEL")
+            or DEFAULT_ALIYUN_IMAGE_MODELS
+        )
     )
 
     ttk.Label(model_grid, text="LLM 供应商").grid(row=1, column=0, sticky="w", pady=5)
@@ -1700,7 +1766,7 @@ def main() -> None:
     )
     image_provider_box.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=5)
 
-    ttk.Label(model_grid, text="阿里云生图模型").grid(row=2, column=2, sticky="w", padx=(16, 0), pady=5)
+    ttk.Label(model_grid, text="生图模型").grid(row=2, column=2, sticky="w", padx=(16, 0), pady=5)
     image_model_box = ttk.Combobox(
         model_grid,
         textvariable=image_model_var,
@@ -1713,11 +1779,19 @@ def main() -> None:
         if provider == "aliyun":
             values = ALIYUN_LLM_MODEL_OPTIONS
             fallback = DEFAULT_ALIYUN_LLM_MODEL
+        elif provider == "volcengine":
+            values = VOLCENGINE_LLM_MODEL_OPTIONS
+            fallback = DEFAULT_VOLCENGINE_LLM_MODEL
         elif provider == "ppinfra":
             values = PPINFRA_LLM_MODEL_OPTIONS
             fallback = DEFAULT_LLM_MODEL
         else:
-            values = [AUTO_LLM_MODEL_OPTION] + ALIYUN_LLM_MODEL_OPTIONS + PPINFRA_LLM_MODEL_OPTIONS
+            values = (
+                [AUTO_LLM_MODEL_OPTION]
+                + ALIYUN_LLM_MODEL_OPTIONS
+                + VOLCENGINE_LLM_MODEL_OPTIONS
+                + PPINFRA_LLM_MODEL_OPTIONS
+            )
             fallback = AUTO_LLM_MODEL_OPTION
         llm_model_box["values"] = values
         if llm_model_var.get() not in values:
@@ -1726,6 +1800,14 @@ def main() -> None:
     def _sync_image_model_state(*_args) -> None:
         source = normalize_image_source(image_provider_var.get())
         if source == "aliyun":
+            image_model_box["values"] = ALIYUN_IMAGE_MODEL_OPTIONS
+            if image_model_var.get() not in ALIYUN_IMAGE_MODEL_OPTIONS:
+                image_model_var.set(DEFAULT_ALIYUN_IMAGE_MODELS)
+            image_model_box.configure(state="normal")
+        elif source == "volcengine":
+            image_model_box["values"] = VOLCENGINE_IMAGE_MODEL_OPTIONS
+            if image_model_var.get() not in VOLCENGINE_IMAGE_MODEL_OPTIONS:
+                image_model_var.set(DEFAULT_VOLCENGINE_IMAGE_MODELS)
             image_model_box.configure(state="normal")
         else:
             image_model_box.configure(state="disabled")
@@ -1811,49 +1893,6 @@ def main() -> None:
         root.after(300, _run_auto)
 
     root.after(500, _maybe_autorun_from_env)
-
-    # --- Create tab ---
-    tab_create = ttk.Frame(nb)
-    nb.add(tab_create, text="仅生成")
-    create_grid = ttk.Frame(tab_create)
-    create_grid.pack(fill="x", padx=4, pady=12)
-    create_grid.columnconfigure(1, weight=1)
-
-    create_title_var = tk.StringVar(value=DEFAULT_TITLE)
-    create_assets_var = tk.StringVar(value=DEFAULT_ASSETS_GLOB)
-    create_count_var = tk.IntVar(value=1)
-    create_no_copy_var = tk.BooleanVar(value=False)
-    create_evaluation_viewpoint_var = tk.StringVar(value=DEFAULT_EVALUATION_VIEWPOINT)
-    create_prompt = tk.Text(create_grid, height=4, relief="solid", bd=1, wrap="word", font=base_font)
-
-    _add_labeled_entry(create_grid, 0, "标题", create_title_var)
-    ttk.Label(create_grid, text="提示词").grid(row=1, column=0, sticky="nw", pady=5)
-    create_prompt.grid(row=1, column=1, sticky="we", pady=5, padx=(10, 0))
-    _init_prompt_placeholder(create_prompt)
-    _add_labeled_entry(create_grid, 2, "评价视角", create_evaluation_viewpoint_var)
-    _add_labeled_entry(create_grid, 3, "素材 glob", create_assets_var)
-    ttk.Label(create_grid, text="数量").grid(row=4, column=0, sticky="w", pady=5)
-    ttk.Spinbox(create_grid, from_=1, to=50, textvariable=create_count_var, width=8).grid(
-        row=4, column=1, sticky="w", pady=5, padx=(10, 0)
-    )
-    ttk.Checkbutton(create_grid, text="不复制素材 (--no-copy)", variable=create_no_copy_var).grid(
-        row=5, column=1, sticky="w", pady=5, padx=(10, 0)
-    )
-
-    def _run_create() -> None:
-        params = {
-            "title": create_title_var.get(),
-            "prompt": _read_prompt(create_prompt),
-            "evaluation_viewpoint": create_evaluation_viewpoint_var.get(),
-            "assets_glob": create_assets_var.get(),
-            "count": create_count_var.get(),
-            "no_copy": create_no_copy_var.get(),
-        }
-        _run_command("create", params, _auto_env())
-
-    ttk.Button(tab_create, text="运行 create：只生成本地草稿", command=_run_create, style="Accent.TButton").pack(
-        anchor="w", padx=4, pady=(0, 10)
-    )
 
     # --- Run tab ---
     tab_run = ttk.Frame(nb)
@@ -2031,7 +2070,7 @@ def main() -> None:
     publish_filter = ttk.Frame(tab_publish, style="Panel.TFrame", padding=(12, 10))
     publish_filter.pack(fill="x", padx=4, pady=(0, 10))
     publish_filter.columnconfigure(3, weight=1)
-    publish_date_var = tk.StringVar(value=datetime.now(BEIJING_TZ).strftime("%Y-%m-%d"))
+    publish_date_var = tk.StringVar(value="")
     publish_limit_var = tk.IntVar(value=0)
     publish_dry_var = tk.BooleanVar(value=True)
     publish_headless_var = tk.BooleanVar(value=False)
@@ -2249,14 +2288,14 @@ def main() -> None:
 
     metrics_limit_var = tk.IntVar(value=0)
     metrics_headless_var = tk.BooleanVar(value=False)
+    metrics_require_all_var = tk.BooleanVar(value=True)
     metrics_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
-    metrics_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
 
-    ttk.Label(metrics_grid, text="同步数量 limit").grid(row=0, column=0, sticky="w", pady=5)
+    ttk.Label(metrics_grid, text="同步上限 limit").grid(row=0, column=0, sticky="w", pady=5)
     ttk.Spinbox(metrics_grid, from_=0, to=500, textvariable=metrics_limit_var, width=8).grid(
         row=0, column=1, sticky="w", padx=(10, 0), pady=5
     )
-    ttk.Label(metrics_grid, text="0 表示按页面滚动上限尽量同步", style="Muted.TLabel").grid(
+    ttk.Label(metrics_grid, text="0 表示全量同步；填写 N 时严格采集 N 条", style="Muted.TLabel").grid(
         row=0, column=2, sticky="w", padx=(10, 0), pady=5
     )
 
@@ -2265,7 +2304,7 @@ def main() -> None:
     ttk.Label(metrics_options, text="同步选项", style="PanelSection.TLabel").grid(row=0, column=0, sticky="w")
     ttk.Label(
         metrics_options,
-        text="无界面同步需要该工作区 Profile 已登录；首次登录请先点击顶部“登录/检查Profile”。",
+        text="默认必须采集到页面显示的全部已发布数量，缺失时不会覆盖 latest；首次登录请先点击顶部“登录/检查Profile”。",
         style="PanelMuted.TLabel",
         wraplength=620,
     ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 8))
@@ -2275,17 +2314,23 @@ def main() -> None:
         variable=metrics_headless_var,
         style="Panel.TCheckbutton",
     ).grid(row=2, column=0, sticky="w")
+    ttk.Checkbutton(
+        metrics_options,
+        text="必须全量同步（缺失则失败，不覆盖 latest）",
+        variable=metrics_require_all_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=3, column=0, sticky="w", pady=(5, 0))
+    ttk.Label(
+        metrics_options,
+        text="全量同步会持续滚动采集，直到采够目标数量或明确判定未完成；随后才关闭页面。",
+        style="PanelMuted.TLabel",
+        wraplength=460,
+    ).grid(row=3, column=1, columnspan=3, sticky="w", padx=(24, 0), pady=(5, 0))
     ttk.Label(metrics_options, text="登录等待（秒）", style="Panel.TLabel").grid(
         row=2, column=1, sticky="e", padx=(24, 8)
     )
     ttk.Spinbox(metrics_options, from_=0, to=3600, textvariable=metrics_login_hold_var, width=8).grid(
         row=2, column=2, sticky="w"
-    )
-    ttk.Label(metrics_options, text="页面等待（秒）", style="Panel.TLabel").grid(
-        row=3, column=1, sticky="e", padx=(24, 8), pady=(5, 0)
-    )
-    ttk.Spinbox(metrics_options, from_=30, to=3600, textvariable=metrics_wait_timeout_var, width=8).grid(
-        row=3, column=2, sticky="w", pady=(5, 0)
     )
 
     metrics_table_panel = ttk.Frame(tab_metrics, style="Panel.TFrame", padding=(12, 10))
@@ -2461,8 +2506,8 @@ def main() -> None:
             {
                 "limit": metrics_limit_var.get(),
                 "headless": metrics_headless_var.get(),
+                "allow_partial": not metrics_require_all_var.get(),
                 "login_hold": metrics_login_hold_var.get(),
-                "wait_timeout": metrics_wait_timeout_var.get(),
             },
             _collect_env_overrides(),
         )
@@ -2609,12 +2654,15 @@ def main() -> None:
     row = 0
     for label, key, default, secret in [
         ("DashScope Key (DASHSCOPE_API_KEY)", "DASHSCOPE_API_KEY", "", True),
+        ("Volcengine Ark Key (VOLCENGINE_API_KEY)", "VOLCENGINE_API_KEY", "", True),
         ("ppinfra Key (LLM_API_KEY)", "LLM_API_KEY", "", True),
         ("NewsAPI Key (NEWS_API_KEY)", "NEWS_API_KEY", "", True),
         ("Pexels Key (PEXELS_API_KEY)", "PEXELS_API_KEY", "", True),
         ("Aliyun LLM Base URL", "ALIYUN_LLM_BASE_URL", DEFAULT_ALIYUN_LLM_BASE_URL, False),
+        ("Volcengine Ark Base URL", "VOLCENGINE_LLM_BASE_URL", DEFAULT_VOLCENGINE_LLM_BASE_URL, False),
         ("ppinfra Base URL", "LLM_BASE_URL", DEFAULT_LLM_BASE_URL, False),
         ("Aliyun Image Size", "ALIYUN_IMAGE_SIZE", DEFAULT_ALIYUN_IMAGE_SIZE, False),
+        ("Volcengine Image Size", "VOLCENGINE_IMAGE_SIZE", DEFAULT_VOLCENGINE_IMAGE_SIZE, False),
         ("Aliyun Negative Prompt", "ALIYUN_IMAGE_NEGATIVE_PROMPT", DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT, False),
         ("XHS Published URL", "XHS_PUBLISHED_URL", "", False),
         ("NEWS_CHINA_RATIO", "NEWS_CHINA_RATIO", DEFAULT_NEWS_CHINA_RATIO, False),
@@ -2643,38 +2691,49 @@ def main() -> None:
     quota_panel = ttk.Frame(tab_cfg, style="Panel.TFrame", padding=(12, 10))
     quota_panel.pack(fill="x", padx=4, pady=(14, 10))
     quota_panel.columnconfigure(1, weight=1)
-    ttk.Label(quota_panel, text="阿里云百炼额度查询", style="PanelSection.TLabel").grid(
+    ttk.Label(quota_panel, text="模型免费额度查询", style="PanelSection.TLabel").grid(
         row=0, column=0, columnspan=4, sticky="w"
     )
     ttk.Label(
         quota_panel,
-        text="Aliyun Bailian quota: 读取官方免费额度页；首次使用请用可视浏览器登录，之后可尝试无界面查询。",
+        text=(
+            "Use the official console pages to read Aliyun Bailian quota and "
+            "Volcengine Ark quota. Browser profiles are stored under data/browser."
+        ),
         style="PanelMuted.TLabel",
         wraplength=720,
     ).grid(row=1, column=0, columnspan=4, sticky="we", pady=(2, 8))
 
-    quota_models_var = tk.StringVar(value="qwen3.7-plus,wan2.7-image,wan2.7-image-pro")
+    quota_models_var = tk.StringVar(value="glm-5.2,qwen-image-2.0-pro-2026-04-22")
     quota_headless_var = tk.BooleanVar(value=False)
     quota_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     quota_wait_timeout_var = tk.IntVar(value=120)
+    volc_quota_models_var = tk.StringVar(
+        value="doubao-seed-2-1-turbo-260628,doubao-seedream-5-0-lite-260128"
+    )
+    volc_quota_headless_var = tk.BooleanVar(value=False)
+    volc_quota_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
+    volc_quota_wait_timeout_var = tk.IntVar(value=120)
 
-    ttk.Label(quota_panel, text="模型筛选", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=5)
+    ttk.Label(quota_panel, text="Aliyun Bailian quota", style="Panel.TLabel").grid(
+        row=2, column=0, sticky="w", pady=(5, 2)
+    )
     ttk.Entry(quota_panel, textvariable=quota_models_var, width=52).grid(
-        row=2, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=5
+        row=2, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=(5, 2)
     )
     ttk.Checkbutton(
         quota_panel,
-        text="无界面查询",
+        text="Headless",
         variable=quota_headless_var,
         style="Panel.TCheckbutton",
     ).grid(row=3, column=0, sticky="w", pady=5)
-    ttk.Label(quota_panel, text="登录等待（秒）", style="Panel.TLabel").grid(
+    ttk.Label(quota_panel, text="Login hold (s)", style="Panel.TLabel").grid(
         row=3, column=1, sticky="e", padx=(10, 8), pady=5
     )
     ttk.Spinbox(quota_panel, from_=0, to=3600, textvariable=quota_login_hold_var, width=8).grid(
         row=3, column=2, sticky="w", pady=5
     )
-    ttk.Label(quota_panel, text="页面等待（秒）", style="Panel.TLabel").grid(
+    ttk.Label(quota_panel, text="Wait (s)", style="Panel.TLabel").grid(
         row=4, column=1, sticky="e", padx=(10, 8), pady=5
     )
     ttk.Spinbox(quota_panel, from_=30, to=3600, textvariable=quota_wait_timeout_var, width=8).grid(
@@ -2698,7 +2757,52 @@ def main() -> None:
         text="查询阿里云百炼额度",
         command=_run_aliyun_quota,
         style="Accent.TButton",
-    ).grid(row=5, column=0, sticky="w", pady=(10, 0))
+    ).grid(row=5, column=0, sticky="w", pady=(10, 10))
+
+    ttk.Separator(quota_panel).grid(row=6, column=0, columnspan=4, sticky="we", pady=(4, 10))
+    ttk.Label(quota_panel, text="Volcengine Ark quota", style="Panel.TLabel").grid(
+        row=7, column=0, sticky="w", pady=(5, 2)
+    )
+    ttk.Entry(quota_panel, textvariable=volc_quota_models_var, width=52).grid(
+        row=7, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=(5, 2)
+    )
+    ttk.Checkbutton(
+        quota_panel,
+        text="Headless",
+        variable=volc_quota_headless_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=8, column=0, sticky="w", pady=5)
+    ttk.Label(quota_panel, text="Login hold (s)", style="Panel.TLabel").grid(
+        row=8, column=1, sticky="e", padx=(10, 8), pady=5
+    )
+    ttk.Spinbox(quota_panel, from_=0, to=3600, textvariable=volc_quota_login_hold_var, width=8).grid(
+        row=8, column=2, sticky="w", pady=5
+    )
+    ttk.Label(quota_panel, text="Wait (s)", style="Panel.TLabel").grid(
+        row=9, column=1, sticky="e", padx=(10, 8), pady=5
+    )
+    ttk.Spinbox(quota_panel, from_=30, to=3600, textvariable=volc_quota_wait_timeout_var, width=8).grid(
+        row=9, column=2, sticky="w", pady=5
+    )
+
+    def _run_volcengine_quota() -> None:
+        _run_command(
+            "volcengine-quota",
+            {
+                "models": volc_quota_models_var.get(),
+                "headless": volc_quota_headless_var.get(),
+                "login_hold": volc_quota_login_hold_var.get(),
+                "wait_timeout": volc_quota_wait_timeout_var.get(),
+            },
+            _collect_env_overrides(),
+        )
+
+    ttk.Button(
+        quota_panel,
+        text="查询火山引擎 Ark 额度",
+        command=_run_volcengine_quota,
+        style="Accent.TButton",
+    ).grid(row=10, column=0, sticky="w", pady=(10, 0))
 
     root.mainloop()
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import timezone
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
@@ -30,6 +30,29 @@ def _parse_datetime(value: str) -> str:
         return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     except Exception:
         return text
+
+
+def _extract_release_date(text: str) -> str:
+    value = re.sub(r"\s+", " ", text or "").strip()
+    if not value:
+        return ""
+    match = re.search(r"(?P<y>20\d{2})[年/-](?P<m>\d{1,2})[月/-](?P<d>\d{1,2})日?", value)
+    if match:
+        return f"{int(match.group('y')):04d}-{int(match.group('m')):02d}-{int(match.group('d')):02d}"
+    match = re.search(r"(?P<m>\d{1,2})月(?P<d>\d{1,2})日", value)
+    if not match:
+        return ""
+    today = datetime.now(timezone.utc).date()
+    year = today.year
+    month = int(match.group("m"))
+    day = int(match.group("d"))
+    try:
+        candidate = datetime(year, month, day).date()
+    except ValueError:
+        return ""
+    if candidate > today:
+        year -= 1
+    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def _child_text(node, tag_names: list[str]) -> str:
@@ -160,6 +183,13 @@ _OFFICIAL_HTML_NOISE = (
     "登录",
     "注册",
     "控制台",
+    "用户指南",
+    "计费说明",
+    "服务计费",
+    "默认参数",
+    "调用文档",
+    "接入指南",
+    "快速开始",
     "复制",
     "下载",
     "反馈",
@@ -169,6 +199,12 @@ _OFFICIAL_HTML_NOISE = (
     "目录",
     "联系我们",
     "隐私",
+)
+
+_OFFICIAL_HTML_HARD_NOISE = (
+    "模型上下架",
+    "服务协议",
+    "监控告警",
 )
 
 _OFFICIAL_HTML_RELEASE_SIGNALS = (
@@ -212,6 +248,8 @@ def _looks_like_official_ai_update(text: str, vendor: str) -> bool:
         return False
     low = value.lower()
     has_release_signal = any(signal in low or signal in value for signal in _OFFICIAL_HTML_RELEASE_SIGNALS)
+    if any(noise in low or noise in value for noise in _OFFICIAL_HTML_HARD_NOISE):
+        return False
     if any(noise in low or noise in value for noise in _OFFICIAL_HTML_NOISE) and not has_release_signal:
         return False
     return (
@@ -230,8 +268,12 @@ def parse_official_html(
     """Extract release/update-like snippets from official product documentation pages."""
     items: list[AIUpdateItem] = []
     seen_titles: set[str] = set()
+    current_date = ""
 
     for line in _html_lines(html_text):
+        line_date = _extract_release_date(line)
+        if line_date:
+            current_date = line_date
         if not _looks_like_official_ai_update(line, vendor):
             continue
         title = line[:90].strip()
@@ -246,7 +288,7 @@ def parse_official_html(
                 source_name=source_name,
                 source_type="official",
                 url=base_url,
-                published_at="",
+                published_at=line_date or current_date,
                 vendor=vendor,
                 product="",
                 raw_excerpt=line,
@@ -276,7 +318,7 @@ def parse_official_html(
                 source_name=source_name,
                 source_type="official",
                 url=urljoin(base_url, href),
-                published_at="",
+                published_at=_extract_release_date(text),
                 vendor=vendor,
                 product="",
                 raw_excerpt=text,

@@ -51,7 +51,7 @@ def test_coerce_text_preserves_daily_news_body_object_as_json():
     assert json.loads(out) == body_obj
 
 
-def test_generate_draft_uses_25565_max_tokens(monkeypatch):
+def test_generate_draft_uses_60000_max_tokens(monkeypatch):
     captured = {}
 
     class FakeModel:
@@ -89,4 +89,4 @@ def test_generate_draft_uses_25565_max_tokens(monkeypatch):
         asset_paths=[],
     )
 
-    assert captured["kwargs"]["max_tokens"] == 25565
+    assert captured["kwargs"]["max_tokens"] == 60000

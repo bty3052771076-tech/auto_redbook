@@ -5,6 +5,7 @@ import pytest
 from src.publish import playwright_steps
 from src.publish.playwright_steps import (
     _classify_xhs_page_state,
+    _context_default_timeout_ms,
     _format_progress_message,
     _html_for_contenteditable_text,
     _locators_for_body,
@@ -52,6 +53,11 @@ def test_format_progress_message_includes_detail():
         _format_progress_message("upload_images", "in_progress", "2 files")
         == "[xhs-upload] upload_images: in_progress | 2 files"
     )
+
+
+def test_context_default_timeout_follows_wait_timeout():
+    assert _context_default_timeout_ms(600000) == 600000
+    assert _context_default_timeout_ms(1000) == 30000
 
 
 def test_body_locators_include_rich_text_editors():

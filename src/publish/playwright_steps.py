@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import html
 import json
@@ -90,6 +90,10 @@ SAVE_OK_TEXTS = [
 DRAFT_BOX_TEXT = "\u8349\u7a3f\u7bb1"
 DRAFT_ITEM_SELECTOR = ".draft-item"
 WAIT_TIMEOUT_MS = 300000
+
+
+def _context_default_timeout_ms(wait_timeout_ms: int) -> int:
+    return max(30000, int(wait_timeout_ms or 0))
 UPLOAD_COUNT_PATTERN = re.compile(r"(\d+)\s*/\s*18")
 GENERIC_DRAFT_TITLES = {"", "\u6682\u65e0\u7b14\u8bb0\u6807\u9898", "\u65e0\u6807\u9898"}
 READY_PAGE_HINTS = [
@@ -391,6 +395,31 @@ def _published_metrics_collect_cap() -> int:
     except ValueError:
         value = 1000
     return max(1, value)
+
+
+def _published_metrics_collection_status(*, collected: int, target_total: int, limit: int = 0) -> dict[str, Any]:
+    collected_count = max(0, int(collected or 0))
+    target_count = max(0, int(target_total or 0))
+    limit_count = max(0, int(limit or 0))
+    if limit_count:
+        required_total = min(limit_count, target_count) if target_count else limit_count
+    elif target_count:
+        required_total = target_count
+    else:
+        required_total = collected_count
+    missing_count = max(0, required_total - collected_count)
+    complete = missing_count == 0
+    message = (
+        f"fetched={collected_count} target={target_count or 'unknown'} "
+        f"missing={missing_count} required={required_total}"
+    )
+    return {
+        "complete": complete,
+        "target_total": target_count,
+        "required_total": required_total,
+        "missing_count": missing_count,
+        "message": message,
+    }
 
 
 def _parse_published_total_text(text: str) -> int:
@@ -1225,6 +1254,17 @@ def _click_draft(page) -> tuple[bool, str]:
             if _click_first(page.get_by_role("button", name=text)):
                 return True, f"{prefix}:role-button:{text}"
         for text in DRAFT_TEXTS:
+            try:
+                if _click_first(page.get_by_text(text, exact=True), force=True, timeout_ms=2000):
+                    return True, f"{prefix}:text-exact:{text}"
+            except Exception:
+                pass
+            try:
+                if _click_first(page.get_by_text(text), force=True, timeout_ms=2000):
+                    return True, f"{prefix}:text:{text}"
+            except Exception:
+                pass
+        for text in DRAFT_TEXTS:
             selectors = [
                 f"button:has-text('{text}')",
                 f"[role='button']:has-text('{text}')",
@@ -1284,13 +1324,6 @@ def _click_draft(page) -> tuple[bool, str]:
             return True, f"{prefix}:js-text:{clicked}"
         return False, ""
 
-    try:
-        x, y = _bottom_draft_click_point(page.viewport_size)
-        page.mouse.click(x, y)
-        return True, f"coordinate-bottom-draft:x={x},y={y}"
-    except Exception:
-        pass
-
     ok, detail = _click_ranked_candidate("current")
     if ok:
         return True, detail
@@ -1300,6 +1333,13 @@ def _click_draft(page) -> tuple[bool, str]:
     ok, detail = _click_by_text_js("current")
     if ok:
         return True, detail
+
+    try:
+        x, y = _bottom_draft_click_point(page.viewport_size)
+        page.mouse.click(x, y)
+        return True, f"coordinate-bottom-draft:x={x},y={y}"
+    except Exception:
+        pass
 
     for prefix, scroll_script in (
         (
@@ -1549,6 +1589,49 @@ def _confirm_delete_dialog(page, timeout_s: float = 3.0) -> bool:
 
 def _verify_draft_item(page, title: str) -> bool:
     return _draft_item_exists(page, title) and _draft_item_has_cover(page, title)
+
+
+def _open_draft_list_and_check_saved(
+    page,
+    post: Post,
+    *,
+    wait_timeout_ms: int,
+    headless: bool,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> tuple[bool, bool]:
+    opened = False
+    exists = False
+    try:
+        opened = _open_draft_box(page)
+        if opened:
+            _open_image_draft_tab(page)
+            page.locator(DRAFT_ITEM_SELECTOR).first.wait_for(timeout=30000)
+            exists = _draft_item_exists(page, post.title)
+    except Exception:
+        exists = False
+    if exists:
+        return opened, exists
+
+    try:
+        _open_platform_draft_list(
+            page,
+            draft_type=post.type.value,
+            login_hold=0,
+            wait_timeout_ms=wait_timeout_ms,
+            headless=headless,
+            progress_callback=progress_callback,
+        )
+        opened = True
+        attempts = max(1, min(60, (max(0, int(wait_timeout_ms)) + 999) // 1000))
+        for idx in range(attempts):
+            exists = _draft_item_exists(page, post.title)
+            if exists:
+                break
+            if idx + 1 < attempts:
+                time.sleep(1)
+    except Exception:
+        exists = False
+    return opened, exists
 
 
 def _extract_draft_count(page) -> Optional[int]:
@@ -2344,7 +2427,7 @@ def run_publish_drafts_sync(
                 if args:
                     launch_kwargs["args"] = args
                 context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
-            context.set_default_timeout(30000)
+            context.set_default_timeout(_context_default_timeout_ms(wait_timeout_ms))
             page = context.new_page() if not should_close_context else (context.pages[0] if context.pages else context.new_page())
 
             _open_platform_draft_list(
@@ -2489,7 +2572,7 @@ def run_save_draft_sync(
                 if args:
                     launch_kwargs["args"] = args
                 context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
-            context.set_default_timeout(30000)
+            context.set_default_timeout(_context_default_timeout_ms(wait_timeout_ms))
             steps[-1].status = "success"
             try:
                 # In CDP mode, avoid hijacking an existing tab (e.g. ChatGPT page); open a new one.
@@ -2707,15 +2790,14 @@ def run_save_draft_sync(
                 fallback_opened = False
                 fallback_exists = False
                 if not ok:
-                    try:
-                        fallback_opened = _open_draft_box(page)
-                        if fallback_opened:
-                            _open_image_draft_tab(page)
-                            page.locator(DRAFT_ITEM_SELECTOR).first.wait_for(timeout=30000)
-                            fallback_exists = _draft_item_exists(page, post.title)
-                            ok = fallback_exists
-                    except Exception:
-                        fallback_exists = False
+                    fallback_opened, fallback_exists = _open_draft_list_and_check_saved(
+                        page,
+                        post,
+                        wait_timeout_ms=wait_timeout_ms,
+                        headless=headless_value,
+                        progress_callback=progress_callback,
+                    )
+                    ok = fallback_exists
                 steps[-1].detail = (
                     f"toast={toast or 'none'} before={before_count} after={after_count} "
                     f"fallback_opened={fallback_opened} fallback_exists={fallback_exists}"
@@ -2833,7 +2915,7 @@ def run_delete_drafts_sync(
             if args:
                 launch_kwargs["args"] = args
             context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
-            context.set_default_timeout(30000)
+            context.set_default_timeout(_context_default_timeout_ms(wait_timeout_ms))
             page = context.pages[0] if context.pages else context.new_page()
             location = (draft_location or "publish").strip().lower()
             failure_count = 0
@@ -3006,6 +3088,10 @@ def run_collect_published_metrics_sync(
 ) -> dict:
     result: dict[str, Any] = {
         "total": 0,
+        "target_total": 0,
+        "required_total": 0,
+        "missing_count": 0,
+        "complete": True,
         "items": [],
         "errors": [],
         "urls_tried": [],
@@ -3014,6 +3100,12 @@ def run_collect_published_metrics_sync(
     profile_dir.mkdir(parents=True, exist_ok=True)
     headless_value = _resolve_headless(headless)
     max_scrolls = max(1, int(os.getenv("XHS_METRICS_MAX_SCROLLS") or "240"))
+    raw_stagnant = (os.getenv("XHS_METRICS_STAGNANT_ROUNDS") or "").strip()
+    try:
+        stagnant_round_limit = int(raw_stagnant) if raw_stagnant else 90
+    except ValueError:
+        stagnant_round_limit = 90
+    stagnant_round_limit = max(18, min(max_scrolls, stagnant_round_limit))
 
     try:
         with sync_playwright() as p:
@@ -3023,7 +3115,7 @@ def run_collect_published_metrics_sync(
             if args:
                 launch_kwargs["args"] = args
             context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
-            context.set_default_timeout(30000)
+            context.set_default_timeout(_context_default_timeout_ms(wait_timeout_ms))
             page = context.pages[0] if context.pages else context.new_page()
             collected_cards: list[dict[str, str]] = []
 
@@ -3045,6 +3137,8 @@ def run_collect_published_metrics_sync(
                         pass
 
                     target_total = _extract_published_note_total(page)
+                    if target_total:
+                        result["target_total"] = max(int(result.get("target_total") or 0), target_total)
                     previous_unique_count = 0
                     stagnant_rounds = 0
                     for scroll_idx in range(max_scrolls):
@@ -3073,7 +3167,7 @@ def run_collect_published_metrics_sync(
                         scroll_state = _scroll_published_metrics_page(page)
                         if not scroll_state.get("scrolled"):
                             stagnant_rounds += 1
-                        if stagnant_rounds >= 18:
+                        if stagnant_rounds >= stagnant_round_limit:
                             break
                         time.sleep(0.75)
 
@@ -3081,12 +3175,28 @@ def run_collect_published_metrics_sync(
                     if metrics:
                         result["items"] = [metric.model_dump() for metric in metrics]
                         result["total"] = len(metrics)
-                        break
+                        status = _published_metrics_collection_status(
+                            collected=len(metrics),
+                            target_total=int(result.get("target_total") or target_total or 0),
+                            limit=limit,
+                        )
+                        result.update(status)
+                        if status["complete"]:
+                            break
 
                 if not result["items"]:
                     result["errors"].append(
                         "no published metrics found; check login profile or set XHS_PUBLISHED_URL to the note management page"
                     )
+                else:
+                    status = _published_metrics_collection_status(
+                        collected=int(result.get("total") or 0),
+                        target_total=int(result.get("target_total") or 0),
+                        limit=limit,
+                    )
+                    result.update(status)
+                    if not status["complete"]:
+                        result["errors"].append(f"incomplete published metrics: {status['message']}")
                 event_path = save_event(
                     {
                         "type": "published_metrics",
@@ -3094,6 +3204,10 @@ def run_collect_published_metrics_sync(
                         "headless": headless_value,
                         "summary": {
                             "total": result["total"],
+                            "target_total": result["target_total"],
+                            "required_total": result["required_total"],
+                            "missing_count": result["missing_count"],
+                            "complete": result["complete"],
                             "urls_tried": result["urls_tried"],
                             "errors": result["errors"],
                         },

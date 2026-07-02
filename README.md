@@ -1,321 +1,243 @@
-# Auto Redbook Workflow
+# Auto Redbook
 
-本项目用于在本地生成小红书图文内容，并通过 Playwright 自动保存到小红书创作者中心草稿箱。它支持普通图文、每日新闻、每日 AI 讯息、幽默虚构新闻、AI 配图、草稿发布、草稿删除、已发布数据同步与发布方向分析。
+Auto Redbook 是一个面向小红书创作者中心的本地自动化工具，用于生成图文草稿、保存到草稿箱、发布草稿、同步已发布数据，并基于互动数据辅助选择下一批新闻方向。
 
-默认原则很简单：密钥和草稿数据只留在本机；上传和发布必须由你显式触发；不绕过小红书扫码、验证码或平台风控。
+当前版本重点支持两类内容：
+
+- `每日新闻`：从新闻源获取候选，筛选单条重点新闻，生成标题、正文、评价和配图。
+- `每日AI讯息`：收集近 3 个北京时间自然日内的 AI 技术、模型、产品动态，去重后生成一条多图简报。
 
 ## 功能概览
 
-- `普通图文`：标题 + 提示词 + 本地图片或 AI 配图，生成可上传草稿。
-- `每日新闻`：从 NewsAPI、GNews、聚合数据 Juhe、hot_news 或本地候选文件获取新闻，清洗正文，生成中文新闻草稿。
-- `每日AI讯息`：从官方 AI 博客、RSS、GitHub Release、国内模型厂商发布页获取约 10 条动态，渲染为多张简报图并保存草稿。
-- `每日假新闻`：生成明显虚构、用于娱乐的新闻草稿，正文会包含虚构声明。
-- `AI 配图`：默认使用阿里云百炼文生图；也可切换 Pexels 或本地 assets。
-- `GUI`：图形界面可选择 LLM 供应商、图片来源、模型、上传参数、发布/删除草稿、同步已发布数据。
-- `已发布数据分析`：同步点赞、评论、收藏、浏览数据到本地表格，并给出后续发布方向建议。
-- `阿里云额度查询`：通过官方百炼控制台页面查看 LLM / 生图模型免费额度和到期信息。
+- CLI 与 Tkinter GUI 两套入口。
+- 支持 Aliyun 百炼 / DashScope 与 Volcengine Ark 作为 LLM 供应商。
+- 支持 Aliyun 图像模型、Volcengine Seedream、Pexels 或本地素材作为图片来源。
+- 自动打开小红书创作者中心并保存图文草稿。
+- 支持从草稿箱批量发布、删除草稿。
+- 支持全量同步已发布笔记的浏览、点赞、评论、收藏、分享等指标。
+- 支持查询 Aliyun 百炼与 Volcengine Ark 控制台中的模型免费额度或使用情况。
+- 本地保存运行记录、帖子 JSON、图片素材和同步结果，方便复盘。
 
-## 环境准备
+## 环境要求
 
-请不要在 C 盘安装项目依赖。推荐把虚拟环境、pip 缓存、Playwright 浏览器都放在当前工作区。
+- Windows + PowerShell。
+- Python 3.10 或更高版本。
+- 已登录的小红书创作者中心账号。
+- 可用的模型 API Key。至少配置一个 LLM 供应商；如果使用自动配图，需要配置图片供应商或提供本地素材。
 
-需要准备：
-
-- Python 3.10+
-- 小红书账号
-- Chrome / Chromium 登录态
-- 阿里云百炼 / DashScope 账号，用于 LLM 和生图
-- 可选新闻源 Key：GNews、NewsAPI、聚合数据 Juhe
-- 可选 Pexels Key：仅当你要用 Pexels 图片检索时需要
-
-首次初始化：
+首次安装依赖：
 
 ```powershell
+Set-Location E:\AI\codex\redbook_workflow
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-$env:PIP_CACHE_DIR=(Resolve-Path ".").Path + "\.pip-cache"
-$env:PLAYWRIGHT_BROWSERS_PATH=(Resolve-Path ".").Path + "\.playwright-browsers"
-
-pip install -r requirements.txt
-python -m playwright install chromium
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## 密钥配置
-
-推荐使用 PowerShell 环境变量或 GUI 保存到本地 `.env.gui`。不要把真实 Key 写进 README、代码或提交到 GitHub。
+Playwright 首次使用需要 Chromium。建议把浏览器缓存放在工作区内，避免写入系统盘：
 
 ```powershell
-$env:LLM_PROVIDER="aliyun"
-$env:ALIYUN_LLM_API_KEY="YOUR_DASHSCOPE_KEY"
-$env:ALIYUN_LLM_MODEL="qwen3.7-plus"
-
-$env:IMAGE_PROVIDER="aliyun"
-$env:ALIYUN_IMAGE_API_KEY="YOUR_DASHSCOPE_KEY"
-$env:ALIYUN_IMAGE_MODEL="wan2.7-image"
-
-$env:NEWS_PROVIDER="gnews"
-$env:GNEWS_API_KEY="YOUR_GNEWS_API_KEY"
+Set-Location E:\AI\codex\redbook_workflow
+$env:PLAYWRIGHT_BROWSERS_PATH="$PWD\.playwright-browsers"
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
-`.gitignore` 已忽略：
+## 配置
 
-- `.env*`
-- `docs/*api-key.md`
-- `data/`
-- `logs/`
-- `output/`
-- `.venv/`
-- `.pip-cache/`
-- `.playwright-browsers/`
-- 本地 GUI exe
+推荐使用环境变量或 GUI 的配置页。不要把真实 API Key 提交到仓库。
 
-## 快速启动
+常用变量：
+
+```powershell
+# LLM 供应商：auto / aliyun / volcengine / ppinfra
+$env:LLM_PROVIDER="aliyun"
+$env:IMAGE_PROVIDER="aliyun"
+
+# Aliyun / DashScope
+$env:DASHSCOPE_API_KEY="..."
+$env:ALIYUN_LLM_MODEL="glm-5.2"
+$env:ALIYUN_IMAGE_MODEL="qwen-image-2.0-pro-2026-04-22"
+
+# Volcengine Ark
+$env:VOLCENGINE_API_KEY="..."
+$env:VOLCENGINE_LLM_MODEL="doubao-seed-2-1-turbo-260628"
+$env:VOLCENGINE_IMAGE_MODEL="doubao-seedream-5-0-lite-260128"
+
+# 可选新闻与图片源
+$env:NEWS_API_KEY="..."
+$env:GNEWS_API_KEY="..."
+$env:JUHE_API_KEY="..."
+$env:PEXELS_API_KEY="..."
+```
+
+也可以先创建本地私有目录，再放入 key 文件，例如 `docs/aliyun_image_api-key.md`、`docs/volcengine_api-key.md`、`docs/news_api-key.md`：
+
+```powershell
+New-Item -ItemType Directory -Force docs
+```
+
+`docs/` 已作为本地私有目录忽略，不会上传到 GitHub。
+
+## GUI 使用
 
 启动 GUI：
 
 ```powershell
-.\AutoRedbookGUI-Launcher.exe
-```
-
-或直接运行 Python GUI：
-
-```powershell
+Set-Location E:\AI\codex\redbook_workflow
 .\.venv\Scripts\python.exe -m apps.gui
 ```
 
-打开正确的小红书创作者中心 Profile：
+如果已构建本地启动器，也可以运行：
 
 ```powershell
-.\Open-XHS-Creator.cmd
+.\Start-GUI.cmd
 ```
 
-GUI 使用的是工作区内的浏览器 profile，避免误用系统默认 Chrome 账号。
+GUI 中常用页签：
 
-## 常用命令
+- 生成并上传：选择内容类型、模型供应商、图片来源，生成并保存到小红书草稿箱。
+- 已发布数据：全量同步已发布笔记指标，并分析下一批选题方向。
+- 发布草稿：从小红书草稿箱中发布本地已记录的草稿。
+- 删除草稿：按条件删除草稿箱内容，建议先 dry-run。
+- 配置：填写本地环境变量和查询模型免费额度。
 
-生成并保存 1 条每日新闻草稿：
+## CLI 常用命令
+
+生成一条 `每日新闻` 并保存到草稿箱：
 
 ```powershell
-.\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --evaluation-viewpoint "无视角评价" --assets-glob "assets/empty/*" --count 1 --login-hold 600 --wait-timeout 600 --force
+Set-Location E:\AI\codex\redbook_workflow
+.\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --prompt "财经产业 / 公司政策 / 市场变化" --evaluation-viewpoint "无视角评价" --assets-glob "assets/empty/*" --count 1 --login-hold 600 --wait-timeout 600 --force
 ```
 
-生成 1 条每日 AI 讯息简报草稿：
+生成一条 `每日AI讯息` 并保存到草稿箱：
 
 ```powershell
+Set-Location E:\AI\codex\redbook_workflow
 .\.venv\Scripts\python.exe -m apps.cli auto --title "每日AI讯息" --assets-glob "assets/empty/*" --count 1 --login-hold 600 --wait-timeout 600 --force
 ```
 
-如果已经登录工作区 Chrome profile，可以无界面上传：
+已登录 profile 后可尝试无界面运行：
 
 ```powershell
 .\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --assets-glob "assets/empty/*" --count 1 --login-hold 0 --wait-timeout 600 --force --headless
 ```
 
-只生成本地草稿，不上传：
+查看本地帖子：
 
 ```powershell
-.\.venv\Scripts\python.exe -m apps.cli create --title "每日新闻" --assets-glob "assets/empty/*" --count 1
+.\.venv\Scripts\python.exe -m apps.cli list
+.\.venv\Scripts\python.exe -m apps.cli show <post_id>
 ```
 
-发布已上传到草稿箱的草稿，建议先 dry-run 预览：
+重新保存某条草稿：
+
+```powershell
+.\.venv\Scripts\python.exe -m apps.cli retry <post_id> --force --login-hold 600 --wait-timeout 600
+```
+
+发布草稿前建议先预览：
 
 ```powershell
 .\.venv\Scripts\python.exe -m apps.cli publish-drafts --dry-run --date today --login-hold 600 --wait-timeout 600
 .\.venv\Scripts\python.exe -m apps.cli publish-drafts --date today --limit 3 --yes --login-hold 600 --wait-timeout 600
 ```
 
-删除草稿，建议先 dry-run 预览：
+删除草稿前建议先预览：
 
 ```powershell
 .\.venv\Scripts\python.exe -m apps.cli delete-drafts --draft-type image --limit 10 --dry-run --login-hold 600 --wait-timeout 600
 .\.venv\Scripts\python.exe -m apps.cli delete-drafts --draft-type image --limit 10 --yes --login-hold 600 --wait-timeout 600
 ```
 
-同步已发布数据：
+## 已发布数据同步
+
+全量同步已发布笔记指标：
 
 ```powershell
-.\.venv\Scripts\python.exe -m apps.cli update-metrics --limit 50 --login-hold 600 --wait-timeout 600
+.\.venv\Scripts\python.exe -m apps.cli update-metrics --limit 0 --login-hold 600
 ```
 
-分析发布方向：
+已登录 profile 的无界面同步：
+
+```powershell
+.\.venv\Scripts\python.exe -m apps.cli update-metrics --limit 0 --headless --login-hold 0
+```
+
+默认是严格全量：
+
+- `--limit 0`：按页面显示的 `全部 N` 全量采集。
+- `--limit N`：采集请求范围内的 N 条。
+- 如果页面显示 `全部 322` 但只采到 `317`，不会覆盖 latest 文件。
+- 只有显式传入 `--allow-partial` 才允许保存部分结果。
+
+全量同步不会把“页面等待时间”当作任务总截止时间。页面会在采够目标数量，或明确判定本轮未完成并返回错误后关闭。
+
+分析已发布数据：
 
 ```powershell
 .\.venv\Scripts\python.exe -m apps.cli analyze-metrics
 .\.venv\Scripts\python.exe -m apps.cli analyze-metrics --save
 ```
 
-查询阿里云百炼额度：
+## 模型额度查询
+
+Aliyun 百炼：
 
 ```powershell
-.\.venv\Scripts\python.exe -m apps.cli aliyun-quota --model qwen3.7-plus --model wan2.7-image --login-hold 600 --wait-timeout 120
+.\.venv\Scripts\python.exe -m apps.cli aliyun-quota --model glm-5.2 --model qwen-image-2.0-pro-2026-04-22 --login-hold 600 --wait-timeout 120
 ```
 
-## 特殊标题工作流
+Volcengine Ark：
 
-### 每日新闻
+```powershell
+.\.venv\Scripts\python.exe -m apps.cli volcengine-quota --model doubao-seed-2-1-turbo-260628 --model doubao-seedream-5-0-lite-260128 --login-hold 600 --wait-timeout 120
+```
 
-当 `--title "每日新闻"` 时，程序会抓取新闻候选，获取原文上下文，调用 LLM 生成中文草稿，并保存新闻来源 metadata。
+这两个命令通过官方控制台页面读取信息，不调用付费推理接口。
 
-默认新闻源：
+## 本地数据
 
-- NewsAPI
-- GNews
-- 聚合数据 Juhe 新闻头条
-- 聚合数据 Juhe 财经新闻
-- hot_news 热榜兜底
-- 本地候选文件 `NEWS_CANDIDATES_FILE`
+仓库只保存代码、测试、启动脚本和 README。以下内容默认只保留在本地：
 
-正文会按以下结构输出：
+- `data/`：帖子、图片、运行记录、已发布指标。
+- `output/`：调试输出。
+- `docs/`：本地任务记录、API Key 文件、临时说明。
+- `AGENT.md`、`CODING_PROGRESS.md`：本地协作记录。
+- `.venv/`、`.playwright-browsers/`：本地运行环境。
+
+## 项目结构
 
 ```text
-原文标题：...
-
-内容：
-...
-
-评价：
-...
-
-日期：YYYY-MM-DD
-
-来源：来源名称
+apps/                 CLI、GUI 和端到端入口
+scripts/              Windows 启动器和辅助脚本
+src/ai_digest/        每日AI讯息采集、排序、生成和渲染
+src/news/             每日新闻候选获取与筛选
+src/llm/              LLM 调用封装
+src/images/           Aliyun、Volcengine、Pexels 和本地图片处理
+src/publish/          小红书创作者中心 Playwright 自动化
+src/analytics/        已发布数据同步和分析
+src/storage/          本地 JSON/CSV/JSONL 存储
+tests/                单元测试和回归测试
 ```
-
-原始 URL 不写进正文，只保存到本地 `post.json`。
-
-### 每日AI讯息
-
-当 `--title "每日AI讯息"` 时，程序固定生成 1 条 AI 动态简报草稿；简报中默认约 10 条动态，数量由环境变量控制，而不是由 `--count` 重复生成多条。
-
-主要配置：
-
-```powershell
-$env:AI_DIGEST_TARGET_ITEMS="10"
-$env:AI_DIGEST_MIN_OFFICIAL_ITEMS="6"
-```
-
-默认主信源：
-
-- OpenAI News
-- Anthropic News
-- Google DeepMind Blog
-- Meta AI Blog
-- Microsoft AI Blog
-- NVIDIA Deep Learning Blog
-- Hugging Face Blog
-- Hugging Face Transformers GitHub Releases
-- 阿里云百炼 / 通义
-- 智谱 GLM
-- MiniMax
-- 火山方舟 / 豆包
-- 百度千帆 / 文心
-- 月之暗面 Kimi
-
-可选补充/验证信源：
-
-- X 搜索页
-- Hacker News / Algolia 搜索页
-
-官方信源足够时，社交/搜索源只用于验证；官方信源不足时，才作为补位候选。
-
-### 每日假新闻
-
-当 `--title "每日假新闻"` 时，程序会生成明显虚构的娱乐新闻草稿。建议提供 `--prompt` 指定主题。
-
-```powershell
-.\.venv\Scripts\python.exe -m apps.cli auto --title "每日假新闻" --prompt "火星快递导致地球外卖迟到" --assets-glob "assets/empty/*" --login-hold 600
-```
-
-## 图片来源
-
-默认图片来源为阿里云百炼文生图：
-
-```powershell
-$env:IMAGE_PROVIDER="aliyun"
-$env:ALIYUN_IMAGE_MODEL="wan2.7-image"
-$env:ALIYUN_IMAGE_SIZE="1104*1472"
-```
-
-常用模型：
-
-- `wan2.7-image`
-- `wan2.7-image-pro`
-- `qwen-image-2.0-pro-2026-04-22`
-
-如果本地 assets 命中图片，会优先使用本地图片；当使用 `assets/empty/*` 且无本地图片时，会触发自动配图。
-
-## 输出位置
-
-本地输出不会上传 GitHub：
-
-- `data/posts/<post_id>/post.json`
-- `data/posts/<post_id>/assets/`
-- `data/runs/run_records.csv`
-- `data/analytics/published_metrics.csv`
-- `data/analytics/published_metrics_latest.csv`
-
-每条新闻或 AI 简报都会保存来源 metadata，便于后续追溯。
-
-## GUI 功能
-
-GUI 入口：
-
-```powershell
-.\.venv\Scripts\python.exe -m apps.gui
-```
-
-GUI 支持：
-
-- 一键生成并保存草稿
-- 快捷标题：每日新闻、每日AI讯息、每日假新闻
-- 选择 LLM 供应商和模型
-- 选择图片来源和阿里云生图模型
-- dry-run、无界面上传、login-hold、wait-timeout
-- 删除草稿、发布草稿
-- 同步已发布数据
-- 表格查看点赞、评论、收藏、浏览，并按列排序
-- 分析后续发布方向
-- 查询阿里云百炼额度
 
 ## 测试
 
-运行全量测试：
+运行核心测试：
 
 ```powershell
+Set-Location E:\AI\codex\redbook_workflow
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-运行 AI 简报相关测试：
+只验证 GUI 参数和已发布数据同步逻辑：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_ai_digest.py tests\test_ai_digest_sources.py tests\test_ai_digest_collect.py tests\test_ai_digest_generate.py tests\test_ai_digest_render.py tests\test_ai_digest_workflow.py -q
+.\.venv\Scripts\python.exe -m pytest tests\test_published_post_sync.py tests\test_published_metrics.py tests\test_gui.py -q
 ```
 
-编译检查：
+## 安全说明
 
-```powershell
-.\.venv\Scripts\python.exe -m compileall -q apps src
-```
-
-## 安全提醒
-
-- 不要提交真实 API Key。
-- 不要提交 `data/` 下的草稿、浏览器 profile、运行记录或已发布数据。
-- 不要提交 `.env.gui`。
-- 上传 GitHub 前建议运行密钥扫描。
-- 发布草稿前建议先 `publish-drafts --dry-run`。
-- 删除草稿前建议先 `delete-drafts --dry-run`。
-
-## 相关文档
-
-- `docs/每日AI讯息功能说明-2026-06-30.md`
-- `docs/assets/daily_ai_digest_concept_2026-06-30.png`
-- `docs/阿里云百炼额度查询-2026-06-30.md`
-- `docs/hot_news新闻源接入-2026-06-29.md`
-- `docs/小红书草稿发布功能-2026-06-29.md`
-- `docs/GUI共享草稿预览与发布同步-2026-06-29.md`
-- `docs/聚合数据新闻源接入-2026-06-21.md`
-- `docs/每日新闻正文渲染修复-2026-06-21.md`
-- `docs/每日新闻历史URL查重-2026-06-20.md`
-- `docs/模型与GUI供应商配置.md`
+- 不要提交真实 API Key、浏览器 profile、草稿数据、运行截图或已发布指标。
+- 首次连接小红书、Aliyun、Volcengine 控制台时建议使用可视浏览器完成登录。
+- 自动发布和删除草稿前先使用 dry-run。
+- 生成式模型输出需要人工复核，尤其是新闻事实、时间、来源和图片适配性。

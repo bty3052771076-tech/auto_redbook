@@ -130,6 +130,47 @@ def test_parse_official_html_extracts_release_lines_as_official_candidates():
     assert "ERNIE X1.1" in " ".join(item.title for item in items)
 
 
+def test_parse_official_html_extracts_publish_date_from_release_line():
+    parse_official_html = getattr(fetchers, "parse_official_html", None)
+    assert parse_official_html is not None
+    html = """
+    <html><body>
+      <p>2026年7月2日 GLM-5.2 模型发布，强化多模态理解、代码生成和复杂推理能力。</p>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="智谱 GLM",
+        vendor="智谱 GLM",
+        base_url="https://docs.bigmodel.cn/cn/update/new-releases",
+    )
+
+    assert items
+    assert items[0].published_at == "2026-07-02"
+
+
+def test_parse_official_html_applies_nearby_publish_date_heading_to_release_line():
+    parse_official_html = getattr(fetchers, "parse_official_html", None)
+    assert parse_official_html is not None
+    html = """
+    <html><body>
+      <h2>2026年7月2日</h2>
+      <p>GLM-5.2 模型发布，强化多模态理解、代码生成和复杂推理能力。</p>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="智谱 GLM",
+        vendor="智谱 GLM",
+        base_url="https://docs.bigmodel.cn/cn/update/new-releases",
+    )
+
+    assert items
+    assert items[0].published_at == "2026-07-02"
+
+
 def test_parse_official_html_filters_common_doc_navigation_noise():
     parse_official_html = getattr(fetchers, "parse_official_html", None)
     assert parse_official_html is not None
@@ -153,3 +194,49 @@ def test_parse_official_html_filters_common_doc_navigation_noise():
 
     titles = [item.title for item in items]
     assert titles == ["Kimi K2 Thinking 模型发布并开源，全面提升 Agent 和推理能力。"]
+
+
+def test_parse_official_html_filters_model_doc_and_billing_noise():
+    parse_official_html = getattr(fetchers, "parse_official_html", None)
+    assert parse_official_html is not None
+    html = """
+    <html><body>
+      <p>用户指南（模型）</p>
+      <p>模型服务计费说明</p>
+      <p>模型默认参数说明</p>
+      <p>MiniMax M3 模型发布，强化长文本推理和多工具调用能力。</p>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="MiniMax",
+        vendor="MiniMax",
+        base_url="https://platform.minimax.io/docs/release-notes/models",
+    )
+
+    titles = [item.title for item in items]
+    assert titles == ["MiniMax M3 模型发布，强化长文本推理和多工具调用能力。"]
+
+
+def test_parse_official_html_filters_generic_update_directory_noise():
+    parse_official_html = getattr(fetchers, "parse_official_html", None)
+    assert parse_official_html is not None
+    html = """
+    <html><body>
+      <p>模型上下架与更新</p>
+      <p>豆包模型服务协议</p>
+      <p>推理服务监控告警</p>
+      <p>GLM-5.2 模型发布，强化多模态理解、代码生成和复杂推理能力。</p>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="智谱 GLM",
+        vendor="智谱 GLM",
+        base_url="https://docs.bigmodel.cn/cn/update/new-releases",
+    )
+
+    titles = [item.title for item in items]
+    assert titles == ["GLM-5.2 模型发布，强化多模态理解、代码生成和复杂推理能力。"]

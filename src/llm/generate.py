@@ -10,7 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from src.config import LLMConfig
 
 
-DEFAULT_LLM_MAX_TOKENS = 25565
+DEFAULT_LLM_MAX_TOKENS = 60000
 
 
 def _truncate(text: str, max_len: int) -> str:
