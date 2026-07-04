@@ -24,17 +24,22 @@ from apps.gui import (
     IMAGE_SOURCE_OPTIONS,
     LLM_PROVIDER_OPTIONS,
     PublishedMetricTableRow,
+    QuotaDashboardRow,
     RecentPostSummary,
     UiEventQueue,
     build_xhs_login_launch_args,
     build_xhs_creator_launch_args,
     build_cli_args,
+    build_quota_dashboard_rows,
     build_provider_env_overrides,
     build_subprocess_env,
+    combine_prompt_entries,
+    DEFAULT_PROMPT_ENTRY_COUNT,
     ensure_daily_news_candidate_pool_env,
     env_flag_enabled,
     env_int_value,
     extract_post_id_from_choice,
+    filter_quota_dashboard_rows,
     format_post_choice,
     format_post_detail,
     format_post_time_detail,
@@ -44,10 +49,20 @@ from apps.gui import (
     list_publishable_drafts,
     list_recent_posts,
     load_env_file,
+    load_latest_quota_snapshots,
+    merge_model_option_values,
     open_xhs_creator,
+    parse_command_progress_line,
+    progress_status_from_event,
+    quota_dashboard_layout,
+    quota_dashboard_row_kind_label,
+    quota_dashboard_row_title,
+    sort_quota_dashboard_rows,
+    quota_dashboard_selection_target,
     resolve_assets_glob_for_image_source,
     resolve_delete_mode_flags,
     save_env_file,
+    split_prompt_entries_from_text,
     sort_published_metric_table_rows,
     VOLCENGINE_IMAGE_MODEL_OPTIONS,
     VOLCENGINE_LLM_MODEL_OPTIONS,
@@ -64,9 +79,13 @@ def test_gui_exposes_llm_and_image_provider_model_options():
     assert "qwen3.7-plus" in ALIYUN_LLM_MODEL_OPTIONS
     assert "deepseek-v4-flash" in ALIYUN_LLM_MODEL_OPTIONS
     assert "doubao-seed-2-1-turbo-260628" in VOLCENGINE_LLM_MODEL_OPTIONS
+    assert "glm-5.2" in VOLCENGINE_LLM_MODEL_OPTIONS
+    assert "deepseek-v4-pro" in VOLCENGINE_LLM_MODEL_OPTIONS
+    assert "deepseek-v4-flash" in VOLCENGINE_LLM_MODEL_OPTIONS
     assert ALIYUN_IMAGE_MODEL_OPTIONS == [
         "wan2.7-image",
         "wan2.7-image-pro",
+        "qwen-image-2.0-pro-2026-06-22",
         "qwen-image-2.0-pro-2026-04-22",
     ]
     assert VOLCENGINE_IMAGE_MODEL_OPTIONS == [
@@ -161,7 +180,7 @@ def test_command_runner_emits_heartbeat_when_process_is_silent(monkeypatch):
     runner.run([sys.executable, "--version"], {})
 
     deadline = time.time() + 1
-    while not any("仍在运行" in line for line in lines) and time.time() < deadline:
+    while not any("当前步骤" in line for line in lines) and time.time() < deadline:
         time.sleep(0.01)
 
     release.set()
@@ -169,7 +188,7 @@ def test_command_runner_emits_heartbeat_when_process_is_silent(monkeypatch):
     while (runner.is_running() or not exits) and time.time() < deadline:
         time.sleep(0.01)
 
-    assert any("仍在运行" in line for line in lines)
+    assert any("当前步骤" in line and "CLI 子进程" in line for line in lines)
     assert exits == [0]
 
 
@@ -227,6 +246,15 @@ def test_env_autorun_helpers_parse_flags_and_ints():
     assert env_int_value("5", 1, min_value=1) == 5
     assert env_int_value("bad", 3, min_value=1) == 3
     assert env_int_value("-2", 3, min_value=1) == 1
+
+
+def test_prompt_entry_helpers_split_combine_and_dedupe():
+    assert DEFAULT_PROMPT_ENTRY_COUNT >= 3
+    assert split_prompt_entries_from_text("世界杯|体育；足球\n世界杯") == ["世界杯", "体育", "足球"]
+
+    prompt = combine_prompt_entries(["世界杯", "体育 足球", "", "世界杯", "财经政策；市场变化"])
+
+    assert prompt == "世界杯\n体育 足球\n财经政策\n市场变化"
 
 
 def test_build_subprocess_env_forces_unbuffered_utf8_output():
@@ -323,19 +351,19 @@ def test_ensure_daily_news_candidate_pool_env_expands_multi_count_jobs():
         count=3,
     )
 
-    assert int(env["NEWS_MAX_RECORDS"]) >= 60
+    assert env["NEWS_MAX_RECORDS"] == "60"
     assert env["PYTHONIOENCODING"] == "utf-8"
     assert env["PYTHONUTF8"] == "1"
 
 
-def test_ensure_daily_news_candidate_pool_env_keeps_larger_user_value():
+def test_ensure_daily_news_candidate_pool_env_uses_exact_twenty_times_pool_even_with_larger_user_value():
     env = ensure_daily_news_candidate_pool_env(
         {"NEWS_MAX_RECORDS": "120"},
         title="\u6bcf\u65e5\u65b0\u95fb",
         count=3,
     )
 
-    assert env["NEWS_MAX_RECORDS"] == "120"
+    assert env["NEWS_MAX_RECORDS"] == "60"
 
 
 def test_ensure_daily_news_candidate_pool_env_does_not_expand_other_titles():
@@ -348,6 +376,31 @@ def test_ensure_daily_news_candidate_pool_env_does_not_expand_other_titles():
     assert "NEWS_MAX_RECORDS" not in env
     assert env["PYTHONIOENCODING"] == "utf-8"
     assert env["PYTHONUTF8"] == "1"
+
+
+def test_parse_command_progress_line_reads_generic_stage_events():
+    event = parse_command_progress_line("[auto] stage=生成草稿 | in_progress | count=3")
+
+    assert event == {
+        "command": "auto",
+        "stage": "生成草稿",
+        "status": "in_progress",
+        "detail": "count=3",
+    }
+
+
+def test_parse_command_progress_line_reads_xhs_upload_events():
+    event = parse_command_progress_line(
+        "[xhs-upload] collect_metrics: in_progress | items=330 target=335 scroll=220/240"
+    )
+
+    assert event == {
+        "command": "xhs-upload",
+        "stage": "collect_metrics",
+        "status": "in_progress",
+        "detail": "items=330 target=335 scroll=220/240",
+    }
+    assert progress_status_from_event(event) == "运行中：xhs-upload / collect_metrics / in_progress / items=330 target=335 scroll=220/240"
 
 
 def test_resolve_assets_glob_for_image_source():
@@ -840,6 +893,17 @@ def test_gui_has_daily_ai_digest_quick_title_button():
     assert 'title_var.set("每日AI讯息")' in source
 
 
+def test_auto_tab_uses_multiple_prompt_entry_boxes():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "prompt_entry_vars" in source
+    assert "DEFAULT_PROMPT_ENTRY_COUNT" in source
+    assert "combine_prompt_entries(var.get() for var in prompt_entry_vars)" in source
+    assert "split_prompt_entries_from_text(prompt_value" in source
+    assert "tk.Text(auto_grid" not in source
+
+
 def test_build_cli_args_auto_daily_ai_digest_keeps_special_title():
     args = build_cli_args(
         "auto",
@@ -1048,6 +1112,8 @@ def test_build_cli_args_aliyun_quota():
             "headless": True,
             "login_hold": 0,
             "wait_timeout": 120,
+            "save_raw": True,
+            "visible_only": True,
         },
     )
 
@@ -1056,6 +1122,8 @@ def test_build_cli_args_aliyun_quota():
     assert "qwen3.7-plus" in args
     assert "wan2.7-image" in args
     assert "--headless" in args
+    assert "--save-raw" in args
+    assert "--visible-only" in args
     assert "--login-hold" in args and "0" in args
     assert "--wait-timeout" in args and "120" in args
 
@@ -1068,6 +1136,8 @@ def test_build_cli_args_volcengine_quota():
             "headless": True,
             "login_hold": 0,
             "wait_timeout": 120,
+            "save_raw": True,
+            "visible_only": True,
         },
     )
 
@@ -1076,8 +1146,341 @@ def test_build_cli_args_volcengine_quota():
     assert "doubao-seed-2-1-turbo-260628" in args
     assert "doubao-seedream-5-0-lite-260128" in args
     assert "--headless" in args
+    assert "--save-raw" in args
+    assert "--visible-only" in args
     assert "--login-hold" in args and "0" in args
     assert "--wait-timeout" in args and "120" in args
+
+
+def test_build_cli_args_sync_quotas():
+    args = build_cli_args(
+        "sync-quotas",
+        params={
+            "all_free": False,
+            "aliyun_models": ["glm-5.2", "qwen-image-2.0-pro-2026-06-22"],
+            "volcengine_models": "glm-5.2,deepseek-v4-pro,doubao-seedream-5-0-lite-260128",
+            "headless": True,
+            "login_hold": 0,
+            "wait_timeout": 120,
+            "visible_only": True,
+        },
+    )
+
+    assert args[1:4] == ["-m", "apps.cli", "sync-quotas"]
+    assert "--target-only" in args
+    assert args.count("--aliyun-model") == 2
+    assert args.count("--volcengine-model") == 3
+    assert "--headless" in args
+    assert "--visible-only" in args
+    assert "--login-hold" in args and "0" in args
+    assert "--wait-timeout" in args and "120" in args
+
+
+def test_build_cli_args_sync_quotas_defaults_to_all_free_without_target_filters():
+    args = build_cli_args(
+        "sync-quotas",
+        params={
+            "all_free": True,
+            "aliyun_models": ["glm-5.2"],
+            "volcengine_models": ["deepseek-v4-pro"],
+            "headless": True,
+            "login_hold": 0,
+            "wait_timeout": 120,
+        },
+    )
+
+    assert args[1:4] == ["-m", "apps.cli", "sync-quotas"]
+    assert "--target-only" not in args
+    assert "--aliyun-model" not in args
+    assert "--volcengine-model" not in args
+
+
+def test_build_quota_dashboard_rows_calculates_bar_percentages():
+    rows = build_quota_dashboard_rows(
+        {
+            "aliyun": {
+                "provider": "aliyun",
+                "source_mode": "visible_page_only",
+                "records": [
+                    {
+                        "model": "glm-5.2",
+                        "kind": "llm",
+                        "status": "available",
+                        "remaining": 800,
+                        "used": 200,
+                        "total": 1000,
+                        "unit": "Token",
+                    },
+                    {
+                        "model": "qwen-image-2.0-pro-2026-06-22",
+                        "kind": "image",
+                        "status": "not_visible_on_page",
+                    },
+                ],
+            }
+        }
+    )
+
+    assert all(isinstance(row, QuotaDashboardRow) for row in rows)
+    by_model = {row.model: row for row in rows}
+    assert by_model["glm-5.2"].percent == 0.8
+    assert by_model["glm-5.2"].display_value == "800/1000 Token"
+    assert by_model["qwen-image-2.0-pro-2026-06-22"].percent is None
+    assert by_model["qwen-image-2.0-pro-2026-06-22"].display_value == "网页未展示"
+
+
+def test_build_quota_dashboard_rows_formats_large_numbers_without_scientific_notation():
+    rows = build_quota_dashboard_rows(
+        {
+            "aliyun": {
+                "provider": "aliyun",
+                "records": [
+                    {
+                        "model": "glm-5.2",
+                        "kind": "llm",
+                        "status": "available",
+                        "remaining": 205875.0,
+                        "total": 1000000.0,
+                        "unit": "token",
+                    }
+                ],
+            }
+        }
+    )
+
+    assert rows[0].display_value == "205875/1000000 token"
+
+
+def test_filter_quota_dashboard_rows_matches_model_provider_kind_and_status():
+    rows = [
+        QuotaDashboardRow(
+            provider="aliyun",
+            model="glm-5.2",
+            kind="llm",
+            status="available",
+            display_value="205875 / 1000000 token",
+        ),
+        QuotaDashboardRow(
+            provider="volcengine",
+            model="doubao-seedream-5-0-lite-260128",
+            kind="image",
+            status="available",
+            display_value="37 / 50 张",
+        ),
+        QuotaDashboardRow(
+            provider="aliyun",
+            model="qwen-audio",
+            kind="unknown",
+            status="not_visible_on_page",
+            display_value="网页未展示",
+        ),
+    ]
+
+    assert [row.model for row in filter_quota_dashboard_rows(rows, "seedream image")] == [
+        "doubao-seedream-5-0-lite-260128"
+    ]
+    assert [row.model for row in filter_quota_dashboard_rows(rows, "aliyun token")] == ["glm-5.2"]
+    assert [row.model for row in filter_quota_dashboard_rows(rows, "not_visible")] == ["qwen-audio"]
+    assert filter_quota_dashboard_rows(rows, "   ") == rows
+
+
+def test_sort_quota_dashboard_rows_orders_numeric_values_with_unknown_last():
+    rows = [
+        QuotaDashboardRow(provider="aliyun", model="unknown", remaining=None, percent=None),
+        QuotaDashboardRow(provider="aliyun", model="low", remaining=10, percent=0.1),
+        QuotaDashboardRow(provider="volcengine", model="high", remaining=900, percent=0.9),
+    ]
+
+    assert [row.model for row in sort_quota_dashboard_rows(rows, "remaining", descending=True)] == [
+        "high",
+        "low",
+        "unknown",
+    ]
+    assert [row.model for row in sort_quota_dashboard_rows(rows, "percent", descending=False)] == [
+        "low",
+        "high",
+        "unknown",
+    ]
+
+
+def test_quota_dashboard_layout_keeps_long_names_and_values_on_one_line():
+    rows = build_quota_dashboard_rows(
+        {
+            "volcengine": {
+                "provider": "volcengine",
+                "records": [
+                    {
+                        "model": "doubao-seed-1-6-lite",
+                        "kind": "llm",
+                        "status": "available",
+                        "remaining": 500000,
+                        "total": 500000,
+                        "unit": "token",
+                    }
+                ],
+            }
+        }
+    )
+    row = rows[0]
+    layout = quota_dashboard_layout(640)
+    title = quota_dashboard_row_title(row, layout["model_width"])
+
+    assert "\n" not in title
+    assert title.startswith("doubao-seed-1-6-lite")
+    assert " / " not in row.display_value
+    assert row.display_value == "500000/500000 token"
+    assert layout["value_width"] >= 145
+
+
+def test_load_latest_quota_snapshots_skips_empty_failure_snapshot(tmp_path: Path):
+    quota_dir = tmp_path / "quota"
+    quota_dir.mkdir()
+    old_valid = quota_dir / "aliyun_quota_20260704_001000.json"
+    old_valid.write_text(
+        json.dumps({"provider": "aliyun", "records": [{"model": "glm-5.2", "remaining": 10}]}),
+        encoding="utf-8",
+    )
+    latest_empty = quota_dir / "aliyun_quota_20260704_002000.json"
+    latest_empty.write_text(
+        json.dumps({"provider": "aliyun", "records": [], "errors": ["login required"]}),
+        encoding="utf-8",
+    )
+    os.utime(old_valid, (1000, 1000))
+    os.utime(latest_empty, (2000, 2000))
+
+    snapshots = load_latest_quota_snapshots(quota_dir=quota_dir, providers=("aliyun",))
+
+    assert snapshots["aliyun"]["_snapshot_name"] == old_valid.name
+
+
+def test_quota_dashboard_selection_target_distinguishes_llm_and_image_rows():
+    llm_row = QuotaDashboardRow(
+        provider="volcengine",
+        model="glm-5.2",
+        kind="llm",
+        status="available",
+        remaining=500000,
+    )
+    image_row = QuotaDashboardRow(
+        provider="aliyun",
+        model="qwen-image-2.0-pro-2026-06-22",
+        kind="image",
+        status="available",
+        remaining=100,
+    )
+    local_row = QuotaDashboardRow(provider="unknown", model="glm-5.2", kind="llm")
+    exhausted_row = QuotaDashboardRow(
+        provider="aliyun",
+        model="qwen3.7-plus",
+        kind="llm",
+        status="exhausted",
+        remaining=0,
+    )
+
+    assert quota_dashboard_selection_target(llm_row) == ("llm", "volcengine", "glm-5.2")
+    assert quota_dashboard_selection_target(image_row) == (
+        "image",
+        "aliyun",
+        "qwen-image-2.0-pro-2026-06-22",
+    )
+    assert quota_dashboard_selection_target(local_row) is None
+    assert quota_dashboard_selection_target(exhausted_row) is None
+
+
+def test_quota_dashboard_selection_target_infers_image_models_with_unknown_kind():
+    seedream_row = QuotaDashboardRow(
+        provider="volcengine",
+        model="doubao-seedream-5-0",
+        kind="unknown",
+        status="available",
+        remaining=37,
+    )
+    qwen_image_row = QuotaDashboardRow(
+        provider="aliyun",
+        model="qwen-image-2.0-pro-2026-06-22",
+        kind="unknown",
+        status="available",
+        remaining=98,
+    )
+    video_row = QuotaDashboardRow(
+        provider="aliyun",
+        model="wan2.7-t2v-2026-06-12",
+        kind="unknown",
+        status="available",
+        remaining=50,
+    )
+
+    assert quota_dashboard_selection_target(seedream_row) == ("image", "volcengine", "doubao-seedream-5-0")
+    assert quota_dashboard_selection_target(qwen_image_row) == (
+        "image",
+        "aliyun",
+        "qwen-image-2.0-pro-2026-06-22",
+    )
+    assert quota_dashboard_selection_target(video_row) is None
+
+
+def test_quota_dashboard_row_kind_label_explains_inferred_and_display_only_rows():
+    seedream_row = QuotaDashboardRow(
+        provider="volcengine",
+        model="doubao-seedream-5-0",
+        kind="unknown",
+        status="available",
+        remaining=37,
+    )
+    video_row = QuotaDashboardRow(
+        provider="aliyun",
+        model="wan2.7-t2v-2026-06-12",
+        kind="unknown",
+        status="available",
+        remaining=50,
+    )
+    unavailable_row = QuotaDashboardRow(
+        provider="volcengine",
+        model="doubao-seed-evolving",
+        kind="llm",
+        status="unavailable",
+        remaining=500000,
+    )
+
+    assert quota_dashboard_row_kind_label(seedream_row) == "image · 推断"
+    assert quota_dashboard_row_kind_label(video_row) == "仅展示"
+    assert quota_dashboard_row_kind_label(unavailable_row) == "llm · 不可用"
+
+
+def test_merge_model_option_values_appends_clicked_quota_model_without_duplicates():
+    values = merge_model_option_values(("glm-5.1", "glm-5.2"), "deepseek-v4-pro")
+
+    assert values == ("glm-5.1", "glm-5.2", "deepseek-v4-pro")
+    assert merge_model_option_values(values, "glm-5.2") == values
+
+
+def test_auto_tab_has_quota_dashboard_instead_of_default_preview():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "quota_dashboard_panel" in source
+    assert "quota_rows_canvas" in source
+    assert "quota_model_button" in source
+    assert "quota_row_hit" in source
+    assert "quota_search_var" in source
+    assert "quota_sort_var" in source
+    assert "quota_dashboard_layout" in source
+    assert "quota_dashboard_row_title" in source
+    assert "width=96" not in source
+    assert "prepare_quota_dashboard_rows" in source
+    assert "模型额度" in source
+    assert "同步免费额度" in source
+    assert "sync-quotas" in source
+    assert "_show_right_bottom_panel(\"quota\")" in source
+    assert 'ttk.Label(preview_header, text="草稿预览"' not in source
+
+
+def test_quota_sync_defaults_to_visible_login_browser():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "quota_sync_headless_var = tk.BooleanVar(value=False)" in source
+    assert '"login_hold": DEFAULT_LOGIN_HOLD if not quota_sync_headless_var.get() else 0' in source
 
 
 def test_gui_has_aliyun_quota_panel():
@@ -1086,6 +1489,8 @@ def test_gui_has_aliyun_quota_panel():
 
     assert "aliyun-quota" in source
     assert "Aliyun Bailian quota" in source
+    assert "Save raw snapshot" in source
+    assert "Visible page only" in source
 
 
 def test_gui_has_volcengine_quota_panel():
@@ -1094,6 +1499,8 @@ def test_gui_has_volcengine_quota_panel():
 
     assert "volcengine-quota" in source
     assert "Volcengine Ark quota" in source
+    assert "Save raw snapshot" in source
+    assert "Visible page only" in source
 
 
 def test_gui_no_longer_exposes_create_only_tab():

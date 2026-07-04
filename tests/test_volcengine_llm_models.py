@@ -15,6 +15,9 @@ def test_volcengine_llm_model_catalog_matches_current_ark_list():
     assert DEFAULT_VOLCENGINE_LLM_MODEL == "doubao-seed-2-1-turbo-260628"
     assert "doubao-seed-2-1-pro-260628" in VOLCENGINE_AVAILABLE_LLM_MODELS
     assert "deepseek-v4-flash-260425" in VOLCENGINE_AVAILABLE_LLM_MODELS
+    assert "deepseek-v4-flash" in VOLCENGINE_AVAILABLE_LLM_MODELS
+    assert "deepseek-v4-pro" in VOLCENGINE_AVAILABLE_LLM_MODELS
+    assert "glm-5.2" in VOLCENGINE_AVAILABLE_LLM_MODELS
     assert "glm-4-7-251222" in VOLCENGINE_AVAILABLE_LLM_MODELS
 
 
@@ -37,6 +40,8 @@ def test_volcengine_llm_provider_builds_multiple_configs(monkeypatch):
 
 def test_ark_llm_provider_alias_uses_ark_api_key(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "ark")
+    monkeypatch.delenv("VOLCENGINE_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("VOLCENGINE_API_KEY", raising=False)
     monkeypatch.setenv("ARK_API_KEY", "dummy-ark")
     monkeypatch.setenv("VOLCENGINE_LLM_MODEL", "glm-4-7-251222")
 
@@ -58,8 +63,11 @@ def test_volcengine_llm_reads_local_key_file(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("LLM_PROVIDER", "volcengine")
     monkeypatch.setenv("VOLCENGINE_LLM_MODEL", "doubao-seed-2-1-turbo-260628")
+    monkeypatch.delenv("VOLCENGINE_LLM_API_KEY", raising=False)
     monkeypatch.delenv("VOLCENGINE_API_KEY", raising=False)
     monkeypatch.delenv("ARK_API_KEY", raising=False)
+    monkeypatch.delenv("VOLCENGINE_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("ARK_BASE_URL", raising=False)
 
     docs = tmp_path / "docs"
     docs.mkdir()

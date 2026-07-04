@@ -58,11 +58,11 @@ $env:IMAGE_PROVIDER="aliyun"
 # Aliyun / DashScope
 $env:DASHSCOPE_API_KEY="..."
 $env:ALIYUN_LLM_MODEL="glm-5.2"
-$env:ALIYUN_IMAGE_MODEL="qwen-image-2.0-pro-2026-04-22"
+$env:ALIYUN_IMAGE_MODEL="qwen-image-2.0-pro-2026-06-22"
 
 # Volcengine Ark
 $env:VOLCENGINE_API_KEY="..."
-$env:VOLCENGINE_LLM_MODEL="doubao-seed-2-1-turbo-260628"
+$env:VOLCENGINE_LLM_MODEL="glm-5.2"
 $env:VOLCENGINE_IMAGE_MODEL="doubao-seedream-5-0-lite-260128"
 
 # 可选新闻与图片源
@@ -97,7 +97,7 @@ Set-Location E:\AI\codex\redbook_workflow
 
 GUI 中常用页签：
 
-- 生成并上传：选择内容类型、模型供应商、图片来源，生成并保存到小红书草稿箱；当前公开入口不再提供“仅生成”。
+- 生成并上传：选择内容类型、模型供应商、图片来源，生成并保存到小红书草稿箱；“每日新闻”提示词提供多个方向输入框，每个框填写一个检索方向，候选会合并去重后按三日新鲜度、相关度和热度筛选；当前公开入口不再提供“仅生成”。
 - 已发布数据：全量同步已发布笔记指标，并分析下一批选题方向；默认要求严格全量，缺失时不覆盖 latest。
 - 发布草稿：从小红书草稿箱中发布本地已记录的草稿。
 - 删除草稿：按条件删除草稿箱内容，建议先 dry-run。
@@ -110,6 +110,13 @@ GUI 中常用页签：
 ```powershell
 Set-Location E:\AI\codex\redbook_workflow
 .\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --prompt "财经产业 / 公司政策 / 市场变化" --evaluation-viewpoint "无视角评价" --assets-glob "assets/empty/*" --count 1 --login-hold 600 --wait-timeout 600 --force
+```
+
+多方向提示词也可以在 CLI 中使用多行文本，效果与 GUI 的多个提示词框一致：
+
+```powershell
+$prompt = "世界杯`n体育 足球`n品牌平台生态"
+.\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --prompt $prompt --evaluation-viewpoint "无视角评价" --assets-glob "assets/empty/*" --count 3 --login-hold 600 --wait-timeout 600 --force
 ```
 
 生成一条 `每日AI讯息` 并保存到草稿箱：
@@ -200,16 +207,16 @@ $env:XHS_METRICS_STAGNANT_ROUNDS="220"
 Aliyun 百炼：
 
 ```powershell
-.\.venv\Scripts\python.exe -m apps.cli aliyun-quota --model glm-5.2 --model qwen-image-2.0-pro-2026-04-22 --login-hold 600 --wait-timeout 120
+.\.venv\Scripts\python.exe -m apps.cli aliyun-quota --model glm-5.2 --model qwen-image-2.0-pro-2026-06-22 --login-hold 600 --wait-timeout 120 --save-raw
 ```
 
 Volcengine Ark：
 
 ```powershell
-.\.venv\Scripts\python.exe -m apps.cli volcengine-quota --model doubao-seed-2-1-turbo-260628 --model doubao-seedream-5-0-lite-260128 --login-hold 600 --wait-timeout 120
+.\.venv\Scripts\python.exe -m apps.cli volcengine-quota --model glm-5.2 --model deepseek-v4-pro --model deepseek-v4-flash --model doubao-seedream-5-0-lite-260128 --login-hold 600 --wait-timeout 120 --save-raw
 ```
 
-这两个命令通过官方控制台页面读取信息，不调用付费推理接口。
+这两个命令通过官方控制台页面读取信息，不调用付费推理接口。`--save-raw` 会把原始可见文本和解析结果保存到 `data/quota/`，便于控制台 UI 变化时排查。详细说明见 `docs/模型免费额度查询-2026-07-03.md`。
 
 ## 本地数据
 

@@ -41,6 +41,7 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
         AIDigestSource("doubao", "official", "https://www.volcengine.com/docs/82379/1159178", "火山方舟/豆包", "html"),
         AIDigestSource("baidu-qianfan", "official", "https://cloud.baidu.com/doc/qianfan/s/Kmh4stnjp", "百度千帆/文心", "html"),
         AIDigestSource("moonshot-kimi", "official", "https://platform.moonshot.cn/blog/tags/announcement", "月之暗面 Kimi", "html"),
+        AIDigestSource("aihot-daily", "search", "https://aihot.virxact.com/daily", "AI HOT", "aihot_daily"),
         AIDigestSource("x", "social", "https://x.com/search?q=AI%20model%20release&f=live", "X", "social_html", enabled=False),
         AIDigestSource("hackernews", "social", "https://hn.algolia.com/?q=AI%20model", "Hacker News", "social_html", enabled=False),
     ]
@@ -70,5 +71,8 @@ def resolve_ai_digest_sources(env: dict[str, str] | None = None) -> list[AIDiges
     else:
         primary = [by_name[name] for name in primary_names if name in by_name]
 
-    social = [by_name[name] for name in social_names if name in by_name]
+    if not social_names:
+        social = [source for source in sources if source.kind == "search" and source.enabled]
+    else:
+        social = [by_name[name] for name in social_names if name in by_name]
     return [*primary, *social]

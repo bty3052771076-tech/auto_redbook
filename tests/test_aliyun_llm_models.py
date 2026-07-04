@@ -5,6 +5,17 @@ from pathlib import Path
 from src.config import ALIYUN_FREE_LLM_MODELS, DEFAULT_ALIYUN_LLM_MODEL, load_llm_configs
 
 
+def _isolate_volcengine_config(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "VOLCENGINE_LLM_API_KEY",
+        "VOLCENGINE_API_KEY",
+        "VOLCENGINE_IMAGE_API_KEY",
+        "ARK_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_aliyun_free_llm_model_catalog_matches_current_console_list():
     assert DEFAULT_ALIYUN_LLM_MODEL == "qwen3.7-plus"
     assert ALIYUN_FREE_LLM_MODELS == [
@@ -29,7 +40,8 @@ def test_aliyun_free_llm_model_catalog_matches_current_console_list():
     ]
 
 
-def test_aliyun_llm_models_list_builds_multiple_configs(monkeypatch):
+def test_aliyun_llm_models_list_builds_multiple_configs(monkeypatch, tmp_path: Path):
+    _isolate_volcengine_config(monkeypatch, tmp_path)
     monkeypatch.setenv("ALIYUN_LLM_API_KEY", "dummy-aliyun")
     monkeypatch.setenv("ALIYUN_LLM_MODELS", "m1,m2 m1")
     monkeypatch.setenv("LLM_API_KEY", "dummy-fallback")
@@ -40,7 +52,9 @@ def test_aliyun_llm_models_list_builds_multiple_configs(monkeypatch):
     assert [c.model for c in cfgs[:2]] == ["m1", "m2"]
 
 
-def test_aliyun_llm_models_list_overrides_single_model(monkeypatch):
+def test_aliyun_llm_models_list_overrides_single_model(monkeypatch, tmp_path: Path):
+    _isolate_volcengine_config(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_PROVIDER", "aliyun")
     monkeypatch.setenv("ALIYUN_LLM_API_KEY", "dummy-aliyun")
     monkeypatch.setenv("ALIYUN_LLM_MODEL", "single")
     monkeypatch.setenv("ALIYUN_LLM_MODELS", "list1,list2")
@@ -51,7 +65,9 @@ def test_aliyun_llm_models_list_overrides_single_model(monkeypatch):
     assert [c.model for c in cfgs] == ["list1", "list2"]
 
 
-def test_aliyun_llm_single_model_fallback(monkeypatch):
+def test_aliyun_llm_single_model_fallback(monkeypatch, tmp_path: Path):
+    _isolate_volcengine_config(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_PROVIDER", "aliyun")
     monkeypatch.setenv("ALIYUN_LLM_API_KEY", "dummy-aliyun")
     monkeypatch.setenv("ALIYUN_LLM_MODEL", "single")
     monkeypatch.delenv("ALIYUN_LLM_MODELS", raising=False)

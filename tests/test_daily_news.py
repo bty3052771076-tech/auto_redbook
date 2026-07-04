@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -26,6 +27,29 @@ from src.workflow.create_post import (
     _normalize_daily_news_topics,
     _render_daily_news_body_fields,
 )
+
+
+BJT = timezone(timedelta(hours=8), name="Asia/Shanghai")
+
+
+def _recent_news_seendate(days_ago: int, *, hour: int = 10) -> str:
+    dt = datetime.now(BJT).replace(hour=hour, minute=0, second=0, microsecond=0) - timedelta(days=days_ago)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _recent_news_date(days_ago: int = 0) -> str:
+    dt = datetime.now(BJT).replace(hour=10, minute=0, second=0, microsecond=0) - timedelta(days=days_ago)
+    return dt.date().isoformat()
+
+
+def test_daily_news_query_variants_expand_space_separated_prompt_keywords(monkeypatch):
+    monkeypatch.delenv("NEWS_QUERY_DEFAULT", raising=False)
+
+    queries = daily_news._build_prompt_news_queries("世界杯 体育 足球")
+
+    assert queries[:4] == ["世界杯 体育 足球", "世界杯", "体育", "足球"]
+    assert any("world cup" in query.lower() for query in queries)
+    assert len(queries) == len(dict.fromkeys(query.lower() for query in queries))
 
 
 def _daily_news_body_fields(body: str) -> dict:
@@ -242,7 +266,7 @@ def test_create_daily_news_falls_back_when_llm_echoes_prompt(monkeypatch, tmp_pa
         url="https://example.com/news",
         source="Example",
         domain="example.com",
-        seendate="2026-06-19T00:00:00Z",
+        seendate=_recent_news_seendate(0),
         description="多家公司开始讨论 AI 写作工具对内容生产的影响。",
         content="业内人士关注 AI 写作工具的效率、质量和识别问题。",
     )
@@ -474,7 +498,7 @@ def test_finalize_daily_news_body_removes_incomplete_comment_tail_before_publish
         url="https://example.com/lg-oled",
         source="PRNewswire",
         domain="prnewswire.com",
-        seendate="2026-06-22",
+        seendate=_recent_news_seendate(0),
         description="LG Display said its OLED panels received perfect color and brightness certification.",
         content="LG Display announced its large-sized OLED panels received Perfect Color/Brightness certification.",
     )
@@ -1203,7 +1227,7 @@ def test_create_daily_news_single_stores_url_locally_but_not_in_body(monkeypatch
         url="https://example.com/source",
         source="Example News",
         domain="example.com",
-        seendate="2026-06-19T08:00:00Z",
+        seendate=_recent_news_seendate(0),
         description="The chip company said the product targets inference workloads.",
         content="The company described performance and energy-efficiency updates.",
     )
@@ -1227,7 +1251,7 @@ def test_create_daily_news_single_stores_url_locally_but_not_in_body(monkeypatch
                 "点评：\n"
                 "从中国受众视角看，AI芯片竞争会继续影响算力供给、产业链安全和应用成本。更值得关注的是技术指标能否转化为稳定供应，"
                 "以及不同市场在合规、生态和价格上的后续变化。你更关注性能还是供应稳定性？\n\n"
-                "发布时间：2026-06-19\n\n"
+                f"发布时间：{_recent_news_date()}\n\n"
                 "来源：Example News https://example.com/source"
             ),
             "topics": ["每日新闻", "AI芯片", "科技"],
@@ -1246,14 +1270,15 @@ def test_create_daily_news_single_stores_url_locally_but_not_in_body(monkeypatch
     assert "http://" not in post.body and "https://" not in post.body
     data = _daily_news_body_fields(post.body)
     assert data["来源"] == "Example News"
-    assert data["日期"] == "2026-06-19"
+    assert data["日期"] == _recent_news_date()
     assert post.platform["news"]["source_url"] == "https://example.com/source"
     assert post.platform["news"]["picked"]["url"] == "https://example.com/source"
     assert post.platform["news"]["api_source"] == "hotnews"
     assert post.platform["news"]["source_api"]["provider"] == "hotnews"
     assert post.platform["news"]["source_api"]["item_source"] == "Example News"
-    assert fetch_kwargs["max_records"] == 2
-    assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 2
+    assert fetch_kwargs["max_records"] == 20
+    assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 1
+    assert post.platform["news"]["selection_pool"]["raw_fetch_count"] == 20
 
 
 def test_create_daily_news_single_outputs_fixed_body_fields(monkeypatch, tmp_path):
@@ -1268,7 +1293,7 @@ def test_create_daily_news_single_outputs_fixed_body_fields(monkeypatch, tmp_pat
         url="https://example.com/source",
         source="Example News",
         domain="example.com",
-        seendate="2026-06-19T08:00:00Z",
+        seendate=_recent_news_seendate(0),
         description="The chip company said the product targets inference workloads.",
         content="The company described performance and energy-efficiency updates.",
     )
@@ -1288,7 +1313,7 @@ def test_create_daily_news_single_outputs_fixed_body_fields(monkeypatch, tmp_pat
                 "从已给信息看，事件仍处在产品发布层面，具体量产、客户采用和商业效果仍需等待后续披露。\n\n"
                 "点评：\n"
                 "AI芯片竞争会继续影响算力供给、产业链安全和应用成本，关键是技术指标能否转化为稳定供应。\n\n"
-                "发布时间：2026-06-19\n\n"
+                f"发布时间：{_recent_news_date()}\n\n"
                 "来源：Example News https://example.com/source"
             ),
             "topics": ["每日新闻", "AI芯片", "科技"],
@@ -1308,7 +1333,7 @@ def test_create_daily_news_single_outputs_fixed_body_fields(monkeypatch, tmp_pat
     assert post.title == "AI芯片新品发布"
     assert "AI芯片" in data["内容"]
     assert "算力供给" in data["评价"]
-    assert data["日期"] == "2026-06-19"
+    assert data["日期"] == _recent_news_date()
     assert data["来源"] == "Example News"
     assert "http" not in post.body
     assert "https://example.com/source" == post.platform["news"]["source_url"]
@@ -1326,7 +1351,7 @@ def test_create_daily_news_posts_scrubs_url_and_persists_source_url(monkeypatch,
         url="https://example.com/eu-tech",
         source="Example Wire",
         domain="example.com",
-        seendate="2026-06-19",
+        seendate=_recent_news_seendate(0),
         description="Officials announced a technology cooperation framework.",
         content="The framework focuses on standards, investment and supply chain dialogue.",
     )
@@ -1348,7 +1373,7 @@ def test_create_daily_news_posts_scrubs_url_and_persists_source_url(monkeypatch,
                 "点评：\n"
                 "从中国受众视角看，国际科技规则变化会影响企业出海、供应链合作和产业竞争节奏。"
                 "更稳妥的判断方式，是持续跟踪正式文本和后续执行细节，而不是只看标题作结论。你认为企业最需要关注哪一项？\n\n"
-                "发布时间：2026-06-19\n\n"
+                f"发布时间：{_recent_news_date()}\n\n"
                 "来源：Example Wire https://example.com/eu-tech"
             ),
             "topics": ["每日新闻", "科技合作", "国际"],
@@ -1367,7 +1392,7 @@ def test_create_daily_news_posts_scrubs_url_and_persists_source_url(monkeypatch,
     assert "https://example.com/eu-tech" not in posts[0].body
     data = _daily_news_body_fields(posts[0].body)
     assert data["来源"] == "Example Wire"
-    assert data["日期"] == "2026-06-19"
+    assert data["日期"] == _recent_news_date()
     assert posts[0].platform["news"]["source_url"] == "https://example.com/eu-tech"
     assert posts[0].platform["news"]["picked"]["url"] == "https://example.com/eu-tech"
     assert posts[0].platform["news"]["api_source"] == "hotnews"
@@ -1387,7 +1412,7 @@ def test_create_daily_news_posts_replaces_cross_candidate_title_and_image_event(
         url="https://example.com/lg-oled",
         source="PRNewswire",
         domain="prnewswire.com",
-        seendate="2026-06-22",
+        seendate=_recent_news_seendate(0),
         description="LG Display said its large-sized OLED panels received perfect color and brightness certification.",
         content=(
             "LG Display announced its large-sized OLED panels for monitors and TVs became the first "
@@ -1411,7 +1436,7 @@ def test_create_daily_news_posts_replaces_cross_candidate_title_and_image_event(
                     "该认证覆盖显示器和电视用OLED面板，突出色彩还原和亮度表现。"
                 ),
                 comment="这项认证的意义在于显示面板性能有了更明确的行业评价维度。",
-                date="2026-06-22",
+                date=_recent_news_date(),
                 source="PRNewswire",
             ),
             "topics": ["每日新闻", "OLED", "显示技术"],
@@ -1449,7 +1474,7 @@ def test_create_daily_news_posts_trims_multi_story_source_before_llm_and_image(m
         url="https://example.com/mixed-hot-list",
         source="Example Hot",
         domain="example.com",
-        seendate="2026-06-30",
+        seendate=_recent_news_seendate(0),
         description=(
             "长鑫存储一季度利润大增，合肥早期产业投资进入收获期。\n"
             "苹果涨价英伟达返现OpenAI发芯片\n"
@@ -1479,7 +1504,7 @@ def test_create_daily_news_posts_trims_multi_story_source_before_llm_and_image(m
                 original_title="长鑫存储一季度暴赚合肥十年赌局翻盘",
                 content="长鑫存储一季度利润大增，合肥早期产业投资进入收获期。",
                 comment="这条新闻的重点在于地方产业投资进入回报观察期。",
-                date="2026-06-30",
+                date=_recent_news_date(),
                 source="Example Hot",
             ),
             "topics": ["每日新闻", "芯片产业"],
@@ -1528,7 +1553,7 @@ def test_create_daily_news_posts_keeps_normal_multi_paragraph_source(monkeypatch
         url="https://example.com/normal-article",
         source="Example News",
         domain="example.com",
-        seendate="2026-06-30",
+        seendate=_recent_news_seendate(0),
         description=(
             "长鑫存储披露一季度盈利改善，产线利用率继续回升。\n"
             "公司称产品结构调整带动毛利率改善。\n"
@@ -1557,7 +1582,7 @@ def test_create_daily_news_posts_keeps_normal_multi_paragraph_source(monkeypatch
                 original_title="长鑫存储披露一季度盈利改善",
                 content="长鑫存储一季度盈利改善，产品结构调整带动毛利率改善。",
                 comment="这条新闻的重点在于国产存储企业经营质量改善。",
-                date="2026-06-30",
+                date=_recent_news_date(),
                 source="Example News",
             ),
             "topics": ["每日新闻", "芯片产业"],
@@ -1668,13 +1693,143 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
     )
 
     picked_domains = [post.platform["news"]["picked"]["domain"] for post in posts]
-    assert fetch_kwargs["max_records"] == 4
+    assert fetch_kwargs["max_records"] == 40
     assert len(posts) == 2
     assert picked_domains.count("36kr.com") <= 1
     assert len(set(picked_domains)) == 2
     for post in posts:
-        assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 4
+        assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 2
+        assert post.platform["news"]["selection_pool"]["raw_fetch_count"] == 40
         assert post.platform["news"]["selection_pool"]["requested_count"] == 2
+
+
+def test_daily_news_upload_filters_candidates_to_beijing_three_day_window(monkeypatch):
+    candidates = [
+        NewsItem(
+            title="今天的财经政策新闻",
+            url="https://example.com/today",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+        ),
+        NewsItem(
+            title="昨天的公司政策新闻",
+            url="https://example.com/yesterday",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(1),
+        ),
+        NewsItem(
+            title="前天的市场变化新闻",
+            url="https://example.com/before-yesterday",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(2),
+        ),
+        NewsItem(
+            title="三天前的旧新闻不应进入候选池",
+            url="https://example.com/old",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(3),
+        ),
+        NewsItem(
+            title="缺少发布时间的新闻不应进入候选池",
+            url="https://example.com/missing-date",
+            source="Example",
+            domain="example.com",
+            seendate="",
+        ),
+    ]
+    fetch_kwargs: dict[str, object] = {}
+
+    def fake_fetch(_prompt, **kwargs):
+        fetch_kwargs.update(kwargs)
+        return candidates, {"provider": "fake-news", "tz": "Asia/Shanghai"}
+
+    monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
+
+    filtered, meta = create_post._fetch_daily_news_candidates_for_upload("新闻", count=2)
+
+    assert fetch_kwargs["max_records"] == 40
+    assert [item.url for item in filtered] == [
+        "https://example.com/today",
+        "https://example.com/yesterday",
+        "https://example.com/before-yesterday",
+    ]
+    pool = meta["selection_pool"]
+    assert pool["requested_count"] == 2
+    assert pool["target_fetch_count"] == 2
+    assert pool["raw_fetch_count"] == 40
+    assert pool["raw_candidate_count"] == 5
+    assert pool["recent_candidate_count"] == 3
+    assert pool["actual_candidate_count"] == 3
+    assert pool["dropped_out_of_window_count"] == 2
+    assert pool["date_window"]["max_age_days"] == 3
+    assert pool["date_window"]["tz"] == "Asia/Shanghai"
+
+
+def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(monkeypatch):
+    candidates = [
+        NewsItem(
+            title="AI startup raises new funding",
+            url="https://example.com/ai",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description="A technology company announced a new funding round.",
+            attention=999,
+        ),
+        NewsItem(
+            title="World Cup ticket resale rules draw scrutiny",
+            url="https://example.com/world-cup-rules",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description="Sports regulators are reviewing World Cup ticket resale rules.",
+            attention=5,
+        ),
+        NewsItem(
+            title="World Cup sponsors prepare new fan campaign",
+            url="https://example.org/world-cup-sponsors",
+            source="Example",
+            domain="example.org",
+            seendate=_recent_news_seendate(1),
+            description="Sports brands are preparing a World Cup fan campaign.",
+            attention=20,
+        ),
+        NewsItem(
+            title="Old World Cup story should be excluded",
+            url="https://example.net/old-world-cup",
+            source="Example",
+            domain="example.net",
+            seendate=_recent_news_seendate(3),
+            description="Sports story outside the three-day window.",
+            attention=100,
+        ),
+    ]
+    fetch_kwargs: dict[str, object] = {}
+
+    def fake_fetch(_prompt, **kwargs):
+        fetch_kwargs.update(kwargs)
+        return candidates, {"provider": "fake-news", "tz": "Asia/Shanghai"}
+
+    monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
+
+    selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=5)
+
+    assert fetch_kwargs["max_records"] == 100
+    assert [item.url for item in selected] == [
+        "https://example.org/world-cup-sponsors",
+        "https://example.com/world-cup-rules",
+    ]
+    pool = meta["selection_pool"]
+    assert pool["requested_count"] == 5
+    assert pool["target_fetch_count"] == 5
+    assert pool["raw_fetch_count"] == 100
+    assert pool["recent_candidate_count"] == 3
+    assert pool["prompt_relevant_candidate_count"] == 2
+    assert pool["actual_candidate_count"] == 2
 
 
 def test_create_daily_news_posts_replaces_generic_original_title_with_post_title(monkeypatch, tmp_path):
@@ -1689,7 +1844,7 @@ def test_create_daily_news_posts_replaces_generic_original_title_with_post_title
         url="https://example.com/shirtless-neighbor",
         source="Boredpanda.com",
         domain="example.com",
-        seendate="2026-06-22",
+        seendate=_recent_news_seendate(0),
         description=(
             "A 34-year-old man had been mowing his lawn shirtless for years. "
             "A neighbor's husband later demanded he cover up while mowing."
@@ -1713,7 +1868,7 @@ def test_create_daily_news_posts_replaces_generic_original_title_with_post_title
                 original_title="科技议题出现进展",
                 content="一名男子多年光膀修剪自家草坪，邻居丈夫随后私信要求他除草时穿上衣。",
                 comment="这起邻里纠纷的重点在于私人空间边界和沟通方式。",
-                date="2026-06-22",
+                date=_recent_news_date(),
                 source="Boredpanda.com",
             ),
             "topics": ["每日新闻", "邻里关系"],
@@ -1747,7 +1902,7 @@ def test_create_daily_news_posts_prefers_post_title_over_mismatched_original_sum
         url="https://example.com/cisco-zero-trust",
         source="Cisco.com",
         domain="example.com",
-        seendate="2026-06-22",
+        seendate=_recent_news_seendate(0),
         description="Cisco Secure Access と Island Enterprise Browser の統合によりゼロトラストを実現。",
         content="Cisco Secure Access and Island Browser combine browser controls with secure access.",
     )
@@ -1765,7 +1920,7 @@ def test_create_daily_news_posts_prefers_post_title_over_mismatched_original_sum
                 original_title="平台封锁VPN用户",
                 content="思科Secure Access与Island企业浏览器整合，把访问控制延伸到用户会话和数据操作。",
                 comment="这一整合回应了远程办公和非托管设备接入中的安全管理难题。",
-                date="2026-06-22",
+                date=_recent_news_date(),
                 source="Cisco.com",
             ),
             "topics": ["每日新闻", "网络安全"],
@@ -1787,7 +1942,7 @@ def test_create_daily_news_posts_prefers_post_title_over_mismatched_original_sum
     assert "VPN" not in post.body
 
 
-def test_create_daily_news_posts_keeps_trying_after_quality_skips(monkeypatch, tmp_path):
+def test_create_daily_news_posts_uses_backup_candidates_after_quality_skips(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         create_post,
@@ -1800,7 +1955,7 @@ def test_create_daily_news_posts_keeps_trying_after_quality_skips(monkeypatch, t
             url=f"https://example.com/news/{i}",
             source="Example News",
             domain="example.com",
-            seendate="2026-06-22",
+            seendate=_recent_news_seendate(0),
             description="\u516c\u5f00\u4fe1\u606f\u663e\u793a\u76f8\u5173\u9879\u76ee\u51fa\u73b0\u65b0\u8fdb\u5c55\u3002",
             content="\u76f8\u5173\u673a\u6784\u56f4\u7ed5\u6280\u672f\u843d\u5730\u3001\u4ea7\u4e1a\u534f\u540c\u548c\u5e94\u7528\u573a\u666f\u516c\u5e03\u4e86\u66f4\u591a\u7ec6\u8282\u3002",
         )
@@ -1865,10 +2020,9 @@ def test_create_daily_news_posts_keeps_trying_after_quality_skips(monkeypatch, t
         auto_image=False,
     )
 
-    assert pick_args["count"] > 15
-    assert calls["count"] == 18
     assert len(posts) == 3
-    assert [post.platform["news"]["candidate_index"] for post in posts] == [16, 17, 18]
+    assert pick_args["count"] == 3
+    assert calls["count"] >= 18
 
 
 def test_create_daily_news_posts_raises_instead_of_returning_partial_posts(monkeypatch, tmp_path):
@@ -1884,7 +2038,7 @@ def test_create_daily_news_posts_raises_instead_of_returning_partial_posts(monke
             url=f"https://example.com/partial/{i}",
             source="Example News",
             domain="example.com",
-            seendate="2026-06-22",
+            seendate=_recent_news_seendate(0),
             description="\u6d4b\u8bd5\u5019\u9009\u63cf\u8ff0\u3002",
             content="\u6d4b\u8bd5\u5019\u9009\u6b63\u6587\u3002",
         )
@@ -1952,7 +2106,7 @@ def test_create_daily_news_fallback_does_not_publish_prompt_as_topic(monkeypatch
         url="https://example.com/news",
         source="Example",
         domain="example.com",
-        seendate="2026-06-16T00:00:00Z",
+        seendate=_recent_news_seendate(0),
         description="A technology dispute escalated.",
         content="The report described a policy dispute around advanced AI model access.",
     )
@@ -1995,7 +2149,7 @@ def test_create_daily_news_rejects_prompt_topic_title_and_generic_body(monkeypat
         url="https://example.com/sunscreen",
         source="The Verge",
         domain="example.com",
-        seendate="2026-06-19T00:25:24Z",
+        seendate=_recent_news_seendate(0),
         description="Other countries have used newer sunscreen ingredients for years.",
         content="The article discusses FDA review of bemotrizinol and sunscreen access.",
     )
@@ -2015,7 +2169,7 @@ def test_create_daily_news_rejects_prompt_topic_title_and_generic_body(monkeypat
                 "在信息仍有限的情况下，读者可以先把它视为一个需要继续跟踪的进展，而不是已经定论的结果。\n\n"
                 "点评：\n"
                 "从中国受众视角看，越是跨地区、跨产业的新闻，越需要区分已确认事实和外界推测。\n\n"
-                "发布时间：2026-06-19\n\n"
+                f"发布时间：{_recent_news_date()}\n\n"
                 "来源：The Verge"
             ),
             "topics": ["每日新闻"],
@@ -2036,7 +2190,7 @@ def test_create_daily_news_rejects_prompt_topic_title_and_generic_body(monkeypat
     assert "防晒" in post.body or "审批" in post.body
     data = _daily_news_body_fields(post.body)
     assert data["来源"] == "The Verge"
-    assert data["日期"] == "2026-06-19"
+    assert data["日期"] == _recent_news_date()
 
 
 def test_daily_news_english_defense_item_ignores_prompt_category_for_fallback():
@@ -2332,6 +2486,47 @@ def test_fetch_daily_news_candidates_with_prompt_uses_default_fallback_without_n
 
     assert candidates[0].title == "AI chip company announces new production plan"
     assert "technology" in meta["queries_used"]
+
+
+def test_fetch_daily_news_candidates_with_multi_prompt_aggregates_query_variants(monkeypatch):
+    monkeypatch.setenv("NEWS_PROVIDER", "newsapi")
+    monkeypatch.setenv("NEWS_API_KEY", "fake-newsapi-key")
+    monkeypatch.delenv("NEWS_QUERY_DEFAULT", raising=False)
+    calls: list[str] = []
+
+    def fake_newsapi_fetch_articles(**kwargs):
+        query = kwargs["query"]
+        calls.append(query)
+        if query == "世界杯 体育 足球":
+            return [
+                NewsItem(
+                    title="Old combined query story",
+                    url="https://example.com/old-combined",
+                    domain="example.com",
+                    seendate="2026-06-01T00:00:00Z",
+                    description="Old World Cup story.",
+                )
+            ]
+        if query == "世界杯":
+            return [
+                NewsItem(
+                    title="世界杯赞助商发布最新球迷活动",
+                    url="https://example.com/world-cup-fresh",
+                    domain="example.com",
+                    seendate=_recent_news_seendate(0),
+                    description="这是一条三日内的世界杯体育足球新闻。",
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(daily_news, "_newsapi_fetch_articles", fake_newsapi_fetch_articles)
+
+    candidates, meta = daily_news.fetch_daily_news_candidates("世界杯 体育 足球", max_records=10)
+
+    assert "世界杯 体育 足球" in calls
+    assert "世界杯" in calls
+    assert any(item.url == "https://example.com/world-cup-fresh" for item in candidates)
+    assert "世界杯" in meta["queries_used"]
 
 
 def test_fetch_daily_news_candidates_gnews_provider_maps_articles(monkeypatch):

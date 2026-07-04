@@ -21,7 +21,7 @@ from src.ai_digest.generate import (
     render_ai_digest_body,
 )
 from src.ai_digest.models import AIDigestBrief
-from src.ai_digest.rank import rank_ai_updates
+from src.ai_digest.rank import ai_digest_quota_counts, rank_ai_updates
 from src.ai_digest.render import render_ai_digest_cards
 from src.images.auto_image import (
     ImageGenerationAbandoned,
@@ -31,7 +31,10 @@ from src.images.auto_image import (
 from src.llm.generate import generate_draft
 from src.news.daily_news import (
     fetch_daily_news_candidates,
+    filter_prompt_relevant_news_items,
+    filter_recent_news_items,
     pick_news_items,
+    rank_news_candidate_pool,
 )
 from src.storage.files import copy_assets_into_post, post_dir, save_post, save_revision
 from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSource
@@ -74,6 +77,9 @@ _DAILY_NEWS_PREFIX_RE = re.compile(r"^(?:每日新闻)(?:[｜|:：\-—–\s]+)?
 _SOURCE_LOOKUP_MIN_CHARS = 120
 _SOURCE_LOOKUP_MAX_CHARS = 5000
 DEFAULT_EVALUATION_VIEWPOINT = "无视角评价"
+AI_DIGEST_MIN_ITEMS = 8
+AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS = 3
+AI_DIGEST_MIN_FOREIGN_AI_ITEMS = 3
 _DAILY_NEWS_TITLE_MIN_LEN = 10
 _NEWS_TITLE_PROMPT_STRONG_MARKERS = (
     "选择一条",
@@ -2674,19 +2680,26 @@ def normalize_evaluation_viewpoint(value: str | None) -> str:
 
 
 def _daily_news_candidate_fetch_limit(count: int) -> int:
-    raw_factor = (os.getenv("NEWS_SELECTION_POOL_FACTOR") or "").strip()
+    return max(1, int(count or 1))
+
+
+def _daily_news_raw_candidate_fetch_limit(target_fetch_count: int) -> int:
+    raw = (os.getenv("NEWS_UPLOAD_RAW_MAX_RECORDS") or os.getenv("NEWS_RAW_MAX_RECORDS") or "").strip()
     try:
-        factor = float(raw_factor) if raw_factor else 2.0
+        value = int(raw) if raw else 0
     except ValueError:
-        factor = 2.0
-    factor = max(1.0, min(5.0, factor))
-    return max(1, int(round(max(1, count) * factor)))
+        value = 0
+    minimum = max(20, target_fetch_count * 20)
+    if value > 0:
+        return max(minimum, value)
+    return minimum
 
 
 def _fetch_daily_news_candidates_for_upload(prompt_norm: str, *, count: int) -> tuple[list[Any], dict[str, Any]]:
     target_fetch_count = _daily_news_candidate_fetch_limit(count)
+    raw_fetch_count = _daily_news_raw_candidate_fetch_limit(target_fetch_count)
     try:
-        candidates, meta = fetch_daily_news_candidates(prompt_norm, max_records=target_fetch_count)
+        candidates, meta = fetch_daily_news_candidates(prompt_norm, max_records=raw_fetch_count)
     except TypeError as exc:
         if "unexpected keyword" not in str(exc) and "positional" not in str(exc):
             raise
@@ -2694,11 +2707,37 @@ def _fetch_daily_news_candidates_for_upload(prompt_norm: str, *, count: int) -> 
         # the old one-argument callable shape.
         candidates, meta = fetch_daily_news_candidates(prompt_norm)
     meta = dict(meta)
+    raw_candidate_count = len(candidates)
+    tz_name = str(meta.get("tz") or os.getenv("NEWS_TZ") or "Asia/Shanghai")
+    recent_candidates, date_window_meta = filter_recent_news_items(
+        list(candidates),
+        tz_name=tz_name,
+        max_age_days=3,
+    )
+    prompt_candidates, prompt_relevance_meta = filter_prompt_relevant_news_items(
+        recent_candidates,
+        prompt_norm,
+    )
+    rank_source = prompt_candidates
+    candidates = rank_news_candidate_pool(rank_source, prompt_norm)[:raw_fetch_count]
+    if not candidates:
+        raise RuntimeError(
+            "no daily news candidates matching the prompt within the Beijing three-day window "
+            f"({date_window_meta['start_date']}..{date_window_meta['end_date']}); "
+            "only today's, yesterday's, and the day-before-yesterday's news can be used"
+        )
     meta["selection_pool"] = {
         "requested_count": max(1, int(count or 1)),
         "target_fetch_count": target_fetch_count,
+        "raw_fetch_count": raw_fetch_count,
+        "raw_candidate_count": raw_candidate_count,
+        "recent_candidate_count": len(recent_candidates),
+        "prompt_relevance": prompt_relevance_meta,
+        "prompt_relevant_candidate_count": len(prompt_candidates),
         "actual_candidate_count": len(candidates),
-        "selection_policy": "attention_recency_source_diversity",
+        "dropped_out_of_window_count": raw_candidate_count - len(recent_candidates),
+        "date_window": date_window_meta,
+        "selection_policy": "prompt_relevance_attention_recency_source_diversity",
         "source_domain_max_ratio": os.getenv("NEWS_SOURCE_DOMAIN_MAX_RATIO") or "0.5",
     }
     return candidates, meta
@@ -3358,6 +3397,8 @@ def _rank_brief_ai_digest_items(
     target_count: int,
     min_official_count: int,
     max_age_days: int,
+    min_domestic_model_count: int = 0,
+    min_foreign_ai_count: int = 0,
 ) -> AIDigestBrief:
     ranked = rank_ai_updates(
         list(brief.items or []),
@@ -3365,13 +3406,39 @@ def _rank_brief_ai_digest_items(
         min_official_count=min_official_count,
         allow_social_backfill=True,
         max_age_days=max_age_days,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
     )
     return _with_ai_digest_items(brief, ranked)
 
 
-def _fit_ai_digest_brief_to_body_limit(brief: AIDigestBrief) -> AIDigestBrief:
+def _ai_digest_selection_error(
+    items,
+    *,
+    target_count: int,
+    min_domestic_model_count: int,
+    min_foreign_ai_count: int,
+    max_age_days: int,
+) -> str:
+    item_list = list(items or [])
+    counts = ai_digest_quota_counts(item_list)
+    problems = []
+    if len(item_list) < target_count:
+        problems.append(f"有效资讯不足{target_count}条，当前{len(item_list)}条")
+    if counts["domestic_model"] < min_domestic_model_count:
+        problems.append(
+            f"国内模型资讯不足{min_domestic_model_count}条，当前{counts['domestic_model']}条"
+        )
+    if counts["foreign_ai"] < min_foreign_ai_count:
+        problems.append(f"国外AI资讯不足{min_foreign_ai_count}条，当前{counts['foreign_ai']}条")
+    if not problems:
+        return ""
+    return f"daily ai digest create failed: {'；'.join(problems)}；仅允许生成日前{max_age_days}日内可追溯资讯"
+
+
+def _fit_ai_digest_brief_to_body_limit(brief: AIDigestBrief, *, min_items: int = 1) -> AIDigestBrief:
     items = list(brief.items or [])
-    while len(items) > 1:
+    while len(items) > max(1, min_items):
         fitted = _with_ai_digest_items(brief, items)
         if len(render_ai_digest_body(fitted)) <= MAX_IMAGE_BODY:
             return fitted
@@ -3388,28 +3455,57 @@ def create_daily_ai_digest_posts(
     prompt_hint: str = "",
     evaluation_viewpoint: str = DEFAULT_EVALUATION_VIEWPOINT,
 ) -> list[Post]:
-    target_count = _env_int("AI_DIGEST_TARGET_ITEMS", 20, min_value=1, max_value=20)
+    target_count = _env_int("AI_DIGEST_TARGET_ITEMS", AI_DIGEST_MIN_ITEMS, min_value=AI_DIGEST_MIN_ITEMS, max_value=20)
     min_official_count = _env_int("AI_DIGEST_MIN_OFFICIAL_ITEMS", 6, min_value=1, max_value=20)
     max_age_days = _env_int("AI_DIGEST_MAX_AGE_DAYS", 3, min_value=1, max_value=30)
+    min_domestic_model_count = _env_int(
+        "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS",
+        AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS,
+        min_value=0,
+        max_value=target_count,
+    )
+    min_foreign_ai_count = _env_int(
+        "AI_DIGEST_MIN_FOREIGN_AI_ITEMS",
+        AI_DIGEST_MIN_FOREIGN_AI_ITEMS,
+        min_value=0,
+        max_value=target_count,
+    )
     candidate_pool_target, candidate_pool_factor = _ai_digest_candidate_pool_target(target_count)
     items, source_meta = collect_ai_digest_updates(
         target_count=candidate_pool_target,
         min_official_count=min_official_count,
         allow_social_backfill=True,
         max_age_days=max_age_days,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
     )
     source_meta = dict(source_meta or {})
     source_meta["candidate_pool_target"] = candidate_pool_target
     source_meta["candidate_pool_factor"] = candidate_pool_factor
     source_meta["selection_pool_items"] = len(items)
+    source_meta["min_items"] = target_count
+    source_meta["min_domestic_model_items"] = min_domestic_model_count
+    source_meta["min_foreign_ai_items"] = min_foreign_ai_count
+    source_meta["selection_pool_quota_counts"] = ai_digest_quota_counts(list(items or []))
     if not items:
         errors = source_meta.get("errors") if isinstance(source_meta, dict) else []
         detail = f"; errors={errors}" if errors else ""
         raise RuntimeError(
             f"daily ai digest create failed: no AI updates within {max_age_days} days{detail}"
         )
+    pool_error = _ai_digest_selection_error(
+        items,
+        target_count=target_count,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+        max_age_days=max_age_days,
+    )
+    if pool_error:
+        errors = source_meta.get("errors") if isinstance(source_meta, dict) else []
+        detail = f"; errors={errors}" if errors else ""
+        raise RuntimeError(pool_error + detail)
 
-    generation_target = min(target_count, len(items))
+    generation_target = target_count
     generation_mode = "llm"
     llm_error = ""
     try:
@@ -3417,6 +3513,8 @@ def create_daily_ai_digest_posts(
             load_llm_configs(),
             items,
             target_count=generation_target,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
         )
     except Exception as exc:
         generation_mode = "fallback"
@@ -3427,13 +3525,54 @@ def create_daily_ai_digest_posts(
         target_count=generation_target,
         min_official_count=min_official_count,
         max_age_days=max_age_days,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
     )
-    if not brief.items:
-        raise RuntimeError(f"daily ai digest create failed: no linked AI updates within {max_age_days} days")
+    final_error = _ai_digest_selection_error(
+        brief.items,
+        target_count=generation_target,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+        max_age_days=max_age_days,
+    )
+    if final_error and generation_mode == "llm":
+        quota_fallback = build_fallback_brief(items, target_count=generation_target)
+        quota_fallback = _rank_brief_ai_digest_items(
+            quota_fallback,
+            target_count=generation_target,
+            min_official_count=min_official_count,
+            max_age_days=max_age_days,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
+        quota_fallback_error = _ai_digest_selection_error(
+            quota_fallback.items,
+            target_count=generation_target,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            max_age_days=max_age_days,
+        )
+        if not quota_fallback_error:
+            brief = quota_fallback
+            generation_mode = "llm_quota_fallback"
+            llm_error = final_error
+            final_error = ""
+    if final_error:
+        raise RuntimeError(final_error)
     selected_before_body_fit = len(brief.items)
-    brief = _fit_ai_digest_brief_to_body_limit(brief)
+    brief = _fit_ai_digest_brief_to_body_limit(brief, min_items=generation_target)
+    body_fit_error = _ai_digest_selection_error(
+        brief.items,
+        target_count=generation_target,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+        max_age_days=max_age_days,
+    )
+    if body_fit_error:
+        raise RuntimeError(body_fit_error)
     source_meta["selected_before_body_fit"] = selected_before_body_fit
     source_meta["body_fit_dropped"] = max(0, selected_before_body_fit - len(brief.items))
+    source_meta["selected_quota_counts"] = ai_digest_quota_counts(list(brief.items or []))
     post = Post(
         type="image",
         status=PostStatus.draft,
@@ -3449,6 +3588,10 @@ def create_daily_ai_digest_posts(
                 "candidate_pool_factor": candidate_pool_factor,
                 "selection_pool_items": len(items),
                 "min_official_items": min_official_count,
+                "min_items": target_count,
+                "min_domestic_model_items": min_domestic_model_count,
+                "min_foreign_ai_items": min_foreign_ai_count,
+                "quota_counts": source_meta["selected_quota_counts"],
                 "max_age_days": max_age_days,
                 "prompt_hint": (prompt_hint or "").strip(),
                 "generation_mode": generation_mode,
@@ -3729,10 +3872,20 @@ def create_daily_news_posts(
         )
 
     candidates, base_meta = _fetch_daily_news_candidates_for_upload(prompt_norm, count=count)
-    # Pick far more than requested because strict quality gates can reject many
-    # third-party news snippets. Count=3 should not silently degrade to 1 draft.
+    # Pick the first pass with the true target count so source diversity quotas
+    # are based on the number of drafts the user asked for. Keep extra ranked
+    # candidates after that because strict quality gates can reject snippets.
     pick_limit = min(len(candidates), max(count * 20, count + 30))
-    picks = pick_news_items(candidates, prompt_norm, count=pick_limit)
+    picks = pick_news_items(candidates, prompt_norm, count=min(count, len(candidates)))
+    seen_pick_keys = {item.url or item.title for item in picks}
+    for item in candidates:
+        key = item.url or item.title
+        if key in seen_pick_keys:
+            continue
+        picks.append(item)
+        seen_pick_keys.add(key)
+        if len(picks) >= pick_limit:
+            break
 
     target_count = count
     posts: list[Post] = []
@@ -3928,7 +4081,8 @@ def create_daily_news_posts(
             f"daily news created only {len(posts)}/{target_count}; "
             f"candidates_tried={len(picks)}/{len(candidates)}, "
             f"failed={failed_count}, skipped_quality={skipped_quality_count}. "
-            "Increase NEWS_MAX_RECORDS or configure another news provider/query; "
+            "Only candidates from today, yesterday, and the day before yesterday are allowed; "
+            "configure another news provider/query if the three-day pool is too small; "
             "partial drafts will be returned for upload."
         )
         print(f"[daily_news] {message}")

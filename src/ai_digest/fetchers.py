@@ -392,3 +392,107 @@ def parse_social_search_html(
             )
         )
     return items
+
+
+_AIHOT_SOURCE_LINE_RE = re.compile(
+    r"(?:官方|公众号|RSS|GitHub|News|网页|博客|Blog|X：|MarkTechPost|The Decoder|TechCrunch|IT之家|Google|Claude Code)",
+    re.IGNORECASE,
+)
+_AIHOT_NOISE_TITLES = (
+    "AI HOT",
+    "今日看点",
+    "内容",
+    "精选",
+    "全部",
+    "日报",
+    "周报",
+    "月报",
+    "更多",
+)
+
+
+def _aihot_vendor(title: str, source_line: str) -> str:
+    text = f"{title} {source_line}"
+    mapping = (
+        ("美团", "美团 LongCat"),
+        ("LongCat", "美团 LongCat"),
+        ("智谱", "智谱 GLM"),
+        ("GLM", "智谱 GLM"),
+        ("阿里", "阿里/Qwen"),
+        ("Qwen", "阿里/Qwen"),
+        ("豆包", "火山方舟/豆包"),
+        ("Doubao", "火山方舟/豆包"),
+        ("MiniMax", "MiniMax"),
+        ("Kimi", "月之暗面 Kimi"),
+        ("DeepSeek", "DeepSeek"),
+        ("OpenAI", "OpenAI"),
+        ("GPT", "OpenAI"),
+        ("Anthropic", "Anthropic"),
+        ("Claude", "Anthropic"),
+        ("Google", "Google"),
+        ("Gemini", "Google DeepMind"),
+        ("NVIDIA", "NVIDIA"),
+        ("xAI", "xAI"),
+        ("Grok", "xAI"),
+        ("Meta", "Meta AI"),
+        ("Mistral", "Mistral AI"),
+        ("Hugging Face", "Hugging Face"),
+    )
+    for marker, vendor in mapping:
+        if marker.lower() in text.lower():
+            return vendor
+    if "：" in source_line:
+        return source_line.split("：", 1)[0].strip()
+    return source_line[:40].strip() or "AI HOT"
+
+
+def parse_aihot_daily_html(
+    html_text: str,
+    *,
+    source_name: str,
+    vendor: str,
+    base_url: str,
+    published_date: str,
+) -> list[AIUpdateItem]:
+    lines = _html_lines(html_text)
+    items: list[AIUpdateItem] = []
+    seen_titles: set[str] = set()
+    for idx in range(0, max(0, len(lines) - 2)):
+        title = lines[idx].strip()
+        source_line = lines[idx + 1].strip()
+        summary = lines[idx + 2].strip()
+        if not (6 <= len(title) <= 120):
+            continue
+        if title.startswith("#") or title.startswith("##"):
+            continue
+        if "2026 年" in title or re.search(r"\b\d{1,2}\s*日\b.*\b\d{1,2}\s*日\b", title):
+            continue
+        if any(title == marker or title.startswith(marker + " ") for marker in _AIHOT_NOISE_TITLES):
+            continue
+        if not _AIHOT_SOURCE_LINE_RE.search(source_line):
+            continue
+        if len(summary) < 28 or (len(summary) < 50 and _AIHOT_SOURCE_LINE_RE.search(summary)):
+            continue
+        title_key = re.sub(r"\s+", "", title).lower()
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        item_vendor = _aihot_vendor(title, source_line) or vendor
+        items.append(
+            AIUpdateItem(
+                title=title,
+                summary=summary[:220],
+                source_name=source_line[:80],
+                source_type="search",
+                url=f"{base_url}?item={len(items) + 1}",
+                published_at=f"{published_date}T08:00:00+08:00",
+                vendor=item_vendor,
+                product="",
+                raw_excerpt=summary,
+                confidence_score=0.72,
+                verification_status="social_confirmed",
+                evidence_urls=[base_url],
+                tags=["AI", source_name, item_vendor],
+            )
+        )
+    return items

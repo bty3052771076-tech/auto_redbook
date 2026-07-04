@@ -582,28 +582,208 @@ def _parse_seendate_utc(seendate: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _recent_news_day_window(
+    *,
+    tz_name: Optional[str] = None,
+    max_age_days: int = 3,
+    now: Optional[datetime] = None,
+):
+    tz = _resolve_tz(tz_name or DEFAULT_TZ)
+    if now is None:
+        now_local = datetime.now(tz)
+    elif now.tzinfo is None:
+        now_local = now.replace(tzinfo=tz)
+    else:
+        now_local = now.astimezone(tz)
+    age_days = max(1, int(max_age_days or 3))
+    end_day = now_local.date()
+    start_day = end_day - timedelta(days=age_days - 1)
+    return start_day, end_day, tz
+
+
+def filter_recent_news_items(
+    items: list[NewsItem],
+    *,
+    tz_name: Optional[str] = None,
+    max_age_days: int = 3,
+    now: Optional[datetime] = None,
+) -> tuple[list[NewsItem], dict[str, Any]]:
+    """
+    Keep only items published within the Beijing-calendar freshness window.
+
+    For daily-news draft generation the accepted dates are the posting day,
+    yesterday, and the day before yesterday. Items with missing or unparseable
+    dates are excluded because they cannot prove freshness.
+    """
+    start_day, end_day, tz = _recent_news_day_window(
+        tz_name=tz_name,
+        max_age_days=max_age_days,
+        now=now,
+    )
+    kept: list[NewsItem] = []
+    missing_or_unparseable = 0
+    outside_window = 0
+    for item in items:
+        published = _parse_seendate_utc(item.seendate)
+        if published is None:
+            missing_or_unparseable += 1
+            continue
+        local_day = published.astimezone(tz).date()
+        if start_day <= local_day <= end_day:
+            kept.append(item)
+        else:
+            outside_window += 1
+
+    meta = {
+        "tz": tz_name or DEFAULT_TZ,
+        "max_age_days": max(1, int(max_age_days or 3)),
+        "start_date": start_day.isoformat(),
+        "end_date": end_day.isoformat(),
+        "input_count": len(items),
+        "kept_count": len(kept),
+        "missing_or_unparseable_date_count": missing_or_unparseable,
+        "outside_window_count": outside_window,
+    }
+    return kept, meta
+
+
 def _relevance_score(item: NewsItem, prompt_hint: str) -> float:
     hint = (prompt_hint or "").strip()
     if not hint:
         return 0.0
     hint_lc = hint.lower()
-    item_text = f"{item.title} {item.domain or ''}".lower()
     hint_tokens = _tokens(hint_lc)
     if not hint_tokens:
         return 0.0
-    title_tokens = _tokens(item.title)
-    all_tokens = _tokens(item_text)
 
+    title_text = item.title or ""
+    description_text = item.description or ""
+    content_text = item.content or ""
+    source_text = f"{item.source or ''} {item.domain or ''}"
+    visible_text = f"{title_text} {description_text} {source_text}".lower()
+
+    title_tokens = _tokens(title_text)
+    description_tokens = _tokens(description_text)
+    content_tokens = _tokens(content_text[:1200])
+    source_tokens = _tokens(source_text)
     title_hit = len(hint_tokens & title_tokens)
-    all_hit = len(hint_tokens & all_tokens)
+    description_hit = len(hint_tokens & description_tokens)
+    content_hit = len(hint_tokens & content_tokens)
+    source_hit = len(hint_tokens & source_tokens)
 
-    # Normalize by hint size and heavily weight title matches.
+    # Normalize by hint size and heavily weight title/summary matches.
     denom = max(1, len(hint_tokens))
-    score = (2.0 * title_hit + 1.0 * all_hit) / denom
+    score = (
+        3.0 * title_hit
+        + 1.5 * description_hit
+        + 0.4 * content_hit
+        + 0.5 * source_hit
+    ) / denom
 
-    if hint_lc in item_text:
+    if hint_lc in visible_text:
         score += 1.0
+    elif hint_lc in (content_text or "").lower():
+        score += 0.4
+
+    combined_text = f"{title_text} {description_text} {content_text}"
+    combined_lc = combined_text.lower()
+    if "政策" in hint and re.search(r"(政策|新规|规定|法规|条例|监管|措施|施行|调整)", combined_text):
+        score += 0.6
+    if "公司" in hint and re.search(r"(公司|企业|平台|上市|融资|并购|管理层)", combined_text):
+        score += 0.4
+    if "市场" in hint and re.search(r"(市场|价格|股价|行业|需求|供给|销售|消费)", combined_text):
+        score += 0.4
+    if re.search(r"(科技|技术|人工智能|AI|ai)", hint) and re.search(
+        r"(科技|技术|人工智能|芯片|算力|模型|软件|半导体|ai|tech|technology|chip|accelerator|inference|software|semiconductor|model)",
+        combined_lc,
+    ):
+        score += 0.8
+    if re.search(r"(产业|行业|公司|企业)", hint) and re.search(
+        r"(产业|產業|行业|行業|公司|企业|企業|平台|服务|服務|company|industry|business|market|sector)",
+        combined_lc,
+    ):
+        score += 0.6
+    if "财经" in hint and re.search(
+        r"(财经|经济|市场|金融|股价|价格|投资|融资|economy|finance|market|stock|price|investment|funding)",
+        combined_lc,
+    ):
+        score += 0.6
+    if "社会" in hint and re.search(
+        r"(社会|民生|医疗|教育|交通|劳动|权益|健康|society|public|health|access|fda|review|regulation)",
+        combined_lc,
+    ):
+        score += 0.6
+    if "国际" in hint and re.search(
+        r"(国际|全球|海外|国家|外交|global|world|international|countries|foreign|us|europe|japan)",
+        combined_lc,
+    ):
+        score += 0.6
+    if "体育" in hint and re.search(
+        r"(体育|赛事|足球|篮球|世界杯|sports?|world cup|football|basketball|league|match)",
+        combined_lc,
+    ):
+        score += 0.6
     return score
+
+
+def filter_prompt_relevant_news_items(
+    items: list[NewsItem],
+    prompt_hint: str,
+) -> tuple[list[NewsItem], dict[str, Any]]:
+    """Keep only candidates with direct prompt relevance when a prompt is present."""
+    hint = (prompt_hint or "").strip()
+    if not hint:
+        return list(items), {
+            "enabled": False,
+            "input_count": len(items),
+            "kept_count": len(items),
+            "dropped_count": 0,
+            "min_score": 0.0,
+        }
+
+    scored: list[tuple[float, int, NewsItem]] = []
+    for idx, item in enumerate(items):
+        score = _relevance_score(item, hint)
+        if score > 0:
+            scored.append((score, -idx, item))
+    kept = [item for _, _, item in scored]
+    return kept, {
+        "enabled": True,
+        "input_count": len(items),
+        "kept_count": len(kept),
+        "dropped_count": len(items) - len(kept),
+        "min_score": 0.0,
+    }
+
+
+def rank_news_candidate_pool(
+    items: list[NewsItem],
+    prompt_hint: str,
+) -> list[NewsItem]:
+    """Rank a broad candidate pool without applying final publish quotas."""
+    if not items:
+        return []
+    hint = (prompt_hint or "").strip()
+    counts = _cross_domain_counts(items)
+    scored: list[tuple[float, datetime, int, int, NewsItem]] = []
+    seen: set[str] = set()
+    china_bonus = _china_bonus()
+    for idx, item in enumerate(items):
+        key = item.url or item.title
+        if key in seen:
+            continue
+        seen.add(key)
+        score = _relevance_score(item, hint) if hint else 0.0
+        score += max(0, counts[idx] - 1) * CROSS_DOMAIN_BONUS
+        score += _attention_score(item) * 0.2
+        if _is_china_item(item):
+            score += china_bonus
+        seen_at = _parse_seendate_utc(item.seendate) or datetime.min.replace(
+            tzinfo=timezone.utc
+        )
+        scored.append((score, seen_at, counts[idx], -idx, item))
+    scored.sort(reverse=True)
+    return [item for _, _, _, _, item in scored]
 
 
 def _best_relevance(items: list[NewsItem], hint: str) -> float:
@@ -639,6 +819,12 @@ def _maybe_translate_hint_to_en(hint: str) -> str:
         tokens.append("economy")
     if "科技" in hint or "AI" in hint.upper() or "人工智能" in hint:
         tokens.append("technology")
+    if "世界杯" in hint or "世界盃" in hint:
+        tokens.append("world cup")
+    if "体育" in hint or "體育" in hint:
+        tokens.append("sports")
+    if "足球" in hint:
+        tokens.append("football")
     if "战争" in hint or "戰爭" in hint:
         tokens.append("war")
     if "国际" in hint or "國際" in hint:
@@ -880,7 +1066,7 @@ def _split_news_queries(value: str | None) -> list[str]:
     text = (value or "").strip()
     if not text:
         return []
-    parts = re.split(r"[,，;；\n|]+", text)
+    parts = re.split(r"[,，;；、\n|]+", text)
     queries: list[str] = []
     seen: set[str] = set()
     for part in parts:
@@ -891,6 +1077,43 @@ def _split_news_queries(value: str | None) -> list[str]:
         queries.append(q)
         seen.add(key)
     return queries
+
+
+def _split_prompt_keyword_queries(value: str | None) -> list[str]:
+    text = (value or "").strip()
+    if not text:
+        return []
+    parts = re.split(r"[,，;；、\n|/\s]+", text)
+    queries: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        q = part.strip()
+        if len(q) < 2:
+            continue
+        key = q.lower()
+        if key in seen:
+            continue
+        queries.append(q)
+        seen.add(key)
+    return queries
+
+
+def _build_prompt_news_queries(prompt_hint: str) -> list[str]:
+    hint_query = (prompt_hint or "").strip()
+    if not hint_query:
+        return _default_news_queries()
+    hint_en = _maybe_translate_hint_to_en(hint_query)
+    default_queries = _split_news_queries(os.getenv("NEWS_QUERY_DEFAULT")) or [DEFAULT_QUERY]
+    out: list[str] = []
+    seen: set[str] = set()
+    for q in [hint_query, *_split_prompt_keyword_queries(hint_query), hint_en, *default_queries]:
+        item = re.sub(r"\s+", " ", (q or "")).strip()
+        key = item.lower()
+        if not item or key in seen:
+            continue
+        out.append(item)
+        seen.add(key)
+    return out
 
 
 def _default_news_queries() -> list[str]:
@@ -1601,7 +1824,10 @@ def fetch_daily_news_candidates(
     if provider_env == "auto":
         provider_env = ""
     tz_name = (tz_name or os.getenv("NEWS_TZ") or DEFAULT_TZ).strip()
-    max_records = int(os.getenv("NEWS_MAX_RECORDS") or (max_records or DEFAULT_MAX_RECORDS))
+    if max_records is None:
+        max_records = int(os.getenv("NEWS_MAX_RECORDS") or DEFAULT_MAX_RECORDS)
+    else:
+        max_records = int(max_records)
     timeout_s = float(os.getenv("NEWS_TIMEOUT_S") or (timeout_s or DEFAULT_TIMEOUT_S))
 
     startdatetime, enddatetime = _today_range_utc(tz_name)
@@ -1652,12 +1878,12 @@ def fetch_daily_news_candidates(
         )
 
     hint_query = (prompt_hint or "").strip()
-    hint_en = _maybe_translate_hint_to_en(hint_query) if hint_query else ""
     if hint_query:
+        queries = _build_prompt_news_queries(hint_query)
         default_queries = _split_news_queries(os.getenv("NEWS_QUERY_DEFAULT")) or [DEFAULT_QUERY]
-        queries = [q for q in (hint_query, hint_en, *default_queries) if q]
     else:
         queries = _default_news_queries()
+        default_queries = []
     aggregate_empty_prompt = not bool(hint_query)
     history_dedupe_is_enabled = news_history_dedupe_enabled()
     used_news_url_keys = collect_used_news_url_keys() if history_dedupe_is_enabled else set()
@@ -1678,13 +1904,15 @@ def fetch_daily_news_candidates(
         provider_candidates: list[NewsItem] = []
         provider_queries = queries[:1] if provider in ("file", "hotnews") else queries
         for q in provider_queries:
+            if hint_query and q in default_queries and provider_candidates:
+                break
             chosen_provider = provider
             chosen_query = q
             try:
                 if provider == "newsapi":
                     api_key, base_url = _load_newsapi_config()
                     chosen_source_api = {"provider": "newsapi", "base_url": base_url}
-                    sort_by = "relevancy" if q in (hint_query, hint_en) and q else "publishedAt"
+                    sort_by = "relevancy" if hint_query and q not in default_queries else "publishedAt"
                     raw = _newsapi_fetch_articles(
                         api_key=api_key,
                         base_url=base_url,
@@ -1806,7 +2034,8 @@ def fetch_daily_news_candidates(
                             last_err = "all candidates filtered by history URL dedupe"
                     if not candidates:
                         continue
-                    if aggregate_empty_prompt:
+                    aggregate_query = aggregate_empty_prompt or (bool(hint_query) and q not in default_queries)
+                    if aggregate_query:
                         provider_candidates.extend(candidates)
                         queries_used.append(q)
                         provider_candidates = _dedupe_candidates(provider_candidates)
@@ -1819,7 +2048,7 @@ def fetch_daily_news_candidates(
                 last_err = f"{provider}/{q}: {exc}"
                 provider_errors.append(last_err)
                 candidates = []
-        if aggregate_empty_prompt and provider_candidates:
+        if (aggregate_empty_prompt or hint_query) and provider_candidates:
             candidates = _dedupe_candidates(provider_candidates)[:max_records]
             chosen_query = ",".join(queries_used) if queries_used else chosen_query
         if candidates:

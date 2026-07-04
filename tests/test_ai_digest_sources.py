@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from src.ai_digest import fetchers
-from src.ai_digest.fetchers import parse_github_releases_json, parse_rss_feed, parse_social_search_html
+from src.ai_digest.fetchers import (
+    parse_aihot_daily_html,
+    parse_github_releases_json,
+    parse_rss_feed,
+    parse_social_search_html,
+)
 from src.ai_digest.sources import default_ai_digest_sources, resolve_ai_digest_sources
 
 
@@ -11,8 +16,10 @@ def test_default_sources_include_expandable_official_and_social_groups():
     names = {source.name for source in sources}
     assert {"openai", "anthropic", "deepmind", "huggingface", "github-ai"}.issubset(names)
     assert {"zhipu-glm", "minimax", "doubao", "baidu-qianfan"}.issubset(names)
+    assert "aihot-daily" in names
     assert any(source.kind == "official" for source in sources)
     assert any(source.kind == "social" for source in sources)
+    assert any(source.kind == "search" for source in sources)
     assert all(source.enabled for source in sources if source.kind == "official")
 
 
@@ -41,6 +48,47 @@ def test_resolve_ai_digest_sources_filters_by_env_names(monkeypatch):
     sources = resolve_ai_digest_sources()
 
     assert [source.name for source in sources] == ["openai", "huggingface", "x"]
+
+
+def test_resolve_ai_digest_sources_includes_enabled_search_backfill_by_default(monkeypatch):
+    monkeypatch.delenv("AI_DIGEST_PRIMARY_SOURCES", raising=False)
+    monkeypatch.delenv("AI_DIGEST_SOCIAL_SOURCES", raising=False)
+
+    names = [source.name for source in resolve_ai_digest_sources()]
+
+    assert "aihot-daily" in names
+
+
+def test_parse_aihot_daily_html_maps_traceable_digest_items():
+    html = """
+    <html><body>
+      <p>美团 LongCat-2.0 正式发布：国产算力集群训练的万亿参数大模型</p>
+      <p>公众号·官方 公众号：龙猫LongCat（美团）</p>
+      <p>美团发布新一代万亿参数大模型LongCat-2.0并开源，原生支持1M超长上下文，在国产算力集群上完成训练与推理。</p>
+      <p>7 日 GitHub 开源 Spec Kit 工具包 8 日 Harness-1 搜索智能体</p>
+      <p>Hacker News 热门（buzzing.cc 中文翻译）</p>
+      <p>这是归档导航区域，不应被当作一条正式 AI 资讯进入候选池。</p>
+      <p>Claude Code v2.1.198 发布</p>
+      <p>官方 Claude Code：GitHub Releases（RSS）</p>
+      <p>Claude Code 更新浏览器、后台智能体和开发者工具能力，修复多项工作流问题并增强团队协作，适合开发者关注自动化编码流程变化。</p>
+    </body></html>
+    """
+
+    items = parse_aihot_daily_html(
+        html,
+        source_name="AI HOT",
+        vendor="AI HOT",
+        base_url="https://aihot.virxact.com/daily/2026-07-02",
+        published_date="2026-07-02",
+    )
+
+    assert len(items) == 2
+    assert items[0].vendor == "美团 LongCat"
+    assert items[0].source_type == "search"
+    assert items[0].published_at == "2026-07-02T08:00:00+08:00"
+    assert items[0].evidence_urls == ["https://aihot.virxact.com/daily/2026-07-02"]
+    assert items[1].vendor == "Anthropic"
+    assert all("7 日 GitHub" not in item.title for item in items)
 
 
 def test_parse_rss_feed_maps_items_to_ai_updates():

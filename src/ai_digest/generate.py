@@ -306,7 +306,13 @@ def _ensure_chinese_brief(brief: AIDigestBrief) -> AIDigestBrief:
     return AIDigestBrief.model_validate(data)
 
 
-def build_ai_digest_prompt(items: Iterable[AIUpdateItem], *, target_count: int = 10) -> str:
+def build_ai_digest_prompt(
+    items: Iterable[AIUpdateItem],
+    *,
+    target_count: int = 10,
+    min_domestic_model_count: int = 0,
+    min_foreign_ai_count: int = 0,
+) -> str:
     rows = []
     for idx, item in enumerate(items, 1):
         rows.append(
@@ -325,20 +331,28 @@ def build_ai_digest_prompt(items: Iterable[AIUpdateItem], *, target_count: int =
                 "raw_excerpt": item.raw_excerpt[:800],
             }
         )
+    quota_rule = ""
+    if min_domestic_model_count or min_foreign_ai_count:
+        quota_rule = (
+            f"硬性配额：最终 items 不少于 {target_count} 条；"
+            f"至少 {min_domestic_model_count} 条中国/国内模型、模型版本或模型 API 资讯；"
+            f"至少 {min_foreign_ai_count} 条国外 AI 平台、模型、工具或开源资讯。\n"
+        )
     return (
         "你正在为小红书图文笔记制作《每日AI讯息》。\n"
-        f"目标：从候选中挑选约 {target_count} 条 AI 平台、模型、工具、开源项目动态。\n"
-        "要求：官方源优先；社交源只能用于补充或验证；不得编造未提供的信息；全部输出中文。\n"
-        "筛选规则：先去重，同一模型、基准、产品、版本或开源项目的不同链接只保留最重要的一条；"
-        "优先选择模型发布、版本升级、API/开发者工具、评测基准、开源项目、基础设施技术更新；"
-        "观点探讨、趋势评论、采用案例、行业观察只在技术/模型类候选不足时作为补充。\n"
-        "排序规则：按北京时间发布日期排序，发帖日当天的最重要 AI 资讯放在 items 第一项；"
-        "同一天内再按关注度、验证强度和用户价值排序。\n"
-        "如果候选信息是英文、日文或其他语言，必须翻译并改写为自然中文；公司名、模型名、产品名可保留原文。\n"
-        "请返回严格 JSON，字段为 title, subtitle, date, items, source_summary。\n"
-        "items 每项字段：title, summary, source_name, source_type, url, published_at, vendor, product, raw_excerpt, evidence_urls, tags。\n"
-        "summary 控制在 50-90 字，说明更新内容和对用户/开发者的意义。\n"
-        "候选数据：\n"
+        + f"目标：从候选中挑选约 {target_count} 条 AI 平台、模型、工具、开源项目动态。\n"
+        + quota_rule
+        + "要求：官方源优先；社交源只能用于补充或验证；不得编造未提供的信息；全部输出中文。\n"
+        + "筛选规则：先去重，同一模型、基准、产品、版本或开源项目的不同链接只保留最重要的一条；"
+        + "优先选择模型发布、版本升级、API/开发者工具、评测基准、开源项目、基础设施技术更新；"
+        + "观点探讨、趋势评论、采用案例、行业观察只在技术/模型类候选不足时作为补充。\n"
+        + "排序规则：按北京时间发布日期排序，发帖日当天的最重要 AI 资讯放在 items 第一项；"
+        + "同一天内再按关注度、验证强度和用户价值排序。\n"
+        + "如果候选信息是英文、日文或其他语言，必须翻译并改写为自然中文；公司名、模型名、产品名可保留原文。\n"
+        + "请返回严格 JSON，字段为 title, subtitle, date, items, source_summary。\n"
+        + "items 每项字段：title, summary, source_name, source_type, url, published_at, vendor, product, raw_excerpt, evidence_urls, tags。\n"
+        + "summary 控制在 50-90 字，说明更新内容和对用户/开发者的意义。\n"
+        + "候选数据：\n"
         + json.dumps(rows, ensure_ascii=False, indent=2)
     )
 
@@ -372,13 +386,20 @@ def generate_ai_digest_brief_with_llm(
     items: list[AIUpdateItem],
     *,
     target_count: int = 10,
+    min_domestic_model_count: int = 0,
+    min_foreign_ai_count: int = 0,
     date: str = "",
 ) -> AIDigestBrief:
     """Use the configured LLM to select, translate, and summarize AI digest items."""
     if not cfgs:
         raise RuntimeError("LLM config missing for daily AI digest")
 
-    user_prompt = build_ai_digest_prompt(items, target_count=target_count)
+    user_prompt = build_ai_digest_prompt(
+        items,
+        target_count=target_count,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+    )
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -469,10 +490,10 @@ def _selection_summary_line(selection_meta: dict | None, *, item_count: int) -> 
 def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None = None) -> str:
     sources = []
     for item in brief.items:
-        name = item.source_name or item.vendor
+        name = item.vendor or item.source_name
         if name and name not in sources:
             sources.append(name)
-    source_text = " / ".join(sources[:8]) or "官方公开渠道"
+    source_text = " / ".join(name[:16] for name in sources[:8]) or "官方公开渠道"
     lines = [
         "每日AI讯息",
         "",
@@ -489,8 +510,8 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
         url = item.normalized_url or next((u.strip() for u in item.evidence_urls if u.strip()), "")
         if not url:
             continue
-        source = (item.source_name or item.vendor or f"动态{idx}").strip()
-        link_lines.append(f"{idx}. {source[:18]} {url}")
+        source = (item.vendor or item.source_name or f"动态{idx}").strip()
+        link_lines.append(f"{idx}. {source[:12]} {url}")
     if link_lines:
         lines.extend(["", "来源链接：", *link_lines])
     return "\n".join(lines)

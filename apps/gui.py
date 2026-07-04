@@ -13,7 +13,7 @@ import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from src.analytics.post_sync import find_post_for_published_metric
 from src.analytics.published_metrics import analyze_published_metrics, render_published_metrics_analysis
@@ -66,6 +66,7 @@ DEFAULT_LOGIN_HOLD = 600
 DEFAULT_WAIT_TIMEOUT = 600
 DEFAULT_COMMAND_HEARTBEAT_S = 20.0
 COMMAND_OUTPUT_POLL_S = 0.2
+DEFAULT_PROMPT_ENTRY_COUNT = 4
 
 LLM_PROVIDER_OPTIONS = ["aliyun", "volcengine", "ppinfra", "auto"]
 IMAGE_SOURCE_LOCAL = "local"
@@ -84,6 +85,7 @@ DEFAULT_IMAGE_SOURCE = DEFAULT_IMAGE_PROVIDER
 ALIYUN_IMAGE_MODEL_OPTIONS = [
     "wan2.7-image",
     "wan2.7-image-pro",
+    "qwen-image-2.0-pro-2026-06-22",
     "qwen-image-2.0-pro-2026-04-22",
 ]
 VOLCENGINE_IMAGE_MODEL_OPTIONS = [
@@ -94,6 +96,13 @@ VOLCENGINE_IMAGE_MODEL_OPTIONS = [
 ]
 DEFAULT_ALIYUN_IMAGE_MODELS = ALIYUN_IMAGE_MODEL_OPTIONS[0]
 DEFAULT_VOLCENGINE_IMAGE_MODELS = VOLCENGINE_IMAGE_MODEL_OPTIONS[0]
+DEFAULT_ALIYUN_QUOTA_MODELS = ["glm-5.2", "qwen-image-2.0-pro-2026-06-22"]
+DEFAULT_VOLCENGINE_QUOTA_MODELS = [
+    "glm-5.2",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "doubao-seedream-5-0-lite-260128",
+]
 DEFAULT_ALIYUN_IMAGE_SIZE = "1104*1472"
 DEFAULT_VOLCENGINE_IMAGE_SIZE = "1440x2560"
 DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT = (
@@ -146,6 +155,39 @@ class PublishedMetricTableRow:
     captured_at: str = ""
     url: str = ""
     id: str = ""
+
+
+@dataclass(frozen=True)
+class QuotaDashboardRow:
+    provider: str
+    model: str
+    kind: str = "unknown"
+    status: str = "unknown"
+    remaining: int | float | None = None
+    used: int | float | None = None
+    total: int | float | None = None
+    unit: str = ""
+    percent: float | None = None
+    display_value: str = "未知"
+    source_mode: str = ""
+    snapshot_name: str = ""
+
+
+_QUOTA_PROVIDER_ORDER = {"aliyun": 0, "volcengine": 1}
+_QUOTA_KIND_ORDER = {"llm": 0, "image": 1, "unknown": 2}
+_QUOTA_PROVIDER_SEARCH_ALIASES = {
+    "aliyun": "aliyun ali 阿里云 百炼 bailian",
+    "volcengine": "volcengine volcano 火山引擎 ark",
+}
+QUOTA_DASHBOARD_SORT_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("default", "平台 / 类型 / 模型"),
+    ("remaining", "剩余额度"),
+    ("percent", "剩余比例"),
+    ("model", "模型名"),
+    ("provider", "平台"),
+    ("status", "状态"),
+)
+QUOTA_DASHBOARD_SORT_KEY_BY_LABEL = {label: key for key, label in QUOTA_DASHBOARD_SORT_OPTIONS}
 
 
 def _looks_like_post_id(name: str) -> bool:
@@ -524,6 +566,365 @@ def _preview_metric_lines(metric: dict[str, Any]) -> list[str]:
     return [line for label, value in rows if (line := _preview_line(label, value))]
 
 
+def _as_quota_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            parsed = float(text)
+        except ValueError:
+            return None
+        return int(parsed) if parsed.is_integer() else parsed
+    return None
+
+
+def _quota_number_text(value: int | float) -> str:
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.4f}".rstrip("0").rstrip(".")
+
+
+def _quota_display_value(record: Mapping[str, Any]) -> str:
+    status = str(record.get("status") or "unknown")
+    remaining = _as_quota_number(record.get("remaining"))
+    total = _as_quota_number(record.get("total"))
+    unit = str(record.get("unit") or "").strip()
+    status_labels = {
+        "not_visible_on_page": "网页未展示",
+        "quota_not_returned": "平台未返回",
+        "not_found": "未找到",
+        "unknown": "未知",
+        "no_free_quota": "无免费额度",
+        "expired": "已过期",
+        "exhausted": "已用完",
+    }
+    if remaining is not None and total is not None:
+        suffix = f" {unit}" if unit else ""
+        return f"{_quota_number_text(remaining)}/{_quota_number_text(total)}{suffix}"
+    if remaining is not None:
+        suffix = f" {unit}" if unit else ""
+        return f"{_quota_number_text(remaining)}{suffix}"
+    return status_labels.get(status, status or "未知")
+
+
+def _quota_percent(record: Mapping[str, Any]) -> float | None:
+    remaining = _as_quota_number(record.get("remaining"))
+    total = _as_quota_number(record.get("total"))
+    if remaining is None or total is None or total <= 0:
+        return None
+    return max(0.0, min(1.0, float(remaining) / float(total)))
+
+
+def _quota_selectable_kind(kind: str, model: str) -> str:
+    kind_norm = (kind or "").strip().lower()
+    if kind_norm in {"llm", "image"}:
+        return kind_norm
+    model_lc = (model or "").strip().lower()
+    if not model_lc:
+        return ""
+    unsupported_markers = (
+        "t2v",
+        "i2v",
+        "r2v",
+        "kf2v",
+        "video",
+        "seaweed",
+        "seedance",
+        "seed3d",
+        "3d",
+        "hitem3d",
+        "hyper3d",
+        "happyhorse",
+    )
+    if any(marker in model_lc for marker in unsupported_markers):
+        return ""
+    image_markers = (
+        "image",
+        "seedream",
+        "seededit",
+        "t2i",
+        "i2i",
+        "wordart",
+        "erase",
+        "segmentation",
+        "face",
+    )
+    if any(marker in model_lc for marker in image_markers):
+        return "image"
+    llm_prefixes = ("glm-", "deepseek-", "kimi-", "qwen", "doubao-", "moonshot-", "baichuan-")
+    if model_lc.startswith(llm_prefixes):
+        return "llm"
+    return ""
+
+
+def quota_dashboard_selection_target(row: QuotaDashboardRow) -> tuple[str, str, str] | None:
+    provider = (row.provider or "").strip().lower()
+    model = (row.model or "").strip()
+    kind = _quota_selectable_kind(row.kind, model)
+    if provider not in {"aliyun", "volcengine"} or kind not in {"llm", "image"} or not model:
+        return None
+    if (row.status or "").strip().lower() != "available":
+        return None
+    if row.remaining is None or row.remaining <= 0:
+        return None
+    return kind, provider, model
+
+
+def quota_dashboard_row_kind_label(row: QuotaDashboardRow) -> str:
+    raw_kind = (row.kind or "").strip().lower()
+    inferred_kind = _quota_selectable_kind(row.kind, row.model)
+    status = (row.status or "").strip().lower()
+    if inferred_kind in {"llm", "image"}:
+        if status != "available":
+            return f"{inferred_kind} · 不可用"
+        if row.remaining is None or row.remaining <= 0:
+            return f"{inferred_kind} · 无额度"
+        if raw_kind in {"", "unknown"}:
+            return f"{inferred_kind} · 推断"
+        return inferred_kind
+    if status != "available":
+        return f"{raw_kind or 'unknown'} · 不可用"
+    if raw_kind in {"", "unknown"}:
+        return "仅展示"
+    return f"{raw_kind} · 仅展示"
+
+
+def quota_dashboard_layout(width: int) -> dict[str, int]:
+    canvas_width = max(int(width or 0), 420)
+    x0 = 14
+    right_margin = 12
+    gap = 10
+    content_width = max(0, canvas_width - x0 - right_margin)
+    value_width = 160 if canvas_width >= 560 else 142
+    model_width = min(260, max(175, int(content_width * 0.36)))
+    bar_width = content_width - model_width - value_width - (gap * 2)
+    if bar_width < 96:
+        model_width = max(145, model_width - (96 - bar_width))
+        bar_width = content_width - model_width - value_width - (gap * 2)
+    if bar_width < 72:
+        value_width = max(124, value_width - (72 - bar_width))
+        bar_width = content_width - model_width - value_width - (gap * 2)
+    bar_width = max(72, bar_width)
+    bar_x = x0 + model_width + gap
+    value_x = bar_x + bar_width + gap
+    return {
+        "x0": x0,
+        "right_margin": right_margin,
+        "model_width": model_width,
+        "bar_x": bar_x,
+        "bar_width": bar_width,
+        "value_x": value_x,
+        "value_width": value_width,
+    }
+
+
+def _ellipsize_middle(text: str, max_chars: int) -> str:
+    value = str(text or "")
+    if len(value) <= max_chars:
+        return value
+    if max_chars <= 3:
+        return value[:max_chars]
+    keep = max_chars - 3
+    head = max(1, keep // 2)
+    tail = max(1, keep - head)
+    return f"{value[:head]}...{value[-tail:]}"
+
+
+def quota_dashboard_row_title(row: QuotaDashboardRow, model_width: int) -> str:
+    suffix = f" · {quota_dashboard_row_kind_label(row)}"
+    max_total_chars = max(12, int(max(80, model_width) / 7))
+    max_model_chars = max(8, max_total_chars - len(suffix))
+    return f"{_ellipsize_middle(row.model, max_model_chars)}{suffix}"
+
+
+def merge_model_option_values(values: Iterable[object], model: str) -> tuple[str, ...]:
+    model_text = (model or "").strip()
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        out.append(item)
+        seen.add(item)
+    if model_text and model_text not in seen:
+        out.append(model_text)
+    return tuple(out)
+
+
+def build_quota_dashboard_rows(
+    snapshots: Mapping[str, Mapping[str, Any]],
+) -> list[QuotaDashboardRow]:
+    rows: list[QuotaDashboardRow] = []
+    for fallback_provider, snapshot in snapshots.items():
+        provider = str(snapshot.get("provider") or fallback_provider or "").strip() or "unknown"
+        source_mode = str(snapshot.get("source_mode") or "").strip()
+        snapshot_name = str(snapshot.get("_snapshot_name") or "").strip()
+        records = snapshot.get("records") or []
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            model = str(record.get("model") or "").strip()
+            if not model:
+                continue
+            kind = str(record.get("kind") or "unknown").strip() or "unknown"
+            rows.append(
+                QuotaDashboardRow(
+                    provider=provider,
+                    model=model,
+                    kind=kind,
+                    status=str(record.get("status") or "unknown").strip() or "unknown",
+                    remaining=_as_quota_number(record.get("remaining")),
+                    used=_as_quota_number(record.get("used")),
+                    total=_as_quota_number(record.get("total")),
+                    unit=str(record.get("unit") or "").strip(),
+                    percent=_quota_percent(record),
+                    display_value=_quota_display_value(record),
+                    source_mode=source_mode,
+                    snapshot_name=snapshot_name,
+                )
+            )
+    return sorted(
+        rows,
+        key=lambda row: (
+            _QUOTA_PROVIDER_ORDER.get(row.provider, 99),
+            _QUOTA_KIND_ORDER.get(row.kind, 99),
+            row.model.lower(),
+        ),
+    )
+
+
+def _quota_dashboard_default_sort_key(row: QuotaDashboardRow) -> tuple[int, int, str, str]:
+    return (
+        _QUOTA_PROVIDER_ORDER.get((row.provider or "").strip().lower(), 99),
+        _QUOTA_KIND_ORDER.get((row.kind or "").strip().lower(), 99),
+        (row.model or "").strip().lower(),
+        (row.status or "").strip().lower(),
+    )
+
+
+def _quota_dashboard_search_blob(row: QuotaDashboardRow) -> str:
+    provider = (row.provider or "").strip().lower()
+    parts = [
+        provider,
+        _QUOTA_PROVIDER_SEARCH_ALIASES.get(provider, ""),
+        row.model,
+        row.kind,
+        row.status,
+        row.display_value,
+        row.unit,
+        row.source_mode,
+        row.snapshot_name,
+    ]
+    return " ".join(str(part or "").lower() for part in parts)
+
+
+def filter_quota_dashboard_rows(
+    rows: Iterable[QuotaDashboardRow],
+    query: str,
+) -> list[QuotaDashboardRow]:
+    items = list(rows)
+    tokens = [token.lower() for token in re.split(r"\s+", (query or "").strip()) if token]
+    if not tokens:
+        return items
+    return [row for row in items if all(token in _quota_dashboard_search_blob(row) for token in tokens)]
+
+
+def _quota_numeric_sort_key(
+    row: QuotaDashboardRow,
+    attr: str,
+    *,
+    descending: bool,
+) -> tuple[int, float, tuple[int, int, str, str]]:
+    value = getattr(row, attr)
+    if value is None:
+        return (1, 0.0, _quota_dashboard_default_sort_key(row))
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return (1, 0.0, _quota_dashboard_default_sort_key(row))
+    return (0, -number if descending else number, _quota_dashboard_default_sort_key(row))
+
+
+def sort_quota_dashboard_rows(
+    rows: Iterable[QuotaDashboardRow],
+    sort_key: str = "default",
+    *,
+    descending: bool = False,
+) -> list[QuotaDashboardRow]:
+    key = (sort_key or "default").strip().lower()
+    items = list(rows)
+    if key in {"remaining", "used", "total", "percent"}:
+        return sorted(items, key=lambda row: _quota_numeric_sort_key(row, key, descending=descending))
+    if key == "model":
+        return sorted(
+            items,
+            key=lambda row: ((row.model or "").strip().lower(), _quota_dashboard_default_sort_key(row)),
+            reverse=descending,
+        )
+    if key == "provider":
+        return sorted(
+            items,
+            key=lambda row: (
+                _QUOTA_PROVIDER_ORDER.get((row.provider or "").strip().lower(), 99),
+                (row.provider or "").strip().lower(),
+                _quota_dashboard_default_sort_key(row),
+            ),
+            reverse=descending,
+        )
+    if key == "status":
+        return sorted(
+            items,
+            key=lambda row: ((row.status or "").strip().lower(), _quota_dashboard_default_sort_key(row)),
+            reverse=descending,
+        )
+    return sorted(items, key=_quota_dashboard_default_sort_key, reverse=descending)
+
+
+def prepare_quota_dashboard_rows(
+    rows: Iterable[QuotaDashboardRow],
+    *,
+    query: str = "",
+    sort_key: str = "default",
+    descending: bool = False,
+) -> list[QuotaDashboardRow]:
+    filtered = filter_quota_dashboard_rows(rows, query)
+    return sort_quota_dashboard_rows(filtered, sort_key, descending=descending)
+
+
+def load_latest_quota_snapshots(
+    *,
+    quota_dir: Path | None = None,
+    providers: Iterable[str] = ("aliyun", "volcengine"),
+) -> dict[str, dict[str, Any]]:
+    root = quota_dir or PROJECT_ROOT / "data" / "quota"
+    snapshots: dict[str, dict[str, Any]] = {}
+    for provider in providers:
+        files = sorted(root.glob(f"{provider}_quota_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in files:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                records = payload.get("records")
+                if not isinstance(records, list) or not records:
+                    continue
+                payload.setdefault("provider", provider)
+                payload["_snapshot_name"] = path.name
+                snapshots[provider] = payload
+                break
+    return snapshots
+
+
 def format_shared_draft_preview(
     *,
     post_id: str = "",
@@ -799,6 +1200,45 @@ def resolve_assets_glob_for_image_source(image_source: str, assets_glob: str) ->
     return AUTO_IMAGE_ASSETS_GLOB
 
 
+def split_prompt_entries_from_text(value: str, *, limit: int = DEFAULT_PROMPT_ENTRY_COUNT) -> list[str]:
+    text = (value or "").strip()
+    if not text:
+        return []
+    pieces = [
+        re.sub(r"\s+", " ", item).strip()
+        for item in re.split(r"[\n|；;]+", text)
+    ]
+    entries: list[str] = []
+    seen: set[str] = set()
+    for piece in pieces:
+        if not piece:
+            continue
+        key = piece.lower()
+        if key in seen:
+            continue
+        entries.append(piece)
+        seen.add(key)
+    if limit <= 0 or len(entries) <= limit:
+        return entries
+    return entries[: limit - 1] + ["\n".join(entries[limit - 1 :])]
+
+
+def combine_prompt_entries(values: Iterable[object]) -> str:
+    prompts: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        for item in split_prompt_entries_from_text(text, limit=0):
+            key = item.lower()
+            if key in seen:
+                continue
+            prompts.append(item)
+            seen.add(key)
+    return "\n".join(prompts)
+
+
 def resolve_delete_mode_flags(delete_mode: str, confirm_mode: str) -> tuple[bool, bool]:
     """
     Translate human-readable delete choices into CLI flags.
@@ -982,14 +1422,57 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             models = [m.strip() for m in re.split(r"[,;\s]+", raw_models) if m.strip()]
         else:
             models = [str(m).strip() for m in raw_models if str(m).strip()]
+        all_free = bool(params.get("all_free") or False)
         headless = bool(params.get("headless") or False)
+        save_raw = bool(params.get("save_raw") or False)
+        visible_only = bool(params.get("visible_only") or False)
         login_hold = int(params.get("login_hold") or 0)
         wait_timeout = int(params.get("wait_timeout") or 120)
 
-        for model in models:
-            args.extend(["--model", model])
+        if all_free:
+            args.append("--all-free")
+        else:
+            for model in models:
+                args.extend(["--model", model])
         if headless:
             args.append("--headless")
+        if save_raw:
+            args.append("--save-raw")
+        if visible_only:
+            args.append("--visible-only")
+        args.extend(["--login-hold", str(login_hold)])
+        args.extend(["--wait-timeout", str(wait_timeout)])
+        return args
+
+    if subcommand == "sync-quotas":
+        raw_aliyun_models = params.get("aliyun_models") or []
+        raw_volcengine_models = params.get("volcengine_models") or []
+        if isinstance(raw_aliyun_models, str):
+            aliyun_models = [m.strip() for m in re.split(r"[,;\s]+", raw_aliyun_models) if m.strip()]
+        else:
+            aliyun_models = [str(m).strip() for m in raw_aliyun_models if str(m).strip()]
+        if isinstance(raw_volcengine_models, str):
+            volcengine_models = [m.strip() for m in re.split(r"[,;\s]+", raw_volcengine_models) if m.strip()]
+        else:
+            volcengine_models = [str(m).strip() for m in raw_volcengine_models if str(m).strip()]
+        headless = bool(params.get("headless") or False)
+        visible_only = bool(params.get("visible_only") or False)
+        all_free = bool(params.get("all_free", True))
+        login_hold = int(params.get("login_hold") or 0)
+        wait_timeout = int(params.get("wait_timeout") or 120)
+
+        if all_free:
+            args.append("--all-free")
+        else:
+            args.append("--target-only")
+            for model in aliyun_models:
+                args.extend(["--aliyun-model", model])
+            for model in volcengine_models:
+                args.extend(["--volcengine-model", model])
+        if headless:
+            args.append("--headless")
+        if visible_only:
+            args.append("--visible-only")
         args.extend(["--login-hold", str(login_hold)])
         args.extend(["--wait-timeout", str(wait_timeout)])
         return args
@@ -1117,13 +1600,7 @@ def ensure_daily_news_candidate_pool_env(
     if (title or "").strip() != DEFAULT_TITLE or count_int <= 1:
         return env
 
-    desired = max(60, count_int * 20)
-    raw_current = (env.get("NEWS_MAX_RECORDS") or os.getenv("NEWS_MAX_RECORDS") or "").strip()
-    try:
-        current = int(raw_current) if raw_current else 0
-    except ValueError:
-        current = 0
-    env["NEWS_MAX_RECORDS"] = str(max(current, desired))
+    env["NEWS_MAX_RECORDS"] = str(max(1, count_int) * 20)
     return env
 
 
@@ -1155,6 +1632,7 @@ class _RunState:
     proc: Optional[subprocess.Popen] = None
     thread: Optional[threading.Thread] = None
     running: bool = False
+    current_status: str = ""
 
 
 class UiEventQueue:
@@ -1187,11 +1665,54 @@ def _format_elapsed(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def parse_command_progress_line(line: str) -> dict[str, str] | None:
+    text = (line or "").strip()
+    if not text.startswith("["):
+        return None
+    generic = re.match(
+        r"^\[(?P<command>[^\]]+)\]\s+stage=(?P<stage>[^|]+?)\s*\|\s*(?P<status>[^|]+?)(?:\s*\|\s*(?P<detail>.*))?$",
+        text,
+    )
+    if generic:
+        return {
+            "command": generic.group("command").strip(),
+            "stage": generic.group("stage").strip(),
+            "status": generic.group("status").strip(),
+            "detail": (generic.group("detail") or "").strip(),
+        }
+    existing = re.match(
+        r"^\[(?P<command>[^\]]+)\]\s+(?P<stage>[A-Za-z0-9_.-]+):\s*(?P<status>[A-Za-z0-9_.-]+)(?:\s*\|\s*(?P<detail>.*))?$",
+        text,
+    )
+    if existing:
+        return {
+            "command": existing.group("command").strip(),
+            "stage": existing.group("stage").strip(),
+            "status": existing.group("status").strip(),
+            "detail": (existing.group("detail") or "").strip(),
+        }
+    return None
+
+
+def progress_status_from_event(event: Mapping[str, str]) -> str:
+    command = str(event.get("command") or "").strip()
+    stage = str(event.get("stage") or "").strip()
+    status = str(event.get("status") or "").strip()
+    detail = str(event.get("detail") or "").strip()
+    parts = [part for part in (command, stage, status, detail) if part]
+    return f"运行中：{' / '.join(parts)}" if parts else "运行中：等待当前步骤"
+
+
 def _heartbeat_line(elapsed_seconds: float) -> str:
     return (
         f"[gui] 仍在运行，已耗时 {_format_elapsed(elapsed_seconds)}；"
         "当前可能在等待新闻 API、LLM、VLM 生图或小红书页面响应。\n"
     )
+
+
+def _heartbeat_line(elapsed_seconds: float, current_status: str = "") -> str:
+    status = (current_status or "运行中：等待 CLI 输出当前步骤").strip()
+    return f"[gui] 当前步骤：{status}；已耗时 {_format_elapsed(elapsed_seconds)}。\n"
 
 
 class CommandRunner:
@@ -1233,6 +1754,8 @@ class CommandRunner:
             self._on_line("[gui] 已有任务正在运行，请先停止当前任务。\n")
             return
         self._state.running = True
+        self._state.current_status = "运行中：启动 CLI 子进程"
+        self._on_status(self._state.current_status)
         self._on_status("运行中：正在启动")
 
         def _target() -> None:
@@ -1253,6 +1776,8 @@ class CommandRunner:
                     errors="replace",
                 )
                 self._state.proc = proc
+                self._state.current_status = f"运行中：CLI 子进程已启动 pid={getattr(proc, 'pid', 'unknown')}"
+                self._on_status(self._state.current_status)
                 self._on_status(f"运行中：pid={getattr(proc, 'pid', 'unknown')}")
                 output_queue: queue.Queue[object] = queue.Queue()
 
@@ -1274,12 +1799,19 @@ class CommandRunner:
                     except queue.Empty:
                         if self._heartbeat_seconds > 0 and time.monotonic() >= next_heartbeat:
                             now = time.monotonic()
-                            self._on_line(_heartbeat_line(now - started_at))
+                            self._on_line(_heartbeat_line(now - started_at, self._state.current_status))
                             next_heartbeat = now + self._heartbeat_seconds
                         continue
                     if item is sentinel:
                         break
-                    self._on_line(str(item))
+                    text = str(item)
+                    self._on_line(text)
+                    for output_line in text.splitlines():
+                        event = parse_command_progress_line(output_line)
+                        if not event:
+                            continue
+                        self._state.current_status = progress_status_from_event(event)
+                        self._on_status(self._state.current_status)
                     if self._heartbeat_seconds > 0:
                         next_heartbeat = time.monotonic() + self._heartbeat_seconds
                 code = int(proc.wait())
@@ -1289,6 +1821,7 @@ class CommandRunner:
             finally:
                 self._state.proc = None
                 self._state.running = False
+                self._state.current_status = ""
                 self._on_status("空闲")
                 self._on_exit(code)
 
@@ -1382,9 +1915,11 @@ def main() -> None:
     right_stack = ttk.PanedWindow(right, orient="vertical")
     right_stack.pack(fill="both", expand=True)
     log_panel = ttk.Frame(right_stack)
-    preview_panel = ttk.Frame(right_stack, style="Panel.TFrame")
+    bottom_panel = ttk.Frame(right_stack, style="Panel.TFrame")
+    preview_panel = ttk.Frame(bottom_panel, style="Panel.TFrame")
+    quota_dashboard_panel = ttk.Frame(bottom_panel, style="Panel.TFrame")
     right_stack.add(log_panel, weight=3)
-    right_stack.add(preview_panel, weight=2)
+    right_stack.add(bottom_panel, weight=2)
 
     log_header = ttk.Frame(log_panel)
     log_header.pack(fill="x", pady=(0, 8))
@@ -1405,7 +1940,7 @@ def main() -> None:
 
     preview_header = ttk.Frame(preview_panel, style="Panel.TFrame")
     preview_header.pack(fill="x", padx=10, pady=(10, 6))
-    ttk.Label(preview_header, text="草稿预览", style="PanelSection.TLabel").pack(side="left")
+    ttk.Label(preview_header, text="记录详情", style="PanelSection.TLabel").pack(side="left")
     ttk.Label(
         preview_header,
         text="选中草稿处理 / 发布草稿 / 已发布数据中的记录后在这里查看完整信息",
@@ -1431,6 +1966,281 @@ def main() -> None:
         shared_preview.configure(state="disabled")
 
     _set_shared_preview("请选择左侧草稿或已发布数据行查看完整预览。")
+
+    quota_dashboard_all_rows: list[QuotaDashboardRow] = []
+    quota_dashboard_rows: list[QuotaDashboardRow] = []
+    quota_status_var = tk.StringVar(value="读取本地额度快照中...")
+    quota_search_var = tk.StringVar(value="")
+    quota_sort_var = tk.StringVar(value=QUOTA_DASHBOARD_SORT_OPTIONS[0][1])
+    quota_sort_desc_var = tk.BooleanVar(value=False)
+    quota_sync_headless_var = tk.BooleanVar(value=False)
+    quota_sync_visible_only_var = tk.BooleanVar(value=False)
+
+    quota_header = ttk.Frame(quota_dashboard_panel, style="Panel.TFrame")
+    quota_header.pack(fill="x", padx=10, pady=(10, 6))
+    ttk.Label(quota_header, text="模型额度", style="PanelSection.TLabel").pack(side="left")
+    ttk.Label(
+        quota_header,
+        textvariable=quota_status_var,
+        style="PanelMuted.TLabel",
+    ).pack(side="left", padx=(10, 0))
+
+    quota_actions = ttk.Frame(quota_dashboard_panel, style="Panel.TFrame")
+    quota_actions.pack(fill="x", padx=10, pady=(0, 8))
+    ttk.Button(quota_actions, text="同步免费额度", command=lambda: _run_quota_sync(), style="Accent.TButton").pack(
+        side="left"
+    )
+    ttk.Button(quota_actions, text="刷新本地额度", command=lambda: _refresh_quota_dashboard()).pack(
+        side="left", padx=(8, 0)
+    )
+    ttk.Checkbutton(
+        quota_actions,
+        text="无界面",
+        variable=quota_sync_headless_var,
+        style="Panel.TCheckbutton",
+    ).pack(side="left", padx=(12, 0))
+    ttk.Checkbutton(
+        quota_actions,
+        text="网页可见模式",
+        variable=quota_sync_visible_only_var,
+        style="Panel.TCheckbutton",
+    ).pack(side="left", padx=(10, 0))
+
+    quota_filter_bar = ttk.Frame(quota_dashboard_panel, style="Panel.TFrame")
+    quota_filter_bar.pack(fill="x", padx=10, pady=(0, 8))
+    quota_search_line = ttk.Frame(quota_filter_bar, style="Panel.TFrame")
+    quota_search_line.pack(fill="x")
+    ttk.Label(quota_search_line, text="搜索", style="PanelMuted.TLabel").pack(side="left")
+    quota_search_entry = ttk.Entry(quota_search_line, textvariable=quota_search_var, width=22)
+    quota_search_entry.pack(side="left", fill="x", expand=True, padx=(8, 6))
+    ttk.Button(quota_search_line, text="清空", command=lambda: quota_search_var.set("")).pack(side="left")
+
+    quota_sort_line = ttk.Frame(quota_filter_bar, style="Panel.TFrame")
+    quota_sort_line.pack(fill="x", pady=(6, 0))
+    ttk.Label(quota_sort_line, text="排序", style="PanelMuted.TLabel").pack(side="left")
+    quota_sort_box = ttk.Combobox(
+        quota_sort_line,
+        textvariable=quota_sort_var,
+        values=[label for _key, label in QUOTA_DASHBOARD_SORT_OPTIONS],
+        state="readonly",
+        width=16,
+    )
+    quota_sort_box.pack(side="left", padx=(8, 8))
+    ttk.Checkbutton(
+        quota_sort_line,
+        text="倒序",
+        variable=quota_sort_desc_var,
+        style="Panel.TCheckbutton",
+    ).pack(side="left")
+
+    quota_canvas_frame = ttk.Frame(quota_dashboard_panel, style="Panel.TFrame")
+    quota_canvas_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    quota_rows_canvas = tk.Canvas(
+        quota_canvas_frame,
+        bg=palette["panel"],
+        highlightthickness=0,
+        height=220,
+    )
+    quota_canvas_scroll = ttk.Scrollbar(quota_canvas_frame, orient="vertical", command=quota_rows_canvas.yview)
+    quota_rows_canvas.configure(yscrollcommand=quota_canvas_scroll.set)
+    quota_rows_canvas.pack(side="left", fill="both", expand=True)
+    quota_canvas_scroll.pack(side="right", fill="y")
+    quota_dashboard_click_lookup: dict[str, QuotaDashboardRow] = {}
+
+    def _quota_bar_color(row: QuotaDashboardRow) -> str:
+        if row.percent is None:
+            return "#b4aea4"
+        if row.percent <= 0.08:
+            return "#b85c4a"
+        if row.percent <= 0.25:
+            return "#c4923f"
+        return palette["accent"]
+
+    def _draw_quota_dashboard() -> None:
+        quota_rows_canvas.delete("all")
+        quota_dashboard_click_lookup.clear()
+        width = max(int(quota_rows_canvas.winfo_width() or 0), 420)
+        layout = quota_dashboard_layout(width)
+        x0 = layout["x0"]
+        bar_x = layout["bar_x"]
+        bar_w = layout["bar_width"]
+        value_x = layout["value_x"]
+        value_w = layout["value_width"]
+        y = 18
+        last_provider = ""
+        if not quota_dashboard_rows:
+            quota_rows_canvas.create_text(
+                x0,
+                y,
+                anchor="nw",
+                fill=palette["muted"],
+                font=("Microsoft YaHei UI", 10),
+                text="暂无额度快照。点击“同步免费额度”读取阿里云和火山引擎控制台。",
+                width=width - 28,
+            )
+            quota_rows_canvas.configure(scrollregion=(0, 0, width, 80))
+            return
+
+        for idx, row in enumerate(quota_dashboard_rows):
+            if row.provider != last_provider:
+                provider_label = "阿里云百炼" if row.provider == "aliyun" else "火山引擎 Ark"
+                quota_rows_canvas.create_text(
+                    x0,
+                    y,
+                    anchor="nw",
+                    fill=palette["ink"],
+                    font=("Microsoft YaHei UI", 10, "bold"),
+                    text=provider_label,
+                )
+                y += 24
+                last_provider = row.provider
+
+            name = quota_dashboard_row_title(row, layout["model_width"])
+            click_target = quota_dashboard_selection_target(row)
+            row_tag = f"quota-row-{idx}"
+            item_tags = ("quota_model_button", row_tag) if click_target else (row_tag,)
+            if click_target:
+                quota_dashboard_click_lookup[row_tag] = row
+            row_fill = "#fff7ed" if click_target else ("#fbf7ee" if idx % 2 else palette["panel"])
+            quota_rows_canvas.create_rectangle(
+                x0 - 6,
+                y - 4,
+                width - 10,
+                y + 24,
+                fill=row_fill,
+                outline="",
+                tags=(*item_tags, "quota_row_hit"),
+            )
+            if click_target:
+                quota_rows_canvas.create_rectangle(
+                    x0 - 6,
+                    y - 4,
+                    x0 - 2,
+                    y + 24,
+                    fill=palette["accent"],
+                    outline="",
+                    tags=item_tags,
+                )
+            quota_rows_canvas.create_text(
+                x0,
+                y,
+                anchor="nw",
+                fill=palette["accent"] if click_target else palette["muted"],
+                font=("Microsoft YaHei UI", 9, "underline") if click_target else ("Microsoft YaHei UI", 9),
+                text=name,
+                tags=item_tags,
+            )
+            quota_rows_canvas.create_rectangle(
+                bar_x,
+                y + 3,
+                bar_x + bar_w,
+                y + 15,
+                fill=palette["soft"],
+                outline="",
+                tags=item_tags,
+            )
+            if row.percent is not None:
+                quota_rows_canvas.create_rectangle(
+                    bar_x,
+                    y + 3,
+                    bar_x + max(2, int(bar_w * row.percent)),
+                    y + 15,
+                    fill=_quota_bar_color(row),
+                    outline="",
+                    tags=item_tags,
+                )
+            else:
+                quota_rows_canvas.create_line(
+                    bar_x,
+                    y + 9,
+                    bar_x + bar_w,
+                    y + 9,
+                    fill=_quota_bar_color(row),
+                    dash=(3, 4),
+                    tags=item_tags,
+                )
+            quota_rows_canvas.create_text(
+                value_x + value_w,
+                y,
+                anchor="ne",
+                fill=palette["muted"],
+                font=("Microsoft YaHei UI", 9),
+                text=row.display_value,
+                tags=item_tags,
+            )
+            y += 30
+
+        quota_rows_canvas.configure(scrollregion=(0, 0, width, y + 12))
+
+    def _apply_quota_dashboard_view(*_args) -> None:
+        nonlocal quota_dashboard_rows
+        sort_key = QUOTA_DASHBOARD_SORT_KEY_BY_LABEL.get(quota_sort_var.get(), "default")
+        quota_dashboard_rows = prepare_quota_dashboard_rows(
+            quota_dashboard_all_rows,
+            query=quota_search_var.get(),
+            sort_key=sort_key,
+            descending=quota_sort_desc_var.get(),
+        )
+        total = len(quota_dashboard_all_rows)
+        if total:
+            snapshot_names = sorted({row.snapshot_name for row in quota_dashboard_all_rows if row.snapshot_name})
+            suffix = f" · {', '.join(snapshot_names[:2])}" if snapshot_names else ""
+            if len(quota_dashboard_rows) == total and not quota_search_var.get().strip():
+                quota_status_var.set(f"已加载 {total} 个模型{suffix}")
+            else:
+                quota_status_var.set(f"显示 {len(quota_dashboard_rows)} / {total} 个模型{suffix}")
+        else:
+            quota_status_var.set("暂无本地额度快照")
+        _draw_quota_dashboard()
+
+    def _refresh_quota_dashboard() -> None:
+        nonlocal quota_dashboard_all_rows
+        snapshots = load_latest_quota_snapshots()
+        quota_dashboard_all_rows = build_quota_dashboard_rows(snapshots)
+        _apply_quota_dashboard_view()
+
+    def _show_right_bottom_panel(mode: str) -> None:
+        preview_panel.pack_forget()
+        quota_dashboard_panel.pack_forget()
+        if mode == "quota":
+            quota_dashboard_panel.pack(fill="both", expand=True)
+            _refresh_quota_dashboard()
+        else:
+            preview_panel.pack(fill="both", expand=True)
+
+    def _quota_row_from_canvas_event(_event=None) -> QuotaDashboardRow | None:
+        try:
+            current = quota_rows_canvas.find_withtag("current")
+        except Exception:
+            current = ()
+        if not current:
+            return None
+        try:
+            tags = quota_rows_canvas.gettags(current[0])
+        except Exception:
+            return None
+        for tag in tags:
+            row = quota_dashboard_click_lookup.get(str(tag))
+            if row is not None:
+                return row
+        return None
+
+    def _on_quota_model_click(event=None) -> None:
+        row = _quota_row_from_canvas_event(event)
+        if row is None:
+            return
+        _select_quota_dashboard_row(row)
+
+    def _on_quota_model_motion(event=None) -> None:
+        quota_rows_canvas.configure(cursor="hand2" if _quota_row_from_canvas_event(event) else "")
+
+    quota_rows_canvas.bind("<Configure>", lambda _event: _draw_quota_dashboard())
+    quota_rows_canvas.bind("<Motion>", _on_quota_model_motion)
+    quota_rows_canvas.tag_bind("quota_model_button", "<Button-1>", _on_quota_model_click)
+    quota_search_var.trace_add("write", _apply_quota_dashboard_view)
+    quota_sort_var.trace_add("write", _apply_quota_dashboard_view)
+    quota_sort_desc_var.trace_add("write", _apply_quota_dashboard_view)
+    _show_right_bottom_panel("quota")
 
     ui_events = UiEventQueue()
 
@@ -1480,6 +2290,15 @@ def main() -> None:
 
     nb = ttk.Notebook(left)
     nb.pack(fill="both", expand=True)
+
+    def _on_notebook_tab_changed(_event=None) -> None:
+        try:
+            current_tab = nb.tab(nb.select(), "text")
+        except Exception:
+            current_tab = ""
+        _show_right_bottom_panel("quota" if current_tab == "自动发帖" else "preview")
+
+    nb.bind("<<NotebookTabChanged>>", _on_notebook_tab_changed)
 
     def _add_scrollable_tab(text: str):
         outer = ttk.Frame(nb)
@@ -1612,6 +2431,20 @@ def main() -> None:
             )
         runner.run(args, build_subprocess_env(env_overrides))
 
+    def _run_quota_sync() -> None:
+        post_command_success_callbacks.append(_refresh_quota_dashboard)
+        _run_command(
+            "sync-quotas",
+            {
+                "all_free": True,
+                "headless": quota_sync_headless_var.get(),
+                "visible_only": quota_sync_visible_only_var.get(),
+                "login_hold": DEFAULT_LOGIN_HOLD if not quota_sync_headless_var.get() else 0,
+                "wait_timeout": 120,
+            },
+            _collect_env_overrides(),
+        )
+
     # --- Auto tab ---
     tab_auto = _add_scrollable_tab("自动发帖")
 
@@ -1639,33 +2472,6 @@ def main() -> None:
     wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
     evaluation_viewpoint_var = tk.StringVar(value=DEFAULT_EVALUATION_VIEWPOINT)
 
-    prompt_placeholder = "可选，例如：中国要闻 / 科技热点 / 上海周末活动"
-
-    def _init_prompt_placeholder(widget) -> None:
-        widget.insert("1.0", prompt_placeholder)
-        widget.configure(fg=palette["muted"])
-
-        def _on_focus_in(_evt=None) -> None:
-            cur = widget.get("1.0", "end-1c")
-            if cur.strip() == prompt_placeholder:
-                widget.delete("1.0", "end")
-                widget.configure(fg=palette["ink"])
-
-        def _on_focus_out(_evt=None) -> None:
-            cur = widget.get("1.0", "end-1c")
-            if not cur.strip():
-                widget.insert("1.0", prompt_placeholder)
-                widget.configure(fg=palette["muted"])
-
-        widget.bind("<FocusIn>", _on_focus_in)
-        widget.bind("<FocusOut>", _on_focus_out)
-
-    def _read_prompt(widget) -> str:
-        cur = widget.get("1.0", "end-1c")
-        if cur.strip() == prompt_placeholder:
-            return ""
-        return cur.strip()
-
     _add_labeled_entry(auto_grid, 0, "标题", title_var)
     quick_titles = ttk.Frame(auto_grid)
     quick_titles.grid(row=1, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
@@ -1678,9 +2484,28 @@ def main() -> None:
     )
 
     ttk.Label(auto_grid, text="提示词").grid(row=2, column=0, sticky="nw", pady=5)
-    prompt_text = tk.Text(auto_grid, height=4, relief="solid", bd=1, wrap="word", font=base_font)
-    prompt_text.grid(row=2, column=1, columnspan=3, sticky="we", pady=5, padx=(10, 0))
-    _init_prompt_placeholder(prompt_text)
+    prompt_entry_vars = [tk.StringVar(value="") for _ in range(DEFAULT_PROMPT_ENTRY_COUNT)]
+    prompt_panel = ttk.Frame(auto_grid)
+    prompt_panel.grid(row=2, column=1, columnspan=3, sticky="we", pady=5, padx=(10, 0))
+    prompt_panel.columnconfigure(1, weight=1)
+    prompt_panel.columnconfigure(3, weight=1)
+    for idx, prompt_var in enumerate(prompt_entry_vars):
+        row = idx // 2
+        col = (idx % 2) * 2
+        ttk.Label(prompt_panel, text=f"方向 {idx + 1}").grid(row=row, column=col, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(prompt_panel, textvariable=prompt_var, font=base_font).grid(
+            row=row,
+            column=col + 1,
+            sticky="we",
+            padx=(0, 12 if col == 0 else 0),
+            pady=3,
+        )
+    ttk.Label(
+        prompt_panel,
+        text="每个框填写一个检索方向；生成每日新闻时会分别抓取候选，再按三日新鲜度、相关度和热度合并筛选。",
+        style="Muted.TLabel",
+        wraplength=760,
+    ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
     _add_labeled_entry(auto_grid, 3, "评价视角", evaluation_viewpoint_var)
 
@@ -1820,6 +2645,26 @@ def main() -> None:
                 f"选择 {source} 时会忽略本地 assets，自动使用 {AUTO_IMAGE_ASSETS_GLOB} 触发自动配图。"
             )
 
+    def _select_quota_dashboard_row(row: QuotaDashboardRow) -> None:
+        target = quota_dashboard_selection_target(row)
+        if target is None:
+            quota_status_var.set("quota row is not selectable")
+            return
+        target_kind, provider, model = target
+        if target_kind == "llm":
+            llm_provider_var.set(provider)
+            _sync_llm_model_values()
+            llm_model_box["values"] = merge_model_option_values(llm_model_box["values"], model)
+            llm_model_var.set(model)
+            quota_status_var.set(f"selected LLM: {provider} / {model}")
+            return
+        image_provider_var.set(provider)
+        _sync_image_model_state()
+        image_model_box["values"] = merge_model_option_values(image_model_box["values"], model)
+        image_model_var.set(model)
+        assets_var.set(resolve_assets_glob_for_image_source(provider, assets_var.get()))
+        quota_status_var.set(f"selected image model: {provider} / {model}")
+
     llm_provider_var.trace_add("write", _sync_llm_model_values)
     image_provider_var.trace_add("write", _sync_image_model_state)
     _sync_llm_model_values()
@@ -1837,7 +2682,7 @@ def main() -> None:
     def _run_auto() -> None:
         params = {
             "title": title_var.get(),
-            "prompt": _read_prompt(prompt_text),
+            "prompt": combine_prompt_entries(var.get() for var in prompt_entry_vars),
             "evaluation_viewpoint": evaluation_viewpoint_var.get(),
             "assets_glob": assets_var.get(),
             "image_source": image_provider_var.get(),
@@ -1885,9 +2730,10 @@ def main() -> None:
 
         prompt_value = (os.getenv("AUTO_REDBOOK_GUI_PROMPT") or "").strip()
         if prompt_value:
-            prompt_text.delete("1.0", "end")
-            prompt_text.insert("1.0", prompt_value)
-            prompt_text.configure(fg=palette["ink"])
+            for var in prompt_entry_vars:
+                var.set("")
+            for idx, value in enumerate(split_prompt_entries_from_text(prompt_value, limit=len(prompt_entry_vars))):
+                prompt_entry_vars[idx].set(value)
 
         log_line("[gui] AUTO_REDBOOK_GUI_AUTORUN=auto，已从 GUI 自动触发 auto 任务。\n")
         root.after(300, _run_auto)
@@ -2704,14 +3550,19 @@ def main() -> None:
         wraplength=720,
     ).grid(row=1, column=0, columnspan=4, sticky="we", pady=(2, 8))
 
-    quota_models_var = tk.StringVar(value="glm-5.2,qwen-image-2.0-pro-2026-04-22")
+    quota_models_var = tk.StringVar(value="glm-5.2,qwen-image-2.0-pro-2026-06-22")
     quota_headless_var = tk.BooleanVar(value=False)
+    quota_save_raw_var = tk.BooleanVar(value=True)
+    quota_visible_only_var = tk.BooleanVar(value=False)
     quota_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     quota_wait_timeout_var = tk.IntVar(value=120)
     volc_quota_models_var = tk.StringVar(
-        value="doubao-seed-2-1-turbo-260628,doubao-seedream-5-0-lite-260128"
+        value="doubao-seed-2-1-turbo-260628,glm-5.2,deepseek-v4-pro,deepseek-v4-flash,"
+        "doubao-seedream-5-0-lite-260128"
     )
     volc_quota_headless_var = tk.BooleanVar(value=False)
+    volc_quota_save_raw_var = tk.BooleanVar(value=True)
+    volc_quota_visible_only_var = tk.BooleanVar(value=False)
     volc_quota_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     volc_quota_wait_timeout_var = tk.IntVar(value=120)
 
@@ -2727,6 +3578,18 @@ def main() -> None:
         variable=quota_headless_var,
         style="Panel.TCheckbutton",
     ).grid(row=3, column=0, sticky="w", pady=5)
+    ttk.Checkbutton(
+        quota_panel,
+        text="Save raw snapshot",
+        variable=quota_save_raw_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=4, column=0, sticky="w", pady=5)
+    ttk.Checkbutton(
+        quota_panel,
+        text="Visible page only",
+        variable=quota_visible_only_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=5, column=0, sticky="w", pady=5)
     ttk.Label(quota_panel, text="Login hold (s)", style="Panel.TLabel").grid(
         row=3, column=1, sticky="e", padx=(10, 8), pady=5
     )
@@ -2746,6 +3609,8 @@ def main() -> None:
             {
                 "models": quota_models_var.get(),
                 "headless": quota_headless_var.get(),
+                "save_raw": quota_save_raw_var.get(),
+                "visible_only": quota_visible_only_var.get(),
                 "login_hold": quota_login_hold_var.get(),
                 "wait_timeout": quota_wait_timeout_var.get(),
             },
@@ -2757,32 +3622,44 @@ def main() -> None:
         text="查询阿里云百炼额度",
         command=_run_aliyun_quota,
         style="Accent.TButton",
-    ).grid(row=5, column=0, sticky="w", pady=(10, 10))
+    ).grid(row=6, column=0, sticky="w", pady=(10, 10))
 
-    ttk.Separator(quota_panel).grid(row=6, column=0, columnspan=4, sticky="we", pady=(4, 10))
+    ttk.Separator(quota_panel).grid(row=7, column=0, columnspan=4, sticky="we", pady=(4, 10))
     ttk.Label(quota_panel, text="Volcengine Ark quota", style="Panel.TLabel").grid(
-        row=7, column=0, sticky="w", pady=(5, 2)
+        row=8, column=0, sticky="w", pady=(5, 2)
     )
     ttk.Entry(quota_panel, textvariable=volc_quota_models_var, width=52).grid(
-        row=7, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=(5, 2)
+        row=8, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=(5, 2)
     )
     ttk.Checkbutton(
         quota_panel,
         text="Headless",
         variable=volc_quota_headless_var,
         style="Panel.TCheckbutton",
-    ).grid(row=8, column=0, sticky="w", pady=5)
+    ).grid(row=9, column=0, sticky="w", pady=5)
+    ttk.Checkbutton(
+        quota_panel,
+        text="Save raw snapshot",
+        variable=volc_quota_save_raw_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=10, column=0, sticky="w", pady=5)
+    ttk.Checkbutton(
+        quota_panel,
+        text="Visible page only",
+        variable=volc_quota_visible_only_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=11, column=0, sticky="w", pady=5)
     ttk.Label(quota_panel, text="Login hold (s)", style="Panel.TLabel").grid(
-        row=8, column=1, sticky="e", padx=(10, 8), pady=5
-    )
-    ttk.Spinbox(quota_panel, from_=0, to=3600, textvariable=volc_quota_login_hold_var, width=8).grid(
-        row=8, column=2, sticky="w", pady=5
-    )
-    ttk.Label(quota_panel, text="Wait (s)", style="Panel.TLabel").grid(
         row=9, column=1, sticky="e", padx=(10, 8), pady=5
     )
-    ttk.Spinbox(quota_panel, from_=30, to=3600, textvariable=volc_quota_wait_timeout_var, width=8).grid(
+    ttk.Spinbox(quota_panel, from_=0, to=3600, textvariable=volc_quota_login_hold_var, width=8).grid(
         row=9, column=2, sticky="w", pady=5
+    )
+    ttk.Label(quota_panel, text="Wait (s)", style="Panel.TLabel").grid(
+        row=10, column=1, sticky="e", padx=(10, 8), pady=5
+    )
+    ttk.Spinbox(quota_panel, from_=30, to=3600, textvariable=volc_quota_wait_timeout_var, width=8).grid(
+        row=10, column=2, sticky="w", pady=5
     )
 
     def _run_volcengine_quota() -> None:
@@ -2791,6 +3668,8 @@ def main() -> None:
             {
                 "models": volc_quota_models_var.get(),
                 "headless": volc_quota_headless_var.get(),
+                "save_raw": volc_quota_save_raw_var.get(),
+                "visible_only": volc_quota_visible_only_var.get(),
                 "login_hold": volc_quota_login_hold_var.get(),
                 "wait_timeout": volc_quota_wait_timeout_var.get(),
             },
@@ -2802,7 +3681,7 @@ def main() -> None:
         text="查询火山引擎 Ark 额度",
         command=_run_volcengine_quota,
         style="Accent.TButton",
-    ).grid(row=10, column=0, sticky="w", pady=(10, 0))
+    ).grid(row=12, column=0, sticky="w", pady=(10, 0))
 
     root.mainloop()
 

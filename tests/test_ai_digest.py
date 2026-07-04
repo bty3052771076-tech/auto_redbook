@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from src.ai_digest.models import AIUpdateItem
 from src.ai_digest import rank as rank_mod
-from src.ai_digest.rank import rank_ai_updates
+from src.ai_digest.rank import ai_digest_quota_counts, rank_ai_updates
 
 
 def _item(
@@ -294,6 +294,123 @@ def test_rank_ai_updates_uses_beijing_three_calendar_days():
 
     assert [item.title for item in ranked] == ["北京时间前天凌晨的新动态"]
     assert rank_mod.ai_update_beijing_day_key(ranked[0]) == "2026-06-30"
+
+
+def test_rank_ai_updates_enforces_daily_digest_domestic_model_and_foreign_quotas():
+    now = datetime(2026, 7, 3, 11, 30, tzinfo=timezone(timedelta(hours=8)))
+    domestic_models = [
+        _item(
+            "GLM-5.2 模型版本发布",
+            source_name="智谱 GLM",
+            url="https://docs.bigmodel.cn/cn/update/glm-5-2",
+            published_at="2026-07-03T01:00:00Z",
+            product="GLM-5.2",
+            confidence_score=0.72,
+        ),
+        _item(
+            "Qwen3-Coder API 升级",
+            source_name="阿里云百炼",
+            url="https://help.aliyun.com/model-studio/qwen3-coder",
+            published_at="2026-07-02T10:00:00Z",
+            product="Qwen3-Coder",
+            confidence_score=0.68,
+        ),
+        _item(
+            "豆包 Doubao-Seed 模型更新",
+            source_name="火山方舟",
+            url="https://www.volcengine.com/docs/ark/doubao-seed",
+            published_at="2026-07-01T09:00:00Z",
+            product="Doubao-Seed",
+            confidence_score=0.66,
+        ),
+    ]
+    foreign_updates = [
+        _item(
+            "OpenAI GPT-5.2 API 更新",
+            source_name="OpenAI",
+            url="https://openai.com/index/gpt-5-2-api",
+            published_at="2026-07-03T03:00:00Z",
+            product="GPT-5.2",
+            confidence_score=0.94,
+        ),
+        _item(
+            "Anthropic Claude Code 工具更新",
+            source_name="Anthropic",
+            url="https://www.anthropic.com/news/claude-code",
+            published_at="2026-07-02T05:00:00Z",
+            product="Claude Code",
+            confidence_score=0.91,
+        ),
+        _item(
+            "Google Gemini 推理能力升级",
+            source_name="Google DeepMind",
+            url="https://deepmind.google/discover/blog/gemini-reasoning",
+            published_at="2026-07-01T06:00:00Z",
+            product="Gemini",
+            confidence_score=0.9,
+        ),
+    ]
+    high_attention_supplements = [
+        _item(
+            f"AI 行业观点讨论{i}",
+            source_name="Hugging Face",
+            url=f"https://huggingface.co/blog/ai-trend-{i}",
+            published_at="2026-07-03T02:00:00Z",
+            summary="观点探讨，分析 AI 专业化趋势。",
+            raw_excerpt="Opinion: why AI specialization is inevitable.",
+            confidence_score=0.99 - i * 0.01,
+        )
+        for i in range(5)
+    ]
+    stale = _item(
+        "DeepSeek 上月模型动态",
+        source_name="DeepSeek",
+        url="https://api-docs.deepseek.com/news/old",
+        published_at="2026-06-15T08:00:00Z",
+        product="DeepSeek",
+        confidence_score=0.99,
+    )
+
+    ranked = rank_ai_updates(
+        [*high_attention_supplements, *foreign_updates, stale, *domestic_models],
+        target_count=8,
+        min_official_count=1,
+        allow_social_backfill=True,
+        max_age_days=3,
+        now=now,
+        min_domestic_model_count=3,
+        min_foreign_ai_count=3,
+    )
+
+    counts = ai_digest_quota_counts(ranked)
+    titles = [item.title for item in ranked]
+    assert len(ranked) == 8
+    assert counts["domestic_model"] >= 3
+    assert counts["foreign_ai"] >= 3
+    assert "DeepSeek 上月模型动态" not in titles
+
+
+def test_ai_update_region_recognizes_new_domestic_model_families():
+    longcat = _item(
+        "美团 LongCat-2.0 正式发布：国产算力集群训练的万亿参数大模型",
+        source_name="AI HOT",
+        url="https://aihot.virxact.com/daily/2026-07-02?item=1",
+        published_at="2026-07-02T08:00:00+08:00",
+        product="LongCat-2.0",
+        summary="美团发布新一代万亿参数大模型LongCat-2.0并开源，原生支持1M超长上下文。",
+    )
+    skywork = _item(
+        "昆仑万维天工3.2发布Skywork Tags，AI智能体加入工作群聊",
+        source_name="AI HOT",
+        url="https://aihot.virxact.com/daily/2026-07-03?item=11",
+        published_at="2026-07-03T08:00:00+08:00",
+        product="Skywork Tags",
+        summary="昆仑万维发布天工3.2相关更新，加入AI智能体协作能力。",
+    )
+
+    assert rank_mod.ai_update_region(longcat) == "domestic"
+    assert rank_mod.ai_update_is_model_news(longcat)
+    assert rank_mod.ai_update_region(skywork) == "domestic"
 
 
 def test_rank_ai_updates_prioritizes_technical_model_updates_over_discussion_on_same_beijing_day():

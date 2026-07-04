@@ -61,6 +61,20 @@ def test_build_ai_digest_prompt_requires_chinese_translation_for_foreign_updates
     assert "全部输出中文" in prompt
 
 
+def test_build_ai_digest_prompt_mentions_daily_digest_quota_rules():
+    prompt = build_ai_digest_prompt(
+        _updates(8),
+        target_count=8,
+        min_domestic_model_count=3,
+        min_foreign_ai_count=3,
+    )
+
+    assert "硬性配额" in prompt
+    assert "不少于 8 条" in prompt
+    assert "至少 3 条中国/国内模型" in prompt
+    assert "至少 3 条国外 AI" in prompt
+
+
 def test_generate_ai_digest_brief_with_llm_returns_chinese_items(monkeypatch):
     item = AIUpdateItem(
         title="OpenAI launches new developer tools",
@@ -304,3 +318,27 @@ def test_render_ai_digest_body_includes_source_links_for_each_item():
     assert "来源链接：" in body
     assert "1. OpenAI https://example.com/0" in body
     assert "2. OpenAI https://example.com/1" in body
+
+
+def test_render_ai_digest_body_keeps_eight_links_under_platform_limit_with_long_sources():
+    items = [
+        AIUpdateItem(
+            title=f"AI HOT 动态{i}",
+            summary="这是一条来自聚合源的 AI 模型或工具更新摘要。",
+            source_name="阿里巴巴发布 Page Agent，一个开源的 JavaScript 客户端库，嵌入网页后可通过自然语言操作 DOM 元素。",
+            source_type="search",
+            url=f"https://aihot.virxact.com/daily/2026-07-03?item={i}",
+            published_at="2026-07-03T08:00:00+08:00",
+            vendor="阿里/Qwen" if i < 3 else "OpenAI",
+            product="",
+            raw_excerpt="raw",
+            tags=["AI"],
+        )
+        for i in range(8)
+    ]
+    brief = build_fallback_brief(items, target_count=8, date="2026-07-03")
+
+    body = render_ai_digest_body(brief, selection_meta={"fetched_count": 200, "fresh_count": 58, "deduped_count": 47})
+
+    assert len(body) <= 1000
+    assert body.count("https://aihot.virxact.com/daily/2026-07-03?item=") == 8

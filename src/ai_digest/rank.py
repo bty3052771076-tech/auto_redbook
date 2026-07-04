@@ -119,6 +119,94 @@ _TECHNICAL_MARKERS = (
     "推理",
     "代码",
 )
+_DOMESTIC_AI_MARKERS = (
+    "阿里",
+    "阿里云",
+    "aliyun",
+    "alibaba",
+    "dashscope",
+    "通义",
+    "千问",
+    "qwen",
+    "火山",
+    "火山方舟",
+    "volcengine",
+    "字节",
+    "bytedance",
+    "美团",
+    "longcat",
+    "豆包",
+    "doubao",
+    "seedream",
+    "seed",
+    "智谱",
+    "zhipu",
+    "bigmodel",
+    "glm",
+    "deepseek",
+    "月之暗面",
+    "moonshot",
+    "kimi",
+    "minimax",
+    "abab",
+    "腾讯",
+    "tencent",
+    "混元",
+    "hunyuan",
+    "百度",
+    "baidu",
+    "文心",
+    "ernie",
+    "商汤",
+    "sensechat",
+    "昆仑",
+    "天工",
+    "skywork",
+    "阶跃",
+    "stepfun",
+    "百川",
+    "baichuan",
+    "零一万物",
+    "01.ai",
+)
+_FOREIGN_AI_MARKERS = (
+    "openai",
+    "chatgpt",
+    "gpt",
+    "anthropic",
+    "claude",
+    "google",
+    "deepmind",
+    "gemini",
+    "gemma",
+    "microsoft",
+    "github",
+    "copilot",
+    "meta",
+    "llama",
+    "x.ai",
+    "xai",
+    "grok",
+    "mistral",
+    "perplexity",
+    "hugging face",
+    "huggingface",
+    "nvidia",
+    "stability ai",
+    "stable diffusion",
+    "cohere",
+    "ai21",
+)
+_MODEL_NEWS_MARKERS = (
+    *_MODEL_RELEASE_MARKERS,
+    "reasoning",
+    "inference",
+    "multimodal",
+    "推理",
+    "多模态",
+    "上下文",
+    "context",
+)
 _DISCUSSION_MARKERS = (
     "why",
     "opinion",
@@ -205,8 +293,54 @@ def _text_blob(item: AIUpdateItem) -> str:
     )
 
 
+def _topic_blob(item: AIUpdateItem) -> str:
+    return " ".join(
+        part.strip()
+        for part in (
+            item.title,
+            item.summary,
+            item.product,
+            item.raw_excerpt,
+            _url_topic_text(item.url),
+        )
+        if part and part.strip()
+    )
+
+
+def _source_blob(item: AIUpdateItem) -> str:
+    try:
+        host = urlsplit(item.url or "").netloc
+    except ValueError:
+        host = ""
+    return " ".join(
+        part.strip()
+        for part in (item.vendor, item.source_name, host)
+        if part and part.strip()
+    )
+
+
 def _normalize_token(value: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value or "", flags=re.IGNORECASE).lower()
+
+
+def _contains_marker(value: str, marker: str) -> bool:
+    text = (value or "").lower()
+    needle = (marker or "").lower().strip()
+    if not needle:
+        return False
+    if any("\u4e00" <= ch <= "\u9fff" for ch in needle) or any(ch in needle for ch in ".-/ "):
+        return needle in text
+    if re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", text):
+        return True
+    if needle in {"meta", "xai", "ai21"}:
+        return False
+    compact = _normalize_token(text)
+    compact_needle = _normalize_token(needle)
+    return bool(compact_needle and compact_needle in compact)
+
+
+def _contains_any_marker(value: str, markers: tuple[str, ...]) -> bool:
+    return any(_contains_marker(value, marker) for marker in markers)
 
 
 def _url_topic_text(url: str) -> str:
@@ -309,6 +443,50 @@ def ai_update_category(item: AIUpdateItem) -> str:
 
 def ai_update_category_priority(item: AIUpdateItem) -> int:
     return _CATEGORY_PRIORITY.get(ai_update_category(item), 0)
+
+
+def ai_update_region(item: AIUpdateItem) -> str:
+    topic = _topic_blob(item).lower()
+    source = _source_blob(item).lower()
+    topic_is_domestic = _contains_any_marker(topic, _DOMESTIC_AI_MARKERS)
+    topic_is_foreign = _contains_any_marker(topic, _FOREIGN_AI_MARKERS)
+    if topic_is_domestic and not topic_is_foreign:
+        return "domestic"
+    if topic_is_foreign and not topic_is_domestic:
+        return "foreign"
+
+    source_is_domestic = _contains_any_marker(source, _DOMESTIC_AI_MARKERS)
+    source_is_foreign = _contains_any_marker(source, _FOREIGN_AI_MARKERS)
+    if source_is_domestic and not source_is_foreign:
+        return "domestic"
+    if source_is_foreign and not source_is_domestic:
+        return "foreign"
+    if topic_is_domestic:
+        return "domestic"
+    if topic_is_foreign:
+        return "foreign"
+    return "unknown"
+
+
+def ai_update_is_model_news(item: AIUpdateItem) -> bool:
+    if ai_update_category(item) in {"model_release", "benchmark"}:
+        return True
+    return _contains_any_marker(_topic_blob(item).lower(), _MODEL_NEWS_MARKERS)
+
+
+def ai_update_is_domestic_model_news(item: AIUpdateItem) -> bool:
+    return ai_update_region(item) == "domestic" and ai_update_is_model_news(item)
+
+
+def ai_update_is_foreign_ai_news(item: AIUpdateItem) -> bool:
+    return ai_update_region(item) == "foreign"
+
+
+def ai_digest_quota_counts(items: list[AIUpdateItem]) -> dict[str, int]:
+    return {
+        "domestic_model": sum(1 for item in items if ai_update_is_domestic_model_news(item)),
+        "foreign_ai": sum(1 for item in items if ai_update_is_foreign_ai_news(item)),
+    }
 
 
 def filter_recent_ai_updates(
@@ -495,6 +673,90 @@ def _interleave_by_vendor(items: list[AIUpdateItem], *, target_count: int) -> li
     return selected
 
 
+def _selection_key(item: AIUpdateItem) -> str:
+    return _trace_url(item) or item.dedupe_key or item.title_key or f"{item.title}|{item.published_at}"
+
+
+def _meets_ai_digest_quotas(
+    items: list[AIUpdateItem],
+    *,
+    min_domestic_model_count: int,
+    min_foreign_ai_count: int,
+) -> bool:
+    counts = ai_digest_quota_counts(items)
+    return (
+        counts["domestic_model"] >= max(0, min_domestic_model_count)
+        and counts["foreign_ai"] >= max(0, min_foreign_ai_count)
+    )
+
+
+def _can_drop_for_quota(
+    item: AIUpdateItem,
+    selected: list[AIUpdateItem],
+    *,
+    min_domestic_model_count: int,
+    min_foreign_ai_count: int,
+) -> bool:
+    counts = ai_digest_quota_counts(selected)
+    if ai_update_is_domestic_model_news(item) and counts["domestic_model"] <= min_domestic_model_count:
+        return False
+    if ai_update_is_foreign_ai_news(item) and counts["foreign_ai"] <= min_foreign_ai_count:
+        return False
+    return True
+
+
+def _select_with_ai_digest_quotas(
+    ranked: list[AIUpdateItem],
+    *,
+    target_count: int,
+    min_domestic_model_count: int = 0,
+    min_foreign_ai_count: int = 0,
+) -> list[AIUpdateItem]:
+    target = max(1, int(target_count or 1))
+    selected = list(ranked[:target])
+    selected_keys = {_selection_key(item) for item in selected}
+
+    def ensure_quota(predicate, minimum: int) -> None:
+        nonlocal selected_keys
+        minimum = max(0, int(minimum or 0))
+        while sum(1 for item in selected if predicate(item)) < minimum:
+            candidate = next(
+                (
+                    item
+                    for item in ranked
+                    if predicate(item) and _selection_key(item) not in selected_keys
+                ),
+                None,
+            )
+            if candidate is None:
+                break
+            replace_index = next(
+                (
+                    idx
+                    for idx in range(len(selected) - 1, -1, -1)
+                    if not predicate(selected[idx])
+                    and _can_drop_for_quota(
+                        selected[idx],
+                        selected,
+                        min_domestic_model_count=min_domestic_model_count,
+                        min_foreign_ai_count=min_foreign_ai_count,
+                    )
+                ),
+                None,
+            )
+            if replace_index is None:
+                break
+            selected_keys.discard(_selection_key(selected[replace_index]))
+            selected[replace_index] = candidate
+            selected_keys.add(_selection_key(candidate))
+
+    ensure_quota(ai_update_is_domestic_model_news, min_domestic_model_count)
+    ensure_quota(ai_update_is_foreign_ai_news, min_foreign_ai_count)
+
+    selected_keys = {_selection_key(item) for item in selected}
+    return [item for item in ranked if _selection_key(item) in selected_keys][:target]
+
+
 def rank_ai_updates(
     items: list[AIUpdateItem],
     *,
@@ -503,6 +765,8 @@ def rank_ai_updates(
     allow_social_backfill: bool = True,
     max_age_days: int | None = None,
     now: datetime | date | None = None,
+    min_domestic_model_count: int = 0,
+    min_foreign_ai_count: int = 0,
 ) -> list[AIUpdateItem]:
     target = max(1, int(target_count or 10))
     deduped = _dedupe_updates(
@@ -520,10 +784,36 @@ def rank_ai_updates(
     social_like = sorted(social_like, key=_rank_sort_key, reverse=True)
 
     if len(official_like) >= min_official_count:
-        return _interleave_by_vendor_for_same_day(official_like, target_count=target)
+        official_ranked = _interleave_by_vendor_for_same_day(official_like, target_count=len(official_like))
+        selected = _select_with_ai_digest_quotas(
+            official_ranked,
+            target_count=target,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
+        if _meets_ai_digest_quotas(
+            selected,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        ):
+            return selected
+        if not allow_social_backfill:
+            return selected
 
     if not allow_social_backfill:
-        return _interleave_by_vendor_for_same_day(official_like, target_count=target)
+        official_ranked = _interleave_by_vendor_for_same_day(official_like, target_count=len(official_like))
+        return _select_with_ai_digest_quotas(
+            official_ranked,
+            target_count=target,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
 
     combined = sorted([*official_like, *social_like], key=_rank_sort_key, reverse=True)
-    return _interleave_by_vendor_for_same_day(combined, target_count=target)
+    combined_ranked = _interleave_by_vendor_for_same_day(combined, target_count=len(combined))
+    return _select_with_ai_digest_quotas(
+        combined_ranked,
+        target_count=target,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+    )

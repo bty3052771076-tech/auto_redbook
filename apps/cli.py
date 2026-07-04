@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 import sys
 import webbrowser
@@ -50,6 +51,33 @@ from src.workflow.create_post import (
 
 app = typer.Typer(help="小红书自动发帖（生成并保存草稿）CLI")
 DAILY_AI_DIGEST_TITLE = "每日AI讯息"
+
+
+def _jsonable_quota_result(provider: str, result: dict) -> dict:
+    payload = dict(result or {})
+    payload["provider"] = provider
+    records = []
+    for record in payload.get("records") or []:
+        if hasattr(record, "to_dict"):
+            records.append(record.to_dict())
+        elif isinstance(record, dict):
+            records.append(record)
+        else:
+            records.append(dict(record))
+    payload["records"] = records
+    return payload
+
+
+def _save_quota_snapshot(provider: str, result: dict, snapshot_dir: Optional[Path] = None) -> Path:
+    root = snapshot_dir or Path("data") / "quota"
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d_%H%M%S")
+    path = root / f"{provider}_quota_{stamp}.json"
+    path.write_text(
+        json.dumps(_jsonable_quota_result(provider, result), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _ensure_utf8_output() -> None:
@@ -105,6 +133,22 @@ def _format_stage_error(stage: str, error) -> str:
     return f"error: stage={stage} | {error}"
 
 
+def _format_progress_event(command: str, stage: str, status: str = "in_progress", detail: str = "") -> str:
+    message = f"[{command}] stage={stage} | {status}"
+    detail_text = str(detail or "").strip()
+    if detail_text:
+        message = f"{message} | {detail_text}"
+    return message
+
+
+def _emit_progress_event(command: str, stage: str, status: str = "in_progress", detail: str = "") -> None:
+    typer.echo(_format_progress_event(command, stage, status, detail))
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def _stage_from_create_exception(exc: Exception) -> str:
     message = str(exc).lower()
     if "daily ai digest" in message or "ai digest" in message or "ai updates" in message:
@@ -145,6 +189,15 @@ def _emit_missing_assets_hint(title: str, *, dry_run: bool = False) -> None:
         return
     if not dry_run:
         typer.echo("未找到素材文件，将自动查找配图（如已启用 AUTO_IMAGE 且配置了图片 API）。")
+
+
+def _generation_stage_for_title(title: str) -> str:
+    title_norm = (title or "").strip()
+    if _is_daily_ai_digest_title(title_norm):
+        return "生成每日AI讯息"
+    if title_norm == "每日新闻":
+        return "生成每日新闻"
+    return "生成草稿"
 
 
 def _upload_progress(post_id: str):
@@ -367,6 +420,9 @@ def create(
     started_at = now_iso()
     run_errors: list[str] = []
     generation_failed_count = 0
+    generation_stage = _generation_stage_for_title(title_norm)
+    _emit_progress_event("create", "准备生成", "in_progress", f"title={title_norm} count={requested_count}")
+    _emit_progress_event("create", generation_stage, "in_progress", f"count={requested_count}")
 
     if _is_daily_ai_digest_title(title_norm):
         try:
@@ -425,6 +481,7 @@ def create(
                 continue
 
     if not posts:
+        _emit_progress_event("create", generation_stage, "failed", "posts=0")
         _record_generation_run(
             command="create",
             title=title_norm,
@@ -440,6 +497,7 @@ def create(
         typer.echo("error: no posts created")
         raise typer.Exit(code=1)
 
+    _emit_progress_event("create", generation_stage, "success", f"posts={len(posts)}")
     _record_generation_run(
         command="create",
         title=title_norm,
@@ -550,20 +608,25 @@ def run(
     force: bool = typer.Option(False, help="run even if not approved or validation fails"),
 ):
     """Save a draft via Playwright."""
+    _emit_progress_event("run", "读取草稿", "in_progress", f"post_id={post_id}")
     try:
         post = load_post(post_id)
     except FileNotFoundError:
         typer.echo("post 不存在")
         raise typer.Exit(code=1)
 
+    _emit_progress_event("run", "读取草稿", "success", f"post_id={post.id}")
     if post.status != PostStatus.approved and not force:
         typer.echo("post 未审批，请先运行 approve 或使用 --force")
         raise typer.Exit(code=1)
 
+    _emit_progress_event("run", "校验草稿", "in_progress", f"post_id={post.id}")
     result = validate_post(post)
     _emit_validation(result)
     if result.errors and not force:
+        _emit_progress_event("run", "校验草稿", "failed", f"post_id={post.id} errors={len(result.errors)}")
         raise typer.Exit(code=1)
+    _emit_progress_event("run", "校验草稿", "success", f"post_id={post.id}")
 
     asset_paths = _resolve_asset_paths(post, assets_glob)
     if post.type == PostType.image and not asset_paths and not dry_run:
@@ -573,6 +636,7 @@ def run(
     _warn_headless_login_hold(headless, login_hold)
     attempt = _next_attempt(post_id)
     exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
+    _emit_progress_event("run", "上传草稿", "in_progress", f"post_id={post.id}")
     exec_rec = run_save_draft_sync(
         post,
         assets=asset_paths,
@@ -595,6 +659,14 @@ def run(
         typer.echo(f"- {s.name}: {s.status}{detail}")
     if exec_rec.error:
         typer.echo(_format_stage_error("上传", exec_rec.error))
+
+
+    if exec_rec.error:
+        _emit_progress_event("run", "上传草稿", "failed", f"post_id={post.id} error={exec_rec.error}")
+    elif exec_rec.result == "saved_draft" or dry_run:
+        _emit_progress_event("run", "上传草稿", "success", f"post_id={post.id} result={exec_rec.result}")
+    else:
+        _emit_progress_event("run", "上传草稿", exec_rec.result or "failed", f"post_id={post.id}")
 
 
 @app.command()
@@ -641,6 +713,9 @@ def auto(
     generation_failed_count = 0
 
     _warn_headless_login_hold(headless, login_hold)
+    generation_stage = _generation_stage_for_title(title_norm)
+    _emit_progress_event("auto", "准备生成", "in_progress", f"title={title_norm} count={requested_count}")
+    _emit_progress_event("auto", generation_stage, "in_progress", f"count={requested_count}")
     if _is_daily_ai_digest_title(title_norm):
         try:
             posts = create_daily_ai_digest_posts(
@@ -701,6 +776,7 @@ def auto(
     for p in posts:
         typer.echo(f"- post_id={p.id} | 标题：{p.title}")
     if not posts:
+        _emit_progress_event("auto", generation_stage, "failed", "posts=0")
         _record_generation_run(
             command="auto",
             title=title_norm,
@@ -716,12 +792,15 @@ def auto(
         typer.echo("error: no posts created")
         raise typer.Exit(code=1)
 
+    _emit_progress_event("auto", generation_stage, "success", f"posts={len(posts)}")
     continue_on_invalid = requested_count > 1
     skipped_invalid = 0
     uploaded = 0
     upload_failed = 0
 
-    for post in posts:
+    total_posts = len(posts)
+    for idx, post in enumerate(posts, start=1):
+        _emit_progress_event("auto", "校验草稿", "in_progress", f"post_id={post.id} index={idx}/{total_posts}")
         result = validate_post(post)
         _emit_validation(result)
         if result.errors and not force:
@@ -734,6 +813,7 @@ def auto(
                 }
                 post.updated_at = now_iso()
                 save_post(post)
+                _emit_progress_event("auto", "校验草稿", "failed", f"post_id={post.id} errors={len(result.errors)}")
                 run_errors.append(f"validation failed post_id={post.id}: {result.errors}")
                 _record_generation_run(
                     command="auto",
@@ -761,6 +841,7 @@ def auto(
             }
             post.updated_at = now_iso()
             save_post(post)
+            _emit_progress_event("auto", "校验草稿", "failed", f"post_id={post.id} errors={len(result.errors)}")
             typer.echo(f"skip invalid post_id={post.id}")
             run_errors.append(f"validation failed post_id={post.id}: {result.errors}")
             continue
@@ -768,11 +849,13 @@ def auto(
         post.status = PostStatus.approved
         post.updated_at = now_iso()
         save_post(post)
+        _emit_progress_event("auto", "校验草稿", "success", f"post_id={post.id}")
 
         resolved_assets = _resolve_asset_paths(post, "")
         attempt = _next_attempt(post.id)
         exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
         try:
+            _emit_progress_event("auto", "上传草稿", "in_progress", f"post_id={post.id} index={idx}/{total_posts}")
             exec_rec = run_save_draft_sync(
                 post,
                 assets=resolved_assets,
@@ -791,6 +874,7 @@ def auto(
             save_post(post)
             upload_failed += 1
             run_errors.append(f"upload exception post_id={post.id}: {exc}")
+            _emit_progress_event("auto", "上传草稿", "failed", f"post_id={post.id} error={exc}")
             typer.echo(_format_stage_error("上传", f"post_id={post.id} upload exception: {exc}"))
             continue
 
@@ -806,10 +890,13 @@ def auto(
         if exec_rec.error:
             typer.echo(_format_stage_error("上传", exec_rec.error))
             run_errors.append(f"upload failed post_id={post.id}: {exec_rec.error}")
+            _emit_progress_event("auto", "上传草稿", "failed", f"post_id={post.id} error={exec_rec.error}")
         if exec_rec.result == "saved_draft":
             uploaded += 1
+            _emit_progress_event("auto", "上传草稿", "success", f"post_id={post.id}")
         elif not dry_run:
             upload_failed += 1
+            _emit_progress_event("auto", "上传草稿", exec_rec.result or "failed", f"post_id={post.id}")
 
     failed_total = max(
         generation_failed_count + skipped_invalid + upload_failed,
@@ -831,6 +918,7 @@ def auto(
         f"summary: generated={len(posts)} uploaded={uploaded} failed={failed_total} "
         f"skipped_invalid={skipped_invalid} upload_failed={upload_failed} requested={requested_count}"
     )
+    _emit_progress_event("auto", "完成", "success", f"generated={len(posts)} uploaded={uploaded} failed={failed_total}")
 
 
 @app.command("aliyun-quota")
@@ -840,6 +928,11 @@ def aliyun_quota(
         "--model",
         help="Filter specific Bailian models; may be repeated. Defaults to configured Aliyun LLM/image models.",
     ),
+    all_free: bool = typer.Option(
+        False,
+        "--all-free",
+        help="collect every model with an Aliyun free-tier quota returned by the official console API",
+    ),
     headless: bool = typer.Option(
         False,
         "--headless",
@@ -848,6 +941,13 @@ def aliyun_quota(
     login_hold: int = typer.Option(0, help="seconds to keep the visible browser open for Aliyun console login"),
     wait_timeout: int = typer.Option(120, help="seconds to wait for the Bailian quota table"),
     open_only: bool = typer.Option(False, "--open-only", help="only open the official Bailian free-quota page"),
+    save_raw: bool = typer.Option(False, "--save-raw", help="save parsed records and raw console text under data/quota"),
+    visible_only: bool = typer.Option(
+        False,
+        "--visible-only",
+        help="strict mode: parse only visible page text and do not use captured console API payloads",
+    ),
+    snapshot_dir: Optional[Path] = typer.Option(None, "--snapshot-dir", help="directory for --save-raw snapshots"),
 ):
     """Read Aliyun Bailian free quota from the official console page."""
     typer.echo("Aliyun Bailian quota")
@@ -871,21 +971,29 @@ def aliyun_quota(
     def _progress(message: str) -> None:
         typer.echo(message)
 
+    _emit_progress_event("aliyun-quota", "同步阿里云额度", "in_progress", f"all_free={all_free}")
     result = run_collect_aliyun_quota_sync(
-        models=[m.strip() for m in (model or []) if m and m.strip()] or None,
+        models=None if all_free else [m.strip() for m in (model or []) if m and m.strip()] or None,
+        all_free=all_free,
         login_hold=login_hold,
         wait_timeout_ms=wait_timeout * 1000,
         headless=True if headless else None,
+        visible_only=visible_only,
         progress_callback=_progress,
     )
 
     typer.echo(format_aliyun_quota_records(result.get("records", [])))
+    if save_raw:
+        snapshot_path = _save_quota_snapshot("aliyun", result, snapshot_dir=snapshot_dir)
+        typer.echo(f"snapshot: {snapshot_path}")
     if result.get("usage_url"):
         typer.echo(f"usage-statistics-url: {result['usage_url']}")
         typer.echo("usage-statistics-note: Aliyun usage statistics may be delayed; use it as a reference, not a real-time balance.")
     if result.get("errors"):
         typer.echo(f"errors: {result['errors']}")
+        _emit_progress_event("aliyun-quota", "同步阿里云额度", "failed", f"errors={len(result['errors'])}")
         raise typer.Exit(code=1)
+    _emit_progress_event("aliyun-quota", "同步阿里云额度", "success", f"records={len(result.get('records', []))}")
 
 
 @app.command("volcengine-quota")
@@ -895,6 +1003,11 @@ def volcengine_quota(
         "--model",
         help="Filter specific Ark models; may be repeated. Defaults to configured Volcengine LLM/image models.",
     ),
+    all_free: bool = typer.Option(
+        False,
+        "--all-free",
+        help="collect every model with a Volcengine Ark free inference resource pack returned by the console API",
+    ),
     headless: bool = typer.Option(
         False,
         "--headless",
@@ -903,6 +1016,13 @@ def volcengine_quota(
     login_hold: int = typer.Option(0, help="seconds to keep the visible browser open for Volcengine console login"),
     wait_timeout: int = typer.Option(120, help="seconds to wait for the Ark usage/free-quota table"),
     open_only: bool = typer.Option(False, "--open-only", help="only open the official Ark usage page"),
+    save_raw: bool = typer.Option(False, "--save-raw", help="save parsed records and raw console text under data/quota"),
+    visible_only: bool = typer.Option(
+        False,
+        "--visible-only",
+        help="strict mode: parse only visible page text and do not use captured console API payloads",
+    ),
+    snapshot_dir: Optional[Path] = typer.Option(None, "--snapshot-dir", help="directory for --save-raw snapshots"),
 ):
     """Read Volcengine Ark quota/usage from the official console page."""
     typer.echo("Volcengine Ark quota")
@@ -928,20 +1048,113 @@ def volcengine_quota(
     def _progress(message: str) -> None:
         typer.echo(message)
 
+    _emit_progress_event("volcengine-quota", "同步火山引擎额度", "in_progress", f"all_free={all_free}")
     result = run_collect_volcengine_quota_sync(
-        models=[m.strip() for m in (model or []) if m and m.strip()] or None,
+        models=None if all_free else [m.strip() for m in (model or []) if m and m.strip()] or None,
+        all_free=all_free,
         login_hold=login_hold,
         wait_timeout_ms=wait_timeout * 1000,
         headless=True if headless else None,
+        visible_only=visible_only,
         progress_callback=_progress,
     )
 
     typer.echo(format_volcengine_quota_records(result.get("records", [])))
+    if save_raw:
+        snapshot_path = _save_quota_snapshot("volcengine", result, snapshot_dir=snapshot_dir)
+        typer.echo(f"snapshot: {snapshot_path}")
     typer.echo(f"free-quota-doc-url: {result.get('free_quota_doc_url') or VOLCENGINE_ARK_FREE_QUOTA_DOC_URL}")
     typer.echo(f"model-list-doc-url: {result.get('model_list_doc_url') or VOLCENGINE_ARK_MODEL_LIST_DOC_URL}")
     if result.get("errors"):
         typer.echo(f"errors: {result['errors']}")
+        _emit_progress_event("volcengine-quota", "同步火山引擎额度", "failed", f"errors={len(result['errors'])}")
         raise typer.Exit(code=1)
+    _emit_progress_event("volcengine-quota", "同步火山引擎额度", "success", f"records={len(result.get('records', []))}")
+
+
+@app.command("sync-quotas")
+def sync_quotas(
+    aliyun_model: Optional[list[str]] = typer.Option(
+        None,
+        "--aliyun-model",
+        help="Filter Aliyun Bailian models; may be repeated. Defaults to configured Aliyun quota models.",
+    ),
+    volcengine_model: Optional[list[str]] = typer.Option(
+        None,
+        "--volcengine-model",
+        help="Filter Volcengine Ark models; may be repeated. Defaults to configured Ark quota models.",
+    ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="read supplier consoles without visible windows; requires logged-in workspace profiles",
+    ),
+    login_hold: int = typer.Option(0, help="seconds to keep visible browsers open for supplier-console login"),
+    wait_timeout: int = typer.Option(120, help="seconds to wait for supplier quota pages"),
+    visible_only: bool = typer.Option(
+        False,
+        "--visible-only",
+        help="strict mode: parse only visible page text and do not use captured console API payloads",
+    ),
+    all_free: bool = typer.Option(
+        True,
+        "--all-free/--target-only",
+        help="collect all models with remaining/free quota by default; use --target-only to query the requested model list",
+    ),
+    snapshot_dir: Optional[Path] = typer.Option(None, "--snapshot-dir", help="directory for saved quota snapshots"),
+):
+    """Synchronize Aliyun and Volcengine free-quota snapshots for the GUI dashboard."""
+    warnings: list[str] = []
+
+    def _progress(message: str) -> None:
+        typer.echo(message)
+
+    _emit_progress_event("sync-quotas", "同步阿里云额度", "in_progress", f"all_free={all_free}")
+    typer.echo("Aliyun Bailian quota")
+    aliyun_result = run_collect_aliyun_quota_sync(
+        models=None if all_free else [m.strip() for m in (aliyun_model or []) if m and m.strip()] or None,
+        all_free=all_free,
+        login_hold=login_hold,
+        wait_timeout_ms=wait_timeout * 1000,
+        headless=True if headless else None,
+        visible_only=visible_only,
+        progress_callback=_progress,
+    )
+    typer.echo(format_aliyun_quota_records(aliyun_result.get("records", [])))
+    aliyun_snapshot = _save_quota_snapshot("aliyun", aliyun_result, snapshot_dir=snapshot_dir)
+    typer.echo(f"snapshot: {aliyun_snapshot}")
+    if aliyun_result.get("errors"):
+        warnings.append(f"aliyun: {aliyun_result['errors']}")
+        _emit_progress_event("sync-quotas", "同步阿里云额度", "warning", f"errors={len(aliyun_result['errors'])}")
+    else:
+        _emit_progress_event("sync-quotas", "同步阿里云额度", "success", f"records={len(aliyun_result.get('records', []))}")
+
+    typer.echo("")
+    _emit_progress_event("sync-quotas", "同步火山引擎额度", "in_progress", f"all_free={all_free}")
+    typer.echo("Volcengine Ark quota")
+    volcengine_result = run_collect_volcengine_quota_sync(
+        models=None if all_free else [m.strip() for m in (volcengine_model or []) if m and m.strip()] or None,
+        all_free=all_free,
+        login_hold=login_hold,
+        wait_timeout_ms=wait_timeout * 1000,
+        headless=True if headless else None,
+        visible_only=visible_only,
+        progress_callback=_progress,
+    )
+    typer.echo(format_volcengine_quota_records(volcengine_result.get("records", [])))
+    volcengine_snapshot = _save_quota_snapshot("volcengine", volcengine_result, snapshot_dir=snapshot_dir)
+    typer.echo(f"snapshot: {volcengine_snapshot}")
+    if volcengine_result.get("errors"):
+        warnings.append(f"volcengine: {volcengine_result['errors']}")
+        _emit_progress_event("sync-quotas", "同步火山引擎额度", "warning", f"errors={len(volcengine_result['errors'])}")
+    else:
+        _emit_progress_event("sync-quotas", "同步火山引擎额度", "success", f"records={len(volcengine_result.get('records', []))}")
+
+    if warnings:
+        typer.echo(f"warnings: {warnings}")
+        _emit_progress_event("sync-quotas", "完成", "warning", f"warnings={len(warnings)}")
+    else:
+        _emit_progress_event("sync-quotas", "完成", "success")
 
 
 @app.command("update-metrics")
@@ -969,6 +1182,7 @@ def update_metrics(
     def _progress(message: str) -> None:
         typer.echo(message)
 
+    _emit_progress_event("update-metrics", "同步已发布数据", "in_progress", f"limit={limit or 'all'}")
     result = run_collect_published_metrics_sync(
         limit=limit,
         login_hold=login_hold,
@@ -987,6 +1201,7 @@ def update_metrics(
         f"missing={missing_count} complete={complete}"
     )
     if not metrics:
+        _emit_progress_event("update-metrics", "同步已发布数据", "failed", "fetched=0")
         typer.echo("error: no published metrics collected; refusing to overwrite latest analytics.")
         if result.get("event_path"):
             typer.echo(f"event: {result['event_path']}")
@@ -994,6 +1209,12 @@ def update_metrics(
             typer.echo(f"errors: {result['errors']}")
         raise typer.Exit(code=1)
     if metrics and not complete and not allow_partial:
+        _emit_progress_event(
+            "update-metrics",
+            "同步已发布数据",
+            "failed",
+            f"fetched={len(metrics)} target={target_total or 'unknown'} missing={missing_count}",
+        )
         typer.echo(
             "error: incomplete published metrics; refusing to overwrite latest analytics "
             f"(fetched={len(metrics)} target={target_total or 'unknown'} missing={missing_count}). "
@@ -1004,6 +1225,12 @@ def update_metrics(
             typer.echo(f"event: {result['event_path']}")
         raise typer.Exit(code=1)
     if metrics and not complete and allow_partial:
+        _emit_progress_event(
+            "update-metrics",
+            "同步已发布数据",
+            "warning",
+            f"fetched={len(metrics)} target={target_total or 'unknown'} missing={missing_count}",
+        )
         typer.echo(
             "warning: saving partial published metrics "
             f"(fetched={len(metrics)} target={target_total or 'unknown'} missing={missing_count})"
@@ -1028,6 +1255,13 @@ def update_metrics(
         typer.echo(f"errors: {result['errors']}")
         if not metrics:
             raise typer.Exit(code=1)
+    if complete:
+        _emit_progress_event(
+            "update-metrics",
+            "同步已发布数据",
+            "success",
+            f"fetched={len(metrics)} target={target_total or 'unknown'}",
+        )
 
 
 @app.command("analyze-metrics")
@@ -1076,6 +1310,7 @@ def publish_drafts(
         raise typer.Exit(code=1)
 
     _warn_headless_login_hold(headless, login_hold)
+    _emit_progress_event("publish-drafts", "选择草稿", "in_progress", f"date={date or 'none'} ids={len(ids)} all={all_posts}")
     posts = _select_publishable_posts(
         date=date,
         post_ids=ids,
@@ -1083,9 +1318,11 @@ def publish_drafts(
         limit=limit,
     )
     if not posts:
+        _emit_progress_event("publish-drafts", "选择草稿", "failed", "selected=0")
         typer.echo("未找到匹配的本地已上传草稿")
         raise typer.Exit(code=1)
 
+    _emit_progress_event("publish-drafts", "选择草稿", "success", f"selected={len(posts)}")
     typer.echo(f"selected local drafts={len(posts)}")
     for post in posts:
         typer.echo(f"- {post.id} | {post.title} | uploaded_at={post.uploaded_at or ''}")
@@ -1099,6 +1336,7 @@ def publish_drafts(
     def _progress(message: str) -> None:
         typer.echo(message)
 
+    _emit_progress_event("publish-drafts", "发布草稿", "in_progress", f"selected={len(posts)} dry_run={dry_run}")
     result = run_publish_drafts_sync(
         posts=posts,
         draft_type=draft_type,
@@ -1119,6 +1357,9 @@ def publish_drafts(
         typer.echo(f"event: {result['event_path']}")
     if result.get("errors"):
         typer.echo(f"errors: {result['errors']}")
+        _emit_progress_event("publish-drafts", "发布草稿", "warning", f"errors={len(result['errors'])}")
+    else:
+        _emit_progress_event("publish-drafts", "发布草稿", "success", f"published={result.get('published', 0)} total={len(posts)}")
 
     if dry_run:
         return
@@ -1183,6 +1424,7 @@ def delete_drafts(
 
     previews: list[dict] = []
     for t in types:
+        _emit_progress_event("delete-drafts", "预览草稿", "in_progress", f"type={t} limit={limit or 'all'}")
         preview = run_delete_drafts_sync(
             draft_type=t,
             draft_location=location,
@@ -1194,10 +1436,12 @@ def delete_drafts(
             headless=_headless_option_value(headless),
         )
         previews.append(preview)
+        _emit_progress_event("delete-drafts", "预览草稿", "success", f"type={t} total={preview.get('total', 0)}")
         _print_preview(preview)
 
     preview_errors = [err for p in previews for err in (p.get("errors") or [])]
     if preview_errors:
+        _emit_progress_event("delete-drafts", "预览草稿", "failed", f"errors={len(preview_errors)}")
         typer.echo("预览草稿失败，未执行删除")
         raise typer.Exit(code=1)
 
@@ -1216,6 +1460,7 @@ def delete_drafts(
             return
 
     for t in types:
+        _emit_progress_event("delete-drafts", "删除草稿", "in_progress", f"type={t} limit={limit or 'all'}")
         res = run_delete_drafts_sync(
             draft_type=t,
             draft_location=location,
@@ -1234,6 +1479,9 @@ def delete_drafts(
             typer.echo(f"event: {res['event_path']}")
         if res.get("errors"):
             typer.echo(f"errors: {res['errors']}")
+            _emit_progress_event("delete-drafts", "删除草稿", "failed", f"type={t} errors={len(res['errors'])}")
+        else:
+            _emit_progress_event("delete-drafts", "删除草稿", "success", f"type={t} deleted={res.get('deleted', 0)} total={res.get('total', 0)}")
 
 
 @app.command()

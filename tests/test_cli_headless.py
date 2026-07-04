@@ -1,4 +1,5 @@
 from apps.cli import (
+    _format_progress_event,
     _format_stage_error,
     _headless_option_value,
     _headless_requested,
@@ -54,3 +55,9 @@ def test_stage_from_create_exception_labels_vlm_failure_before_generic_api_key()
     stage = _stage_from_create_exception(RuntimeError("Aliyun image api_key missing"))
 
     assert stage == "VLM\u751f\u56fe"
+
+
+def test_format_progress_event_labels_current_step():
+    message = _format_progress_event("auto", "生成草稿", "in_progress", "count=3")
+
+    assert message == "[auto] stage=生成草稿 | in_progress | count=3"
