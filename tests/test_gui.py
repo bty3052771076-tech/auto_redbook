@@ -51,6 +51,7 @@ from apps.gui import (
     load_env_file,
     load_latest_quota_snapshots,
     merge_model_option_values,
+    normalize_optional_day_count,
     open_xhs_creator,
     parse_command_progress_line,
     progress_status_from_event,
@@ -255,6 +256,14 @@ def test_prompt_entry_helpers_split_combine_and_dedupe():
     prompt = combine_prompt_entries(["世界杯", "体育 足球", "", "世界杯", "财经政策；市场变化"])
 
     assert prompt == "世界杯\n体育 足球\n财经政策\n市场变化"
+
+
+def test_normalize_optional_day_count():
+    assert normalize_optional_day_count("") == ""
+    assert normalize_optional_day_count(None) == ""
+    assert normalize_optional_day_count("7") == "7"
+    assert normalize_optional_day_count("0") == "1"
+    assert normalize_optional_day_count("bad") == ""
 
 
 def test_build_subprocess_env_forces_unbuffered_utf8_output():
@@ -902,6 +911,14 @@ def test_auto_tab_uses_multiple_prompt_entry_boxes():
     assert "combine_prompt_entries(var.get() for var in prompt_entry_vars)" in source
     assert "split_prompt_entries_from_text(prompt_value" in source
     assert "tk.Text(auto_grid" not in source
+    assert "lookback_days_var" in source
+    assert "AUTO_REDBOOK_GUI_LOOKBACK_DAYS" in source
+    assert "--lookback-days" in source
+    assert "single_news_material_file_var" in source
+    assert "multi_news_materials_file_var" in source
+    assert "--single-news-material-file" in source
+    assert "news_materials_file_var" in source
+    assert "--news-materials-file" in source
 
 
 def test_build_cli_args_auto_daily_ai_digest_keeps_special_title():
@@ -931,6 +948,8 @@ def test_build_cli_args_auto():
             "evaluation_viewpoint": "产业政策视角",
             "assets_glob": "assets/pics/*",
             "count": 2,
+            "lookback_days": "7",
+            "news_materials_file": "data/manual_news/today.md",
             "no_copy": True,
             "dry_run": True,
             "headless": True,
@@ -943,11 +962,52 @@ def test_build_cli_args_auto():
     assert "--title" in args and "每日新闻" in args
     assert "--prompt" in args and "美国时政" in args
     assert "--evaluation-viewpoint" in args and "产业政策视角" in args
+    assert "--lookback-days" in args and "7" in args
+    assert "--news-materials-file" in args and "data/manual_news/today.md" in args
     assert "--count" in args and "2" in args
     assert "--no-copy" in args
     assert "--dry-run" in args
     assert "--headless" in args
     assert "--force" in args
+
+
+def test_build_cli_args_auto_single_news_material_forces_one_without_prompt_or_lookback():
+    args = build_cli_args(
+        "auto",
+        params={
+            "title": "每日新闻",
+            "prompt": "this should be ignored",
+            "evaluation_viewpoint": "无视角评价",
+            "assets_glob": "assets/pics/*",
+            "count": 9,
+            "lookback_days": "14",
+            "single_news_material_file": "data/manual_news/one.md",
+            "news_materials_file": "",
+            "dry_run": True,
+            "login_hold": 0,
+            "wait_timeout": 20,
+        },
+    )
+
+    assert "--single-news-material-file" in args
+    assert "data/manual_news/one.md" in args
+    assert "--news-materials-file" not in args
+    assert "--prompt" not in args
+    assert "--lookback-days" not in args
+    count_idx = args.index("--count")
+    assert args[count_idx + 1] == "1"
+
+
+def test_build_cli_args_auto_rejects_both_single_and_multi_news_materials():
+    with pytest.raises(ValueError, match="single.*multi"):
+        build_cli_args(
+            "auto",
+            params={
+                "title": "每日新闻",
+                "single_news_material_file": "data/manual_news/one.md",
+                "news_materials_file": "data/manual_news/many.md",
+            },
+        )
 
 
 def test_build_cli_args_auto_aliyun_image_source_ignores_local_assets():

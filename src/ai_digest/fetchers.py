@@ -55,6 +55,35 @@ def _extract_release_date(text: str) -> str:
     return f"{year:04d}-{month:02d}-{day:02d}"
 
 
+def _date_from_match(match: re.Match[str]) -> str:
+    return f"{int(match.group('y')):04d}-{int(match.group('m')):02d}-{int(match.group('d')):02d}"
+
+
+def _extract_page_release_date(html_text: str) -> str:
+    raw = html_text or ""
+    patterns = (
+        r"(?is)\bdatePublished\b.{0,120}?(?P<y>20\d{2})[-/年](?P<m>\d{1,2})[-/月](?P<d>\d{1,2})",
+        r"(?is)\bDate\b.{0,240}?(?P<y>20\d{2})[-/年](?P<m>\d{1,2})[-/月](?P<d>\d{1,2})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return _date_from_match(match)
+
+    published_ms = re.search(r'\\?"published_at\\?"\s*:\s*(?P<ts>\d{12,14})', raw)
+    if published_ms:
+        try:
+            dt = datetime.fromtimestamp(int(published_ms.group("ts")) / 1000, tz=timezone.utc)
+            return dt.date().isoformat()
+        except (OverflowError, ValueError, OSError):
+            pass
+
+    now_match = re.search(r'\\?"now\\?"\s*:\s*\\?"\$D(?P<ts>20\d{2}-\d{2}-\d{2})T', raw)
+    if now_match and any(signal in raw for signal in _OFFICIAL_HTML_RELEASE_SIGNALS):
+        return now_match.group("ts")
+    return ""
+
+
 def _child_text(node, tag_names: list[str]) -> str:
     for tag in tag_names:
         found = node.find(tag)
@@ -173,6 +202,7 @@ _OFFICIAL_HTML_NOISE = (
     "available pages",
     "exploring further",
     "home page",
+    "home models blog",
     "api docs",
     "blogs",
     "开放文档",
@@ -197,6 +227,12 @@ _OFFICIAL_HTML_NOISE = (
     "上一页",
     "下一页",
     "目录",
+    "frontier ai llms",
+    "assistants, agents, services",
+    "latest models",
+    "products solutions",
+    "模型能力总览",
+    "开放平台文档中心",
     "联系我们",
     "隐私",
 )
@@ -205,6 +241,7 @@ _OFFICIAL_HTML_HARD_NOISE = (
     "模型上下架",
     "服务协议",
     "监控告警",
+    "release notes",
 )
 
 _OFFICIAL_HTML_RELEASE_SIGNALS = (
@@ -214,6 +251,7 @@ _OFFICIAL_HTML_RELEASE_SIGNALS = (
     "升级",
     "开源",
     "推出",
+    "适配",
     "新增",
     "提升",
     "release",
@@ -258,6 +296,34 @@ def _looks_like_official_ai_update(text: str, vendor: str) -> bool:
     )
 
 
+def _official_release_signal_score(item: AIUpdateItem) -> int:
+    title = item.title or ""
+    low = title.lower()
+    score = 0
+    if any(signal in low or signal in title for signal in _OFFICIAL_HTML_RELEASE_SIGNALS):
+        score += 3
+    if re.search(r"\b(?:glm|qwen|kimi|doubao|seed|deepseek|minimax|ernie|abab)[-\w.]*\b", title, re.IGNORECASE):
+        score += 2
+    if any(marker in title for marker in ("模型", "大模型", "Agent", "智能体", "API")):
+        score += 1
+    return score
+
+
+def _limit_page_release_items(items: list[AIUpdateItem], page_release_date: str) -> list[AIUpdateItem]:
+    if not page_release_date or len(items) <= 1:
+        return items
+    dated = [item for item in items if item.published_at == page_release_date]
+    if not dated:
+        return items
+    ranked = sorted(
+        dated,
+        key=lambda item: (_official_release_signal_score(item), -len(item.title or "")),
+        reverse=True,
+    )
+    selected = [item for item in ranked if _official_release_signal_score(item) > 0]
+    return selected[:1] or ranked[:1]
+
+
 def parse_official_html(
     html_text: str,
     *,
@@ -269,6 +335,7 @@ def parse_official_html(
     items: list[AIUpdateItem] = []
     seen_titles: set[str] = set()
     current_date = ""
+    page_release_date = _extract_page_release_date(html_text)
 
     for line in _html_lines(html_text):
         line_date = _extract_release_date(line)
@@ -288,7 +355,7 @@ def parse_official_html(
                 source_name=source_name,
                 source_type="official",
                 url=base_url,
-                published_at=line_date or current_date,
+                published_at=line_date or current_date or page_release_date,
                 vendor=vendor,
                 product="",
                 raw_excerpt=line,
@@ -299,7 +366,7 @@ def parse_official_html(
             break
 
     if items:
-        return items
+        return _limit_page_release_items(items, page_release_date)
 
     parser = _LinkCollector()
     parser.feed(html_text or "")
@@ -318,7 +385,7 @@ def parse_official_html(
                 source_name=source_name,
                 source_type="official",
                 url=urljoin(base_url, href),
-                published_at=_extract_release_date(text),
+                published_at=_extract_release_date(text) or page_release_date,
                 vendor=vendor,
                 product="",
                 raw_excerpt=text,

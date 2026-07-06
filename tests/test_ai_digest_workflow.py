@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from src.ai_digest.models import AIDigestBrief, AIUpdateItem
 from src.storage.models import PostStatus
 from src.workflow import create_post
@@ -125,9 +127,12 @@ def test_create_daily_ai_digest_posts_uses_llm_brief_for_chinese_items(monkeypat
 
     posts = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)
 
-    assert calls == [pool]
+    assert len(calls) == 1
+    assert {item.url for item in calls[0]} == {item.url for item in pool}
     assert collect_kwargs[0]["target_count"] == 24
-    assert collect_kwargs[0]["max_age_days"] == 3
+    assert collect_kwargs[0]["max_age_days"] == 14
+    assert collect_kwargs[0]["include_pool_items"] is True
+    assert collect_kwargs[0]["force_search_backfill"] is True
     assert collect_kwargs[0]["min_domestic_model_count"] == 3
     assert collect_kwargs[0]["min_foreign_ai_count"] == 3
     assert llm_kwargs[0]["target_count"] == 8
@@ -190,6 +195,103 @@ def test_create_daily_ai_digest_posts_collects_expanded_pool_and_records_counts(
     assert meta["quota_counts"]["foreign_ai"] >= 3
     assert llm_kwargs[0]["target_count"] == 8
     assert "候选池：抓取30条，近3日20条，去重后12条，发布8条" in post.body
+
+
+def test_create_daily_ai_digest_posts_auto_expands_to_seven_days(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_DIGEST_MAX_AGE_DAYS", raising=False)
+    monkeypatch.delenv("AI_DIGEST_LOOKBACK_DAYS", raising=False)
+    monkeypatch.delenv("CONTENT_LOOKBACK_DAYS", raising=False)
+    collect_kwargs: list[dict] = []
+
+    def fake_collect_ai_digest_updates(**kwargs):
+        collect_kwargs.append(kwargs)
+        pool = _updates(8)
+        older = (
+            (datetime.now(timezone.utc) - timedelta(days=4))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        pool = [
+            item.model_copy(update={"published_at": older})
+            if idx >= 5
+            else item
+            for idx, item in enumerate(pool)
+        ]
+        return pool, {
+            "sources": ["fixture"],
+            "fetched_count": len(pool),
+            "fresh_count": len(pool),
+            "deduped_count": len(pool),
+            "ranked_count": len(pool),
+            "social_backfill_used": False,
+        }
+
+    monkeypatch.setattr(create_post, "collect_ai_digest_updates", fake_collect_ai_digest_updates)
+    monkeypatch.setattr(create_post, "load_llm_configs", lambda: (_ for _ in ()).throw(RuntimeError("no test llm")))
+
+    post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
+    meta = post.platform["ai_digest"]
+
+    assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [14]
+    assert meta["max_age_days"] == 7
+    assert meta["actual_items"] == 8
+    lookback = meta["source_meta"]["lookback"]
+    assert lookback["mode"] == "auto_expand"
+    assert lookback["selected_max_age_days"] == 7
+    assert [attempt["max_age_days"] for attempt in lookback["attempts"]] == [3, 7]
+    assert [attempt["selection_pool_items"] for attempt in lookback["attempts"]] == [5, 8]
+
+
+def test_create_daily_ai_digest_posts_default_lookback_fetches_once_at_largest_window(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_DIGEST_MAX_AGE_DAYS", raising=False)
+    monkeypatch.delenv("AI_DIGEST_LOOKBACK_DAYS", raising=False)
+    monkeypatch.delenv("CONTENT_LOOKBACK_DAYS", raising=False)
+    collect_kwargs: list[dict] = []
+
+    def fake_collect_ai_digest_updates(**kwargs):
+        collect_kwargs.append(kwargs)
+        return _updates(8), {
+            "sources": ["fixture"],
+            "fetched_count": 8,
+            "fresh_count": 8,
+            "deduped_count": 8,
+            "ranked_count": 8,
+            "social_backfill_used": False,
+        }
+
+    monkeypatch.setattr(create_post, "collect_ai_digest_updates", fake_collect_ai_digest_updates)
+    monkeypatch.setattr(create_post, "load_llm_configs", lambda: (_ for _ in ()).throw(RuntimeError("no test llm")))
+
+    create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)
+
+    assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [14]
+
+
+def test_create_daily_ai_digest_posts_fixed_lookback_days_does_not_expand(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_DIGEST_MAX_AGE_DAYS", raising=False)
+    collect_kwargs: list[dict] = []
+
+    def fake_collect_ai_digest_updates(**kwargs):
+        collect_kwargs.append(kwargs)
+        return _updates(5), {
+            "sources": ["fixture"],
+            "fetched_count": 5,
+            "fresh_count": 5,
+            "deduped_count": 5,
+            "ranked_count": 5,
+            "social_backfill_used": False,
+        }
+
+    monkeypatch.setattr(create_post, "collect_ai_digest_updates", fake_collect_ai_digest_updates)
+
+    with pytest.raises(RuntimeError, match="daily ai digest material insufficient"):
+        create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True, lookback_days=3)
+
+    assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [3]
 
 
 def test_create_daily_ai_digest_posts_falls_back_when_llm_breaks_quota(monkeypatch, tmp_path: Path):

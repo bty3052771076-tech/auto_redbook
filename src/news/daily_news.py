@@ -196,14 +196,20 @@ def _resolve_tz(tz_name: str):
         return datetime.now().astimezone().tzinfo or timezone.utc
 
 
-def _today_range_utc(tz_name: str) -> tuple[str, str]:
+def _recent_range_utc(tz_name: str, *, days: int = 1) -> tuple[str, str]:
     tz = _resolve_tz(tz_name)
     now_local = datetime.now(tz)
-    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    age_days = max(1, int(days or 1))
+    start_day = now_local.date() - timedelta(days=age_days - 1)
+    start_local = datetime.combine(start_day, datetime.min.time(), tzinfo=tz)
     start_utc = start_local.astimezone(timezone.utc)
     end_utc = now_local.astimezone(timezone.utc)
     fmt = "%Y%m%d%H%M%S"
     return start_utc.strftime(fmt), end_utc.strftime(fmt)
+
+
+def _today_range_utc(tz_name: str) -> tuple[str, str]:
+    return _recent_range_utc(tz_name, days=1)
 
 
 def _tokens(text: str) -> set[str]:
@@ -1303,7 +1309,21 @@ def _numeric_value(value: Any) -> Optional[float]:
 
 
 def _record_attention(record: dict[str, Any]) -> Optional[float]:
-    for key in ("score", "hot", "heat", "hot_score", "rank_score", "views", "view_count", "read_count"):
+    for key in (
+        "score",
+        "hot",
+        "heat",
+        "hot_score",
+        "rank_score",
+        "views",
+        "view_count",
+        "read_count",
+        "热度",
+        "关注度",
+        "阅读",
+        "浏览",
+        "观看",
+    ):
         if key in record:
             value = _numeric_value(record.get(key))
             if value is not None:
@@ -1806,12 +1826,199 @@ def _file_fetch_articles(*, path: str, max_records: int) -> list[NewsItem]:
     return items
 
 
+_MANUAL_NEWS_TITLE_KEYS = ("title", "headline", "新闻", "标题", "新闻标题")
+_MANUAL_NEWS_SOURCE_KEYS = ("source", "source_name", "author_name", "media", "来源", "媒体", "出处")
+_MANUAL_NEWS_URL_KEYS = ("url", "link", "href", "链接", "原文链接", "网址")
+_MANUAL_NEWS_TIME_KEYS = (
+    "seendate",
+    "published_at",
+    "publishedAt",
+    "publish_time",
+    "date",
+    "time",
+    "时间",
+    "发布时间",
+    "发布日期",
+    "日期",
+)
+_MANUAL_NEWS_DESC_KEYS = ("description", "summary", "desc", "abstract", "摘要", "简介", "导语")
+_MANUAL_NEWS_CONTENT_KEYS = ("content", "body", "text", "正文", "内容", "新闻内容", "材料", "原文")
+_MANUAL_NEWS_IMAGE_KEYS = ("socialimage", "image", "cover", "thumbnail", "配图", "图片")
+_MANUAL_NEWS_COUNTRY_KEYS = ("sourcecountry", "country", "国家", "地区")
+_MANUAL_NEWS_LANGUAGE_KEYS = ("language", "lang", "语言")
+
+
+def _manual_first_text(record: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        if key in record:
+            value = _juhe_text(record.get(key))
+            if value:
+                return value
+    return ""
+
+
+def _manual_news_url(title: str, url: str) -> str:
+    if url:
+        return url
+    slug = urllib.parse.quote(re.sub(r"\s+", "-", title.strip())[:80] or "manual-news")
+    return f"manual://news/{slug}"
+
+
+def _manual_record_to_news_item(record: dict[str, Any]) -> NewsItem | None:
+    title = _manual_first_text(record, _MANUAL_NEWS_TITLE_KEYS)
+    content = _manual_first_text(record, _MANUAL_NEWS_CONTENT_KEYS)
+    desc = _manual_first_text(record, _MANUAL_NEWS_DESC_KEYS)
+    if not title:
+        title = (desc or content).splitlines()[0].strip() if (desc or content) else ""
+    if not title:
+        return None
+    url_item = _manual_news_url(title, _manual_first_text(record, _MANUAL_NEWS_URL_KEYS))
+    domain = _manual_first_text(record, ("domain", "域名"))
+    if not domain:
+        try:
+            parsed_domain = urllib.parse.urlparse(url_item).netloc.strip().lower()
+            domain = parsed_domain if parsed_domain and not url_item.startswith("manual://") else "manual.local"
+        except Exception:
+            domain = "manual.local"
+    return NewsItem(
+        title=title,
+        url=url_item,
+        source=_manual_first_text(record, _MANUAL_NEWS_SOURCE_KEYS) or None,
+        description=desc or (content[:180] if content else None),
+        content=content or desc or None,
+        domain=domain or None,
+        seendate=_manual_first_text(record, _MANUAL_NEWS_TIME_KEYS) or None,
+        language=_manual_first_text(record, _MANUAL_NEWS_LANGUAGE_KEYS) or None,
+        socialimage=_manual_first_text(record, _MANUAL_NEWS_IMAGE_KEYS) or None,
+        sourcecountry=_manual_first_text(record, _MANUAL_NEWS_COUNTRY_KEYS) or None,
+        attention=_record_attention(record),
+    )
+
+
+def _manual_json_records(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, dict):
+        records = data.get("items") or data.get("candidates") or data.get("news") or data.get("新闻") or []
+    else:
+        records = data
+    if not isinstance(records, list):
+        raise RuntimeError("manual news materials JSON must contain a list or an object with items/candidates/news")
+    return [rec for rec in records if isinstance(rec, dict)]
+
+
+def _manual_text_blocks(text: str) -> list[str]:
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n\s*(?:-{3,}|={3,}|\*{3,})\s*\n", normalized)
+    if len(blocks) == 1:
+        blocks = re.split(r"\n\s*(?=#{1,3}\s+|\d+[.、]\s*(?:新闻|标题|title)\s*[:：])", normalized, flags=re.IGNORECASE)
+    return [block.strip() for block in blocks if block.strip()]
+
+
+def _manual_text_record(block: str) -> dict[str, Any]:
+    record: dict[str, Any] = {}
+    current_key = ""
+    plain_lines: list[str] = []
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current_key:
+                record[current_key] = f"{record.get(current_key, '')}\n"
+            continue
+        heading = re.match(r"^#{1,6}\s*(?P<title>.+)$", line)
+        if heading and not record.get("标题"):
+            record["标题"] = heading.group("title").strip()
+            current_key = "内容"
+            continue
+        match = re.match(r"^(?P<key>[\w\u4e00-\u9fff][\w\u4e00-\u9fff\s_/.-]{0,18})\s*[:：]\s*(?P<value>.*)$", line)
+        if match:
+            key = re.sub(r"\s+", "", match.group("key")).strip()
+            value = match.group("value").strip()
+            record[key] = value
+            current_key = key
+            continue
+        if current_key in _MANUAL_NEWS_CONTENT_KEYS or current_key in {"正文", "内容", "新闻内容", "材料", "原文"}:
+            prev = str(record.get(current_key) or "").rstrip()
+            record[current_key] = f"{prev}\n{line}".strip() if prev else line
+        else:
+            plain_lines.append(line)
+    if plain_lines:
+        if not record.get("标题"):
+            record["标题"] = plain_lines[0]
+            plain_lines = plain_lines[1:]
+        if plain_lines and not any(key in record for key in _MANUAL_NEWS_CONTENT_KEYS):
+            record["内容"] = "\n".join(plain_lines).strip()
+    return record
+
+
+def parse_manual_news_materials(text: str, *, max_records: int | None = None) -> list[NewsItem]:
+    """
+    Parse user-provided news materials from JSON-like text or readable Markdown/plain text.
+
+    Text records can be separated by `---` and use labels such as 标题/时间/来源/链接/内容.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    records: list[dict[str, Any]]
+    if raw[0] in "[{":
+        try:
+            records = _manual_json_records(json.loads(raw))
+        except json.JSONDecodeError:
+            records = [_manual_text_record(block) for block in _manual_text_blocks(raw)]
+    else:
+        records = [_manual_text_record(block) for block in _manual_text_blocks(raw)]
+    limit = max_records if max_records is not None else len(records)
+    items: list[NewsItem] = []
+    for record in records:
+        item = _manual_record_to_news_item(record)
+        if item is None:
+            continue
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def load_manual_news_materials_file(path: str | Path, *, max_records: int) -> list[NewsItem]:
+    file_path = Path(path)
+    text = file_path.read_text(encoding="utf-8-sig")
+    if file_path.suffix.lower() == ".jsonl":
+        records: list[dict[str, Any]] = []
+        for line in text.splitlines():
+            raw = line.strip()
+            if not raw:
+                continue
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                records.append(data)
+            if len(records) >= max_records:
+                break
+        items: list[NewsItem] = []
+        for record in records:
+            item = _manual_record_to_news_item(record)
+            if item is not None:
+                items.append(item)
+        return items
+    return parse_manual_news_materials(text, max_records=max_records)
+
+
+def load_single_news_material_file(path: str | Path) -> NewsItem:
+    items = load_manual_news_materials_file(path, max_records=2)
+    if len(items) != 1:
+        raise RuntimeError(
+            f"single news material file must contain exactly one news item; got {len(items)}"
+        )
+    return items[0]
+
+
 def fetch_daily_news_candidates(
     prompt_hint: str,
     *,
     tz_name: Optional[str] = None,
     max_records: Optional[int] = None,
+    search_days: Optional[int] = None,
     timeout_s: Optional[float] = None,
+    expand_query_variants: bool = True,
+    materials_file: str | Path | None = None,
 ) -> tuple[list[NewsItem], dict[str, Any]]:
     """
     Fetch today's news via an external API.
@@ -1828,16 +2035,24 @@ def fetch_daily_news_candidates(
         max_records = int(os.getenv("NEWS_MAX_RECORDS") or DEFAULT_MAX_RECORDS)
     else:
         max_records = int(max_records)
+    if search_days is None:
+        search_days = int(os.getenv("NEWS_FETCH_WINDOW_DAYS") or "1")
+    else:
+        search_days = int(search_days)
+    search_days = max(1, search_days)
     timeout_s = float(os.getenv("NEWS_TIMEOUT_S") or (timeout_s or DEFAULT_TIMEOUT_S))
 
-    startdatetime, enddatetime = _today_range_utc(tz_name)
+    startdatetime, enddatetime = _recent_range_utc(tz_name, days=search_days)
     start_dt = datetime.strptime(startdatetime, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     end_dt = datetime.strptime(enddatetime, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     from_iso = start_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
     to_iso = end_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
 
+    manual_materials_file = str(materials_file or os.getenv("NEWS_MATERIALS_FILE") or "").strip()
     provider_plan: list[str]
-    if provider_env:
+    if manual_materials_file:
+        provider_plan = ["manual"]
+    elif provider_env:
         provider_plan = [provider_env]
     else:
         file_path = (os.getenv("NEWS_CANDIDATES_FILE") or "").strip()
@@ -1865,7 +2080,7 @@ def fetch_daily_news_candidates(
             provider_plan.append("hotnews")
     provider_plan = list(dict.fromkeys(provider_plan))
 
-    supported_providers = ("newsapi", "gnews", "juhe", "hotnews", "file")
+    supported_providers = ("newsapi", "gnews", "juhe", "hotnews", "file", "manual")
     unsupported = [p for p in provider_plan if p not in supported_providers]
     if unsupported:
         raise RuntimeError(
@@ -1879,7 +2094,7 @@ def fetch_daily_news_candidates(
 
     hint_query = (prompt_hint or "").strip()
     if hint_query:
-        queries = _build_prompt_news_queries(hint_query)
+        queries = _build_prompt_news_queries(hint_query) if expand_query_variants else [hint_query]
         default_queries = _split_news_queries(os.getenv("NEWS_QUERY_DEFAULT")) or [DEFAULT_QUERY]
     else:
         queries = _default_news_queries()
@@ -1902,7 +2117,7 @@ def fetch_daily_news_candidates(
         if provider not in provider_attempts:
             provider_attempts.append(provider)
         provider_candidates: list[NewsItem] = []
-        provider_queries = queries[:1] if provider in ("file", "hotnews") else queries
+        provider_queries = queries[:1] if provider in ("file", "manual", "hotnews") else queries
         for q in provider_queries:
             if hint_query and q in default_queries and provider_candidates:
                 break
@@ -2015,6 +2230,15 @@ def fetch_daily_news_candidates(
                         timeout_s=timeout_s,
                     )
                     used_time_range = False
+                elif provider == "manual":
+                    if not manual_materials_file:
+                        raise RuntimeError("NEWS_MATERIALS_FILE or --news-materials-file is required when NEWS_PROVIDER=manual")
+                    chosen_source_api = {"provider": "manual", "file_path": manual_materials_file}
+                    candidates = load_manual_news_materials_file(
+                        manual_materials_file,
+                        max_records=max_records,
+                    )
+                    used_time_range = False
                 else:
                     file_path = (os.getenv("NEWS_CANDIDATES_FILE") or "").strip()
                     if not file_path:
@@ -2076,9 +2300,11 @@ def fetch_daily_news_candidates(
         "tz": tz_name,
         "query": chosen_query,
         "query_variants": queries,
+        "query_expansion_enabled": bool(expand_query_variants),
         "queries_used": queries_used or ([chosen_query] if candidates else []),
         "startdatetime": startdatetime,
         "enddatetime": enddatetime,
+        "search_days": search_days,
         "used_today_range": used_time_range,
         "history_dedupe": {
             "enabled": history_dedupe_is_enabled,
@@ -2088,6 +2314,11 @@ def fetch_daily_news_candidates(
         },
         "candidates": [asdict(c) for c in candidates[:10]],
     }
+    if chosen_provider == "manual":
+        meta["manual_materials"] = {
+            "file_path": manual_materials_file,
+            "count": len(candidates),
+        }
     return candidates, meta
 
 

@@ -4,6 +4,7 @@ from src.ai_digest import fetchers
 from src.ai_digest.fetchers import (
     parse_aihot_daily_html,
     parse_github_releases_json,
+    parse_official_html,
     parse_rss_feed,
     parse_social_search_html,
 )
@@ -15,7 +16,15 @@ def test_default_sources_include_expandable_official_and_social_groups():
 
     names = {source.name for source in sources}
     assert {"openai", "anthropic", "deepmind", "huggingface", "github-ai"}.issubset(names)
-    assert {"zhipu-glm", "minimax", "doubao", "baidu-qianfan"}.issubset(names)
+    assert {
+        "zhipu-glm",
+        "zcode",
+        "deepseek",
+        "minimax",
+        "doubao",
+        "baidu-qianfan",
+        "bytedance-seed",
+    }.issubset(names)
     assert "aihot-daily" in names
     assert any(source.kind == "official" for source in sources)
     assert any(source.kind == "social" for source in sources)
@@ -23,13 +32,91 @@ def test_default_sources_include_expandable_official_and_social_groups():
     assert all(source.enabled for source in sources if source.kind == "official")
 
 
+def test_default_sources_expand_model_labs_and_keep_huggingface_as_final_aggregator():
+    sources = default_ai_digest_sources()
+    by_name = {source.name: source for source in sources}
+
+    assert {
+        "qwen-blog",
+        "qwen-github",
+        "tencent-hunyuan",
+        "stepfun",
+        "mistral",
+        "xai",
+        "cohere",
+    }.issubset(by_name)
+    assert by_name["qwen-blog"].kind == "official"
+    assert by_name["qwen-github"].kind == "github"
+    assert by_name["qwen-github"].parser == "github_releases"
+    assert by_name["tencent-hunyuan"].kind == "official"
+    assert by_name["stepfun"].kind == "official"
+    assert by_name["mistral"].kind == "official"
+    assert by_name["mistral"].parser == "rss"
+    assert by_name["xai"].kind == "official"
+    assert by_name["cohere"].kind == "official"
+    assert by_name["huggingface"].kind == "aggregator"
+    assert by_name["github-ai"].kind == "aggregator"
+
+
+def test_default_sources_include_all_extended_domestic_and_global_model_feeds():
+    sources = default_ai_digest_sources()
+    by_name = {source.name: source for source in sources}
+
+    expected = {
+        "iflytek-spark": ("official", "html", "xinghuo.xfyun.cn"),
+        "huawei-pangu": ("official", "html", "huaweicloud.com"),
+        "sensetime-sensenova": ("official", "html", "sensetime.com"),
+        "01ai-yi": ("official", "html", "01.ai"),
+        "01ai-yi-github": ("github", "github_releases", "api.github.com/repos/01-ai/yi/releases"),
+        "baichuan-github": ("github", "github_releases", "api.github.com/repos/baichuan-inc/Baichuan2/releases"),
+        "internlm-github": ("github", "github_releases", "api.github.com/repos/InternLM/InternLM/releases"),
+        "minicpm-github": ("github", "github_releases", "api.github.com/repos/OpenBMB/MiniCPM/releases"),
+        "minicpm-v-github": ("github", "github_releases", "api.github.com/repos/OpenBMB/MiniCPM-V/releases"),
+        "skywork": ("official", "html", "kunlun.com"),
+        "kling": ("official", "html", "kuaishou.com"),
+        "google-gemini": ("official", "html", "ai.google.dev"),
+        "amazon-nova": ("official", "html", "aws.amazon.com/nova/models"),
+        "ai21": ("official", "html", "docs.ai21.com/changelog"),
+        "perplexity-sonar": ("official", "html", "docs.perplexity.ai/docs/sonar/models"),
+        "stability-ai": ("official", "html", "stability.ai/news"),
+        "black-forest-labs": ("official", "html", "bfl.ai/blog"),
+        "runway": ("official", "html", "runwayml.com"),
+        "luma-ai": ("official", "html", "lumalabs.ai/news"),
+        "ideogram": ("official", "html", "ideogram.ai"),
+        "recraft": ("official", "html", "recraft.ai/blog"),
+    }
+
+    assert expected.keys() <= by_name.keys()
+    for name, (kind, parser, url_part) in expected.items():
+        source = by_name[name]
+        assert source.kind == kind
+        assert source.parser == parser
+        assert url_part in source.url
+        assert source.enabled is True
+
+
+def test_resolve_ai_digest_sources_places_huggingface_aggregators_last_by_default(monkeypatch):
+    monkeypatch.delenv("AI_DIGEST_PRIMARY_SOURCES", raising=False)
+    monkeypatch.delenv("AI_DIGEST_SOCIAL_SOURCES", raising=False)
+    monkeypatch.delenv("AI_DIGEST_AGGREGATOR_SOURCES", raising=False)
+
+    names = [source.name for source in resolve_ai_digest_sources()]
+
+    assert "aihot-daily" in names
+    assert names[-2:] == ["huggingface", "github-ai"]
+    assert names.index("huggingface") > names.index("aihot-daily")
+
+
 def test_domestic_ai_sources_use_official_release_pages():
     sources = {source.name: source for source in default_ai_digest_sources()}
 
     expected_domains = {
         "zhipu-glm": "bigmodel.cn",
+        "zcode": "zcode.z.ai",
+        "deepseek": "deepseek.com",
         "minimax": "platform.minimax.io",
         "doubao": "volcengine.com",
+        "bytedance-seed": "seed.bytedance.com",
         "baidu-qianfan": "cloud.baidu.com",
     }
 
@@ -219,6 +306,71 @@ def test_parse_official_html_applies_nearby_publish_date_heading_to_release_line
     assert items[0].published_at == "2026-07-02"
 
 
+def test_parse_official_html_uses_page_date_label_for_release_title():
+    parse_official_html = getattr(fetchers, "parse_official_html", None)
+    assert parse_official_html is not None
+    html = """
+    <html><body>
+      <h1>Seed2.1 Officially Released: Advancing AI Productivity</h1>
+      <p>Date</p>
+      <p>2026-06-23</p>
+      <p>Doubao and Volcano Engine users can now start to access Doubao Seed 2.1.</p>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="ByteDance Seed",
+        vendor="ByteDance Seed",
+        base_url="https://seed.bytedance.com/en/blog/seed2-1-officially-released-advancing-ai-productivity",
+    )
+
+    assert items
+    assert items[0].published_at == "2026-06-23"
+
+
+def test_parse_official_html_uses_published_at_millis_for_release_title():
+    parse_official_html = getattr(fetchers, "parse_official_html", None)
+    assert parse_official_html is not None
+    html = """
+    <html><body>
+      <h1>ZCode 3.0 深度适配 GLM-5.2，多 Agent 协作更进一步</h1>
+      <script>{"published_at":1783091813682}</script>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="智谱 ZCode",
+        vendor="智谱 ZCode",
+        base_url="https://zcode.z.ai/cn",
+    )
+
+    assert items
+    assert items[0].published_at == "2026-07-03"
+
+
+def test_parse_official_html_uses_page_now_for_release_banner_when_no_other_date():
+    parse_official_html = getattr(fetchers, "parse_official_html", None)
+    assert parse_official_html is not None
+    html = """
+    <html><body>
+      <a>🎉 DeepSeek-V4 预览版本发布，具备世界顶级推理性能，Agent 能力大幅提高。</a>
+      <script>{"now":"$D2026-06-26T06:13:58.756Z"}</script>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="DeepSeek",
+        vendor="DeepSeek",
+        base_url="https://www.deepseek.com/",
+    )
+
+    assert items
+    assert items[0].published_at == "2026-06-26"
+
+
 def test_parse_official_html_filters_common_doc_navigation_noise():
     parse_official_html = getattr(fetchers, "parse_official_html", None)
     assert parse_official_html is not None
@@ -288,3 +440,23 @@ def test_parse_official_html_filters_generic_update_directory_noise():
 
     titles = [item.title for item in items]
     assert titles == ["GLM-5.2 模型发布，强化多模态理解、代码生成和复杂推理能力。"]
+
+
+def test_parse_official_html_filters_marketing_and_release_note_page_titles():
+    html = """
+    <html><body>
+      <h1>Frontier AI LLMs, assistants, agents, services | Mistral AI</h1>
+      <h1>模型能力总览 - StepFun 开放平台文档中心</h1>
+      <a>Release Notes</a>
+      <p>Products Solutions Research Developers Blog Customers Company</p>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="Mistral AI",
+        vendor="Mistral AI",
+        base_url="https://mistral.ai/news/",
+    )
+
+    assert items == []

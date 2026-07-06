@@ -20,12 +20,27 @@ from .sources import AIDigestSource, resolve_ai_digest_sources
 
 
 FetchSource = Callable[[AIDigestSource], list[AIUpdateItem]]
+ProgressCallback = Callable[[str, str], None]
 DEFAULT_SEARCH_BACKFILL_QUERIES = (
     "国内 AI 模型 发布 GLM Qwen 豆包 DeepSeek Kimi MiniMax",
     "AI model release OpenAI Anthropic Claude Gemini GPT Llama Mistral",
     "AI API developer tools model release open source",
 )
 BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw) if raw else float(default)
+    except ValueError:
+        value = float(default)
+    return max(min_value, min(max_value, value))
+
+
+def _emit_progress(progress: ProgressCallback | None, stage: str, detail: str) -> None:
+    if progress is not None:
+        progress(stage, detail)
 
 
 def _http_get_text(url: str, *, timeout_s: float = 12.0) -> str:
@@ -46,9 +61,14 @@ def _http_get_text(url: str, *, timeout_s: float = 12.0) -> str:
         return resp.read(1_500_000).decode(charset, errors="replace")
 
 
-def fetch_ai_digest_source(source: AIDigestSource, *, timeout_s: float = 12.0) -> list[AIUpdateItem]:
+def fetch_ai_digest_source(
+    source: AIDigestSource,
+    *,
+    timeout_s: float = 12.0,
+    max_age_days: int | None = None,
+) -> list[AIUpdateItem]:
     if source.parser == "aihot_daily":
-        return fetch_aihot_daily_source(source)
+        return fetch_aihot_daily_source(source, days=max_age_days)
     text = _http_get_text(source.url, timeout_s=timeout_s)
     if source.parser == "rss":
         return parse_rss_feed(text, source_name=source.vendor, vendor=source.vendor)
@@ -66,17 +86,18 @@ def _aihot_daily_dates(days: int = 3) -> list[date]:
     return [today - timedelta(days=offset) for offset in range(max(1, int(days or 3)))]
 
 
-def fetch_aihot_daily_source(source: AIDigestSource) -> list[AIUpdateItem]:
+def fetch_aihot_daily_source(source: AIDigestSource, *, days: int | None = None) -> list[AIUpdateItem]:
     days_raw = (os.getenv("AI_DIGEST_AIHOT_DAYS") or "").strip()
     try:
-        days = int(days_raw) if days_raw else 3
+        days = int(days_raw) if days_raw else int(days or 3)
     except ValueError:
-        days = 3
+        days = int(days or 3)
+    timeout_s = _env_float("AI_DIGEST_AIHOT_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
     items: list[AIUpdateItem] = []
     for day in _aihot_daily_dates(days=days):
         url = f"{source.url.rstrip('/')}/{day.isoformat()}"
         try:
-            html = _http_get_text(url, timeout_s=25.0)
+            html = _http_get_text(url, timeout_s=timeout_s)
         except Exception:
             continue
         items.extend(
@@ -106,10 +127,14 @@ def _search_backfill_queries() -> list[str]:
 def _search_backfill_max_records() -> int:
     raw = (os.getenv("AI_DIGEST_SEARCH_BACKFILL_MAX_RECORDS") or "").strip()
     try:
-        value = int(raw) if raw else 30
+        value = int(raw) if raw else 12
     except ValueError:
-        value = 30
+        value = 12
     return max(5, min(80, value))
+
+
+def _search_backfill_timeout_s() -> float:
+    return _env_float("AI_DIGEST_SEARCH_BACKFILL_TIMEOUT_S", 12.0, min_value=3.0, max_value=30.0)
 
 
 def _normalize_news_seen_at(value: str | None) -> str:
@@ -162,17 +187,31 @@ def fetch_ai_digest_search_backfill(
     now: datetime | date | None,
     queries: list[str] | None = None,
     max_records: int | None = None,
+    timeout_s: float | None = None,
+    progress: ProgressCallback | None = None,
 ) -> tuple[list[AIUpdateItem], dict]:
     from src.news.daily_news import fetch_daily_news_candidates, filter_recent_news_items
 
     query_list = queries or _search_backfill_queries()
     record_limit = max_records or _search_backfill_max_records()
+    request_timeout_s = timeout_s if timeout_s is not None else _search_backfill_timeout_s()
     fetched = []
     errors: list[str] = []
     per_query: list[dict] = []
     for query in query_list:
         try:
-            candidates, meta = fetch_daily_news_candidates(query, max_records=record_limit)
+            _emit_progress(
+                progress,
+                "search_backfill_query",
+                f"in_progress query={query[:60]} max_records={record_limit} window={max_age_days or 3}d",
+            )
+            candidates, meta = fetch_daily_news_candidates(
+                query,
+                max_records=record_limit,
+                search_days=max_age_days or 3,
+                timeout_s=request_timeout_s,
+                expand_query_variants=False,
+            )
             recent, date_meta = filter_recent_news_items(
                 list(candidates),
                 tz_name=str((meta or {}).get("tz") or os.getenv("NEWS_TZ") or "Asia/Shanghai"),
@@ -194,8 +233,14 @@ def fetch_ai_digest_search_backfill(
                     "date_window": date_meta,
                 }
             )
+            _emit_progress(
+                progress,
+                "search_backfill_query",
+                f"success query={query[:60]} raw={len(candidates)} recent={len(recent)} converted={len(converted)}",
+            )
         except Exception as exc:
             errors.append(f"{query}: {exc}")
+            _emit_progress(progress, "search_backfill_query", f"failed query={query[:60]} error={exc}")
     return fetched, {"queries": per_query, "errors": errors}
 
 
@@ -226,19 +271,34 @@ def collect_ai_digest_updates(
     now: datetime | date | None = None,
     min_domestic_model_count: int = 0,
     min_foreign_ai_count: int = 0,
+    include_pool_items: bool = False,
+    force_search_backfill: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> tuple[list[AIUpdateItem], dict]:
     resolved = sources if sources is not None else resolve_ai_digest_sources()
-    fetcher = fetch_source or fetch_ai_digest_source
+    source_timeout_s = _env_float("AI_DIGEST_SOURCE_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
+
+    def _fetch_with_window(source: AIDigestSource) -> list[AIUpdateItem]:
+        if fetch_source is not None:
+            return fetch_source(source)
+        return fetch_ai_digest_source(source, max_age_days=max_age_days, timeout_s=source_timeout_s)
+
+    fetcher = _fetch_with_window
     official_sources = [source for source in resolved if source.kind in {"official", "github"}]
     social_sources = [source for source in resolved if source.kind in {"social", "search"}]
+    aggregator_sources = [source for source in resolved if source.kind == "aggregator"]
     fetched: list[AIUpdateItem] = []
     errors: list[str] = []
 
     for source in official_sources:
         try:
-            fetched.extend(fetcher(source))
+            _emit_progress(progress, "fetch_source", f"in_progress name={source.name} kind={source.kind}")
+            source_items = fetcher(source)
+            fetched.extend(source_items)
+            _emit_progress(progress, "fetch_source", f"success name={source.name} items={len(source_items)}")
         except Exception as exc:
             errors.append(f"{source.name}: {exc}")
+            _emit_progress(progress, "fetch_source", f"failed name={source.name} error={exc}")
 
     official_ranked = rank_ai_updates(
         fetched,
@@ -253,15 +313,20 @@ def collect_ai_digest_updates(
     official_count = len(official_ranked)
     social_backfill_used = False
     search_backfill_used = False
+    aggregator_backfill_used = False
     search_backfill_meta: dict = {}
 
     if allow_social_backfill and official_count < min_official_count:
         social_backfill_used = True
         for source in social_sources:
             try:
-                fetched.extend(fetcher(source))
+                _emit_progress(progress, "fetch_source", f"in_progress name={source.name} kind={source.kind}")
+                source_items = fetcher(source)
+                fetched.extend(source_items)
+                _emit_progress(progress, "fetch_source", f"success name={source.name} items={len(source_items)}")
             except Exception as exc:
                 errors.append(f"{source.name}: {exc}")
+                _emit_progress(progress, "fetch_source", f"failed name={source.name} error={exc}")
 
     ranked = rank_ai_updates(
         fetched,
@@ -276,6 +341,39 @@ def collect_ai_digest_updates(
     if (
         allow_social_backfill
         and _search_backfill_enabled()
+        and (
+            force_search_backfill
+            or _needs_search_backfill(
+            ranked,
+            target_count=target_count,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            )
+        )
+    ):
+        search_backfill_used = True
+        _emit_progress(progress, "search_backfill", f"in_progress window={max_age_days or 3}d")
+        extra, search_backfill_meta = fetch_ai_digest_search_backfill(
+            max_age_days=max_age_days,
+            now=now,
+            progress=progress,
+        )
+        fetched.extend(extra)
+        errors.extend(search_backfill_meta.get("errors") or [])
+        _emit_progress(progress, "search_backfill", f"success items={len(extra)} errors={len(search_backfill_meta.get('errors') or [])}")
+        ranked = rank_ai_updates(
+            fetched,
+            target_count=target_count,
+            min_official_count=min_official_count,
+            allow_social_backfill=allow_social_backfill,
+            max_age_days=max_age_days,
+            now=now,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
+    if (
+        allow_social_backfill
+        and aggregator_sources
         and _needs_search_backfill(
             ranked,
             target_count=target_count,
@@ -283,13 +381,16 @@ def collect_ai_digest_updates(
             min_foreign_ai_count=min_foreign_ai_count,
         )
     ):
-        search_backfill_used = True
-        extra, search_backfill_meta = fetch_ai_digest_search_backfill(
-            max_age_days=max_age_days,
-            now=now,
-        )
-        fetched.extend(extra)
-        errors.extend(search_backfill_meta.get("errors") or [])
+        aggregator_backfill_used = True
+        for source in aggregator_sources:
+            try:
+                _emit_progress(progress, "fetch_source", f"in_progress name={source.name} kind={source.kind}")
+                source_items = fetcher(source)
+                fetched.extend(source_items)
+                _emit_progress(progress, "fetch_source", f"success name={source.name} items={len(source_items)}")
+            except Exception as exc:
+                errors.append(f"{source.name}: {exc}")
+                _emit_progress(progress, "fetch_source", f"failed name={source.name} error={exc}")
         ranked = rank_ai_updates(
             fetched,
             target_count=target_count,
@@ -321,9 +422,14 @@ def collect_ai_digest_updates(
         "official_count": official_count,
         "social_backfill_used": social_backfill_used,
         "search_backfill_used": search_backfill_used,
+        "aggregator_backfill_used": aggregator_backfill_used,
         "search_backfill": search_backfill_meta,
         "quota_counts": ai_digest_quota_counts(ranked),
         "sources": [source.name for source in resolved],
         "errors": errors,
     }
+    if include_pool_items:
+        meta["_fetched_items"] = list(fetched)
+        meta["_fresh_items"] = list(fresh_items)
+        meta["_deduped_items"] = list(deduped_items)
     return ranked, meta

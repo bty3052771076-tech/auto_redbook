@@ -4,8 +4,17 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from src.images.auto_image import ImageGenerationAbandoned
 from src.news import daily_news
-from src.news.daily_news import NewsItem, pick_best_news, pick_news_items, _dedupe_candidates
+from src.news.daily_news import (
+    NewsItem,
+    load_manual_news_materials_file,
+    load_single_news_material_file,
+    parse_manual_news_materials,
+    pick_best_news,
+    pick_news_items,
+    _dedupe_candidates,
+)
 from src.news.history import normalize_news_url_key
 from src.config import LLMConfig
 from src.workflow import create_post
@@ -1816,20 +1825,113 @@ def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(
 
     monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
 
-    selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=5)
+    selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
 
-    assert fetch_kwargs["max_records"] == 100
+    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["search_days"] == 14
     assert [item.url for item in selected] == [
         "https://example.org/world-cup-sponsors",
         "https://example.com/world-cup-rules",
     ]
     pool = meta["selection_pool"]
-    assert pool["requested_count"] == 5
-    assert pool["target_fetch_count"] == 5
-    assert pool["raw_fetch_count"] == 100
+    assert pool["requested_count"] == 2
+    assert pool["target_fetch_count"] == 2
+    assert pool["raw_fetch_count"] == 40
     assert pool["recent_candidate_count"] == 3
     assert pool["prompt_relevant_candidate_count"] == 2
     assert pool["actual_candidate_count"] == 2
+    assert pool["lookback"]["mode"] == "auto_expand"
+    assert pool["lookback"]["selected_max_age_days"] == 3
+
+
+def test_daily_news_upload_auto_expands_to_seven_day_window(monkeypatch):
+    candidates = [
+        NewsItem(
+            title="World Cup match schedule update",
+            url="https://example.com/world-cup-today",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description="Sports organizers updated the World Cup match schedule.",
+            attention=20,
+        ),
+        NewsItem(
+            title="World Cup broadcast rights deal advances",
+            url="https://example.org/world-cup-rights",
+            source="Example",
+            domain="example.org",
+            seendate=_recent_news_seendate(4),
+            description="A sports broadcaster advanced a World Cup rights deal.",
+            attention=100,
+        ),
+        NewsItem(
+            title="World Cup travel rules from older report",
+            url="https://example.net/world-cup-old",
+            source="Example",
+            domain="example.net",
+            seendate=_recent_news_seendate(10),
+            description="Older sports report that should not be needed after seven-day expansion.",
+            attention=500,
+        ),
+    ]
+    fetch_kwargs: dict[str, object] = {}
+
+    def fake_fetch(_prompt, **kwargs):
+        fetch_kwargs.update(kwargs)
+        return candidates, {"provider": "fake-news", "tz": "Asia/Shanghai"}
+
+    monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
+
+    selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
+
+    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["search_days"] == 14
+    assert {item.url for item in selected} == {
+        "https://example.com/world-cup-today",
+        "https://example.org/world-cup-rights",
+    }
+    pool = meta["selection_pool"]
+    assert pool["date_window"]["max_age_days"] == 7
+    assert pool["lookback"]["mode"] == "auto_expand"
+    assert pool["lookback"]["selected_max_age_days"] == 7
+    assert [attempt["max_age_days"] for attempt in pool["lookback"]["attempts"]] == [3, 7]
+    assert [attempt["actual_candidate_count"] for attempt in pool["lookback"]["attempts"]] == [1, 2]
+
+
+def test_daily_news_upload_fixed_lookback_days_does_not_expand(monkeypatch):
+    candidates = [
+        NewsItem(
+            title="World Cup match schedule update",
+            url="https://example.com/world-cup-today",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description="Sports organizers updated the World Cup match schedule.",
+            attention=20,
+        ),
+        NewsItem(
+            title="World Cup broadcast rights deal advances",
+            url="https://example.org/world-cup-rights",
+            source="Example",
+            domain="example.org",
+            seendate=_recent_news_seendate(4),
+            description="A sports broadcaster advanced a World Cup rights deal.",
+            attention=100,
+        ),
+    ]
+    fetch_kwargs: dict[str, object] = {}
+
+    def fake_fetch(_prompt, **kwargs):
+        fetch_kwargs.update(kwargs)
+        return candidates, {"provider": "fake-news", "tz": "Asia/Shanghai"}
+
+    monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
+
+    with pytest.raises(RuntimeError, match="daily news material insufficient"):
+        create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2, lookback_days=3)
+
+    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["search_days"] == 3
 
 
 def test_create_daily_news_posts_replaces_generic_original_title_with_post_title(monkeypatch, tmp_path):
@@ -2748,6 +2850,327 @@ def test_fetch_daily_news_candidates_file_provider_reads_json(monkeypatch, tmp_p
     assert candidates[0].title == "科技公司发布新芯片"
     assert candidates[0].domain == "example.com"
     assert meta["provider"] == "file"
+
+
+def test_parse_manual_news_materials_reads_markdown_blocks():
+    text = """
+    标题：央行发布支付便利化新举措
+    时间：2026-07-05 09:30
+    来源：中国新闻网
+    链接：https://example.cn/payments
+    热度：8765
+    内容：央行表示将优化重点场景支付服务，提升境内外人员支付便利性。
+
+    ---
+
+    新闻：国际足联公布世界杯票务安排
+    发布时间：2026-07-04
+    来源：新华社
+    url: https://example.cn/worldcup
+    摘要：世界杯相关票务安排发布，多个阶段将分批开放申请。
+    正文：赛事组织方提醒球迷关注官方渠道。
+    """
+
+    items = parse_manual_news_materials(text)
+
+    assert [item.title for item in items] == ["央行发布支付便利化新举措", "国际足联公布世界杯票务安排"]
+    assert items[0].source == "中国新闻网"
+    assert items[0].seendate == "2026-07-05 09:30"
+    assert items[0].domain == "example.cn"
+    assert items[0].attention == 8765
+    assert "重点场景支付服务" in (items[0].content or "")
+    assert items[1].description == "世界杯相关票务安排发布，多个阶段将分批开放申请。"
+
+
+def test_load_manual_news_materials_file_reads_json_aliases(tmp_path):
+    news_file = tmp_path / "manual_news.json"
+    news_file.write_text(
+        json.dumps(
+            {
+                "news": [
+                    {
+                        "新闻": "国内算力项目落地西部园区",
+                        "时间": "2026-07-05",
+                        "来源": "证券时报",
+                        "链接": "https://example.cn/compute",
+                        "正文": "项目将服务AI训练和产业数字化场景。",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    items = load_manual_news_materials_file(news_file, max_records=5)
+
+    assert len(items) == 1
+    assert items[0].title == "国内算力项目落地西部园区"
+    assert items[0].source == "证券时报"
+    assert items[0].content == "项目将服务AI训练和产业数字化场景。"
+
+
+def test_load_manual_news_materials_file_reads_jsonl(tmp_path):
+    news_file = tmp_path / "manual_news.jsonl"
+    news_file.write_text(
+        "\n".join(
+            [
+                json.dumps({"标题": "暑期文旅市场热度上升", "时间": "2026-07-05", "来源": "央视新闻"}, ensure_ascii=False),
+                json.dumps({"标题": "体育赛事带动周边消费", "时间": "2026-07-05", "来源": "人民网"}, ensure_ascii=False),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    items = load_manual_news_materials_file(news_file, max_records=10)
+
+    assert [item.title for item in items] == ["暑期文旅市场热度上升", "体育赛事带动周边消费"]
+
+
+def test_load_single_news_material_file_requires_exactly_one_item(tmp_path):
+    news_file = tmp_path / "single_news.md"
+    news_file.write_text(
+        """
+        title: Central bank announces payment policy update
+        time: 2026-01-05 09:30
+        source: Example News
+        url: https://example.com/payment-policy
+        content: The central bank announced a policy update with details for payment services.
+        """,
+        encoding="utf-8",
+    )
+
+    item = load_single_news_material_file(news_file)
+
+    assert item.title == "Central bank announces payment policy update"
+    assert item.source == "Example News"
+    assert item.seendate == "2026-01-05 09:30"
+    assert item.domain == "example.com"
+
+    multi_file = tmp_path / "multi_news.md"
+    multi_file.write_text(
+        """
+        title: First item
+        content: first body
+        ---
+        title: Second item
+        content: second body
+        """,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="single news material file must contain exactly one"):
+        load_single_news_material_file(multi_file)
+
+
+def test_fetch_daily_news_candidates_uses_manual_materials_file(monkeypatch, tmp_path):
+    news_file = tmp_path / "manual_news.md"
+    news_file.write_text(
+        f"""
+        标题：体育品牌公布世界杯合作计划
+        时间：{_recent_news_date()}
+        来源：界面新闻
+        链接：https://example.cn/worldcup-brand
+        内容：一家体育品牌围绕世界杯推出合作计划，覆盖门店活动和线上互动。
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.delenv("NEWS_CANDIDATES_FILE", raising=False)
+
+    candidates, meta = daily_news.fetch_daily_news_candidates(
+        "世界杯 品牌",
+        max_records=5,
+        materials_file=str(news_file),
+    )
+
+    assert candidates[0].title == "体育品牌公布世界杯合作计划"
+    assert meta["provider"] == "manual"
+    assert meta["source_api"]["file_path"] == str(news_file)
+    assert meta["manual_materials"]["count"] == 1
+
+
+def test_daily_news_upload_passes_manual_materials_file_to_fetcher(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    materials_file = tmp_path / "manual_news.md"
+    materials_file.write_text("标题：测试新闻\n时间：2026-07-05\n来源：测试源\n内容：测试内容", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def fake_fetch(_prompt, **kwargs):
+        seen.update(kwargs)
+        return [
+            NewsItem(
+                title="测试新闻",
+                url="manual://测试新闻",
+                source="测试源",
+                domain="manual.local",
+                seendate=_recent_news_seendate(0),
+                description="测试内容",
+                content="测试内容",
+            )
+        ], {"provider": "manual", "tz": "Asia/Shanghai"}
+
+    monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
+
+    candidates, meta = create_post._fetch_daily_news_candidates_for_upload(
+        "测试",
+        count=1,
+        news_materials_file=str(materials_file),
+    )
+
+    assert candidates[0].title == "测试新闻"
+    assert seen["materials_file"] == str(materials_file)
+    assert meta["selection_pool"]["raw_candidate_count"] == 1
+
+
+def test_fetch_single_daily_news_candidate_ignores_prompt_and_lookback(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    news_file = tmp_path / "single_news.md"
+    news_file.write_text(
+        """
+        title: Single material policy story
+        time: 2026-01-05
+        source: Example News
+        url: https://example.com/single-policy-story
+        content: A complete single news material that should be used directly.
+        """,
+        encoding="utf-8",
+    )
+
+    candidates, meta = create_post._fetch_daily_news_candidates_for_upload(
+        "sports football prompt that does not match",
+        count=8,
+        lookback_days=3,
+        single_news_material_file=str(news_file),
+    )
+
+    assert [item.title for item in candidates] == ["Single material policy story"]
+    assert meta["provider"] == "manual_single"
+    assert meta["selection_pool"]["requested_count"] == 1
+    assert meta["selection_pool"]["target_fetch_count"] == 1
+    assert meta["selection_pool"]["lookback"]["mode"] == "ignored_for_single_news_material"
+    assert meta["selection_pool"]["prompt_relevance"]["mode"] == "ignored_for_single_news_material"
+
+
+def test_single_news_material_prefers_ai_image_before_pexels(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("IMAGE_PROVIDER", "pexels")
+    news_file = tmp_path / "single_news.md"
+    news_file.write_text(
+        """
+        标题：社交巨头拟出租算力引发市场波动
+        时间：2026-07-05
+        来源：证券时报
+        链接：https://example.com/meta-compute
+        内容：社交巨头拟把闲置人工智能算力对外出租，市场重新评估人工智能基建公司的增长预期。
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+
+    def fake_generate_draft(*_args, **_kwargs):
+        return {
+            "title": "社交巨头出租算力引发市场震荡",
+            "body": _test_daily_news_body(
+                original_title="社交巨头拟出租算力引发市场波动",
+                content="社交巨头拟将闲置人工智能算力对外出租，引发市场对人工智能基建资产利用率的重新定价。",
+                comment="这说明人工智能基建投资开始从扩张叙事进入现金流验证阶段。",
+                date="2026-07-05",
+                source="证券时报",
+            ),
+            "topics": ["每日新闻", "人工智能"],
+            "image_event": "社交巨头人工智能算力出租引发市场波动",
+        }
+
+    providers: list[str | None] = []
+
+    def fake_images(*, dest_dir, provider=None, **_kwargs):
+        providers.append(provider)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / f"{provider or 'none'}.jpg"
+        out.write_bytes(b"image")
+        return [out], [{"provider": provider, "mode": "auto_image"}]
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+    monkeypatch.setattr(create_post, "fetch_and_download_related_images", fake_images)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="should be ignored",
+        asset_paths=[],
+        count=9,
+        auto_image=True,
+        single_news_material_file=str(news_file),
+    )
+
+    assert len(posts) == 1
+    assert providers == ["aliyun"]
+    assert posts[0].platform["images"][0]["provider"] == "aliyun"
+
+
+def test_single_news_material_falls_back_to_pexels_when_ai_image_fails(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    news_file = tmp_path / "single_news.md"
+    news_file.write_text(
+        """
+        标题：社交巨头拟出租算力引发市场波动
+        时间：2026-07-05
+        来源：证券时报
+        链接：https://example.com/meta-compute
+        内容：社交巨头拟把闲置人工智能算力对外出租，市场重新评估人工智能基建公司的增长预期。
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+
+    def fake_generate_draft(*_args, **_kwargs):
+        return {
+            "title": "社交巨头出租算力引发市场震荡",
+            "body": _test_daily_news_body(
+                original_title="社交巨头拟出租算力引发市场波动",
+                content="社交巨头拟将闲置人工智能算力对外出租，引发市场对人工智能基建资产利用率的重新定价。",
+                comment="这说明人工智能基建投资开始从扩张叙事进入现金流验证阶段。",
+                date="2026-07-05",
+                source="证券时报",
+            ),
+            "topics": ["每日新闻", "人工智能"],
+            "image_event": "社交巨头人工智能算力出租引发市场波动",
+        }
+
+    providers: list[str | None] = []
+
+    def fake_images(*, dest_dir, provider=None, **_kwargs):
+        providers.append(provider)
+        if provider == "aliyun":
+            raise ImageGenerationAbandoned(provider="aliyun", attempts=3, errors=["timed out"])
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / "pexels.jpg"
+        out.write_bytes(b"image")
+        return [out], [{"provider": provider, "mode": "auto_image"}]
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+    monkeypatch.setattr(create_post, "fetch_and_download_related_images", fake_images)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="should be ignored",
+        asset_paths=[],
+        count=1,
+        auto_image=True,
+        single_news_material_file=str(news_file),
+    )
+
+    assert len(posts) == 1
+    assert providers == ["aliyun", "pexels"]
+    assert posts[0].platform["images"][0]["provider"] == "pexels"
+    assert posts[0].platform["image_fallback"]["from_provider"] == "aliyun"
+    assert posts[0].platform["image_fallback"]["to_provider"] == "pexels"
 
 
 def test_normalize_news_url_key_removes_tracking_params_and_fragment():

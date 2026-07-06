@@ -70,6 +70,178 @@ def test_click_draft_prefers_visible_text_candidate_before_coordinate_fallback()
     assert page.mouse.clicks == [(548, 675)]
 
 
+def test_click_draft_tries_frame_button_before_coordinate_fallback():
+    class FakeMouse:
+        def __init__(self):
+            self.clicks: list[tuple[int, int]] = []
+
+        def click(self, x, y):
+            self.clicks.append((x, y))
+
+    class EmptyLocator:
+        def count(self):
+            return 0
+
+    class ClickableLocator:
+        def __init__(self):
+            self.clicked = False
+
+        def count(self):
+            return 1
+
+        def nth(self, _idx):
+            return self
+
+        def is_visible(self):
+            return True
+
+        def click(self, **_kwargs):
+            self.clicked = True
+
+    class FakeFrame:
+        def __init__(self):
+            self.button = ClickableLocator()
+
+        def get_by_role(self, role, name=None):
+            if role == "button" and name == "暂存离开":
+                return self.button
+            return EmptyLocator()
+
+        def get_by_text(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+        def locator(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+        def evaluate(self, *_args):
+            return ""
+
+    class FakePage:
+        viewport_size = {"width": 1600, "height": 900}
+        main_frame = object()
+
+        def __init__(self):
+            self.mouse = FakeMouse()
+            self.frame = FakeFrame()
+            self.frames = [self.main_frame, self.frame]
+
+        def evaluate(self, script, *_args):
+            if "return out.slice" in script:
+                return []
+            return []
+
+        def get_by_role(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+        def get_by_text(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+        def locator(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+    page = FakePage()
+
+    clicked, detail = _click_draft(page)
+
+    assert clicked is True
+    assert detail == "frame1:role-button:暂存离开"
+    assert page.frame.button.clicked is True
+    assert page.mouse.clicks == []
+
+
+def test_click_draft_uses_element_from_point_before_mouse_coordinate():
+    class FakeMouse:
+        def __init__(self):
+            self.clicks: list[tuple[int, int]] = []
+
+        def click(self, x, y):
+            self.clicks.append((x, y))
+
+    class EmptyLocator:
+        def count(self):
+            return 0
+
+    class FakePage:
+        viewport_size = {"width": 1280, "height": 720}
+
+        def __init__(self):
+            self.mouse = FakeMouse()
+            self.js_clicked = False
+
+        def evaluate(self, script, *_args):
+            if "return out.slice" in script:
+                return []
+            if "xhs-publish-btn" in script:
+                return ""
+            if "elementFromPoint" in script:
+                self.js_clicked = True
+                return "button:暂存离开"
+            return []
+
+        def get_by_role(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+        def get_by_text(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+        def locator(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+    page = FakePage()
+
+    clicked, detail = _click_draft(page)
+
+    assert clicked is True
+    assert detail == "coordinate-js:x=550,y=675:button:暂存离开"
+    assert page.js_clicked is True
+    assert page.mouse.clicks == []
+
+
+def test_click_draft_prefers_xhs_publish_save_component():
+    class FakeMouse:
+        def __init__(self):
+            self.clicks: list[tuple[int, int]] = []
+
+        def click(self, x, y):
+            self.clicks.append((x, y))
+
+    class EmptyLocator:
+        def count(self):
+            return 0
+
+    class FakePage:
+        viewport_size = {"width": 1280, "height": 720}
+
+        def __init__(self):
+            self.mouse = FakeMouse()
+
+        def evaluate(self, script, *_args):
+            if "return out.slice" in script:
+                return []
+            if "xhs-publish-btn" in script:
+                return "xhs-publish-btn:暂存离开"
+            if "elementFromPoint" in script:
+                return ""
+            return []
+
+        def get_by_role(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+        def get_by_text(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+        def locator(self, *_args, **_kwargs):
+            return EmptyLocator()
+
+    page = FakePage()
+
+    clicked, detail = _click_draft(page)
+
+    assert clicked is True
+    assert detail == "xhs-publish-btn:暂存离开"
+    assert page.mouse.clicks == []
+
+
 def test_open_draft_list_and_check_saved_reopens_publish_page_when_inline_box_missing(monkeypatch):
     calls: list[dict] = []
     page = object()

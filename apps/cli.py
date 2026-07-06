@@ -248,6 +248,8 @@ def _record_generation_run(
         extra={
             "auto_image": _env_first("AUTO_IMAGE"),
             "news_candidates_file": _env_first("NEWS_CANDIDATES_FILE"),
+            "news_materials_file": _env_first("NEWS_MATERIALS_FILE"),
+            "single_news_material_file": _env_first("SINGLE_NEWS_MATERIAL_FILE"),
         },
     )
     paths = append_run_record(record)
@@ -398,6 +400,23 @@ def create(
         "--evaluation-viewpoint",
         help="每日新闻评价视角；默认无视角评价",
     ),
+    lookback_days: Optional[int] = typer.Option(
+        None,
+        "--lookback-days",
+        help="每日新闻/每日AI讯息候选回溯天数；留空则按 3/7/14 天自动扩展",
+    ),
+    news_materials_file: str = typer.Option(
+        "",
+        "--news-materials-file",
+        help="每日新闻人工材料文件（.md/.txt/.json/.jsonl）；提供后跳过在线新闻抓取",
+        show_default=False,
+    ),
+    single_news_material_file: str = typer.Option(
+        "",
+        "--single-news-material-file",
+        help="每日新闻单条材料文件；提供后只生成 1 条，并忽略提示词/数量/回溯筛选",
+        show_default=False,
+    ),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
     count: int = typer.Option(1, help="生成草稿数量（>=1）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
@@ -405,6 +424,15 @@ def create(
     """生成草稿并落盘（post.json + revision）。"""
     title_norm = (title or "").strip()
     prompt_norm = (prompt or "").strip()
+    news_materials_file_norm = (news_materials_file or "").strip()
+    single_news_material_file_norm = (single_news_material_file or "").strip()
+    if news_materials_file_norm and single_news_material_file_norm:
+        typer.echo("error: --single-news-material-file and --news-materials-file are mutually exclusive")
+        raise typer.Exit(code=1)
+    if title_norm == "每日新闻" and single_news_material_file_norm:
+        prompt_norm = ""
+        lookback_days = None
+        count = 1
     asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
     if not asset_paths:
         _emit_missing_assets_hint(title_norm)
@@ -433,6 +461,7 @@ def create(
                 count=1,
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
+                lookback_days=lookback_days,
             )
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
@@ -448,6 +477,9 @@ def create(
                 count=count,
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
+                lookback_days=lookback_days,
+                news_materials_file=news_materials_file_norm,
+                single_news_material_file=single_news_material_file_norm,
             )
         except PartialDailyNewsError as exc:
             typer.echo(f"partial daily news: generated={len(exc.posts)}/{exc.requested_count}; {exc}")
@@ -472,6 +504,9 @@ def create(
                         copy_assets=not no_copy,
                         auto_image=True,
                         image_exclude_ids=used_image_ids,
+                        lookback_days=lookback_days,
+                        news_materials_file=news_materials_file_norm,
+                        single_news_material_file=single_news_material_file_norm,
                     )
                 )
             except Exception as exc:
@@ -678,6 +713,23 @@ def auto(
         "--evaluation-viewpoint",
         help="每日新闻评价视角；默认无视角评价",
     ),
+    lookback_days: Optional[int] = typer.Option(
+        None,
+        "--lookback-days",
+        help="每日新闻/每日AI讯息候选回溯天数；留空则按 3/7/14 天自动扩展",
+    ),
+    news_materials_file: str = typer.Option(
+        "",
+        "--news-materials-file",
+        help="每日新闻人工材料文件（.md/.txt/.json/.jsonl）；提供后跳过在线新闻抓取",
+        show_default=False,
+    ),
+    single_news_material_file: str = typer.Option(
+        "",
+        "--single-news-material-file",
+        help="每日新闻单条材料文件；提供后只生成 1 条，并忽略提示词/数量/回溯筛选",
+        show_default=False,
+    ),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
     count: int = typer.Option(1, help="生成草稿数量（>=1）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
@@ -696,6 +748,15 @@ def auto(
     """Generate content then save draft in one command."""
     title_norm = (title or "").strip()
     prompt_norm = (prompt or "").strip()
+    news_materials_file_norm = (news_materials_file or "").strip()
+    single_news_material_file_norm = (single_news_material_file or "").strip()
+    if news_materials_file_norm and single_news_material_file_norm:
+        typer.echo("error: --single-news-material-file and --news-materials-file are mutually exclusive")
+        raise typer.Exit(code=1)
+    if title_norm == "每日新闻" and single_news_material_file_norm:
+        prompt_norm = ""
+        lookback_days = None
+        count = 1
     asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
     if not asset_paths:
         _emit_missing_assets_hint(title_norm, dry_run=dry_run)
@@ -725,6 +786,7 @@ def auto(
                 count=1,
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
+                lookback_days=lookback_days,
             )
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
@@ -740,6 +802,9 @@ def auto(
                 count=count,
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
+                lookback_days=lookback_days,
+                news_materials_file=news_materials_file_norm,
+                single_news_material_file=single_news_material_file_norm,
             )
         except PartialDailyNewsError as exc:
             typer.echo(f"partial daily news: generated={len(exc.posts)}/{exc.requested_count}; {exc}")
@@ -764,6 +829,9 @@ def auto(
                         copy_assets=not no_copy,
                         auto_image=True,
                         image_exclude_ids=used_image_ids,
+                        lookback_days=lookback_days,
+                        news_materials_file=news_materials_file_norm,
+                        single_news_material_file=single_news_material_file_norm,
                     )
                 )
             except Exception as exc:

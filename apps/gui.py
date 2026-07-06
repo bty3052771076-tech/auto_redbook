@@ -1239,6 +1239,17 @@ def combine_prompt_entries(values: Iterable[object]) -> str:
     return "\n".join(prompts)
 
 
+def normalize_optional_day_count(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        days = int(text)
+    except (TypeError, ValueError):
+        return ""
+    return str(max(1, days))
+
+
 def resolve_delete_mode_flags(delete_mode: str, confirm_mode: str) -> tuple[bool, bool]:
     """
     Translate human-readable delete choices into CLI flags.
@@ -1275,12 +1286,29 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             str(params.get("assets_glob") or DEFAULT_ASSETS_GLOB),
         )
         count = int(params.get("count") or 1)
+        lookback_days = normalize_optional_day_count(params.get("lookback_days"))
+        single_news_material_file = str(params.get("single_news_material_file") or "").strip()
+        news_materials_file = str(
+            params.get("news_materials_file") or params.get("multi_news_materials_file") or ""
+        ).strip()
+        if single_news_material_file and news_materials_file:
+            raise ValueError("single and multi news material files are mutually exclusive")
+        if single_news_material_file:
+            prompt = ""
+            lookback_days = ""
+            count = 1
         no_copy = bool(params.get("no_copy") or False)
 
         args.extend(["--title", title])
         if prompt:
             args.extend(["--prompt", prompt])
         args.extend(["--evaluation-viewpoint", evaluation_viewpoint])
+        if lookback_days:
+            args.extend(["--lookback-days", lookback_days])
+        if single_news_material_file:
+            args.extend(["--single-news-material-file", single_news_material_file])
+        elif news_materials_file:
+            args.extend(["--news-materials-file", news_materials_file])
         if assets_glob:
             args.extend(["--assets-glob", assets_glob])
         args.extend(["--count", str(count)])
@@ -1833,7 +1861,7 @@ class CommandRunner:
 def main() -> None:
     # Import tkinter lazily so tests can import this module without GUI dependencies.
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import filedialog, messagebox, ttk
     from tkinter.scrolledtext import ScrolledText
 
     root = tk.Tk()
@@ -2464,6 +2492,10 @@ def main() -> None:
     title_var = tk.StringVar(value=DEFAULT_TITLE)
     assets_var = tk.StringVar(value=DEFAULT_ASSETS_GLOB)
     count_var = tk.IntVar(value=1)
+    lookback_days_var = tk.StringVar(value="")
+    single_news_material_file_var = tk.StringVar(value="")
+    multi_news_materials_file_var = tk.StringVar(value="")
+    news_materials_file_var = multi_news_materials_file_var
     no_copy_var = tk.BooleanVar(value=False)
     dry_run_var = tk.BooleanVar(value=False)
     headless_var = tk.BooleanVar(value=False)
@@ -2502,7 +2534,7 @@ def main() -> None:
         )
     ttk.Label(
         prompt_panel,
-        text="每个框填写一个检索方向；生成每日新闻时会分别抓取候选，再按三日新鲜度、相关度和热度合并筛选。",
+        text="每个框填写一个检索方向；生成每日新闻时会分别抓取候选，再按回溯天数、相关度和热度合并筛选。",
         style="Muted.TLabel",
         wraplength=760,
     ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -2522,6 +2554,93 @@ def main() -> None:
     ttk.Checkbutton(auto_grid, text="不复制素材 (--no-copy)", variable=no_copy_var).grid(
         row=6, column=2, sticky="w", padx=(10, 0)
     )
+
+    ttk.Label(auto_grid, text="回溯天数").grid(row=7, column=0, sticky="w", pady=5)
+    ttk.Entry(auto_grid, textvariable=lookback_days_var, width=8).grid(
+        row=7, column=1, sticky="w", pady=5, padx=(10, 0)
+    )
+    ttk.Label(
+        auto_grid,
+        text="留空：先用 3 天内候选，不足自动扩至 7/14 天；填写数字：固定只使用发帖日 N 天内候选。",
+        style="Muted.TLabel",
+        wraplength=620,
+    ).grid(row=7, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=5)
+
+    ttk.Label(auto_grid, text="单条新闻材料文件").grid(row=8, column=0, sticky="w", pady=5)
+    single_materials_frame = ttk.Frame(auto_grid)
+    single_materials_frame.grid(row=8, column=1, columnspan=3, sticky="we", pady=5, padx=(10, 0))
+    single_materials_frame.columnconfigure(0, weight=1)
+    ttk.Entry(single_materials_frame, textvariable=single_news_material_file_var, font=base_font).grid(
+        row=0,
+        column=0,
+        sticky="we",
+    )
+
+    def _choose_single_news_material_file() -> None:
+        path = filedialog.askopenfilename(
+            title="选择每日新闻单条材料文件",
+            initialdir=str(PROJECT_ROOT),
+            filetypes=[
+                ("新闻材料", "*.md *.txt *.json *.jsonl"),
+                ("Markdown", "*.md"),
+                ("Text", "*.txt"),
+                ("JSON", "*.json *.jsonl"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            single_news_material_file_var.set(path)
+
+    ttk.Button(single_materials_frame, text="浏览", command=_choose_single_news_material_file).grid(
+        row=0,
+        column=1,
+        sticky="e",
+        padx=(8, 0),
+    )
+    ttk.Label(
+        auto_grid,
+        text="单条模式只用于每日新闻：文件内应只有一条新闻，运行时固定生成 1 条，不使用提示词、数量和回溯筛选。",
+        style="Muted.TLabel",
+        wraplength=760,
+    ).grid(row=9, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
+
+    ttk.Label(auto_grid, text="多条新闻材料文件").grid(row=10, column=0, sticky="w", pady=5)
+    materials_frame = ttk.Frame(auto_grid)
+    materials_frame.grid(row=10, column=1, columnspan=3, sticky="we", pady=5, padx=(10, 0))
+    materials_frame.columnconfigure(0, weight=1)
+    ttk.Entry(materials_frame, textvariable=news_materials_file_var, font=base_font).grid(
+        row=0,
+        column=0,
+        sticky="we",
+    )
+
+    def _choose_news_materials_file() -> None:
+        path = filedialog.askopenfilename(
+            title="选择每日新闻材料文件",
+            initialdir=str(PROJECT_ROOT),
+            filetypes=[
+                ("新闻材料", "*.md *.txt *.json *.jsonl"),
+                ("Markdown", "*.md"),
+                ("Text", "*.txt"),
+                ("JSON", "*.json *.jsonl"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            news_materials_file_var.set(path)
+
+    ttk.Button(materials_frame, text="浏览", command=_choose_news_materials_file).grid(
+        row=0,
+        column=1,
+        sticky="e",
+        padx=(8, 0),
+    )
+    ttk.Label(
+        auto_grid,
+        text="多条模式用于长文件候选池：保留提示词、数量和回溯天数筛选；支持 标题/时间/来源/链接/内容 字段。",
+        style="Muted.TLabel",
+        wraplength=760,
+    ).grid(row=11, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
 
     _add_execution_options(
         tab_auto,
@@ -2687,6 +2806,9 @@ def main() -> None:
             "assets_glob": assets_var.get(),
             "image_source": image_provider_var.get(),
             "count": count_var.get(),
+            "lookback_days": lookback_days_var.get(),
+            "single_news_material_file": single_news_material_file_var.get(),
+            "news_materials_file": news_materials_file_var.get(),
             "no_copy": no_copy_var.get(),
             "dry_run": dry_run_var.get(),
             "headless": headless_var.get(),
@@ -2717,6 +2839,9 @@ def main() -> None:
         )
         assets_var.set(os.getenv("AUTO_REDBOOK_GUI_ASSETS_GLOB") or AUTO_IMAGE_ASSETS_GLOB)
         count_var.set(env_int_value(os.getenv("AUTO_REDBOOK_GUI_COUNT"), count_var.get(), min_value=1))
+        lookback_days_var.set(normalize_optional_day_count(os.getenv("AUTO_REDBOOK_GUI_LOOKBACK_DAYS")))
+        single_news_material_file_var.set(os.getenv("AUTO_REDBOOK_GUI_SINGLE_NEWS_MATERIAL_FILE") or "")
+        news_materials_file_var.set(os.getenv("AUTO_REDBOOK_GUI_NEWS_MATERIALS_FILE") or "")
         dry_run_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_DRY_RUN")))
         headless_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_HEADLESS")))
         force_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_FORCE")))

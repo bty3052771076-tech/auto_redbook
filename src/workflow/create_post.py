@@ -21,7 +21,12 @@ from src.ai_digest.generate import (
     render_ai_digest_body,
 )
 from src.ai_digest.models import AIDigestBrief
-from src.ai_digest.rank import ai_digest_quota_counts, rank_ai_updates
+from src.ai_digest.rank import (
+    ai_digest_quota_counts,
+    dedupe_ai_updates,
+    filter_recent_ai_updates,
+    rank_ai_updates,
+)
 from src.ai_digest.render import render_ai_digest_cards
 from src.images.auto_image import (
     ImageGenerationAbandoned,
@@ -33,6 +38,7 @@ from src.news.daily_news import (
     fetch_daily_news_candidates,
     filter_prompt_relevant_news_items,
     filter_recent_news_items,
+    load_single_news_material_file,
     pick_news_items,
     rank_news_candidate_pool,
 )
@@ -80,6 +86,7 @@ DEFAULT_EVALUATION_VIEWPOINT = "无视角评价"
 AI_DIGEST_MIN_ITEMS = 8
 AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS = 3
 AI_DIGEST_MIN_FOREIGN_AI_ITEMS = 3
+DEFAULT_CANDIDATE_LOOKBACK_WINDOWS = (3, 7, 14)
 _DAILY_NEWS_TITLE_MIN_LEN = 10
 _NEWS_TITLE_PROMPT_STRONG_MARKERS = (
     "选择一条",
@@ -2695,11 +2702,172 @@ def _daily_news_raw_candidate_fetch_limit(target_fetch_count: int) -> int:
     return minimum
 
 
-def _fetch_daily_news_candidates_for_upload(prompt_norm: str, *, count: int) -> tuple[list[Any], dict[str, Any]]:
+_AI_IMAGE_PROVIDER_ALIASES = {
+    "aliyun",
+    "dashscope",
+    "bailian",
+    "qwen_image",
+    "qwen-image",
+    "volcengine",
+    "ark",
+    "doubao",
+    "seedream",
+}
+
+
+def _daily_news_ai_first_provider() -> str:
+    for name in (
+        "SINGLE_NEWS_AI_IMAGE_PROVIDER",
+        "DAILY_NEWS_AI_IMAGE_PROVIDER",
+        "IMAGE_PROVIDER",
+    ):
+        value = (os.getenv(name) or "").strip().lower()
+        if value in _AI_IMAGE_PROVIDER_ALIASES:
+            return value
+    return "aliyun"
+
+
+def _fetch_daily_news_related_images(
+    *,
+    title: str,
+    body: str,
+    topics: list[str],
+    prompt_hint: str,
+    dest_dir: Path,
+    exclude_ids: Optional[set[str]] = None,
+    ai_first: bool = False,
+) -> tuple[list[Path], list[dict[str, Any]], dict[str, Any] | None]:
+    if not ai_first:
+        paths, metas = fetch_and_download_related_images(
+            title=title,
+            body=body,
+            topics=topics,
+            prompt_hint=prompt_hint,
+            dest_dir=dest_dir,
+            exclude_ids=exclude_ids,
+        )
+        return paths, metas, None
+
+    primary_provider = _daily_news_ai_first_provider()
+    try:
+        paths, metas = fetch_and_download_related_images(
+            title=title,
+            body=body,
+            topics=topics,
+            prompt_hint=prompt_hint,
+            dest_dir=dest_dir,
+            exclude_ids=exclude_ids,
+            provider=primary_provider,
+        )
+        return paths, metas, None
+    except Exception as exc:
+        fallback_meta: dict[str, Any] = {
+            "from_provider": primary_provider,
+            "to_provider": "pexels",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc),
+        }
+        if isinstance(exc, ImageGenerationAbandoned):
+            fallback_meta.update(
+                {
+                    "attempts": exc.attempts,
+                    "errors": exc.errors,
+                }
+            )
+        print(
+            f"[auto-image] ai_failed provider={primary_provider} fallback=pexels "
+            f"err={str(exc)[:160]}"
+        )
+        paths, metas = fetch_and_download_related_images(
+            title=title,
+            body=body,
+            topics=topics,
+            prompt_hint=prompt_hint,
+            dest_dir=dest_dir,
+            exclude_ids=exclude_ids,
+            provider="pexels",
+        )
+        return paths, metas, fallback_meta
+
+
+def _fetch_daily_news_candidates_for_upload(
+    prompt_norm: str,
+    *,
+    count: int,
+    lookback_days: object = None,
+    news_materials_file: str | Path | None = None,
+    single_news_material_file: str | Path | None = None,
+) -> tuple[list[Any], dict[str, Any]]:
+    multi_material_path = str(news_materials_file or "").strip()
+    single_material_path = str(single_news_material_file or "").strip()
+    if single_material_path and multi_material_path:
+        raise RuntimeError("single_news_material_file and news_materials_file are mutually exclusive")
+    if single_material_path:
+        item = load_single_news_material_file(single_material_path)
+        meta: dict[str, Any] = {
+            "provider": "manual_single",
+            "api_source": "manual_single",
+            "source_api": {
+                "provider": "manual_single",
+                "file_path": single_material_path,
+            },
+            "provider_plan": ["manual_single"],
+            "provider_attempts": ["manual_single"],
+            "provider_errors": [],
+            "tz": os.getenv("NEWS_TZ") or "Asia/Shanghai",
+            "query": "",
+            "query_variants": [],
+            "query_expansion_enabled": False,
+            "queries_used": [],
+            "search_days": None,
+            "used_today_range": False,
+            "manual_materials": {
+                "file_path": single_material_path,
+                "count": 1,
+                "mode": "single",
+            },
+            "candidates": [asdict(item)],
+            "selection_pool": {
+                "requested_count": 1,
+                "target_fetch_count": 1,
+                "raw_fetch_count": 1,
+                "raw_candidate_count": 1,
+                "recent_candidate_count": 1,
+                "prompt_relevance": {
+                    "mode": "ignored_for_single_news_material",
+                    "prompt_hint": prompt_norm,
+                },
+                "prompt_relevant_candidate_count": 1,
+                "actual_candidate_count": 1,
+                "dropped_out_of_window_count": 0,
+                "date_window": {
+                    "mode": "ignored_for_single_news_material",
+                },
+                "lookback": {
+                    "mode": "ignored_for_single_news_material",
+                    "input": lookback_days,
+                    "attempts": [],
+                },
+                "selection_policy": "single_news_material_direct",
+                "source_domain_max_ratio": None,
+            },
+        }
+        return [item], meta
+
     target_fetch_count = _daily_news_candidate_fetch_limit(count)
     raw_fetch_count = _daily_news_raw_candidate_fetch_limit(target_fetch_count)
+    lookback_windows, lookback_meta = _candidate_lookback_windows(
+        lookback_days,
+        env_names=("NEWS_LOOKBACK_DAYS", "CONTENT_LOOKBACK_DAYS"),
+    )
+    search_days = max(lookback_windows)
     try:
-        candidates, meta = fetch_daily_news_candidates(prompt_norm, max_records=raw_fetch_count)
+        candidates, meta = fetch_daily_news_candidates(
+            prompt_norm,
+            max_records=raw_fetch_count,
+            search_days=search_days,
+            materials_file=news_materials_file,
+        )
     except TypeError as exc:
         if "unexpected keyword" not in str(exc) and "positional" not in str(exc):
             raise
@@ -2709,34 +2877,85 @@ def _fetch_daily_news_candidates_for_upload(prompt_norm: str, *, count: int) -> 
     meta = dict(meta)
     raw_candidate_count = len(candidates)
     tz_name = str(meta.get("tz") or os.getenv("NEWS_TZ") or "Asia/Shanghai")
-    recent_candidates, date_window_meta = filter_recent_news_items(
-        list(candidates),
-        tz_name=tz_name,
-        max_age_days=3,
-    )
-    prompt_candidates, prompt_relevance_meta = filter_prompt_relevant_news_items(
-        recent_candidates,
-        prompt_norm,
-    )
-    rank_source = prompt_candidates
-    candidates = rank_news_candidate_pool(rank_source, prompt_norm)[:raw_fetch_count]
-    if not candidates:
+    attempts: list[dict[str, Any]] = []
+    selected_candidates: list[Any] = []
+    selected_recent_candidates: list[Any] = []
+    selected_prompt_candidates: list[Any] = []
+    selected_date_window_meta: dict[str, Any] = {}
+    selected_prompt_relevance_meta: dict[str, Any] = {}
+    for days in lookback_windows:
+        recent_candidates, date_window_meta = filter_recent_news_items(
+            list(candidates),
+            tz_name=tz_name,
+            max_age_days=days,
+        )
+        prompt_candidates, prompt_relevance_meta = filter_prompt_relevant_news_items(
+            recent_candidates,
+            prompt_norm,
+        )
+        ranked_candidates = rank_news_candidate_pool(prompt_candidates, prompt_norm)[:raw_fetch_count]
+        attempt = {
+            "max_age_days": days,
+            "recent_candidate_count": len(recent_candidates),
+            "prompt_relevant_candidate_count": len(prompt_candidates),
+            "actual_candidate_count": len(ranked_candidates),
+            "date_window": date_window_meta,
+            "prompt_relevance": prompt_relevance_meta,
+        }
+        attempts.append(attempt)
+        if len(ranked_candidates) > len(selected_candidates):
+            selected_candidates = ranked_candidates
+            selected_recent_candidates = recent_candidates
+            selected_prompt_candidates = prompt_candidates
+            selected_date_window_meta = date_window_meta
+            selected_prompt_relevance_meta = prompt_relevance_meta
+        if len(ranked_candidates) >= target_fetch_count:
+            selected_candidates = ranked_candidates
+            selected_recent_candidates = recent_candidates
+            selected_prompt_candidates = prompt_candidates
+            selected_date_window_meta = date_window_meta
+            selected_prompt_relevance_meta = prompt_relevance_meta
+            break
+
+    candidates = selected_candidates
+    if len(candidates) < target_fetch_count:
+        last_window = attempts[-1]["date_window"] if attempts else {}
+        attempt_summary = "; ".join(
+            f"{a['max_age_days']}d recent={a['recent_candidate_count']} "
+            f"relevant={a['prompt_relevant_candidate_count']} selected={a['actual_candidate_count']}"
+            for a in attempts
+        )
+        if lookback_meta["mode"] == "auto_expand":
+            raise RuntimeError(
+                "daily news material insufficient: "
+                f"need at least {target_fetch_count} prompt-matching candidate(s), "
+                f"got {len(candidates)} within {lookback_windows[-1]} days "
+                f"({last_window.get('start_date')}..{last_window.get('end_date')}); "
+                f"tried windows={lookback_windows}; {attempt_summary}"
+            )
         raise RuntimeError(
-            "no daily news candidates matching the prompt within the Beijing three-day window "
-            f"({date_window_meta['start_date']}..{date_window_meta['end_date']}); "
-            "only today's, yesterday's, and the day-before-yesterday's news can be used"
+            "daily news material insufficient: "
+            f"need at least {target_fetch_count} prompt-matching candidate(s), "
+            f"got {len(candidates)} within the fixed Beijing {lookback_windows[-1]}-day window "
+            f"({last_window.get('start_date')}..{last_window.get('end_date')}); "
+            f"{attempt_summary}"
         )
     meta["selection_pool"] = {
         "requested_count": max(1, int(count or 1)),
         "target_fetch_count": target_fetch_count,
         "raw_fetch_count": raw_fetch_count,
         "raw_candidate_count": raw_candidate_count,
-        "recent_candidate_count": len(recent_candidates),
-        "prompt_relevance": prompt_relevance_meta,
-        "prompt_relevant_candidate_count": len(prompt_candidates),
+        "recent_candidate_count": len(selected_recent_candidates),
+        "prompt_relevance": selected_prompt_relevance_meta,
+        "prompt_relevant_candidate_count": len(selected_prompt_candidates),
         "actual_candidate_count": len(candidates),
-        "dropped_out_of_window_count": raw_candidate_count - len(recent_candidates),
-        "date_window": date_window_meta,
+        "dropped_out_of_window_count": raw_candidate_count - len(selected_recent_candidates),
+        "date_window": selected_date_window_meta,
+        "lookback": {
+            **lookback_meta,
+            "selected_max_age_days": selected_date_window_meta.get("max_age_days"),
+            "attempts": attempts,
+        },
         "selection_policy": "prompt_relevance_attention_recency_source_diversity",
         "source_domain_max_ratio": os.getenv("NEWS_SOURCE_DOMAIN_MAX_RATIO") or "0.5",
     }
@@ -3379,10 +3598,61 @@ def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int | No
     return value
 
 
+def _positive_int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = int(text)
+    except (TypeError, ValueError):
+        return None
+    return max(1, parsed)
+
+
+def _candidate_lookback_windows(
+    explicit_days: object = None,
+    *,
+    env_names: tuple[str, ...] = (),
+) -> tuple[list[int], dict[str, Any]]:
+    fixed = _positive_int_or_none(explicit_days)
+    source = "argument" if fixed is not None else ""
+    if fixed is None:
+        for name in env_names:
+            fixed = _positive_int_or_none(os.getenv(name))
+            if fixed is not None:
+                source = name
+                break
+    if fixed is not None:
+        return [fixed], {
+            "mode": "fixed",
+            "source": source or "argument",
+            "windows": [fixed],
+        }
+    windows = list(DEFAULT_CANDIDATE_LOOKBACK_WINDOWS)
+    return windows, {
+        "mode": "auto_expand",
+        "source": "default",
+        "windows": windows,
+    }
+
+
 def _ai_digest_candidate_pool_target(target_count: int) -> tuple[int, int]:
     factor = _env_int("AI_DIGEST_CANDIDATE_POOL_FACTOR", 3, min_value=1, max_value=10)
     pool_target = min(100, max(target_count, target_count * factor))
     return pool_target, factor
+
+
+def _ai_digest_progress_callback():
+    enabled = (os.getenv("AI_DIGEST_PROGRESS") or "1").strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return None
+
+    def emit(stage: str, detail: str) -> None:
+        print(f"[ai-digest] stage={stage} | {detail}", flush=True)
+
+    return emit
 
 
 def _with_ai_digest_items(brief: AIDigestBrief, items) -> AIDigestBrief:
@@ -3454,10 +3724,14 @@ def create_daily_ai_digest_posts(
     auto_image: bool = True,
     prompt_hint: str = "",
     evaluation_viewpoint: str = DEFAULT_EVALUATION_VIEWPOINT,
+    lookback_days: object = None,
 ) -> list[Post]:
     target_count = _env_int("AI_DIGEST_TARGET_ITEMS", AI_DIGEST_MIN_ITEMS, min_value=AI_DIGEST_MIN_ITEMS, max_value=20)
     min_official_count = _env_int("AI_DIGEST_MIN_OFFICIAL_ITEMS", 6, min_value=1, max_value=20)
-    max_age_days = _env_int("AI_DIGEST_MAX_AGE_DAYS", 3, min_value=1, max_value=30)
+    lookback_windows, lookback_meta = _candidate_lookback_windows(
+        lookback_days,
+        env_names=("AI_DIGEST_LOOKBACK_DAYS", "AI_DIGEST_MAX_AGE_DAYS", "CONTENT_LOOKBACK_DAYS"),
+    )
     min_domestic_model_count = _env_int(
         "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS",
         AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS,
@@ -3471,15 +3745,120 @@ def create_daily_ai_digest_posts(
         max_value=target_count,
     )
     candidate_pool_target, candidate_pool_factor = _ai_digest_candidate_pool_target(target_count)
-    items, source_meta = collect_ai_digest_updates(
+    items = []
+    source_meta: dict[str, Any] = {}
+    max_age_days = lookback_windows[0]
+    lookback_attempts: list[dict[str, Any]] = []
+    last_pool_error = ""
+    progress = _ai_digest_progress_callback()
+    collection_days = max(lookback_windows)
+    if progress is not None:
+        progress("collect_pool", f"in_progress mode={lookback_meta['mode']} window={collection_days}d")
+    candidate_items, candidate_meta = collect_ai_digest_updates(
         target_count=candidate_pool_target,
         min_official_count=min_official_count,
         allow_social_backfill=True,
-        max_age_days=max_age_days,
+        max_age_days=collection_days,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
+        include_pool_items=lookback_meta["mode"] == "auto_expand",
+        force_search_backfill=lookback_meta["mode"] == "auto_expand",
+        progress=progress,
     )
-    source_meta = dict(source_meta or {})
+    candidate_meta = dict(candidate_meta or {})
+    fetched_pool_items = list(candidate_meta.pop("_fetched_items", []) or [])
+    candidate_meta.pop("_fresh_items", None)
+    candidate_meta.pop("_deduped_items", None)
+    reusable_pool_items = fetched_pool_items or list(candidate_items or [])
+    if progress is not None:
+        progress(
+            "collect_pool",
+            f"success fetched={candidate_meta.get('fetched_count')} ranked={len(candidate_items or [])}",
+        )
+    for days in lookback_windows:
+        if lookback_meta["mode"] == "auto_expand":
+            window_fresh_items = filter_recent_ai_updates(
+                reusable_pool_items,
+                max_age_days=days,
+                require_url=True,
+            )
+            window_deduped_items = dedupe_ai_updates(window_fresh_items)
+            window_candidate_items = rank_ai_updates(
+                reusable_pool_items,
+                target_count=candidate_pool_target,
+                min_official_count=min_official_count,
+                allow_social_backfill=True,
+                max_age_days=days,
+                min_domestic_model_count=min_domestic_model_count,
+                min_foreign_ai_count=min_foreign_ai_count,
+            )
+            window_meta = {
+                **candidate_meta,
+                "max_age_days": days,
+                "fetched_count": len(reusable_pool_items),
+                "fresh_count": len(window_fresh_items),
+                "deduped_count": len(window_deduped_items),
+                "duplicate_removed_count": max(0, len(window_fresh_items) - len(window_deduped_items)),
+                "ranked_count": len(window_candidate_items),
+                "quota_counts": ai_digest_quota_counts(list(window_candidate_items or [])),
+                "collection_max_age_days": collection_days,
+            }
+        else:
+            window_candidate_items = list(candidate_items or [])
+            window_meta = {**candidate_meta, "collection_max_age_days": collection_days}
+        candidate_counts = ai_digest_quota_counts(list(window_candidate_items or []))
+        if not window_candidate_items:
+            errors = window_meta.get("errors") if isinstance(window_meta, dict) else []
+            detail = f"; errors={errors}" if errors else ""
+            pool_error = f"daily ai digest material insufficient: no AI updates within {days} days{detail}"
+        else:
+            pool_error = _ai_digest_selection_error(
+                window_candidate_items,
+                target_count=target_count,
+                min_domestic_model_count=min_domestic_model_count,
+                min_foreign_ai_count=min_foreign_ai_count,
+                max_age_days=days,
+            )
+        lookback_attempts.append(
+            {
+                "max_age_days": days,
+                "selection_pool_items": len(window_candidate_items or []),
+                "quota_counts": candidate_counts,
+                "error": pool_error,
+                "fetched_count": window_meta.get("fetched_count"),
+                "fresh_count": window_meta.get("fresh_count"),
+                "deduped_count": window_meta.get("deduped_count"),
+                "ranked_count": window_meta.get("ranked_count"),
+            }
+        )
+        items = window_candidate_items
+        source_meta = window_meta
+        max_age_days = days
+        last_pool_error = pool_error
+        if progress is not None:
+            progress(
+                "lookback_window",
+                f"{'success' if not pool_error else 'insufficient'} window={days}d "
+                f"items={len(window_candidate_items or [])} domestic={candidate_counts['domestic_model']} "
+                f"foreign={candidate_counts['foreign_ai']}",
+            )
+        if not pool_error:
+            break
+    if last_pool_error:
+        attempt_summary = "; ".join(
+            f"{a['max_age_days']}d items={a['selection_pool_items']} "
+            f"domestic={a['quota_counts']['domestic_model']} foreign={a['quota_counts']['foreign_ai']}"
+            for a in lookback_attempts
+        )
+        if lookback_meta["mode"] == "auto_expand":
+            raise RuntimeError(
+                "daily ai digest material insufficient: "
+                f"tried windows={lookback_windows}; {attempt_summary}; {last_pool_error}"
+            )
+        raise RuntimeError(
+            "daily ai digest material insufficient: "
+            f"fixed {max_age_days}-day window; {attempt_summary}; {last_pool_error}"
+        )
     source_meta["candidate_pool_target"] = candidate_pool_target
     source_meta["candidate_pool_factor"] = candidate_pool_factor
     source_meta["selection_pool_items"] = len(items)
@@ -3487,23 +3866,11 @@ def create_daily_ai_digest_posts(
     source_meta["min_domestic_model_items"] = min_domestic_model_count
     source_meta["min_foreign_ai_items"] = min_foreign_ai_count
     source_meta["selection_pool_quota_counts"] = ai_digest_quota_counts(list(items or []))
-    if not items:
-        errors = source_meta.get("errors") if isinstance(source_meta, dict) else []
-        detail = f"; errors={errors}" if errors else ""
-        raise RuntimeError(
-            f"daily ai digest create failed: no AI updates within {max_age_days} days{detail}"
-        )
-    pool_error = _ai_digest_selection_error(
-        items,
-        target_count=target_count,
-        min_domestic_model_count=min_domestic_model_count,
-        min_foreign_ai_count=min_foreign_ai_count,
-        max_age_days=max_age_days,
-    )
-    if pool_error:
-        errors = source_meta.get("errors") if isinstance(source_meta, dict) else []
-        detail = f"; errors={errors}" if errors else ""
-        raise RuntimeError(pool_error + detail)
+    source_meta["lookback"] = {
+        **lookback_meta,
+        "selected_max_age_days": max_age_days,
+        "attempts": lookback_attempts,
+    }
 
     generation_target = target_count
     generation_mode = "llm"
@@ -3631,6 +3998,9 @@ def create_post_with_draft(
     auto_image: bool = True,
     image_exclude_ids: Optional[set[str]] = None,
     evaluation_viewpoint: str = DEFAULT_EVALUATION_VIEWPOINT,
+    lookback_days: object = None,
+    news_materials_file: str | Path | None = None,
+    single_news_material_file: str | Path | None = None,
 ) -> Post:
     """
     Generate a draft with LLM and persist post + revision.
@@ -3643,6 +4013,7 @@ def create_post_with_draft(
             copy_assets=copy_assets,
             auto_image=auto_image,
             evaluation_viewpoint=evaluation_viewpoint,
+            lookback_days=lookback_days,
         )[0]
 
     cfgs = load_llm_configs()
@@ -3651,8 +4022,14 @@ def create_post_with_draft(
     if title_norm == "每日新闻":
         viewpoint_norm = normalize_evaluation_viewpoint(evaluation_viewpoint)
         try:
-            prompt_norm = (prompt_hint or "").strip()
-            candidates, news_meta = _fetch_daily_news_candidates_for_upload(prompt_norm, count=1)
+            prompt_norm = "" if str(single_news_material_file or "").strip() else (prompt_hint or "").strip()
+            candidates, news_meta = _fetch_daily_news_candidates_for_upload(
+                prompt_norm,
+                count=1,
+                lookback_days=None if str(single_news_material_file or "").strip() else lookback_days,
+                news_materials_file=news_materials_file,
+                single_news_material_file=single_news_material_file,
+            )
             picks = pick_news_items(candidates, prompt_norm, count=1)
             if not picks:
                 raise RuntimeError("no news candidates selected")
@@ -3667,8 +4044,8 @@ def create_post_with_draft(
                 **traced_news_meta,
                 "picked": asdict(picked),
                 "source_url": picked.url,
-                "mode": "daily_news",
-                "prompt_hint": (prompt_hint or "").strip(),
+                "mode": "daily_news_single_material" if str(single_news_material_file or "").strip() else "daily_news",
+                "prompt_hint": prompt_norm,
                 "evaluation_viewpoint": viewpoint_norm,
             }
             news_prompt = _daily_news_prompt(picked, prompt_norm, viewpoint_norm)
@@ -3802,14 +4179,17 @@ def create_post_with_draft(
     if not assets_paths and auto_image_enabled:
         dest_dir = post_dir(post.id) / "assets"
         image_title = _preferred_image_title(post, post.title)
-        image_paths, image_metas = fetch_and_download_related_images(
+        image_paths, image_metas, image_fallback = _fetch_daily_news_related_images(
             title=image_title,
             body=post.body,
             topics=post.topics,
             prompt_hint=_preferred_image_hint(post, prompt_hint),
             dest_dir=dest_dir,
             exclude_ids=image_exclude_ids,
+            ai_first=bool(str(single_news_material_file or "").strip()),
         )
+        if image_fallback:
+            post.platform["image_fallback"] = image_fallback
         post.platform.setdefault("image", image_metas[0])
         post.platform["images"] = image_metas
         _merge_image_ids(image_exclude_ids, image_metas)
@@ -3844,6 +4224,9 @@ def create_daily_news_posts(
     count: int = 1,
     auto_image: bool = True,
     evaluation_viewpoint: str = DEFAULT_EVALUATION_VIEWPOINT,
+    lookback_days: object = None,
+    news_materials_file: str | Path | None = None,
+    single_news_material_file: str | Path | None = None,
 ) -> list[Post]:
     """
     Special workflow for title="每日新闻".
@@ -3852,9 +4235,12 @@ def create_daily_news_posts(
     - When `count` is 1, behavior is equivalent to a single best match.
     """
     cfgs = load_llm_configs()
-    prompt_norm = (prompt_hint or "").strip()
+    single_material_mode = bool(str(single_news_material_file or "").strip())
+    prompt_norm = "" if single_material_mode else (prompt_hint or "").strip()
     viewpoint_norm = normalize_evaluation_viewpoint(evaluation_viewpoint)
-    if count <= 0:
+    if single_material_mode:
+        count = 1
+    elif count <= 0:
         count = 1
     auto_image_enabled = auto_image and is_auto_image_enabled()
     used_image_ids: set[str] = set()
@@ -3871,7 +4257,13 @@ def create_daily_news_posts(
             or "enable_interleave" in joined
         )
 
-    candidates, base_meta = _fetch_daily_news_candidates_for_upload(prompt_norm, count=count)
+    candidates, base_meta = _fetch_daily_news_candidates_for_upload(
+        prompt_norm,
+        count=count,
+        lookback_days=None if single_material_mode else lookback_days,
+        news_materials_file=news_materials_file,
+        single_news_material_file=single_news_material_file,
+    )
     # Pick the first pass with the true target count so source diversity quotas
     # are based on the number of drafts the user asked for. Keep extra ranked
     # candidates after that because strict quality gates can reject snippets.
@@ -4000,7 +4392,11 @@ def create_daily_news_posts(
                     **traced_news_meta,
                     "picked": asdict(picked),
                     "source_url": picked.url,
-                    "mode": "daily_news_multi" if target_count > 1 else "daily_news",
+                    "mode": (
+                        "daily_news_single_material"
+                        if single_material_mode
+                        else ("daily_news_multi" if target_count > 1 else "daily_news")
+                    ),
                     "prompt_hint": prompt_norm,
                     "evaluation_viewpoint": viewpoint_norm,
                     "pick_index": success_idx + 1,
@@ -4019,14 +4415,17 @@ def create_daily_news_posts(
             image_title = _preferred_image_title(post, post.title)
             image_prompt = _preferred_image_hint(post, prompt_norm)
             try:
-                image_paths, image_metas = fetch_and_download_related_images(
+                image_paths, image_metas, image_fallback = _fetch_daily_news_related_images(
                     title=image_title,
                     body=post.body,
                     topics=post.topics,
                     prompt_hint=image_prompt,
                     dest_dir=dest_dir,
                     exclude_ids=used_image_ids,
+                    ai_first=single_material_mode,
                 )
+                if image_fallback:
+                    post.platform["image_fallback"] = image_fallback
             except ImageGenerationAbandoned as exc:
                 post.status = PostStatus.failed
                 post.platform["image_generate"] = {
