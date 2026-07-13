@@ -26,11 +26,13 @@ from apps.gui import (
     PublishedMetricTableRow,
     QuotaDashboardRow,
     RecentPostSummary,
+    SourceHealthDashboardRow,
     UiEventQueue,
     build_xhs_login_launch_args,
     build_xhs_creator_launch_args,
     build_cli_args,
     build_quota_dashboard_rows,
+    build_source_health_dashboard_rows,
     build_provider_env_overrides,
     build_subprocess_env,
     combine_prompt_entries,
@@ -40,6 +42,7 @@ from apps.gui import (
     env_int_value,
     extract_post_id_from_choice,
     filter_quota_dashboard_rows,
+    filter_source_health_dashboard_rows,
     format_post_choice,
     format_post_detail,
     format_post_time_detail,
@@ -50,6 +53,7 @@ from apps.gui import (
     list_recent_posts,
     load_env_file,
     load_latest_quota_snapshots,
+    load_latest_source_health_snapshots,
     merge_model_option_values,
     normalize_optional_day_count,
     open_xhs_creator,
@@ -59,6 +63,7 @@ from apps.gui import (
     quota_dashboard_row_kind_label,
     quota_dashboard_row_title,
     sort_quota_dashboard_rows,
+    sort_source_health_dashboard_rows,
     quota_dashboard_selection_target,
     resolve_assets_glob_for_image_source,
     resolve_delete_mode_flags,
@@ -68,10 +73,97 @@ from apps.gui import (
     VOLCENGINE_IMAGE_MODEL_OPTIONS,
     VOLCENGINE_LLM_MODEL_OPTIONS,
 )
+from src.sources.health import SourceAttempt, SourceHealthSnapshot, save_source_health_snapshot
 
 
 def test_gui_default_image_provider_prefers_ai_generation():
     assert DEFAULT_IMAGE_PROVIDER == "aliyun"
+
+
+def test_load_latest_source_health_snapshots_skips_missing_and_invalid_files(tmp_path: Path):
+    source_dir = tmp_path / "source_health"
+    source_dir.mkdir()
+    (source_dir / "daily_news.json").write_text("not-json", encoding="utf-8")
+    save_source_health_snapshot(
+        SourceHealthSnapshot(
+            collection="ai_digest",
+            generated_at="2026-07-11T08:00:00Z",
+            attempts=[
+                SourceAttempt(
+                    collection="ai_digest",
+                    source_name="openai",
+                    source_url="https://openai.com/news/rss.xml",
+                    tier="official_stream",
+                    status="success",
+                    checked_at="2026-07-11T08:00:00Z",
+                    elapsed_seconds=0.4,
+                    item_count=4,
+                    dated_count=4,
+                    url_count=4,
+                )
+            ],
+        ),
+        source_dir / "ai_digest.json",
+    )
+
+    snapshots = load_latest_source_health_snapshots(source_dir=source_dir)
+
+    assert set(snapshots) == {"ai_digest"}
+    assert snapshots["ai_digest"].attempts[0].source_name == "openai"
+
+
+def test_source_health_dashboard_rows_filter_and_sort_by_status_and_latency():
+    rows = [
+        SourceHealthDashboardRow(
+            collection="daily_news",
+            source_name="google_rss",
+            source_url="https://news.google.com/rss/search",
+            tier="dated_rss",
+            status="success",
+            checked_at="2026-07-11T08:00:00Z",
+            elapsed_seconds=0.4,
+            item_count=20,
+            dated_count=20,
+            url_count=20,
+        ),
+        SourceHealthDashboardRow(
+            collection="ai_digest",
+            source_name="slow-official",
+            source_url="https://example.com/feed",
+            tier="official_stream",
+            status="timeout",
+            checked_at="2026-07-11T08:01:00Z",
+            elapsed_seconds=8.0,
+        ),
+    ]
+
+    assert [row.source_name for row in filter_source_health_dashboard_rows(rows, "news rss")] == ["google_rss"]
+    assert [row.source_name for row in sort_source_health_dashboard_rows(rows, "latency", descending=True)] == [
+        "slow-official",
+        "google_rss",
+    ]
+    assert [row.source_name for row in sort_source_health_dashboard_rows(rows, "status")] == [
+        "slow-official",
+        "google_rss",
+    ]
+
+
+def test_gui_exposes_source_health_center_with_scan_and_detail_controls():
+    source = (Path(__file__).resolve().parents[1] / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert 'tab_sources = _add_scrollable_tab("信源中心")' in source
+    assert "source_health_tree" in source
+    assert "source_health_search_var" in source
+    assert "prepare_source_health_dashboard_rows" in source
+    assert "检查信源" in source
+    assert "打开来源" in source
+
+
+def test_build_cli_args_check_sources():
+    args = build_cli_args("check-sources", params={"collection": "ai_digest"})
+
+    assert args[1:4] == ["-m", "apps.cli", "check-sources"]
+    assert "--collection" in args and "ai_digest" in args
 
 
 def test_gui_exposes_llm_and_image_provider_model_options():

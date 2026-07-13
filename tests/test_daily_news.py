@@ -1,6 +1,7 @@
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +18,12 @@ from src.news.daily_news import (
 )
 from src.news.history import normalize_news_url_key
 from src.config import LLMConfig
+from src.sources.health import (
+    SourceAttempt,
+    SourceHealthSnapshot,
+    load_source_health_snapshot,
+    save_source_health_snapshot,
+)
 from src.workflow import create_post
 from src.workflow.create_post import (
     _append_news_source_line,
@@ -59,6 +66,242 @@ def test_daily_news_query_variants_expand_space_separated_prompt_keywords(monkey
     assert queries[:4] == ["世界杯 体育 足球", "世界杯", "体育", "足球"]
     assert any("world cup" in query.lower() for query in queries)
     assert len(queries) == len(dict.fromkeys(query.lower() for query in queries))
+
+
+def test_relevance_score_matches_chinese_world_cup_prompt_to_english_headline():
+    item = NewsItem(
+        title="World Cup 2026: France power on after Morocco win",
+        url="https://example.com/world-cup",
+        description="France advanced in the World Cup quarter-final.",
+        seendate=_recent_news_seendate(0),
+        language="en",
+    )
+
+    assert daily_news._relevance_score(item, "世界杯") > 0
+
+
+def test_chinese_company_policy_prompt_maps_to_english_query_and_headline():
+    item = NewsItem(
+        title="Government unveils new policy for listed companies",
+        url="https://example.com/company-policy",
+        description="The regulation will affect corporate reporting and market oversight.",
+        seendate=_recent_news_seendate(0),
+        language="en",
+    )
+
+    translated = daily_news._maybe_translate_hint_to_en("公司政策")
+
+    assert "business" in translated
+    assert "policy" in translated
+    assert daily_news._relevance_score(item, "公司政策") > 0
+
+
+def test_rss_items_from_xml_preserve_publisher_url_and_pubdate():
+    payload = b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+    <rss version=\"2.0\"><channel><item>
+      <title>World Cup 2026: France power on</title>
+      <link>https://news.google.com/rss/articles/example</link>
+      <description><![CDATA[France advanced to the semi-finals.]]></description>
+      <pubDate>Fri, 10 Jul 2026 07:09:00 GMT</pubDate>
+      <source url=\"https://www.theguardian.com\">The Guardian</source>
+    </item></channel></rss>"""
+
+    items = daily_news._rss_items_from_xml(
+        payload,
+        source_name="google_news",
+        fallback_language="en",
+    )
+
+    assert len(items) == 1
+    assert items[0].title == "World Cup 2026: France power on"
+    assert items[0].url == "https://news.google.com/rss/articles/example"
+    assert items[0].source == "The Guardian"
+    assert items[0].domain == "www.theguardian.com"
+    assert items[0].seendate == "2026-07-10T07:09:00Z"
+
+
+def test_bbc_rss_uses_sport_feed_for_world_cup_prompt(monkeypatch):
+    calls = []
+
+    def fake_rss_fetch_articles(*, feed_url, source_name, fallback_language, max_records, timeout_s):
+        calls.append((feed_url, source_name, fallback_language, max_records, timeout_s))
+        return [
+            NewsItem(
+                title="World Cup latest",
+                url="https://www.bbc.co.uk/sport/world-cup",
+                source="BBC Sport",
+                domain="www.bbc.co.uk",
+                seendate=_recent_news_seendate(0),
+                language="en",
+            )
+        ]
+
+    monkeypatch.setattr(daily_news, "_rss_fetch_articles", fake_rss_fetch_articles, raising=False)
+
+    items = daily_news._bbc_rss_fetch_articles(
+        prompt_hint="世界杯",
+        max_records=5,
+        timeout_s=2,
+    )
+
+    assert len(items) == 1
+    assert calls[0][0] == daily_news.BBC_RSS_FEEDS["sport"]
+    assert calls[0][1] == "BBC Sport"
+
+
+def test_google_rss_fetch_articles_builds_a_query_feed_url(monkeypatch):
+    calls = []
+
+    def fake_rss_fetch_articles(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(daily_news, "_rss_fetch_articles", fake_rss_fetch_articles, raising=False)
+    monkeypatch.delenv("GOOGLE_NEWS_RSS_HL", raising=False)
+    monkeypatch.delenv("GOOGLE_NEWS_RSS_GL", raising=False)
+    monkeypatch.delenv("GOOGLE_NEWS_RSS_CEID", raising=False)
+
+    daily_news._google_rss_fetch_articles(query="world cup", max_records=5, timeout_s=2)
+
+    assert "q=world+cup" in calls[0]["feed_url"]
+    assert calls[0]["source_name"] == "Google News RSS"
+    assert calls[0]["fallback_language"] == "en"
+
+
+def test_daily_news_records_provider_health_trace_and_persists_snapshot(tmp_path, monkeypatch):
+    health_path = tmp_path / "source_health" / "daily_news.json"
+    monkeypatch.setenv("NEWS_PROVIDER", "google_rss")
+    monkeypatch.setenv("NEWS_HISTORY_DEDUPE", "0")
+    def fake_google_rss(**kwargs):
+        if kwargs["query"] != "世界杯":
+            return []
+        return [
+            NewsItem(
+                title="World Cup latest",
+                url="https://example.com/world-cup-latest",
+                source="Example Sports",
+                domain="example.com",
+                seendate=_recent_news_seendate(0),
+                language="en",
+            )
+        ]
+
+    monkeypatch.setattr(daily_news, "_google_rss_fetch_articles", fake_google_rss, raising=False)
+
+    candidates, meta = daily_news.fetch_daily_news_candidates(
+        "世界杯",
+        max_records=5,
+        timeout_s=1,
+        source_health_path=health_path,
+        persist_source_health=True,
+    )
+
+    assert candidates
+    attempt = meta["source_health"]["attempts"][0]
+    assert attempt["source_name"] == "google_rss"
+    assert attempt["status"] == "success"
+    assert attempt["item_count"] == 1
+    assert attempt["dated_count"] == 1
+    assert attempt["url_count"] == 1
+
+    persisted = load_source_health_snapshot(health_path)
+    assert persisted is not None
+    assert persisted.collection == "daily_news"
+    assert persisted.attempts[0].source_name == "google_rss"
+
+
+def test_daily_news_health_marks_undated_provider_result_as_missing_date(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEWS_PROVIDER", "google_rss")
+    monkeypatch.setenv("NEWS_HISTORY_DEDUPE", "0")
+    monkeypatch.setattr(
+        daily_news,
+        "_google_rss_fetch_articles",
+        lambda **_kwargs: [
+            NewsItem(
+                title="Undated technology update",
+                url="https://example.com/undated",
+                source="Example",
+                domain="example.com",
+                seendate="",
+                language="en",
+            )
+        ],
+        raising=False,
+    )
+
+    _candidates, meta = daily_news.fetch_daily_news_candidates(
+        "technology",
+        max_records=5,
+        source_health_path=tmp_path / "daily_news.json",
+        persist_source_health=True,
+    )
+
+    assert meta["source_health"]["attempts"][0]["status"] == "missing_date"
+
+
+def test_daily_news_skips_recent_failed_provider_before_rss_fallback(tmp_path, monkeypatch):
+    health_path = tmp_path / "source_health" / "daily_news.json"
+    now = datetime.now(timezone.utc)
+    save_source_health_snapshot(
+        SourceHealthSnapshot(
+            collection="daily_news",
+            generated_at=now.isoformat(),
+            attempts=[
+                SourceAttempt(
+                    collection="daily_news",
+                    source_name="newsapi",
+                    source_url="https://newsapi.org",
+                    tier="keyed_api",
+                    status="timeout",
+                    checked_at=now.isoformat(),
+                    elapsed_seconds=10.0,
+                    error="timed out",
+                )
+            ],
+        ),
+        health_path,
+    )
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.setenv("NEWS_API_KEY", "fake-newsapi-key")
+    monkeypatch.setenv("NEWS_HISTORY_DEDUPE", "0")
+    monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    calls: list[str] = []
+
+    def fake_newsapi(**_kwargs):
+        calls.append("newsapi")
+        raise AssertionError("cooled-down provider should not be called")
+
+    monkeypatch.setattr(daily_news, "_newsapi_fetch_articles", fake_newsapi)
+    monkeypatch.setattr(
+        daily_news,
+        "_google_rss_fetch_articles",
+        lambda **_kwargs: [
+            NewsItem(
+                title="World Cup latest",
+                url="https://example.com/world-cup-fallback",
+                source="Example Sports",
+                domain="example.com",
+                seendate=_recent_news_seendate(0),
+                language="en",
+            )
+        ],
+        raising=False,
+    )
+
+    candidates, meta = daily_news.fetch_daily_news_candidates(
+        "世界杯",
+        max_records=5,
+        timeout_s=1,
+        source_health_path=health_path,
+        source_cooldown_seconds=300,
+        persist_source_health=True,
+    )
+
+    assert candidates[0].url == "https://example.com/world-cup-fallback"
+    assert calls == []
+    assert meta["provider"] == "google_rss_cn"
+    assert meta["source_health"]["cooldown_skipped"] == ["newsapi"]
 
 
 def _daily_news_body_fields(body: str) -> dict:
@@ -178,6 +421,105 @@ def test_pick_news_items_with_hint_returns_top_n():
     picked = pick_news_items(items, "新能源", count=2)
     assert len(picked) == 2
     assert "新能源" in picked[0].title
+
+
+def test_pick_news_items_forces_one_china_item_when_generating_more_than_two(monkeypatch):
+    monkeypatch.setenv("NEWS_CHINA_RATIO", "0")
+    foreign_items = [
+        ("Federal Reserve inflation outlook shifts", "https://foreign0.com/story", "Bond yields moved after the central bank update.", 10),
+        ("European auto tariff vote nears deadline", "https://foreign1.com/story", "Automakers prepare for a Brussels vote.", 9),
+        ("Brazil crop export rules change", "https://foreign2.com/story", "Soy exporters adjust to new port paperwork.", 8),
+        ("Japan chip investment plan expands", "https://foreign3.com/story", "Semiconductor subsidies target factories.", 7),
+    ]
+    items = [
+        NewsItem(
+            title=title,
+            url=url,
+            domain=f"foreign{idx}.com",
+            description=description,
+            attention=attention,
+        )
+        for idx, (title, url, description, attention) in enumerate(foreign_items)
+    ] + [
+        NewsItem(
+            title="国内产业政策发布",
+            url="https://news.cn/finance/policy",
+            domain="news.cn",
+            description="国内产业政策发布并引发市场关注。",
+            sourcecountry="cn",
+            attention=0.1,
+        )
+    ]
+
+    picked = pick_news_items(items, "", count=3)
+
+    assert len(picked) == 3
+    assert sum(1 for item in picked if daily_news._is_china_item(item)) >= 1
+
+
+def test_pick_news_items_forces_two_china_items_when_generating_more_than_five(monkeypatch):
+    monkeypatch.setenv("NEWS_CHINA_RATIO", "0")
+    foreign_items = [
+        ("World Cup ticket prices reshape fan travel", "https://foreign0.com/story", "World Cup ticket prices reshape fan travel.", 20),
+        ("Premier League broadcast rights auction opens", "https://foreign1.com/story", "Premier League rights auction opens.", 19),
+        ("Paris venue sponsor deal faces scrutiny", "https://foreign2.com/story", "Paris venue sponsor deal faces scrutiny.", 18),
+        ("Madrid club debt plan wins approval", "https://foreign3.com/story", "Madrid club debt plan wins approval.", 17),
+        ("Tokyo sportswear sales rise before finals", "https://foreign4.com/story", "Tokyo sportswear sales rise before finals.", 16),
+        ("New York streaming platform buys match clips", "https://foreign5.com/story", "New York streaming platform buys match clips.", 15),
+        ("Seoul esports league expands team cap", "https://foreign6.com/story", "Seoul esports league expands team cap.", 14),
+        ("Sydney stadium operator reports profit jump", "https://foreign7.com/story", "Sydney stadium operator reports profit jump.", 13),
+    ]
+    items = [
+        NewsItem(
+            title=title,
+            url=url,
+            domain=f"foreign{idx}.com",
+            description=description,
+            attention=attention,
+        )
+        for idx, (title, url, description, attention) in enumerate(foreign_items)
+    ] + [
+        NewsItem(
+            title="国内体育品牌政策变化",
+            url="https://sports.cn/brand/policy",
+            domain="sports.cn",
+            description="国内体育品牌和产业政策变化。",
+            sourcecountry="cn",
+            attention=0.2,
+        ),
+        NewsItem(
+            title="中国足球产业公司动态",
+            url="https://news.cn/sports/company",
+            domain="news.cn",
+            description="中国足球产业公司动态受到关注。",
+            sourcecountry="cn",
+            attention=0.1,
+        ),
+    ]
+
+    picked = pick_news_items(items, "", count=6)
+
+    assert len(picked) == 6
+    assert sum(1 for item in picked if daily_news._is_china_item(item)) >= 2
+
+
+def test_china_news_quota_recognizes_official_mainland_domains_but_excludes_taiwan_domain():
+    for domain in (
+        "www.xinhuanet.com",
+        "paper.people.com.cn",
+        "news.cctv.com",
+        "www.gov.cn",
+        "www.chinanews.com.cn",
+    ):
+        item = NewsItem(title="Official source", url=f"https://{domain}/news", domain=domain)
+        assert daily_news._is_china_item(item)
+
+    taiwan_item = NewsItem(
+        title="Taiwan source",
+        url="https://www.cnbeta.com.tw/news",
+        domain="www.cnbeta.com.tw",
+    )
+    assert not daily_news._is_china_item(taiwan_item)
 
 
 def test_ensure_daily_news_sections_adds_headings_without_inventing_comment():
@@ -1286,6 +1628,8 @@ def test_create_daily_news_single_stores_url_locally_but_not_in_body(monkeypatch
     assert post.platform["news"]["source_api"]["provider"] == "hotnews"
     assert post.platform["news"]["source_api"]["item_source"] == "Example News"
     assert fetch_kwargs["max_records"] == 20
+    assert Path(fetch_kwargs["source_health_path"]) == Path("data") / "source_health" / "daily_news.json"
+    assert fetch_kwargs["persist_source_health"] is True
     assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 1
     assert post.platform["news"]["selection_pool"]["raw_fetch_count"] == 20
 
@@ -2060,6 +2404,7 @@ def test_create_daily_news_posts_uses_backup_candidates_after_quality_skips(monk
             seendate=_recent_news_seendate(0),
             description="\u516c\u5f00\u4fe1\u606f\u663e\u793a\u76f8\u5173\u9879\u76ee\u51fa\u73b0\u65b0\u8fdb\u5c55\u3002",
             content="\u76f8\u5173\u673a\u6784\u56f4\u7ed5\u6280\u672f\u843d\u5730\u3001\u4ea7\u4e1a\u534f\u540c\u548c\u5e94\u7528\u573a\u666f\u516c\u5e03\u4e86\u66f4\u591a\u7ec6\u8282\u3002",
+            sourcecountry="cn",
         )
         for i in range(40)
     ]
@@ -2125,6 +2470,98 @@ def test_create_daily_news_posts_uses_backup_candidates_after_quality_skips(monk
     assert len(posts) == 3
     assert pick_args["count"] == 3
     assert calls["count"] >= 18
+
+
+def test_create_daily_news_posts_reserves_final_slot_for_china_quota(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    candidates = [
+        NewsItem(
+            title="海外体育转播权价格上涨",
+            url="https://foreign.example.com/sports-rights",
+            source="Foreign Sports",
+            domain="foreign.example.com",
+            seendate=_recent_news_seendate(0),
+            description="海外体育转播权价格上涨，平台预算受到关注。",
+            content="海外体育转播权价格上涨，平台预算受到关注。",
+            attention=10,
+        ),
+        NewsItem(
+            title="海外品牌赞助预算调整",
+            url="https://brand.example.com/sponsor-budget",
+            source="Foreign Brand",
+            domain="brand.example.com",
+            seendate=_recent_news_seendate(0),
+            description="海外品牌赞助预算调整，营销策略出现变化。",
+            content="海外品牌赞助预算调整，营销策略出现变化。",
+            attention=9,
+        ),
+        NewsItem(
+            title="海外俱乐部融资计划披露",
+            url="https://club.example.com/finance-plan",
+            source="Foreign Club",
+            domain="club.example.com",
+            seendate=_recent_news_seendate(0),
+            description="海外俱乐部融资计划披露，市场估值受到讨论。",
+            content="海外俱乐部融资计划披露，市场估值受到讨论。",
+            attention=8,
+        ),
+        NewsItem(
+            title="国内体育产业政策更新",
+            url="https://sports.cn/policy",
+            source="中国体育报",
+            domain="sports.cn",
+            seendate=_recent_news_seendate(0),
+            description="国内体育产业政策更新，赛事运营和品牌合作受到关注。",
+            content="国内体育产业政策更新，赛事运营和品牌合作受到关注。",
+            sourcecountry="cn",
+            attention=0.1,
+        ),
+    ]
+    monkeypatch.setattr(
+        create_post,
+        "_fetch_daily_news_candidates_for_upload",
+        lambda *_args, **_kwargs: (candidates, {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_focus_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "pick_news_items", lambda items, _prompt, *, count=1: items[:count])
+
+    def fake_generate_draft(*_args, **kwargs):
+        prompt = kwargs["prompt_hint"]
+        match = re.search(r"- 新闻标题：(.+)", prompt)
+        source_match = re.search(r"- 来源名称：(.+)", prompt)
+        source_title = match.group(1).strip() if match else "候选新闻标题"
+        source = source_match.group(1).strip() if source_match else "Example"
+        return {
+            "title": source_title[:18],
+            "body": _test_daily_news_body(
+                original_title=source_title,
+                content=f"{source_title}已经披露，相关市场参与方和政策变化值得持续观察。",
+                comment="这条新闻的看点在于它可能影响后续资源配置和行业预期。",
+                date=_recent_news_date(),
+                source=source,
+            ),
+            "topics": ["每日新闻"],
+            "image_event": source_title,
+        }
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="",
+        asset_paths=[],
+        count=3,
+        auto_image=False,
+    )
+
+    picked_titles = [post.platform["news"]["picked"]["title"] for post in posts]
+    assert "国内体育产业政策更新" in picked_titles
+    assert "海外俱乐部融资计划披露" not in picked_titles
 
 
 def test_create_daily_news_posts_raises_instead_of_returning_partial_posts(monkeypatch, tmp_path):
@@ -2358,6 +2795,113 @@ def test_fetch_daily_news_candidates_auto_tries_configured_gnews_when_newsapi_ti
     assert gnews_calls
 
 
+def test_fetch_daily_news_candidates_auto_uses_google_rss_before_hotnews_when_keyed_provider_fails(monkeypatch):
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.delenv("NEWS_CANDIDATES_FILE", raising=False)
+    monkeypatch.setenv("NEWS_API_KEY", "fake-newsapi-key")
+    monkeypatch.delenv("GNEWS_API_KEY", raising=False)
+    monkeypatch.delenv("GNEWS_TOKEN", raising=False)
+    monkeypatch.delenv("JUHE_NEWS_APPKEY", raising=False)
+    monkeypatch.delenv("JUHE_FINANCE_NEWS_APPKEY", raising=False)
+    monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing gnews")))
+    monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing juhe")))
+
+    def fake_newsapi_fetch_articles(**_kwargs):
+        raise TimeoutError("newsapi timed out")
+
+    def fake_google_rss_fetch_articles(**kwargs):
+        if kwargs["query"] == "世界杯":
+            return []
+        assert kwargs["query"] == "world cup"
+        return [
+            NewsItem(
+                title="World Cup 2026: France reach the semi-finals",
+                url="https://news.google.com/rss/articles/world-cup",
+                source="The Guardian",
+                domain="www.theguardian.com",
+                description="France advanced after the World Cup quarter-final.",
+                seendate=_recent_news_seendate(0),
+                language="en",
+            )
+        ]
+
+    monkeypatch.setattr(daily_news, "_newsapi_fetch_articles", fake_newsapi_fetch_articles)
+    monkeypatch.setattr(daily_news, "_google_rss_fetch_articles", fake_google_rss_fetch_articles, raising=False)
+    monkeypatch.setattr(
+        daily_news,
+        "_bbc_rss_fetch_articles",
+        lambda **_kwargs: pytest.fail("BBC RSS should not run after Google RSS succeeds"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daily_news,
+        "_hotnews_fetch_articles",
+        lambda **_kwargs: pytest.fail("HotNews should not run after Google RSS succeeds"),
+        raising=False,
+    )
+
+    candidates, meta = daily_news.fetch_daily_news_candidates("世界杯", max_records=5, timeout_s=1)
+
+    assert candidates[0].title.startswith("World Cup 2026")
+    assert meta["provider"] == "google_rss_cn"
+    assert meta["provider_plan"] == ["newsapi", "google_rss_cn", "google_rss", "bbc_rss", "hotnews"]
+    assert meta["provider_attempts"] == ["newsapi", "google_rss_cn"]
+    assert any("newsapi timed out" in err for err in meta["provider_errors"])
+
+
+def test_fetch_daily_news_candidates_stops_failed_provider_before_query_variants(monkeypatch):
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.delenv("NEWS_CANDIDATES_FILE", raising=False)
+    monkeypatch.setenv("NEWS_API_KEY", "fake-newsapi-key")
+    monkeypatch.delenv("GNEWS_API_KEY", raising=False)
+    monkeypatch.delenv("GNEWS_TOKEN", raising=False)
+    monkeypatch.delenv("JUHE_NEWS_APPKEY", raising=False)
+    monkeypatch.delenv("JUHE_FINANCE_NEWS_APPKEY", raising=False)
+    monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing gnews")))
+    monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing juhe")))
+    monkeypatch.setattr(daily_news, "_build_prompt_news_queries", lambda _hint: ["world cup", "sports"])
+    newsapi_calls = []
+
+    def fake_newsapi_fetch_articles(**kwargs):
+        newsapi_calls.append(kwargs["query"])
+        raise TimeoutError("newsapi timed out")
+
+    def fake_google_rss_fetch_articles(**kwargs):
+        assert kwargs["query"] == "world cup"
+        return [
+            NewsItem(
+                title="World Cup update",
+                url="https://news.google.com/rss/articles/world-cup-update",
+                source="BBC",
+                domain="www.bbc.com",
+                description="A World Cup update.",
+                seendate=_recent_news_seendate(0),
+                language="en",
+            )
+        ]
+
+    monkeypatch.setattr(daily_news, "_newsapi_fetch_articles", fake_newsapi_fetch_articles)
+    monkeypatch.setattr(daily_news, "_google_rss_fetch_articles", fake_google_rss_fetch_articles, raising=False)
+    monkeypatch.setattr(
+        daily_news,
+        "_bbc_rss_fetch_articles",
+        lambda **_kwargs: pytest.fail("BBC RSS should not run after Google RSS succeeds"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daily_news,
+        "_hotnews_fetch_articles",
+        lambda **_kwargs: pytest.fail("HotNews should not run after Google RSS succeeds"),
+        raising=False,
+    )
+
+    candidates, meta = daily_news.fetch_daily_news_candidates("world cup", max_records=5, timeout_s=1)
+
+    assert candidates[0].title == "World Cup update"
+    assert meta["provider"] == "google_rss_cn"
+    assert newsapi_calls == ["world cup"]
+
+
 def test_hotnews_provider_maps_platform_items(monkeypatch):
     calls = []
 
@@ -2410,6 +2954,8 @@ def test_fetch_daily_news_candidates_auto_uses_hotnews_when_no_keyed_provider(mo
     monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing gnews")))
     monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing juhe")))
     monkeypatch.setattr(daily_news, "_default_news_queries", lambda: ["technology", "world"])
+    monkeypatch.setattr(daily_news, "_google_rss_fetch_articles", lambda **_kwargs: [], raising=False)
+    monkeypatch.setattr(daily_news, "_bbc_rss_fetch_articles", lambda **_kwargs: [], raising=False)
     calls = []
 
     def fake_hotnews_fetch_articles(**kwargs):
@@ -2434,8 +2980,8 @@ def test_fetch_daily_news_candidates_auto_uses_hotnews_when_no_keyed_provider(mo
     assert candidates[0].title == "国内AI治理规则更新"
     assert meta["provider"] == "hotnews"
     assert meta["api_source"] == "hotnews"
-    assert meta["provider_plan"] == ["hotnews"]
-    assert meta["provider_attempts"] == ["hotnews"]
+    assert meta["provider_plan"] == ["google_rss_cn", "google_rss", "bbc_rss", "hotnews"]
+    assert meta["provider_attempts"] == ["google_rss_cn", "google_rss", "bbc_rss", "hotnews"]
     assert meta["source_api"]["provider"] == "hotnews"
     assert meta["source_api"]["base_url"] == "https://orz.ai/api/v1/dailynews"
     assert calls[0]["platforms"]
@@ -2452,6 +2998,8 @@ def test_fetch_daily_news_candidates_auto_uses_hotnews_after_keyed_provider_fail
     monkeypatch.delenv("JUHE_FINANCE_NEWS_APPKEY", raising=False)
     monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing gnews")))
     monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing juhe")))
+    monkeypatch.setattr(daily_news, "_google_rss_fetch_articles", lambda **_kwargs: [], raising=False)
+    monkeypatch.setattr(daily_news, "_bbc_rss_fetch_articles", lambda **_kwargs: [], raising=False)
 
     def fake_newsapi_fetch_articles(**_kwargs):
         raise TimeoutError("newsapi timed out")
@@ -2476,9 +3024,58 @@ def test_fetch_daily_news_candidates_auto_uses_hotnews_after_keyed_provider_fail
 
     assert candidates[0].title == "国际科技企业发布新服务"
     assert meta["provider"] == "hotnews"
-    assert meta["provider_plan"] == ["newsapi", "hotnews"]
-    assert meta["provider_attempts"] == ["newsapi", "hotnews"]
+    assert meta["provider_plan"] == ["newsapi", "google_rss_cn", "google_rss", "bbc_rss", "hotnews"]
+    assert meta["provider_attempts"] == ["newsapi", "google_rss_cn", "google_rss", "bbc_rss", "hotnews"]
     assert any("newsapi timed out" in err for err in meta["provider_errors"])
+
+
+def test_fetch_daily_news_candidates_auto_aggregates_fallback_sources_until_raw_target(monkeypatch):
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.delenv("NEWS_CANDIDATES_FILE", raising=False)
+    for name in (
+        "NEWS_API_KEY",
+        "NEWSAPI_API_KEY",
+        "GNEWS_API_KEY",
+        "GNEWS_TOKEN",
+        "JUHE_NEWS_APPKEY",
+        "JUHE_FINANCE_NEWS_APPKEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(daily_news, "_load_newsapi_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_build_prompt_news_queries", lambda _hint: ["query"])
+
+    def item(index: int, source: str) -> NewsItem:
+        return NewsItem(
+            title=f"query source story {index}",
+            url=f"https://{source}/story-{index}",
+            source=source,
+            domain=source,
+            description="A dated, traceable story.",
+            seendate=_recent_news_seendate(0),
+            language="en",
+        )
+
+    monkeypatch.setattr(
+        daily_news,
+        "_google_rss_fetch_articles",
+        lambda **kwargs: [item(1 if kwargs.get("country") == "CN" else 2, "google.example")],
+        raising=False,
+    )
+    monkeypatch.setattr(daily_news, "_bbc_rss_fetch_articles", lambda **_kwargs: [item(3, "bbc.example")], raising=False)
+    monkeypatch.setattr(daily_news, "_hotnews_fetch_articles", lambda **_kwargs: [], raising=False)
+
+    candidates, meta = daily_news.fetch_daily_news_candidates(
+        "query",
+        max_records=3,
+        timeout_s=1,
+        exhaustive_sources=True,
+    )
+
+    assert len(candidates) == 3
+    assert meta["provider_attempts"][:3] == ["google_rss_cn", "google_rss", "bbc_rss"]
+    assert meta["provider"] == "google_rss_cn"
 
 
 def test_fetch_daily_news_candidates_auto_does_not_fallback_to_gdelt(monkeypatch):
@@ -2488,6 +3085,8 @@ def test_fetch_daily_news_candidates_auto_does_not_fallback_to_gdelt(monkeypatch
     monkeypatch.delenv("GNEWS_TOKEN", raising=False)
     monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing gnews")))
     monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing juhe")))
+    monkeypatch.setattr(daily_news, "_google_rss_fetch_articles", lambda **_kwargs: [], raising=False)
+    monkeypatch.setattr(daily_news, "_bbc_rss_fetch_articles", lambda **_kwargs: [], raising=False)
 
     def fake_newsapi_fetch_articles(**_kwargs):
         raise RuntimeError("newsapi timeout")

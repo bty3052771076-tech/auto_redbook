@@ -152,6 +152,16 @@ def test_xhs_not_found_page_is_not_ready_even_with_creator_shell_text():
     assert state == "not_found"
 
 
+def test_xhs_note_manager_metrics_page_is_ready_without_editor_selectors():
+    state = _classify_xhs_page_state(
+        "https://creator.xiaohongshu.com/new/note-manager",
+        "小红书创作服务平台",
+        "笔记管理\n全部 348\n已发布\n发布时间\n点赞\n评论\n收藏",
+    )
+
+    assert state == "ready"
+
+
 def test_wait_for_xhs_ready_fails_fast_on_not_found_page():
     calls = {"sleep": 0}
     ticks = iter([0, 0, 601])

@@ -203,6 +203,64 @@ def test_generate_ai_digest_brief_rewrites_generic_llm_items_from_source_trace(m
     assert "终端权限" in out.summary
 
 
+def test_generate_ai_digest_brief_restores_source_publish_time_when_llm_changes_it(monkeypatch):
+    item = AIUpdateItem(
+        title="DeepSeek-V4 预览版发布",
+        summary="DeepSeek-V4 预览版本正式上线并同步开源。",
+        source_name="DeepSeek",
+        source_type="official",
+        url="https://api-docs.deepseek.com/zh-cn/news/news260424",
+        published_at="2026-04-24",
+        vendor="DeepSeek",
+        product="DeepSeek-V4",
+        raw_excerpt="DeepSeek-V4 预览版发布 2026/04/24",
+        tags=["国内模型"],
+    )
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": """
+                    {
+                      "title": "每日AI讯息",
+                      "subtitle": "模型更新",
+                      "date": "2026-07-08",
+                      "items": [
+                        {
+                          "title": "DeepSeek-V4预览版发布",
+                          "summary": "DeepSeek-V4上线并开源，强化Agent与推理能力。",
+                          "source_name": "DeepSeek",
+                          "source_type": "official",
+                          "url": "https://api-docs.deepseek.com/zh-cn/news/news260424",
+                          "published_at": "2026-07-08",
+                          "vendor": "DeepSeek",
+                          "product": "DeepSeek-V4",
+                          "raw_excerpt": "DeepSeek-V4 预览版发布",
+                          "evidence_urls": [],
+                          "tags": ["国内模型"]
+                        }
+                      ],
+                      "source_summary": "主要来源：DeepSeek。"
+                    }
+                    """,
+                },
+            )()
+
+    monkeypatch.setattr("src.ai_digest.generate.init_chat_model", lambda *_args, **_kwargs: FakeModel())
+
+    brief = generate_ai_digest_brief_with_llm(
+        [LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.com", provider="test")],
+        [item],
+        target_count=1,
+        date="2026-07-08",
+    )
+
+    assert brief.items[0].published_at == "2026-04-24"
+
+
 def test_parse_ai_digest_brief_json_accepts_llm_output():
     raw = """
     {
@@ -268,7 +326,7 @@ def test_build_fallback_brief_uses_specific_source_content_for_english_updates()
     assert "后台智能体" in out.summary
 
 
-def test_build_fallback_brief_fills_missing_publish_time_from_brief_date():
+def test_build_fallback_brief_does_not_fabricate_missing_publish_time_from_brief_date():
     item = AIUpdateItem(
         title="GLM-5.2 模型发布，强化多模态理解、代码生成和复杂推理能力。",
         summary="GLM-5.2 模型发布，强化多模态理解、代码生成和复杂推理能力。",
@@ -284,7 +342,7 @@ def test_build_fallback_brief_fills_missing_publish_time_from_brief_date():
 
     brief = build_fallback_brief([item], target_count=1, date="2026-07-02")
 
-    assert brief.items[0].published_at == "2026-07-02"
+    assert brief.items[0].published_at == ""
 
 
 def test_build_fallback_brief_uses_url_slug_when_source_title_is_vendor_only():

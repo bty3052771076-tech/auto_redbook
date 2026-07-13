@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from threading import Barrier, BrokenBarrierError
 
 from src.ai_digest import collect as collect_mod
 from src.ai_digest.collect import collect_ai_digest_updates
@@ -8,6 +9,12 @@ from src.ai_digest.models import AIUpdateItem
 from src.ai_digest.rank import ai_digest_quota_counts
 from src.ai_digest.sources import AIDigestSource
 from src.news.daily_news import NewsItem
+from src.sources.health import (
+    SourceAttempt,
+    SourceHealthSnapshot,
+    load_source_health_snapshot,
+    save_source_health_snapshot,
+)
 
 
 def _item(title: str, source_type: str = "official") -> AIUpdateItem:
@@ -49,6 +56,236 @@ def test_collect_ai_digest_updates_skips_social_when_official_sources_are_enough
     assert meta["official_count"] == 8
     assert meta["social_backfill_used"] is False
     assert meta["aggregator_backfill_used"] is False
+
+
+def test_collect_ai_digest_skips_recent_timeout_and_persists_attempt_trace(tmp_path):
+    now = datetime(2026, 6, 30, 9, tzinfo=timezone.utc)
+    health_path = tmp_path / "source_health" / "ai_digest.json"
+    save_source_health_snapshot(
+        SourceHealthSnapshot(
+            collection="ai_digest",
+            generated_at=(now - timedelta(minutes=1)).isoformat(),
+            attempts=[
+                SourceAttempt(
+                    collection="ai_digest",
+                    source_name="timed-out",
+                    source_url="https://example.com/timed-out",
+                    tier="official_stream",
+                    status="timeout",
+                    checked_at=(now - timedelta(minutes=1)).isoformat(),
+                    elapsed_seconds=8.0,
+                    error="timed out",
+                )
+            ],
+        ),
+        health_path,
+    )
+    sources = [
+        AIDigestSource("timed-out", "official", "https://example.com/timed-out", "Timed", "rss"),
+        AIDigestSource("healthy", "official", "https://example.com/healthy", "Healthy", "rss"),
+    ]
+    calls: list[str] = []
+
+    def fake_fetch(source):
+        calls.append(source.name)
+        return [_item("healthy-release")]
+
+    items, meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=1,
+        min_official_count=1,
+        allow_social_backfill=False,
+        max_age_days=3,
+        now=now,
+        source_health_path=health_path,
+        source_cooldown_seconds=300,
+        persist_source_health=True,
+    )
+
+    assert [item.title for item in items] == ["healthy-release"]
+    assert calls == ["healthy"]
+    assert meta["source_health"]["cooldown_skipped"] == ["timed-out"]
+    healthy_attempt = next(
+        item for item in meta["source_health"]["attempts"] if item["source_name"] == "healthy"
+    )
+    assert healthy_attempt["status"] == "success"
+    assert healthy_attempt["item_count"] == 1
+    assert healthy_attempt["dated_count"] == 1
+    assert healthy_attempt["url_count"] == 1
+
+    persisted = load_source_health_snapshot(health_path)
+    assert persisted is not None
+    persisted_by_name = {item.source_name: item for item in persisted.attempts}
+    assert persisted_by_name["timed-out"].status == "timeout"
+    assert persisted_by_name["healthy"].status == "success"
+
+
+def test_collect_ai_digest_fetches_official_streams_before_pages():
+    calls: list[str] = []
+    sources = [
+        AIDigestSource(
+            "official-page",
+            "official",
+            "https://example.com/page",
+            "Page",
+            "html",
+            tier="official_page",
+        ),
+        AIDigestSource(
+            "official-stream",
+            "official",
+            "https://example.com/feed",
+            "Stream",
+            "rss",
+            tier="official_stream",
+        ),
+    ]
+
+    def fake_fetch(source):
+        calls.append(source.name)
+        return [_item(source.name)]
+
+    collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=2,
+        min_official_count=1,
+        max_age_days=3,
+        now=datetime(2026, 6, 30, 9, tzinfo=timezone.utc),
+    )
+
+    assert calls == ["official-stream", "official-page"]
+
+
+def test_collect_ai_digest_does_not_fetch_official_pages_when_streams_fill_the_pool():
+    calls: list[str] = []
+    sources = [
+        AIDigestSource(
+            "official-page",
+            "official",
+            "https://example.com/page",
+            "Page",
+            "html",
+            tier="official_page",
+        ),
+        AIDigestSource(
+            "official-stream",
+            "official",
+            "https://example.com/feed",
+            "Stream",
+            "rss",
+            tier="official_stream",
+        ),
+    ]
+
+    def fake_fetch(source):
+        calls.append(source.name)
+        return [_item("stream-1"), _item("stream-2")] if source.name == "official-stream" else [_item("page")]
+
+    items, meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=2,
+        min_official_count=1,
+        allow_social_backfill=False,
+        max_age_days=3,
+        now=datetime(2026, 6, 30, 9, tzinfo=timezone.utc),
+    )
+
+    assert calls == ["official-stream"]
+    assert len(items) == 2
+    assert meta["official_page_backfill_used"] is False
+
+
+def test_collect_ai_digest_fetches_same_stage_sources_concurrently_when_requested():
+    barrier = Barrier(2)
+    sources = [
+        AIDigestSource(
+            "stream-a",
+            "official",
+            "https://example.com/a",
+            "A",
+            "rss",
+            tier="official_stream",
+        ),
+        AIDigestSource(
+            "stream-b",
+            "official",
+            "https://example.com/b",
+            "B",
+            "rss",
+            tier="official_stream",
+        ),
+    ]
+
+    def fake_fetch(source):
+        try:
+            barrier.wait(timeout=0.5)
+        except BrokenBarrierError:
+            return []
+        return [_item(source.name)]
+
+    items, _meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=2,
+        min_official_count=1,
+        max_age_days=3,
+        now=datetime(2026, 6, 30, 9, tzinfo=timezone.utc),
+        source_concurrency=2,
+        batch_timeout_s=1.0,
+    )
+
+    assert {item.title for item in items} == {"stream-a", "stream-b"}
+
+
+def test_collect_ai_digest_marks_source_with_only_missing_dates_as_missing_date():
+    source = AIDigestSource(
+        "missing-date",
+        "official",
+        "https://example.com/missing-date",
+        "Missing date",
+        "rss",
+        tier="official_stream",
+    )
+    missing_date = _item("undated-release").model_copy(update={"published_at": ""})
+
+    _items, meta = collect_ai_digest_updates(
+        sources=[source],
+        fetch_source=lambda _source: [missing_date],
+        target_count=1,
+        min_official_count=1,
+        allow_social_backfill=False,
+        max_age_days=3,
+        now=datetime(2026, 6, 30, 9, tzinfo=timezone.utc),
+    )
+
+    assert meta["source_health"]["attempts"][0]["status"] == "missing_date"
+
+
+def test_collect_ai_digest_marks_source_with_only_old_items_as_stale():
+    source = AIDigestSource(
+        "stale-source",
+        "official",
+        "https://example.com/stale",
+        "Stale",
+        "rss",
+        tier="official_stream",
+    )
+    stale_item = _item("old-release").model_copy(update={"published_at": "2026-06-20T08:00:00Z"})
+
+    _items, meta = collect_ai_digest_updates(
+        sources=[source],
+        fetch_source=lambda _source: [stale_item],
+        target_count=1,
+        min_official_count=1,
+        allow_social_backfill=False,
+        max_age_days=3,
+        now=datetime(2026, 6, 30, 9, tzinfo=timezone.utc),
+    )
+
+    assert meta["source_health"]["attempts"][0]["status"] == "stale"
 
 
 def test_collect_ai_digest_updates_uses_social_backfill_when_official_sources_are_few():

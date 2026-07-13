@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from src.ai_digest import collect as collect_mod
 from src.ai_digest import fetchers
 from src.ai_digest.fetchers import (
     parse_aihot_daily_html,
@@ -9,6 +12,42 @@ from src.ai_digest.fetchers import (
     parse_social_search_html,
 )
 from src.ai_digest.sources import default_ai_digest_sources, resolve_ai_digest_sources
+
+
+def test_curl_transport_enforces_connect_and_total_time_limits(monkeypatch):
+    calls: list[tuple[list[str], dict]] = []
+
+    class Completed:
+        returncode = 0
+        stdout = b"<rss><channel /></rss>\n200"
+        stderr = b""
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return Completed()
+
+    monkeypatch.setattr(collect_mod.subprocess, "run", fake_run)
+
+    text = collect_mod._curl_get_text("https://example.com/feed", timeout_s=7.0, executable="curl.exe")
+
+    assert text == "<rss><channel /></rss>"
+    assert "--connect-timeout" in calls[0][0]
+    assert "--max-time" in calls[0][0]
+    assert calls[0][1]["timeout"] > 7.0
+
+
+def test_curl_transport_surfaces_http_status(monkeypatch):
+    class Completed:
+        returncode = 0
+        stdout = b"not found\n404"
+        stderr = b""
+
+    monkeypatch.setattr(collect_mod.subprocess, "run", lambda *_args, **_kwargs: Completed())
+
+    with pytest.raises(collect_mod.HTTPError) as exc_info:
+        collect_mod._curl_get_text("https://example.com/missing", timeout_s=5.0, executable="curl.exe")
+
+    assert exc_info.value.code == 404
 
 
 def test_default_sources_include_expandable_official_and_social_groups():
@@ -30,6 +69,17 @@ def test_default_sources_include_expandable_official_and_social_groups():
     assert any(source.kind == "social" for source in sources)
     assert any(source.kind == "search" for source in sources)
     assert all(source.enabled for source in sources if source.kind == "official")
+
+
+def test_default_sources_use_current_official_pages_when_legacy_rss_endpoints_are_retired():
+    by_name = {source.name: source for source in default_ai_digest_sources()}
+
+    assert by_name["anthropic"].url == "https://www.anthropic.com/news"
+    assert by_name["anthropic"].parser == "html"
+    assert by_name["metaai"].url == "https://ai.meta.com/blog"
+    assert by_name["metaai"].parser == "html"
+    assert by_name["microsoft"].url == "https://blogs.microsoft.com/"
+    assert by_name["microsoft"].parser == "html"
 
 
 def test_default_sources_expand_model_labs_and_keep_huggingface_as_final_aggregator():
@@ -285,6 +335,25 @@ def test_parse_official_html_extracts_publish_date_from_release_line():
     assert items[0].published_at == "2026-07-02"
 
 
+def test_parse_official_html_extracts_english_publish_date_from_nearby_line():
+    html = """
+    <html><body>
+      <p>Jul 10, 2026</p>
+      <p>Anthropic announces a Claude model update for developers and agent workflows.</p>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="Anthropic",
+        vendor="Anthropic",
+        base_url="https://www.anthropic.com/news",
+    )
+
+    assert items
+    assert items[0].published_at == "2026-07-10"
+
+
 def test_parse_official_html_applies_nearby_publish_date_heading_to_release_line():
     parse_official_html = getattr(fetchers, "parse_official_html", None)
     assert parse_official_html is not None
@@ -350,7 +419,7 @@ def test_parse_official_html_uses_published_at_millis_for_release_title():
     assert items[0].published_at == "2026-07-03"
 
 
-def test_parse_official_html_uses_page_now_for_release_banner_when_no_other_date():
+def test_parse_official_html_does_not_use_page_now_for_release_banner_when_no_other_date():
     parse_official_html = getattr(fetchers, "parse_official_html", None)
     assert parse_official_html is not None
     html = """
@@ -368,7 +437,28 @@ def test_parse_official_html_uses_page_now_for_release_banner_when_no_other_date
     )
 
     assert items
-    assert items[0].published_at == "2026-06-26"
+    assert items[0].published_at == ""
+
+
+def test_parse_official_html_keeps_deepseek_article_publish_date_not_runtime_now():
+    html = """
+    <html><body>
+      <nav>DeepSeek-V4 预览版发布 2026/04/24</nav>
+      <h1>DeepSeek-V4 预览版：迈入百万上下文普惠时代</h1>
+      <p>今天，我们全新系列模型 DeepSeek-V4 的预览版本正式上线并同步开源。</p>
+      <script>{"now":"$D2026-07-08T06:13:58.756Z"}</script>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="DeepSeek",
+        vendor="DeepSeek",
+        base_url="https://api-docs.deepseek.com/zh-cn/news/news260424",
+    )
+
+    assert items
+    assert {item.published_at for item in items} == {"2026-04-24"}
 
 
 def test_parse_official_html_filters_common_doc_navigation_noise():

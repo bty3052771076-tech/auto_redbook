@@ -32,10 +32,61 @@ def _parse_datetime(value: str) -> str:
         return text
 
 
+_ENGLISH_MONTHS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+_ENGLISH_MONTH_PATTERN = "|".join(sorted(_ENGLISH_MONTHS, key=len, reverse=True))
+
+
+def _english_release_date(value: str) -> str:
+    patterns = (
+        rf"\b(?P<month>{_ENGLISH_MONTH_PATTERN})\.?\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?[,]?\s+(?P<year>20\d{{2}})\b",
+        rf"\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\s+(?P<month>{_ENGLISH_MONTH_PATTERN})\.?[,]?\s+(?P<year>20\d{{2}})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, value, flags=re.IGNORECASE)
+        if not match:
+            continue
+        month = _ENGLISH_MONTHS.get(match.group("month").lower())
+        if month is None:
+            continue
+        try:
+            return datetime(int(match.group("year")), month, int(match.group("day"))).date().isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
 def _extract_release_date(text: str) -> str:
     value = re.sub(r"\s+", " ", text or "").strip()
     if not value:
         return ""
+    english_date = _english_release_date(value)
+    if english_date:
+        return english_date
     match = re.search(r"(?P<y>20\d{2})[年/-](?P<m>\d{1,2})[月/-](?P<d>\d{1,2})日?", value)
     if match:
         return f"{int(match.group('y')):04d}-{int(match.group('m')):02d}-{int(match.group('d')):02d}"
@@ -78,9 +129,6 @@ def _extract_page_release_date(html_text: str) -> str:
         except (OverflowError, ValueError, OSError):
             pass
 
-    now_match = re.search(r'\\?"now\\?"\s*:\s*\\?"\$D(?P<ts>20\d{2}-\d{2}-\d{2})T', raw)
-    if now_match and any(signal in raw for signal in _OFFICIAL_HTML_RELEASE_SIGNALS):
-        return now_match.group("ts")
     return ""
 
 
@@ -324,6 +372,35 @@ def _limit_page_release_items(items: list[AIUpdateItem], page_release_date: str)
     return selected[:1] or ranked[:1]
 
 
+def _with_published_at(item: AIUpdateItem, published_at: str) -> AIUpdateItem:
+    data = item.model_dump()
+    data["published_at"] = published_at
+    return AIUpdateItem.model_validate(data)
+
+
+def _apply_page_release_date(items: list[AIUpdateItem], page_release_date: str) -> list[AIUpdateItem]:
+    """Use article-level dates only when item-level dates are absent.
+
+    Listing pages and home pages often expose a page render time that is not the
+    release time of each visible model update. Keep undated snippets undated
+    unless an explicit article date is available, and then attach it to only the
+    strongest release-like candidate.
+    """
+    if not page_release_date or not items:
+        return items
+    if any(item.published_at for item in items):
+        return _limit_page_release_items(items, page_release_date)
+    ranked = sorted(
+        items,
+        key=lambda item: (_official_release_signal_score(item), -len(item.title or "")),
+        reverse=True,
+    )
+    selected = ranked[:1] if len(ranked) > 1 else ranked
+    if not selected or _official_release_signal_score(selected[0]) <= 0:
+        return items
+    return [_with_published_at(item, page_release_date) for item in selected]
+
+
 def parse_official_html(
     html_text: str,
     *,
@@ -355,7 +432,7 @@ def parse_official_html(
                 source_name=source_name,
                 source_type="official",
                 url=base_url,
-                published_at=line_date or current_date or page_release_date,
+                published_at=line_date or current_date,
                 vendor=vendor,
                 product="",
                 raw_excerpt=line,
@@ -366,7 +443,7 @@ def parse_official_html(
             break
 
     if items:
-        return _limit_page_release_items(items, page_release_date)
+        return _apply_page_release_date(items, page_release_date)
 
     parser = _LinkCollector()
     parser.feed(html_text or "")
@@ -385,7 +462,7 @@ def parse_official_html(
                 source_name=source_name,
                 source_type="official",
                 url=urljoin(base_url, href),
-                published_at=_extract_release_date(text) or page_release_date,
+                published_at=_extract_release_date(text),
                 vendor=vendor,
                 product="",
                 raw_excerpt=text,
@@ -395,7 +472,7 @@ def parse_official_html(
         if len(items) >= 30:
             break
 
-    return items
+    return _apply_page_release_date(items, page_release_date)
 
 
 class _LinkCollector(HTMLParser):

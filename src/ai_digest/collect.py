@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 import os
+from pathlib import Path
+import shutil
+import subprocess
+import time
+from urllib.error import HTTPError, URLError
 import urllib.request
-from typing import Callable
+from typing import Any, Callable
 
 import certifi
 
@@ -17,6 +23,13 @@ from .fetchers import (
 from .models import AIUpdateItem
 from .rank import ai_digest_quota_counts, dedupe_ai_updates, filter_recent_ai_updates, rank_ai_updates
 from .sources import AIDigestSource, resolve_ai_digest_sources
+from src.sources.health import (
+    SourceAttempt,
+    SourceHealthSnapshot,
+    is_source_in_cooldown,
+    load_source_health_snapshot,
+    save_source_health_snapshot,
+)
 
 
 FetchSource = Callable[[AIDigestSource], list[AIUpdateItem]]
@@ -38,12 +51,138 @@ def _env_float(name: str, default: float, *, min_value: float, max_value: float)
     return max(min_value, min(max_value, value))
 
 
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = int(raw) if raw else int(default)
+    except ValueError:
+        value = int(default)
+    return max(min_value, min(max_value, value))
+
+
+def _health_checked_at(now: datetime | date | None) -> datetime:
+    if isinstance(now, datetime):
+        value = now
+    elif isinstance(now, date):
+        value = datetime.combine(now, datetime.min.time())
+    else:
+        value = datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _health_timestamp(value: datetime) -> str:
+    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _source_error_status(exc: Exception) -> str:
+    text = str(exc).lower()
+    if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+        return "timeout"
+    if isinstance(exc, HTTPError):
+        return "http_error"
+    if isinstance(exc, URLError) or "connection" in text or "network" in text:
+        return "transport_error"
+    return "error"
+
+
+def _source_item_counts(items: list[AIUpdateItem]) -> tuple[int, int, int]:
+    item_count = len(items)
+    dated_count = sum(1 for item in items if str(item.published_at or "").strip())
+    url_count = sum(1 for item in items if str(item.url or "").strip())
+    return item_count, dated_count, url_count
+
+
+def _source_result_status(
+    items: list[AIUpdateItem],
+    *,
+    max_age_days: int | None,
+    now: datetime | date | None,
+) -> str:
+    item_count, dated_count, _url_count = _source_item_counts(items)
+    if not item_count:
+        return "empty"
+    if not dated_count:
+        return "missing_date"
+    if max_age_days is not None and not filter_recent_ai_updates(
+        items,
+        max_age_days=max_age_days,
+        now=now,
+        require_url=False,
+    ):
+        return "stale"
+    return "success"
+
+
 def _emit_progress(progress: ProgressCallback | None, stage: str, detail: str) -> None:
     if progress is not None:
         progress(stage, detail)
 
 
+def _curl_executable() -> str:
+    if os.name != "nt":
+        return ""
+    return shutil.which("curl.exe") or ""
+
+
+def _curl_get_text(url: str, *, timeout_s: float, executable: str) -> str:
+    total_timeout = max(1.0, float(timeout_s))
+    connect_timeout = min(5.0, total_timeout)
+    args = [
+        executable,
+        "--location",
+        "--silent",
+        "--show-error",
+        "--compressed",
+        "--max-redirs",
+        "5",
+        "--connect-timeout",
+        f"{connect_timeout:.1f}",
+        "--max-time",
+        f"{total_timeout:.1f}",
+        "--max-filesize",
+        "1500000",
+        "--user-agent",
+        "Mozilla/5.0 (AutoRedbook AI Digest)",
+        "--write-out",
+        "\n%{http_code}",
+        url,
+    ]
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            check=False,
+            timeout=total_timeout + 2.0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"curl timed out after {total_timeout:.1f}s for {url}") from exc
+
+    raw = bytes(result.stdout or b"")
+    body, separator, status_text = raw.rpartition(b"\n")
+    status = 0
+    if separator:
+        try:
+            status = int(status_text.strip() or b"0")
+        except ValueError:
+            body = raw
+    else:
+        body = raw
+    error_text = bytes(result.stderr or b"").decode("utf-8", errors="replace").strip()
+    if status >= 400:
+        raise HTTPError(url, status, error_text or f"HTTP {status}", hdrs=None, fp=None)
+    if result.returncode != 0:
+        raise URLError(error_text or f"curl exited with code {result.returncode} for {url}")
+    if status and not 200 <= status < 400:
+        raise HTTPError(url, status, f"HTTP {status}", hdrs=None, fp=None)
+    return body[:1_500_000].decode("utf-8", errors="replace")
+
+
 def _http_get_text(url: str, *, timeout_s: float = 12.0) -> str:
+    curl_executable = _curl_executable()
+    if curl_executable:
+        return _curl_get_text(url, timeout_s=timeout_s, executable=curl_executable)
     req = urllib.request.Request(
         url,
         headers={"User-Agent": "Mozilla/5.0 (AutoRedbook AI Digest)"},
@@ -274,9 +413,43 @@ def collect_ai_digest_updates(
     include_pool_items: bool = False,
     force_search_backfill: bool = False,
     progress: ProgressCallback | None = None,
+    source_health_path: str | Path | None = None,
+    source_cooldown_seconds: int | None = None,
+    persist_source_health: bool | None = None,
+    source_concurrency: int | None = None,
+    batch_timeout_s: float | None = None,
 ) -> tuple[list[AIUpdateItem], dict]:
     resolved = sources if sources is not None else resolve_ai_digest_sources()
     source_timeout_s = _env_float("AI_DIGEST_SOURCE_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
+    cooldown_seconds = (
+        _env_int("AI_DIGEST_SOURCE_COOLDOWN_S", 300, min_value=0, max_value=3600)
+        if source_cooldown_seconds is None
+        else max(0, int(source_cooldown_seconds))
+    )
+    if source_concurrency is None:
+        source_concurrency = 1 if fetch_source is not None else _env_int(
+            "AI_DIGEST_SOURCE_CONCURRENCY",
+            4,
+            min_value=1,
+            max_value=12,
+        )
+    else:
+        source_concurrency = max(1, min(int(source_concurrency), 12))
+    if batch_timeout_s is None:
+        batch_timeout_s = _env_float("AI_DIGEST_BATCH_TIMEOUT_S", 45.0, min_value=5.0, max_value=120.0)
+    else:
+        batch_timeout_s = max(0.1, float(batch_timeout_s))
+    health_path = Path(source_health_path) if source_health_path else None
+    should_persist_health = bool(health_path) if persist_source_health is None else bool(persist_source_health)
+    previous_health = load_source_health_snapshot(health_path) if health_path else None
+    persisted_attempts = {
+        attempt.source_name: attempt
+        for attempt in (previous_health.attempts if previous_health is not None else [])
+        if attempt.source_name
+    }
+    health_now = _health_checked_at(now)
+    health_attempts: list[SourceAttempt] = []
+    cooldown_skipped: list[str] = []
 
     def _fetch_with_window(source: AIDigestSource) -> list[AIUpdateItem]:
         if fetch_source is not None:
@@ -284,22 +457,157 @@ def collect_ai_digest_updates(
         return fetch_ai_digest_source(source, max_age_days=max_age_days, timeout_s=source_timeout_s)
 
     fetcher = _fetch_with_window
-    official_sources = [source for source in resolved if source.kind in {"official", "github"}]
+    official_candidates = [source for source in resolved if source.kind in {"official", "github"}]
+    official_stream_sources = [source for source in official_candidates if source.tier == "official_stream"]
+    official_page_sources = [
+        source for source in official_candidates if source.tier != "official_stream"
+    ]
     social_sources = [source for source in resolved if source.kind in {"social", "search"}]
     aggregator_sources = [source for source in resolved if source.kind == "aggregator"]
     fetched: list[AIUpdateItem] = []
     errors: list[str] = []
 
-    for source in official_sources:
-        try:
-            _emit_progress(progress, "fetch_source", f"in_progress name={source.name} kind={source.kind}")
-            source_items = fetcher(source)
-            fetched.extend(source_items)
-            _emit_progress(progress, "fetch_source", f"success name={source.name} items={len(source_items)}")
-        except Exception as exc:
-            errors.append(f"{source.name}: {exc}")
-            _emit_progress(progress, "fetch_source", f"failed name={source.name} error={exc}")
+    def _record_source_result(
+        source: AIDigestSource,
+        checked_at: str,
+        elapsed: float,
+        source_items: list[AIUpdateItem],
+        error: Exception | None,
+    ) -> None:
+        if error is not None:
+            attempt = SourceAttempt(
+                collection="ai_digest",
+                source_name=source.name,
+                source_url=source.url,
+                tier=source.tier,
+                status=_source_error_status(error),
+                checked_at=checked_at,
+                elapsed_seconds=elapsed,
+                error=str(error),
+                http_status=getattr(error, "code", None),
+            )
+            health_attempts.append(attempt)
+            persisted_attempts[source.name] = attempt
+            errors.append(f"{source.name}: {error}")
+            _emit_progress(progress, "fetch_source", f"failed name={source.name} error={error}")
+            return
+        item_count, dated_count, url_count = _source_item_counts(source_items)
+        attempt = SourceAttempt(
+            collection="ai_digest",
+            source_name=source.name,
+            source_url=source.url,
+            tier=source.tier,
+            status=_source_result_status(source_items, max_age_days=max_age_days, now=now),
+            checked_at=checked_at,
+            elapsed_seconds=elapsed,
+            item_count=item_count,
+            dated_count=dated_count,
+            url_count=url_count,
+        )
+        health_attempts.append(attempt)
+        persisted_attempts[source.name] = attempt
+        fetched.extend(source_items)
+        _emit_progress(
+            progress,
+            "fetch_source",
+            f"success name={source.name} items={item_count} dated={dated_count} urls={url_count}",
+        )
 
+    def _fetch_one(source: AIDigestSource) -> tuple[str, float, list[AIUpdateItem], Exception | None]:
+        started = time.perf_counter()
+        try:
+            source_items = fetcher(source)
+            return _health_timestamp(health_now), time.perf_counter() - started, source_items, None
+        except Exception as exc:
+            return _health_timestamp(health_now), time.perf_counter() - started, [], exc
+
+    def _fetch_stage(stage_sources: list[AIDigestSource]) -> None:
+        eligible: list[AIDigestSource] = []
+        for source in stage_sources:
+            previous_attempt = persisted_attempts.get(source.name)
+            if is_source_in_cooldown(
+                previous_attempt,
+                now=health_now,
+                cooldown_seconds=cooldown_seconds,
+            ):
+                cooldown_skipped.append(source.name)
+                health_attempts.append(
+                    SourceAttempt(
+                        collection="ai_digest",
+                        source_name=source.name,
+                        source_url=source.url,
+                        tier=source.tier,
+                        status="cooldown",
+                        checked_at=previous_attempt.checked_at if previous_attempt is not None else _health_timestamp(health_now),
+                        elapsed_seconds=0.0,
+                        item_count=previous_attempt.item_count if previous_attempt is not None else 0,
+                        dated_count=previous_attempt.dated_count if previous_attempt is not None else 0,
+                        url_count=previous_attempt.url_count if previous_attempt is not None else 0,
+                        error=previous_attempt.error if previous_attempt is not None else "",
+                        http_status=previous_attempt.http_status if previous_attempt is not None else None,
+                    )
+                )
+                _emit_progress(progress, "fetch_source", f"skipped_cooldown name={source.name} tier={source.tier}")
+                continue
+            eligible.append(source)
+            _emit_progress(progress, "fetch_source", f"in_progress name={source.name} kind={source.kind}")
+        if not eligible:
+            return
+        if source_concurrency <= 1 or len(eligible) == 1:
+            for source in eligible:
+                checked_at, elapsed, source_items, error = _fetch_one(source)
+                _record_source_result(source, checked_at, elapsed, source_items, error)
+            return
+
+        executor = ThreadPoolExecutor(max_workers=min(source_concurrency, len(eligible)))
+        futures = {executor.submit(_fetch_one, source): source for source in eligible}
+        results: dict[AIDigestSource, tuple[str, float, list[AIUpdateItem], Exception | None]] = {}
+        try:
+            done, pending = wait(futures, timeout=batch_timeout_s)
+            for future in done:
+                source = futures[future]
+                try:
+                    results[source] = future.result()
+                except Exception as exc:
+                    results[source] = (_health_timestamp(health_now), batch_timeout_s, [], exc)
+            for future in pending:
+                future.cancel()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        for source in eligible:
+            result = results.get(source)
+            if result is None:
+                timeout_error = TimeoutError(f"source batch deadline exceeded after {batch_timeout_s:.1f}s")
+                _record_source_result(
+                    source,
+                    _health_timestamp(health_now),
+                    batch_timeout_s,
+                    [],
+                    timeout_error,
+                )
+                continue
+            checked_at, elapsed, source_items, error = result
+            _record_source_result(source, checked_at, elapsed, source_items, error)
+
+    _fetch_stage(official_stream_sources)
+    stream_ranked = rank_ai_updates(
+        fetched,
+        target_count=target_count,
+        min_official_count=min_official_count,
+        allow_social_backfill=False,
+        max_age_days=max_age_days,
+        now=now,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+    )
+    official_page_backfill_used = bool(official_page_sources) and _needs_search_backfill(
+        stream_ranked,
+        target_count=target_count,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+    )
+    if official_page_backfill_used:
+        _fetch_stage(official_page_sources)
     official_ranked = rank_ai_updates(
         fetched,
         target_count=target_count,
@@ -318,15 +626,7 @@ def collect_ai_digest_updates(
 
     if allow_social_backfill and official_count < min_official_count:
         social_backfill_used = True
-        for source in social_sources:
-            try:
-                _emit_progress(progress, "fetch_source", f"in_progress name={source.name} kind={source.kind}")
-                source_items = fetcher(source)
-                fetched.extend(source_items)
-                _emit_progress(progress, "fetch_source", f"success name={source.name} items={len(source_items)}")
-            except Exception as exc:
-                errors.append(f"{source.name}: {exc}")
-                _emit_progress(progress, "fetch_source", f"failed name={source.name} error={exc}")
+        _fetch_stage(social_sources)
 
     ranked = rank_ai_updates(
         fetched,
@@ -382,15 +682,7 @@ def collect_ai_digest_updates(
         )
     ):
         aggregator_backfill_used = True
-        for source in aggregator_sources:
-            try:
-                _emit_progress(progress, "fetch_source", f"in_progress name={source.name} kind={source.kind}")
-                source_items = fetcher(source)
-                fetched.extend(source_items)
-                _emit_progress(progress, "fetch_source", f"success name={source.name} items={len(source_items)}")
-            except Exception as exc:
-                errors.append(f"{source.name}: {exc}")
-                _emit_progress(progress, "fetch_source", f"failed name={source.name} error={exc}")
+        _fetch_stage(aggregator_sources)
         ranked = rank_ai_updates(
             fetched,
             target_count=target_count,
@@ -408,6 +700,14 @@ def collect_ai_digest_updates(
         require_url=True,
     )
     deduped_items = dedupe_ai_updates(fresh_items)
+    health_snapshot_path = ""
+    if health_path is not None and should_persist_health:
+        snapshot = SourceHealthSnapshot(
+            collection="ai_digest",
+            generated_at=_health_timestamp(health_now),
+            attempts=sorted(persisted_attempts.values(), key=lambda item: item.source_name),
+        )
+        health_snapshot_path = str(save_source_health_snapshot(snapshot, health_path))
     meta = {
         "target_count": target_count,
         "min_official_count": min_official_count,
@@ -420,6 +720,7 @@ def collect_ai_digest_updates(
         "duplicate_removed_count": max(0, len(fresh_items) - len(deduped_items)),
         "ranked_count": len(ranked),
         "official_count": official_count,
+        "official_page_backfill_used": official_page_backfill_used,
         "social_backfill_used": social_backfill_used,
         "search_backfill_used": search_backfill_used,
         "aggregator_backfill_used": aggregator_backfill_used,
@@ -427,6 +728,13 @@ def collect_ai_digest_updates(
         "quota_counts": ai_digest_quota_counts(ranked),
         "sources": [source.name for source in resolved],
         "errors": errors,
+        "source_health": {
+            "enabled": health_path is not None,
+            "snapshot_path": health_snapshot_path or (str(health_path) if health_path is not None else ""),
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_skipped": cooldown_skipped,
+            "attempts": [attempt.to_dict() for attempt in health_attempts],
+        },
     }
     if include_pool_items:
         meta["_fetched_items"] = list(fetched)

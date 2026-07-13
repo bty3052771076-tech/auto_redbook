@@ -62,6 +62,17 @@ _MODEL_TOPIC_RE = re.compile(
     r"genebench|scarfbench|discoformer|benchmark|bench|eval)\b",
     flags=re.IGNORECASE,
 )
+_MODEL_FAMILY_VERSION_RE = re.compile(
+    r"\b(?P<family>deepseek|glm|qwen|gpt|claude|gemini|gemma|doubao|seedream|kimi|minimax|ernie|llama|mistral)"
+    r"[\s._-]*(?:v)?(?P<version>\d+(?:\.\d+)?)\b",
+    flags=re.IGNORECASE,
+)
+_MODEL_VARIANT_RE = re.compile(
+    r"\b(?:deepseek|glm|qwen|gpt|claude|gemini|gemma|doubao|seedream|kimi|minimax|ernie|llama|mistral)"
+    r"[\s._-]*(?:v)?\d+(?:\.\d+)?[\s._-]+(?P<suffix>[a-z0-9]+)\b",
+    flags=re.IGNORECASE,
+)
+_MODEL_FAMILY_MERGED_SUFFIXES = {"pro", "max", "flash", "lite", "preview", "exp", "speciale"}
 _MODEL_RELEASE_MARKERS = (
     "模型",
     "版本",
@@ -371,7 +382,35 @@ def _product_topic_key(item: AIUpdateItem) -> str:
     return ""
 
 
+def _model_family_topic_key(item: AIUpdateItem) -> str:
+    text = " ".join(
+        part.strip()
+        for part in (
+            item.product,
+            item.title,
+            item.summary,
+            item.raw_excerpt,
+            _url_topic_text(item.url),
+        )
+        if part and part.strip()
+    )
+    match = _MODEL_FAMILY_VERSION_RE.search(text)
+    if not match:
+        return ""
+    family = _normalize_token(match.group("family"))
+    version = _normalize_token(match.group("version"))
+    if not family or not version:
+        return ""
+    suffix_match = _MODEL_VARIANT_RE.search(text)
+    suffix = _normalize_token(suffix_match.group("suffix")) if suffix_match else ""
+    suffix_part = f"-{suffix}" if suffix and suffix not in _MODEL_FAMILY_MERGED_SUFFIXES else ""
+    return f"model:{family}-{version}{suffix_part}"
+
+
 def _semantic_topic_key(item: AIUpdateItem) -> str:
+    model_family_key = _model_family_topic_key(item)
+    if model_family_key:
+        return model_family_key
     product_key = _product_topic_key(item)
     if product_key:
         return product_key

@@ -28,6 +28,7 @@ from src.config import (
     VOLCENGINE_AVAILABLE_LLM_MODELS,
 )
 from src.storage.files import latest_execution, published_metrics_paths
+from src.sources.health import SourceHealthSnapshot, load_source_health_snapshot
 from src.workflow.create_post import DEFAULT_EVALUATION_VIEWPOINT
 
 
@@ -171,6 +172,38 @@ class QuotaDashboardRow:
     display_value: str = "未知"
     source_mode: str = ""
     snapshot_name: str = ""
+
+
+@dataclass(frozen=True)
+class SourceHealthDashboardRow:
+    collection: str
+    source_name: str
+    source_url: str = ""
+    tier: str = ""
+    status: str = "unknown"
+    checked_at: str = ""
+    elapsed_seconds: float = 0.0
+    item_count: int = 0
+    dated_count: int = 0
+    url_count: int = 0
+    error: str = ""
+    http_status: int | None = None
+    snapshot_name: str = ""
+
+
+_SOURCE_HEALTH_COLLECTION_ORDER = {"daily_news": 0, "ai_digest": 1}
+_SOURCE_HEALTH_STATUS_ORDER = {
+    "timeout": 0,
+    "transport_error": 1,
+    "http_error": 2,
+    "error": 3,
+    "cooldown": 4,
+    "missing_date": 5,
+    "stale": 6,
+    "empty": 7,
+    "success": 8,
+    "unknown": 9,
+}
 
 
 _QUOTA_PROVIDER_ORDER = {"aliyun": 0, "volcengine": 1}
@@ -925,6 +958,175 @@ def load_latest_quota_snapshots(
     return snapshots
 
 
+def source_health_collection_label(collection: str) -> str:
+    labels = {
+        "daily_news": "每日新闻",
+        "ai_digest": "每日AI讯息",
+    }
+    return labels.get((collection or "").strip().lower(), collection or "未知采集")
+
+
+def source_health_status_label(status: str) -> str:
+    labels = {
+        "success": "正常",
+        "empty": "无结果",
+        "missing_date": "缺发布日期",
+        "stale": "内容过期",
+        "cooldown": "冷却中",
+        "timeout": "请求超时",
+        "transport_error": "网络错误",
+        "http_error": "网页错误",
+        "error": "采集错误",
+        "unknown": "未知",
+    }
+    return labels.get((status or "").strip().lower(), status or "未知")
+
+
+def source_health_coverage_text(row: SourceHealthDashboardRow) -> str:
+    if row.item_count <= 0:
+        return "0 条"
+    return f"{row.item_count} 条 / 日期 {row.dated_count} / 链接 {row.url_count}"
+
+
+def load_latest_source_health_snapshots(
+    *,
+    source_dir: Path | None = None,
+    collections: Iterable[str] = ("daily_news", "ai_digest"),
+) -> dict[str, SourceHealthSnapshot]:
+    root = source_dir or PROJECT_ROOT / "data" / "source_health"
+    snapshots: dict[str, SourceHealthSnapshot] = {}
+    for collection in collections:
+        name = str(collection or "").strip()
+        if not name:
+            continue
+        snapshot = load_source_health_snapshot(root / f"{name}.json")
+        if snapshot is None or not snapshot.attempts:
+            continue
+        snapshots[name] = snapshot
+    return snapshots
+
+
+def build_source_health_dashboard_rows(
+    snapshots: Mapping[str, SourceHealthSnapshot],
+) -> list[SourceHealthDashboardRow]:
+    rows: list[SourceHealthDashboardRow] = []
+    for fallback_collection, snapshot in snapshots.items():
+        collection = str(snapshot.collection or fallback_collection or "").strip() or "unknown"
+        for attempt in snapshot.attempts:
+            if not attempt.source_name:
+                continue
+            rows.append(
+                SourceHealthDashboardRow(
+                    collection=collection,
+                    source_name=attempt.source_name,
+                    source_url=attempt.source_url,
+                    tier=attempt.tier,
+                    status=attempt.status,
+                    checked_at=attempt.checked_at,
+                    elapsed_seconds=attempt.elapsed_seconds,
+                    item_count=attempt.item_count,
+                    dated_count=attempt.dated_count,
+                    url_count=attempt.url_count,
+                    error=attempt.error,
+                    http_status=attempt.http_status,
+                    snapshot_name=f"{collection}.json",
+                )
+            )
+    return sorted(rows, key=_source_health_default_sort_key)
+
+
+def _source_health_default_sort_key(row: SourceHealthDashboardRow) -> tuple[int, int, str]:
+    return (
+        _SOURCE_HEALTH_COLLECTION_ORDER.get((row.collection or "").strip().lower(), 99),
+        _SOURCE_HEALTH_STATUS_ORDER.get((row.status or "").strip().lower(), 99),
+        (row.source_name or "").strip().lower(),
+    )
+
+
+def _source_health_search_blob(row: SourceHealthDashboardRow) -> str:
+    return " ".join(
+        str(value or "").lower()
+        for value in (
+            row.collection,
+            source_health_collection_label(row.collection),
+            row.source_name,
+            row.source_url,
+            row.tier,
+            row.status,
+            source_health_status_label(row.status),
+            row.error,
+        )
+    )
+
+
+def filter_source_health_dashboard_rows(
+    rows: Iterable[SourceHealthDashboardRow],
+    query: str,
+) -> list[SourceHealthDashboardRow]:
+    items = list(rows)
+    tokens = [token.lower() for token in re.split(r"\s+", (query or "").strip()) if token]
+    if not tokens:
+        return items
+    return [row for row in items if all(token in _source_health_search_blob(row) for token in tokens)]
+
+
+def _source_health_time_key(value: str) -> float:
+    parsed = _parse_stored_time(value)
+    return parsed.timestamp() if parsed is not None else float("-inf")
+
+
+def sort_source_health_dashboard_rows(
+    rows: Iterable[SourceHealthDashboardRow],
+    sort_key: str = "default",
+    *,
+    descending: bool = False,
+) -> list[SourceHealthDashboardRow]:
+    key = (sort_key or "default").strip().lower()
+    items = list(rows)
+    if key == "latency":
+        return sorted(
+            items,
+            key=lambda row: (float(row.elapsed_seconds or 0.0), _source_health_default_sort_key(row)),
+            reverse=descending,
+        )
+    if key == "freshness":
+        return sorted(
+            items,
+            key=lambda row: (_source_health_time_key(row.checked_at), _source_health_default_sort_key(row)),
+            reverse=descending,
+        )
+    if key == "status":
+        return sorted(
+            items,
+            key=lambda row: (
+                _SOURCE_HEALTH_STATUS_ORDER.get((row.status or "").strip().lower(), 99),
+                _source_health_default_sort_key(row),
+            ),
+            reverse=descending,
+        )
+    if key == "source":
+        return sorted(
+            items,
+            key=lambda row: ((row.source_name or "").strip().lower(), _source_health_default_sort_key(row)),
+            reverse=descending,
+        )
+    return sorted(items, key=_source_health_default_sort_key, reverse=descending)
+
+
+def prepare_source_health_dashboard_rows(
+    rows: Iterable[SourceHealthDashboardRow],
+    *,
+    query: str = "",
+    sort_key: str = "default",
+    descending: bool = False,
+) -> list[SourceHealthDashboardRow]:
+    return sort_source_health_dashboard_rows(
+        filter_source_health_dashboard_rows(rows, query),
+        sort_key,
+        descending=descending,
+    )
+
+
 def format_shared_draft_preview(
     *,
     post_id: str = "",
@@ -1444,6 +1646,19 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         args.extend(["--login-hold", str(login_hold)])
         return args
 
+    if subcommand == "check-sources":
+        collection = str(params.get("collection") or "all").strip().lower()
+        if collection not in {"all", "daily_news", "ai_digest"}:
+            raise ValueError("collection must be all, daily_news, or ai_digest")
+        prompt = str(params.get("prompt") or "").strip()
+        max_age_days = normalize_optional_day_count(params.get("max_age_days"))
+        args.extend(["--collection", collection])
+        if prompt:
+            args.extend(["--prompt", prompt])
+        if max_age_days:
+            args.extend(["--max-age-days", max_age_days])
+        return args
+
     if subcommand in ("aliyun-quota", "volcengine-quota"):
         raw_models = params.get("models") or []
         if isinstance(raw_models, str):
@@ -1870,14 +2085,18 @@ def main() -> None:
     root.minsize(1040, 680)
 
     palette = {
-        "paper": "#f7f3ea",
-        "panel": "#fffaf0",
-        "ink": "#26231f",
-        "muted": "#756e62",
-        "line": "#d9cfbd",
-        "accent": "#b75f35",
-        "accent_dark": "#884421",
-        "soft": "#efe5d3",
+        "paper": "#F4F7FA",
+        "panel": "#FFFFFF",
+        "ink": "#17212B",
+        "muted": "#5D6B78",
+        "line": "#D5E0E8",
+        "accent": "#0F766E",
+        "accent_dark": "#115E59",
+        "soft": "#E6F4F1",
+        "signal_good": "#15803D",
+        "signal_warn": "#B45309",
+        "signal_bad": "#B42318",
+        "signal_neutral": "#64748B",
     }
 
     style = ttk.Style(root)
@@ -1957,9 +2176,9 @@ def main() -> None:
     log = ScrolledText(
         log_panel,
         height=16,
-        bg="#171411",
-        fg="#f6eadb",
-        insertbackground="#f6eadb",
+        bg="#16212B",
+        fg="#E7F1F7",
+        insertbackground="#E7F1F7",
         relief="flat",
         font=("Cascadia Mono", 10),
         wrap="word",
@@ -1978,7 +2197,7 @@ def main() -> None:
     shared_preview = ScrolledText(
         preview_panel,
         height=16,
-        bg="#fffaf0",
+        bg=palette["panel"],
         fg=palette["ink"],
         insertbackground=palette["ink"],
         relief="flat",
@@ -2077,11 +2296,11 @@ def main() -> None:
 
     def _quota_bar_color(row: QuotaDashboardRow) -> str:
         if row.percent is None:
-            return "#b4aea4"
+            return palette["signal_neutral"]
         if row.percent <= 0.08:
-            return "#b85c4a"
+            return palette["signal_bad"]
         if row.percent <= 0.25:
-            return "#c4923f"
+            return palette["signal_warn"]
         return palette["accent"]
 
     def _draw_quota_dashboard() -> None:
@@ -2129,7 +2348,7 @@ def main() -> None:
             item_tags = ("quota_model_button", row_tag) if click_target else (row_tag,)
             if click_target:
                 quota_dashboard_click_lookup[row_tag] = row
-            row_fill = "#fff7ed" if click_target else ("#fbf7ee" if idx % 2 else palette["panel"])
+            row_fill = palette["soft"] if click_target else ("#F8FBFC" if idx % 2 else palette["panel"])
             quota_rows_canvas.create_rectangle(
                 x0 - 6,
                 y - 4,
@@ -2865,6 +3084,237 @@ def main() -> None:
 
     root.after(500, _maybe_autorun_from_env)
 
+    # --- Source health center ---
+    tab_sources = _add_scrollable_tab("信源中心")
+    source_top = ttk.Frame(tab_sources)
+    source_top.pack(fill="x", padx=4, pady=(8, 10))
+    ttk.Label(source_top, text="信源中心", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(
+        source_top,
+        text="查看最近一次只读采集的来源状态、日期覆盖率与错误证据。检查信源不会调用 LLM、生图或小红书。",
+        style="Muted.TLabel",
+        wraplength=760,
+    ).pack(anchor="w", pady=(2, 0))
+
+    source_health_all_rows: list[SourceHealthDashboardRow] = []
+    source_health_rows: list[SourceHealthDashboardRow] = []
+    source_health_row_lookup: dict[str, SourceHealthDashboardRow] = {}
+    source_health_search_var = tk.StringVar(value="")
+    source_health_sort_var = tk.StringVar(value="默认顺序")
+    source_health_desc_var = tk.BooleanVar(value=False)
+    source_check_scope_var = tk.StringVar(value="全部")
+    source_health_status_var = tk.StringVar(value="读取本地信源快照中...")
+
+    source_actions = ttk.Frame(tab_sources, style="Panel.TFrame", padding=(12, 10))
+    source_actions.pack(fill="x", padx=4, pady=(0, 8))
+    ttk.Button(source_actions, text="检查信源", command=lambda: _run_source_health_check(), style="Accent.TButton").pack(
+        side="left"
+    )
+    ttk.Button(source_actions, text="刷新本地状态", command=lambda: _refresh_source_health()).pack(
+        side="left", padx=(8, 0)
+    )
+    ttk.Label(source_actions, text="检查范围", style="PanelMuted.TLabel").pack(side="left", padx=(18, 6))
+    ttk.Combobox(
+        source_actions,
+        textvariable=source_check_scope_var,
+        values=("全部", "每日新闻", "每日AI讯息"),
+        state="readonly",
+        width=12,
+    ).pack(side="left")
+    ttk.Label(source_actions, textvariable=source_health_status_var, style="PanelMuted.TLabel").pack(
+        side="right"
+    )
+
+    source_filter = ttk.Frame(tab_sources)
+    source_filter.pack(fill="x", padx=4, pady=(0, 8))
+    ttk.Label(source_filter, text="搜索").pack(side="left")
+    ttk.Entry(source_filter, textvariable=source_health_search_var, width=30).pack(
+        side="left", fill="x", expand=True, padx=(8, 6)
+    )
+    ttk.Button(source_filter, text="清空", command=lambda: source_health_search_var.set("")).pack(side="left")
+    ttk.Label(source_filter, text="排序").pack(side="left", padx=(16, 6))
+    ttk.Combobox(
+        source_filter,
+        textvariable=source_health_sort_var,
+        values=("默认顺序", "状态", "最近检查", "耗时", "来源名称"),
+        state="readonly",
+        width=12,
+    ).pack(side="left")
+    ttk.Checkbutton(source_filter, text="倒序", variable=source_health_desc_var).pack(side="left", padx=(8, 0))
+
+    source_table_frame = ttk.Frame(tab_sources, style="Panel.TFrame", padding=(8, 8))
+    source_table_frame.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+    source_columns = ("collection", "source", "tier", "status", "coverage", "latency", "checked_at")
+    source_health_tree = ttk.Treeview(
+        source_table_frame,
+        columns=source_columns,
+        show="headings",
+        style="Metrics.Treeview",
+        height=14,
+    )
+    source_headings = {
+        "collection": "采集类型",
+        "source": "来源",
+        "tier": "层级",
+        "status": "状态",
+        "coverage": "覆盖率",
+        "latency": "耗时",
+        "checked_at": "最近检查（北京时间）",
+    }
+    source_widths = {
+        "collection": 100,
+        "source": 145,
+        "tier": 120,
+        "status": 95,
+        "coverage": 155,
+        "latency": 78,
+        "checked_at": 168,
+    }
+    for column in source_columns:
+        source_health_tree.heading(column, text=source_headings[column])
+        source_health_tree.column(column, width=source_widths[column], minwidth=70, stretch=column in {"source", "coverage"})
+    source_scroll = ttk.Scrollbar(source_table_frame, orient="vertical", command=source_health_tree.yview)
+    source_health_tree.configure(yscrollcommand=source_scroll.set)
+    source_health_tree.tag_configure("source-good", foreground=palette["signal_good"])
+    source_health_tree.tag_configure("source-warn", foreground=palette["signal_warn"])
+    source_health_tree.tag_configure("source-bad", foreground=palette["signal_bad"])
+    source_health_tree.tag_configure("source-muted", foreground=palette["muted"])
+    source_health_tree.pack(side="left", fill="both", expand=True)
+    source_scroll.pack(side="right", fill="y")
+
+    source_detail_frame = ttk.Frame(tab_sources, style="Panel.TFrame", padding=(12, 10))
+    source_detail_frame.pack(fill="x", padx=4, pady=(0, 10))
+    source_detail_header = ttk.Frame(source_detail_frame, style="Panel.TFrame")
+    source_detail_header.pack(fill="x")
+    ttk.Label(source_detail_header, text="来源证据", style="PanelSection.TLabel").pack(side="left")
+    ttk.Button(source_detail_header, text="打开来源", command=lambda: _open_selected_source_health_url()).pack(side="right")
+    source_health_detail = ScrolledText(
+        source_detail_frame,
+        height=6,
+        bg=palette["panel"],
+        fg=palette["ink"],
+        insertbackground=palette["ink"],
+        relief="solid",
+        bd=1,
+        font=base_font,
+        wrap="word",
+    )
+    source_health_detail.pack(fill="x", pady=(8, 0))
+
+    def _set_source_health_detail(text: str) -> None:
+        source_health_detail.configure(state="normal")
+        source_health_detail.delete("1.0", "end")
+        source_health_detail.insert("1.0", text)
+        source_health_detail.configure(state="disabled")
+
+    def _source_health_sort_key() -> str:
+        return {
+            "状态": "status",
+            "最近检查": "freshness",
+            "耗时": "latency",
+            "来源名称": "source",
+        }.get(source_health_sort_var.get(), "default")
+
+    def _source_health_detail_text(row: SourceHealthDashboardRow) -> str:
+        lines = [
+            f"采集类型：{source_health_collection_label(row.collection)}",
+            f"来源：{row.source_name}",
+            f"层级：{row.tier or '未标注'}",
+            f"状态：{source_health_status_label(row.status)}",
+            f"覆盖率：{source_health_coverage_text(row)}",
+            f"耗时：{row.elapsed_seconds:.2f} 秒",
+            f"最近检查：{_format_display_time(row.checked_at) or row.checked_at or '暂无'}",
+            f"URL：{row.source_url or '暂无'}",
+        ]
+        if row.http_status is not None:
+            lines.append(f"HTTP 状态：{row.http_status}")
+        if row.error:
+            lines.append(f"错误：{row.error}")
+        return "\n".join(lines)
+
+    def _source_health_row_tag(row: SourceHealthDashboardRow) -> str:
+        status = (row.status or "").strip().lower()
+        if status == "success":
+            return "source-good"
+        if status in {"empty", "missing_date", "stale", "cooldown"}:
+            return "source-warn"
+        if status in {"timeout", "transport_error", "http_error", "error"}:
+            return "source-bad"
+        return "source-muted"
+
+    def _apply_source_health_view(*_args) -> None:
+        nonlocal source_health_rows
+        source_health_rows = prepare_source_health_dashboard_rows(
+            source_health_all_rows,
+            query=source_health_search_var.get(),
+            sort_key=_source_health_sort_key(),
+            descending=source_health_desc_var.get(),
+        )
+        source_health_tree.delete(*source_health_tree.get_children())
+        source_health_row_lookup.clear()
+        for index, row in enumerate(source_health_rows):
+            row_id = f"source-health-{index}"
+            source_health_row_lookup[row_id] = row
+            source_health_tree.insert(
+                "",
+                "end",
+                iid=row_id,
+                values=(
+                    source_health_collection_label(row.collection),
+                    row.source_name,
+                    row.tier or "未标注",
+                    source_health_status_label(row.status),
+                    source_health_coverage_text(row),
+                    f"{row.elapsed_seconds:.2f}s",
+                    _format_display_time(row.checked_at) or row.checked_at or "暂无",
+                ),
+                tags=(_source_health_row_tag(row),),
+            )
+        total = len(source_health_all_rows)
+        if total:
+            source_health_status_var.set(f"显示 {len(source_health_rows)} / {total} 个来源")
+        else:
+            source_health_status_var.set("暂无快照：先检查信源或生成内容")
+        if not source_health_rows:
+            _set_source_health_detail("暂无匹配来源。可清空搜索条件，或点击“检查信源”生成只读健康快照。")
+
+    def _refresh_source_health() -> None:
+        nonlocal source_health_all_rows
+        source_health_all_rows = build_source_health_dashboard_rows(load_latest_source_health_snapshots())
+        _apply_source_health_view()
+
+    def _selected_source_health_row() -> SourceHealthDashboardRow | None:
+        selection = source_health_tree.selection()
+        return source_health_row_lookup.get(selection[0]) if selection else None
+
+    def _on_source_health_selection(_event=None) -> None:
+        row = _selected_source_health_row()
+        if row is not None:
+            _set_source_health_detail(_source_health_detail_text(row))
+
+    def _open_selected_source_health_url() -> None:
+        row = _selected_source_health_row()
+        if row is None or not row.source_url:
+            source_health_status_var.set("请先选择带 URL 的来源")
+            return
+        webbrowser.open(row.source_url)
+
+    def _run_source_health_check() -> None:
+        scope = {"全部": "all", "每日新闻": "daily_news", "每日AI讯息": "ai_digest"}.get(
+            source_check_scope_var.get(),
+            "all",
+        )
+        if not runner.is_running():
+            post_command_success_callbacks.append(_refresh_source_health)
+        _run_command("check-sources", {"collection": scope}, _collect_env_overrides())
+
+    source_health_tree.bind("<<TreeviewSelect>>", _on_source_health_selection)
+    source_health_search_var.trace_add("write", _apply_source_health_view)
+    source_health_sort_var.trace_add("write", _apply_source_health_view)
+    source_health_desc_var.trace_add("write", _apply_source_health_view)
+    _set_source_health_detail("选择来源行查看 URL、日期覆盖率、请求耗时和错误信息。")
+    _refresh_source_health()
+
     # --- Run tab ---
     tab_run = ttk.Frame(nb)
     nb.add(tab_run, text="草稿处理")
@@ -2893,7 +3343,7 @@ def main() -> None:
     post_time_detail = ScrolledText(
         time_frame,
         height=5,
-        bg="#fffaf0",
+        bg=palette["panel"],
         fg=palette["ink"],
         insertbackground=palette["ink"],
         relief="solid",
@@ -2906,7 +3356,7 @@ def main() -> None:
     post_detail = ScrolledText(
         detail_frame,
         height=10,
-        bg="#fffaf0",
+        bg=palette["panel"],
         fg=palette["ink"],
         insertbackground=palette["ink"],
         relief="solid",
@@ -3117,7 +3567,7 @@ def main() -> None:
     publish_preview = ScrolledText(
         publish_panel,
         height=9,
-        bg="#fffaf0",
+        bg=palette["panel"],
         fg=palette["ink"],
         insertbackground=palette["ink"],
         relief="solid",
@@ -3443,7 +3893,7 @@ def main() -> None:
     metric_analysis_text = ScrolledText(
         metric_analysis_frame,
         height=12,
-        bg="#fffaf0",
+        bg=palette["panel"],
         fg=palette["ink"],
         insertbackground=palette["ink"],
         relief="solid",

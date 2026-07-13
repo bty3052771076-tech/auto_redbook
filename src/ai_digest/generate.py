@@ -263,6 +263,11 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
         data = item.model_dump()
         if match is not None:
             for key in ("url", "published_at", "source_name", "vendor", "product", "raw_excerpt"):
+                if key in {"url", "published_at", "source_name", "vendor"}:
+                    source_value = str(getattr(match, key) or "").strip()
+                    if source_value:
+                        data[key] = source_value
+                    continue
                 if not str(data.get(key) or "").strip():
                     data[key] = getattr(match, key)
             evidence = list(data.get("evidence_urls") or [])
@@ -282,15 +287,8 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
 
 def _fill_missing_item_publish_times(brief: AIDigestBrief, *, date: str = "") -> AIDigestBrief:
     fallback_date = (date or brief.date or _today_date()).strip()
-    items: list[AIUpdateItem] = []
-    for item in brief.items:
-        data = item.model_dump()
-        if not str(data.get("published_at") or "").strip():
-            data["published_at"] = fallback_date
-        items.append(AIUpdateItem.model_validate(data))
     data = brief.model_dump()
     data["date"] = brief.date or fallback_date
-    data["items"] = [item.model_dump() for item in items]
     return AIDigestBrief.model_validate(data)
 
 
@@ -343,6 +341,8 @@ def build_ai_digest_prompt(
         + f"目标：从候选中挑选约 {target_count} 条 AI 平台、模型、工具、开源项目动态。\n"
         + quota_rule
         + "要求：官方源优先；社交源只能用于补充或验证；不得编造未提供的信息；全部输出中文。\n"
+        + "发布时间硬规则：items[].published_at 必须从候选数据原样复制；不得使用简报日期、抓取日期、页面运行时 now 或自行推断日期替代；"
+        + "候选缺少 published_at 时不得选入最终 items。\n"
         + "筛选规则：先去重，同一模型、基准、产品、版本或开源项目的不同链接只保留最重要的一条；"
         + "优先选择模型发布、版本升级、API/开发者工具、评测基准、开源项目、基础设施技术更新；"
         + "观点探讨、趋势评论、采用案例、行业观察只在技术/模型类候选不足时作为补充。\n"

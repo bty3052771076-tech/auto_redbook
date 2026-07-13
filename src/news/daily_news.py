@@ -5,6 +5,9 @@ import os
 import random
 import re
 import math
+import time
+from email.utils import parsedate_to_datetime
+from html import unescape
 from pathlib import Path
 import urllib.error
 import urllib.parse
@@ -12,9 +15,17 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from xml.etree import ElementTree
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .history import collect_used_news_url_keys, filter_used_news_items, news_history_dedupe_enabled
+from src.sources.health import (
+    SourceAttempt,
+    SourceHealthSnapshot,
+    is_source_in_cooldown,
+    load_source_health_snapshot,
+    save_source_health_snapshot,
+)
 
 DEFAULT_PROVIDER = "gnews"
 DEFAULT_TZ = "Asia/Shanghai"
@@ -63,6 +74,75 @@ GNEWS_BASE_URL = "https://gnews.io/api/v4"
 JUHE_NEWS_BASE_URL = "https://v.juhe.cn/toutiao"
 JUHE_FINANCE_NEWS_BASE_URL = "https://apis.juhe.cn/fapigx/caijing"
 HOTNEWS_BASE_URL = "https://orz.ai/api/v1/dailynews"
+GOOGLE_NEWS_RSS_BASE_URL = "https://news.google.com/rss/search"
+BBC_RSS_FEEDS = {
+    "world": "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "business": "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "technology": "https://feeds.bbci.co.uk/news/technology/rss.xml",
+    "sport": "https://feeds.bbci.co.uk/sport/rss.xml",
+}
+
+# Public Chinese mainland newsrooms. These are used as Google News RSS
+# domain filters, so the workflow only reads publicly exposed headlines and
+# links and does not bypass access controls.
+CN_OFFICIAL_NEWS_DOMAINS = (
+    "xinhuanet.com",
+    "people.com.cn",
+    "cctv.com",
+    "gov.cn",
+    "chinanews.com.cn",
+)
+
+
+def _news_health_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _news_source_error_status(exc: Exception) -> str:
+    text = str(exc).lower()
+    if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+        return "timeout"
+    if isinstance(exc, urllib.error.HTTPError):
+        return "http_error"
+    if isinstance(exc, urllib.error.URLError) or "connection" in text or "network" in text:
+        return "transport_error"
+    return "error"
+
+
+def _news_provider_health_url(provider: str) -> str:
+    if provider == "newsapi":
+        return NEWSAPI_BASE_URL
+    if provider == "gnews":
+        return GNEWS_BASE_URL
+    if provider == "juhe":
+        return JUHE_NEWS_BASE_URL
+    if provider == "google_rss":
+        return _google_news_rss_base_url()
+    if provider == "google_rss_cn":
+        return _google_news_rss_base_url()
+    if provider == "bbc_rss":
+        return "https://feeds.bbci.co.uk/"
+    if provider == "hotnews":
+        return _hotnews_base_url()
+    return ""
+
+
+def _news_provider_health_tier(provider: str) -> str:
+    if provider in {"newsapi", "gnews", "juhe"}:
+        return "keyed_api"
+    if provider in {"google_rss", "google_rss_cn", "bbc_rss"}:
+        return "dated_rss"
+    if provider == "hotnews":
+        return "heat_backfill"
+    return "manual"
+
+
+def _news_provider_result_status(*, item_count: int, dated_count: int) -> str:
+    if item_count <= 0:
+        return "empty"
+    if dated_count <= 0:
+        return "missing_date"
+    return "success"
 HOTNEWS_DEFAULT_PLATFORMS = (
     "jinritoutiao",
     "sina_finance",
@@ -299,6 +379,15 @@ def _is_china_item(item: NewsItem) -> bool:
     domain = _domain_for_item(item)
     if domain.endswith(".cn") or domain.endswith(".gov.cn") or domain.endswith(".edu.cn"):
         return True
+    # Several established mainland sources use .com (or a Taiwan domain)
+    # and do not expose sourcecountry in their RSS metadata.
+    domestic_domains = {
+        *CN_OFFICIAL_NEWS_DOMAINS,
+        "36kr.com",
+        "ithome.com",
+    }
+    if domain in domestic_domains or any(domain.endswith("." + suffix) for suffix in domestic_domains):
+        return True
     return False
 
 
@@ -378,14 +467,20 @@ def _attention_score(item: NewsItem) -> float:
     return score
 
 
-def _limit_single_domain(items: list[NewsItem], *, count: int) -> list[NewsItem]:
+def _limit_single_domain(
+    items: list[NewsItem],
+    *,
+    count: int,
+    cap_count: Optional[int] = None,
+) -> list[NewsItem]:
     if count <= 1 or not items:
         return items[:count] if count > 0 else []
     domains = [_canonical_domain(_domain_for_item(item)) for item in items]
     available_domains = {domain for domain in domains if domain}
     if len(available_domains) <= 1:
         return items[:count]
-    cap = max(1, int(math.ceil(count * _source_domain_max_ratio())))
+    cap_base = count if cap_count is None else max(1, int(cap_count))
+    cap = max(1, int(math.ceil(cap_base * _source_domain_max_ratio())))
     picked: list[NewsItem] = []
     overflow: list[NewsItem] = []
     domain_counts: dict[str, int] = {}
@@ -407,9 +502,19 @@ def _limit_single_domain(items: list[NewsItem], *, count: int) -> list[NewsItem]
     return picked
 
 
+def _required_china_count_for_daily_news(count: int) -> int:
+    if count > 5:
+        return 2
+    if count > 2:
+        return 1
+    return 0
+
+
 def _balance_china_foreign(items: list[NewsItem], *, count: int) -> list[NewsItem]:
     """
     Keep a rough China:foreign ratio (default 6:4) while preserving relevance order.
+    Multi-draft batches also enforce a minimum China-news quota:
+    count > 2 => 1 item, count > 5 => 2 items.
     If one side is insufficient, fill from the other side.
     """
     if count <= 0 or not items:
@@ -418,7 +523,10 @@ def _balance_china_foreign(items: list[NewsItem], *, count: int) -> list[NewsIte
         return items[:1]
 
     ratio = _china_ratio()
-    desired_china = int(round(count * ratio))
+    desired_china = max(
+        _required_china_count_for_daily_news(count),
+        int(round(count * ratio)),
+    )
     desired_china = max(0, min(count, desired_china))
     desired_foreign = count - desired_china
 
@@ -693,11 +801,20 @@ def _relevance_score(item: NewsItem, prompt_hint: str) -> float:
 
     combined_text = f"{title_text} {description_text} {content_text}"
     combined_lc = combined_text.lower()
-    if "政策" in hint and re.search(r"(政策|新规|规定|法规|条例|监管|措施|施行|调整)", combined_text):
+    if "政策" in hint and re.search(
+        r"(政策|新规|规定|法规|条例|监管|措施|施行|调整|policy|policies|regulation|regulatory|rule|law|legislation|measure)",
+        combined_lc,
+    ):
         score += 0.6
-    if "公司" in hint and re.search(r"(公司|企业|平台|上市|融资|并购|管理层)", combined_text):
+    if "公司" in hint and re.search(
+        r"(公司|企业|平台|上市|融资|并购|管理层|company|companies|corporate|business|platform)",
+        combined_lc,
+    ):
         score += 0.4
-    if "市场" in hint and re.search(r"(市场|价格|股价|行业|需求|供给|销售|消费)", combined_text):
+    if "市场" in hint and re.search(
+        r"(市场|價格|价格|股价|行業|行业|需求|供给|銷售|销售|消费|market|markets|price|prices|stock|demand|supply|sales|consumer)",
+        combined_lc,
+    ):
         score += 0.4
     if re.search(r"(科技|技术|人工智能|AI|ai)", hint) and re.search(
         r"(科技|技术|人工智能|芯片|算力|模型|软件|半导体|ai|tech|technology|chip|accelerator|inference|software|semiconductor|model)",
@@ -711,6 +828,16 @@ def _relevance_score(item: NewsItem, prompt_hint: str) -> float:
         score += 0.6
     if "财经" in hint and re.search(
         r"(财经|经济|市场|金融|股价|价格|投资|融资|economy|finance|market|stock|price|investment|funding)",
+        combined_lc,
+    ):
+        score += 0.6
+    if re.search(r"(世界杯|世界盃)", hint) and re.search(
+        r"(世界杯|世界盃|world cup|fifa)",
+        combined_lc,
+    ):
+        score += 0.9
+    if "足球" in hint and re.search(
+        r"(足球|football|soccer|fifa|world cup)",
         combined_lc,
     ):
         score += 0.6
@@ -821,8 +948,22 @@ def _maybe_translate_hint_to_en(hint: str) -> str:
         tokens.append("congress")
     if "外交" in hint:
         tokens.append("diplomacy")
+    if "中国" in hint or "中國" in hint:
+        tokens.append("China")
     if "经济" in hint or "經濟" in hint or "财经" in hint or "財經" in hint:
         tokens.append("economy")
+    if "市场" in hint or "市場" in hint:
+        tokens.append("market")
+    if "政策" in hint:
+        tokens.append("policy")
+    if "公司" in hint or "企业" in hint or "企業" in hint or "平台" in hint:
+        tokens.append("business")
+    if "产业" in hint or "產業" in hint or "行业" in hint or "行業" in hint:
+        tokens.append("industry")
+    if "社会" in hint or "民生" in hint:
+        tokens.append("society")
+    if "气候" in hint or "氣候" in hint or "环境" in hint or "環境" in hint or "碳达峰" in hint or "碳達峰" in hint:
+        tokens.append("climate")
     if "科技" in hint or "AI" in hint.upper() or "人工智能" in hint:
         tokens.append("technology")
     if "世界杯" in hint or "世界盃" in hint:
@@ -923,7 +1064,11 @@ def pick_news_items(
         scored.sort(reverse=True)
         order = [item for _, _, _, _, item in scored]
         deduped = _dedupe_by_story(order, max_count=len(order))
-        deduped = _limit_single_domain(deduped, count=count)
+        deduped = _limit_single_domain(
+            deduped,
+            count=len(deduped),
+            cap_count=count,
+        )
         return _balance_china_foreign(deduped, count=count)
 
     seen: set[str] = set()
@@ -954,7 +1099,11 @@ def pick_news_items(
         seen.add(key)
         unique.append(item)
     deduped = _dedupe_by_story(unique, max_count=len(unique))
-    deduped = _limit_single_domain(deduped, count=count)
+    deduped = _limit_single_domain(
+        deduped,
+        count=len(deduped),
+        cap_count=count,
+    )
     return _balance_china_foreign(deduped, count=count)
 
 
@@ -1657,6 +1806,203 @@ def _juhe_fetch_articles(
     raise RuntimeError("Juhe appkey missing")
 
 
+def _rss_local_name(tag: str) -> str:
+    return str(tag or "").rsplit("}", 1)[-1].lower()
+
+
+def _rss_clean_text(value: Optional[str]) -> str:
+    text = unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _rss_child(item: ElementTree.Element, name: str) -> Optional[ElementTree.Element]:
+    for child in item:
+        if _rss_local_name(child.tag) == name:
+            return child
+    return None
+
+
+def _rss_child_text(item: ElementTree.Element, *names: str) -> str:
+    wanted = {name.lower() for name in names}
+    for child in item:
+        if _rss_local_name(child.tag) in wanted:
+            text = _rss_clean_text(child.text)
+            if text:
+                return text
+    return ""
+
+
+def _rss_item_url(item: ElementTree.Element) -> str:
+    for child in item:
+        if _rss_local_name(child.tag) != "link":
+            continue
+        href = _rss_clean_text(child.attrib.get("href"))
+        if href:
+            return href
+        text = _rss_clean_text(child.text)
+        if text:
+            return text
+    return _rss_child_text(item, "guid", "id")
+
+
+def _rss_pubdate_to_iso(value: Optional[str]) -> Optional[str]:
+    raw = _rss_clean_text(value)
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _rss_items_from_xml(
+    payload: bytes,
+    *,
+    source_name: str,
+    fallback_language: str,
+) -> list[NewsItem]:
+    try:
+        root = ElementTree.fromstring(payload)
+    except ElementTree.ParseError as exc:
+        raise RuntimeError("RSS response is not valid XML") from exc
+
+    items: list[NewsItem] = []
+    for element in root.iter():
+        if _rss_local_name(element.tag) not in {"item", "entry"}:
+            continue
+        title = _rss_child_text(element, "title")
+        url_item = _rss_item_url(element)
+        if not title or not url_item:
+            continue
+        description = _rss_child_text(element, "description", "summary", "encoded", "content") or None
+        date_text = _rss_child_text(element, "pubdate", "published", "updated", "date")
+        source_element = _rss_child(element, "source")
+        publisher = _rss_clean_text(source_element.text if source_element is not None else "") or source_name
+        publisher_url = _rss_clean_text(source_element.attrib.get("url") if source_element is not None else "")
+        domain = urllib.parse.urlparse(publisher_url or url_item).netloc.strip().lower() or None
+        items.append(
+            NewsItem(
+                title=title,
+                url=url_item,
+                source=publisher,
+                description=description,
+                content=description,
+                domain=domain,
+                seendate=_rss_pubdate_to_iso(date_text),
+                language=fallback_language,
+            )
+        )
+    return items
+
+
+def _rss_fetch_articles(
+    *,
+    feed_url: str,
+    source_name: str,
+    fallback_language: str,
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    request = urllib.request.Request(
+        feed_url,
+        headers={"User-Agent": "Mozilla/5.0 (redbook_workflow RSS)"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"{source_name} RSS HTTP error {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        reason = _juhe_text(getattr(exc, "reason", "") or "network error")
+        raise RuntimeError(f"{source_name} RSS request failed: {reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(f"{source_name} RSS request timed out") from exc
+    return _rss_items_from_xml(
+        payload,
+        source_name=source_name,
+        fallback_language=fallback_language,
+    )[: max(1, int(max_records))]
+
+
+def _google_news_rss_base_url() -> str:
+    return (os.getenv("GOOGLE_NEWS_RSS_BASE_URL") or GOOGLE_NEWS_RSS_BASE_URL).strip().rstrip("?")
+
+
+def _google_rss_fetch_articles(
+    *,
+    query: str,
+    max_records: int,
+    timeout_s: float,
+    language: str | None = None,
+    country: str | None = None,
+) -> list[NewsItem]:
+    language = (language or os.getenv("GOOGLE_NEWS_RSS_HL") or "en-US").strip()
+    country = (country or os.getenv("GOOGLE_NEWS_RSS_GL") or "US").strip()
+    ceid = (os.getenv("GOOGLE_NEWS_RSS_CEID") or f"{country}:{language.split('-', 1)[0]}").strip()
+    params = urllib.parse.urlencode({"q": query, "hl": language, "gl": country, "ceid": ceid})
+    feed_url = f"{_google_news_rss_base_url()}?{params}"
+    return _rss_fetch_articles(
+        feed_url=feed_url,
+        source_name="Google News RSS (CN)" if country == "CN" else "Google News RSS",
+        fallback_language=language.split("-", 1)[0] or "en",
+        max_records=max_records,
+        timeout_s=timeout_s,
+    )
+
+
+def _bbc_rss_feed_keys(prompt_hint: str) -> tuple[str, ...]:
+    hint = (prompt_hint or "").lower()
+    if re.search(r"(世界杯|世界盃|体育|體育|足球|篮球|籃球|sport|football|soccer|basketball|league|match)", hint):
+        return ("sport",)
+    if re.search(r"(财经|財經|经济|經濟|金融|市场|市場|公司|企业|企業|产业|產業|business|economy|finance|market|stock)", hint):
+        return ("business",)
+    if re.search(r"(科技|技术|技術|人工智能|ai|芯片|晶片|technology|tech|software|semiconductor)", hint):
+        return ("technology",)
+    return ("world",)
+
+
+def _bbc_rss_fetch_articles(
+    *,
+    prompt_hint: str,
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    labels = {
+        "world": "BBC World",
+        "business": "BBC Business",
+        "technology": "BBC Technology",
+        "sport": "BBC Sport",
+    }
+    items: list[NewsItem] = []
+    errors: list[str] = []
+    for key in _bbc_rss_feed_keys(prompt_hint):
+        try:
+            items.extend(
+                _rss_fetch_articles(
+                    feed_url=BBC_RSS_FEEDS[key],
+                    source_name=labels[key],
+                    fallback_language="en",
+                    max_records=max_records,
+                    timeout_s=timeout_s,
+                )
+            )
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    if not items and errors:
+        raise RuntimeError("; ".join(errors))
+    return _dedupe_candidates(items)[: max(1, int(max_records))]
+
+
 def _hotnews_base_url() -> str:
     return (os.getenv("HOTNEWS_BASE_URL") or HOTNEWS_BASE_URL).strip().rstrip("/")
 
@@ -2019,6 +2365,10 @@ def fetch_daily_news_candidates(
     timeout_s: Optional[float] = None,
     expand_query_variants: bool = True,
     materials_file: str | Path | None = None,
+    source_health_path: str | Path | None = None,
+    source_cooldown_seconds: int | None = None,
+    persist_source_health: bool | None = None,
+    exhaustive_sources: bool = False,
 ) -> tuple[list[NewsItem], dict[str, Any]]:
     """
     Fetch today's news via an external API.
@@ -2041,6 +2391,34 @@ def fetch_daily_news_candidates(
         search_days = int(search_days)
     search_days = max(1, search_days)
     timeout_s = float(os.getenv("NEWS_TIMEOUT_S") or (timeout_s or DEFAULT_TIMEOUT_S))
+    health_path = Path(source_health_path) if source_health_path else None
+    if source_cooldown_seconds is None:
+        try:
+            cooldown_seconds = int((os.getenv("NEWS_SOURCE_COOLDOWN_S") or "300").strip())
+        except ValueError:
+            cooldown_seconds = 300
+    else:
+        cooldown_seconds = int(source_cooldown_seconds)
+    cooldown_seconds = max(0, min(cooldown_seconds, 3600))
+    should_persist_health = bool(health_path) if persist_source_health is None else bool(persist_source_health)
+    previous_health = load_source_health_snapshot(health_path) if health_path else None
+    persisted_health_attempts = {
+        attempt.source_name: attempt
+        for attempt in (previous_health.attempts if previous_health is not None else [])
+        if attempt.source_name
+    }
+    health_attempts: list[SourceAttempt] = []
+    cooldown_skipped: list[str] = []
+
+    def _persist_health_snapshot() -> str:
+        if health_path is None or not should_persist_health:
+            return str(health_path) if health_path is not None else ""
+        snapshot = SourceHealthSnapshot(
+            collection="daily_news",
+            generated_at=_news_health_timestamp(),
+            attempts=sorted(persisted_health_attempts.values(), key=lambda item: item.source_name),
+        )
+        return str(save_source_health_snapshot(snapshot, health_path))
 
     startdatetime, enddatetime = _recent_range_utc(tz_name, days=search_days)
     start_dt = datetime.strptime(startdatetime, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
@@ -2049,6 +2427,7 @@ def fetch_daily_news_candidates(
     to_iso = end_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
 
     manual_materials_file = str(materials_file or os.getenv("NEWS_MATERIALS_FILE") or "").strip()
+    auto_provider_selection = not provider_env and not manual_materials_file
     provider_plan: list[str]
     if manual_materials_file:
         provider_plan = ["manual"]
@@ -2059,8 +2438,8 @@ def fetch_daily_news_candidates(
         if file_path:
             provider_plan = ["file"]
         else:
-            # Auto: prefer keyed APIs when configured. Do not fall back to
-            # GDELT-like snippet sources; hot_news is kept as the final hot-list fallback.
+            # Auto: prefer keyed APIs when configured. Dated RSS sources are the
+            # no-key fallback; hot_news remains the final heat-list supplement.
             provider_plan = []
             try:
                 _load_newsapi_config()
@@ -2077,10 +2456,24 @@ def fetch_daily_news_candidates(
                 provider_plan.append("juhe")
             except Exception:
                 pass
+            # CN regional Google News RSS is the primary no-key source for
+            # Chinese prompts. Keep the international RSS and BBC as breadth
+            # backfills, then use hot lists only as a heat supplement.
+            provider_plan.extend(["google_rss_cn", "google_rss", "bbc_rss"])
             provider_plan.append("hotnews")
     provider_plan = list(dict.fromkeys(provider_plan))
 
-    supported_providers = ("newsapi", "gnews", "juhe", "hotnews", "file", "manual")
+    supported_providers = (
+        "newsapi",
+        "gnews",
+        "juhe",
+        "google_rss",
+        "google_rss_cn",
+        "bbc_rss",
+        "hotnews",
+        "file",
+        "manual",
+    )
     unsupported = [p for p in provider_plan if p not in supported_providers]
     if unsupported:
         raise RuntimeError(
@@ -2113,11 +2506,54 @@ def fetch_daily_news_candidates(
     queries_used: list[str] = []
     used_time_range = False
     provider_attempts: list[str] = []
+    # In automatic mode, keep collecting across providers even after the
+    # first provider returns results. A large raw pool is intentional: later
+    # ranking applies freshness, relevance, history, country and domain rules.
+    collected_candidates: list[NewsItem] = []
+    first_success_provider: str | None = None
     for provider in provider_plan:
         if provider not in provider_attempts:
             provider_attempts.append(provider)
+        previous_attempt = persisted_health_attempts.get(provider)
+        if auto_provider_selection and is_source_in_cooldown(
+            previous_attempt,
+            cooldown_seconds=cooldown_seconds,
+        ):
+            cooldown_skipped.append(provider)
+            health_attempts.append(
+                SourceAttempt(
+                    collection="daily_news",
+                    source_name=provider,
+                    source_url=_news_provider_health_url(provider),
+                    tier=_news_provider_health_tier(provider),
+                    status="cooldown",
+                    checked_at=previous_attempt.checked_at if previous_attempt is not None else _news_health_timestamp(),
+                    elapsed_seconds=0.0,
+                    item_count=previous_attempt.item_count if previous_attempt is not None else 0,
+                    dated_count=previous_attempt.dated_count if previous_attempt is not None else 0,
+                    url_count=previous_attempt.url_count if previous_attempt is not None else 0,
+                    error=previous_attempt.error if previous_attempt is not None else "",
+                    http_status=previous_attempt.http_status if previous_attempt is not None else None,
+                )
+            )
+            continue
+        provider_started = time.perf_counter()
+        provider_checked_at = _news_health_timestamp()
+        provider_error: Exception | None = None
+        provider_item_count = 0
+        provider_dated_count = 0
+        provider_url_count = 0
         provider_candidates: list[NewsItem] = []
-        provider_queries = queries[:1] if provider in ("file", "manual", "hotnews") else queries
+        provider_queries = queries[:1] if provider in ("file", "manual", "hotnews", "bbc_rss") else queries
+        if provider == "google_rss_cn" and exhaustive_sources:
+            # Keep the generic CN search, then explicitly ask for official
+            # mainland newsrooms so a broad aggregator cannot crowd them out.
+            official_queries = [
+                f"{q} site:{domain}"
+                for q in queries[: min(3, len(queries))]
+                for domain in CN_OFFICIAL_NEWS_DOMAINS
+            ]
+            provider_queries = [*provider_queries, *official_queries]
         for q in provider_queries:
             if hint_query and q in default_queries and provider_candidates:
                 break
@@ -2215,6 +2651,33 @@ def fetch_daily_news_candidates(
                             in_today.append(item)
                     candidates = in_today or raw
                     used_time_range = bool(in_today)
+                elif provider in {"google_rss", "google_rss_cn"}:
+                    is_cn_rss = provider == "google_rss_cn"
+                    chosen_source_api = {
+                        "provider": provider,
+                        "base_url": _google_news_rss_base_url(),
+                        "hl": "zh-CN" if is_cn_rss else (os.getenv("GOOGLE_NEWS_RSS_HL") or "en-US").strip(),
+                        "gl": "CN" if is_cn_rss else (os.getenv("GOOGLE_NEWS_RSS_GL") or "US").strip(),
+                    }
+                    candidates = _google_rss_fetch_articles(
+                        query=q,
+                        max_records=max_records,
+                        timeout_s=timeout_s,
+                        language="zh-CN" if is_cn_rss else None,
+                        country="CN" if is_cn_rss else None,
+                    )
+                    used_time_range = False
+                elif provider == "bbc_rss":
+                    chosen_source_api = {
+                        "provider": "bbc_rss",
+                        "feeds": [BBC_RSS_FEEDS[key] for key in _bbc_rss_feed_keys(q)],
+                    }
+                    candidates = _bbc_rss_fetch_articles(
+                        prompt_hint=q,
+                        max_records=max_records,
+                        timeout_s=timeout_s,
+                    )
+                    used_time_range = False
                 elif provider == "hotnews":
                     base_url = _hotnews_base_url()
                     platforms = _hotnews_platforms()
@@ -2249,6 +2712,9 @@ def fetch_daily_news_candidates(
                         max_records=max_records,
                     )
                     used_time_range = False
+                provider_item_count += len(candidates)
+                provider_dated_count += sum(1 for item in candidates if str(item.seendate or "").strip())
+                provider_url_count += sum(1 for item in candidates if str(item.url or "").strip())
                 if candidates:
                     candidates = _dedupe_candidates(candidates)
                     candidates, skipped_used = filter_used_news_items(candidates, used_news_url_keys)
@@ -2263,7 +2729,9 @@ def fetch_daily_news_candidates(
                         provider_candidates.extend(candidates)
                         queries_used.append(q)
                         provider_candidates = _dedupe_candidates(provider_candidates)
-                        if len(provider_candidates) >= max_records:
+                        if len(provider_candidates) >= max_records and not (
+                            exhaustive_sources and provider == "google_rss_cn"
+                        ):
                             break
                         candidates = []
                         continue
@@ -2271,17 +2739,77 @@ def fetch_daily_news_candidates(
             except Exception as exc:
                 last_err = f"{provider}/{q}: {exc}"
                 provider_errors.append(last_err)
+                provider_error = exc
                 candidates = []
+                # A provider-level exception (timeout, authentication, network)
+                # is not query-specific. Move to the next provider instead of
+                # spending the full timeout budget on every query variant.
+                break
+        elapsed_seconds = time.perf_counter() - provider_started
+        if provider_error is not None:
+            health_attempt = SourceAttempt(
+                collection="daily_news",
+                source_name=provider,
+                source_url=_news_provider_health_url(provider),
+                tier=_news_provider_health_tier(provider),
+                status=_news_source_error_status(provider_error),
+                checked_at=provider_checked_at,
+                elapsed_seconds=elapsed_seconds,
+                item_count=provider_item_count,
+                dated_count=provider_dated_count,
+                url_count=provider_url_count,
+                error=str(provider_error),
+                http_status=getattr(provider_error, "code", None),
+            )
+        else:
+            health_attempt = SourceAttempt(
+                collection="daily_news",
+                source_name=provider,
+                source_url=_news_provider_health_url(provider),
+                tier=_news_provider_health_tier(provider),
+                status=_news_provider_result_status(
+                    item_count=provider_item_count,
+                    dated_count=provider_dated_count,
+                ),
+                checked_at=provider_checked_at,
+                elapsed_seconds=elapsed_seconds,
+                item_count=provider_item_count,
+                dated_count=provider_dated_count,
+                url_count=provider_url_count,
+            )
+        health_attempts.append(health_attempt)
+        persisted_health_attempts[provider] = health_attempt
         if (aggregate_empty_prompt or hint_query) and provider_candidates:
             candidates = _dedupe_candidates(provider_candidates)[:max_records]
             chosen_query = ",".join(queries_used) if queries_used else chosen_query
-        if candidates:
+        provider_pool = provider_candidates or candidates
+        if provider_pool:
+            if first_success_provider is None:
+                first_success_provider = provider
+            collected_candidates = _dedupe_candidates(
+                [*collected_candidates, *provider_pool]
+            )[:max_records]
+        if collected_candidates:
+            candidates = collected_candidates
+            if len(collected_candidates) >= max_records and not (
+                auto_provider_selection
+                and exhaustive_sources
+                and provider in {"newsapi", "gnews", "google_rss_cn"}
+            ):
+                break
+            # Automatic fallback is deliberately exhaustive up to the raw
+            # pool target. Explicit NEWS_PROVIDER remains single-provider.
+            if auto_provider_selection and exhaustive_sources:
+                continue
             break
 
     if not candidates:
+        _persist_health_snapshot()
         raise RuntimeError(
             f"no news returned (providers={','.join(provider_attempts)}, query={chosen_query}, err={last_err})"
         )
+    if first_success_provider:
+        chosen_provider = first_success_provider
     chosen_source_api = {
         **chosen_source_api,
         "provider": chosen_provider,
@@ -2290,6 +2818,7 @@ def fetch_daily_news_candidates(
         "provider_attempts": provider_attempts,
     }
 
+    health_snapshot_path = _persist_health_snapshot()
     meta: dict[str, Any] = {
         "provider": chosen_provider,
         "api_source": chosen_provider,
@@ -2311,6 +2840,13 @@ def fetch_daily_news_candidates(
             "used_count": len(used_news_url_keys),
             "skipped_count": len(history_skipped),
             "skipped": history_skipped[:10],
+        },
+        "source_health": {
+            "enabled": health_path is not None,
+            "snapshot_path": health_snapshot_path,
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_skipped": cooldown_skipped,
+            "attempts": [attempt.to_dict() for attempt in health_attempts],
         },
         "candidates": [asdict(c) for c in candidates[:10]],
     }

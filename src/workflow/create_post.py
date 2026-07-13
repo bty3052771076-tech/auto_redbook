@@ -35,6 +35,8 @@ from src.images.auto_image import (
 )
 from src.llm.generate import generate_draft
 from src.news.daily_news import (
+    _is_china_item,
+    _required_china_count_for_daily_news,
     fetch_daily_news_candidates,
     filter_prompt_relevant_news_items,
     filter_recent_news_items,
@@ -2867,6 +2869,9 @@ def _fetch_daily_news_candidates_for_upload(
             max_records=raw_fetch_count,
             search_days=search_days,
             materials_file=news_materials_file,
+            source_health_path=Path("data") / "source_health" / "daily_news.json",
+            persist_source_health=True,
+            exhaustive_sources=True,
         )
     except TypeError as exc:
         if "unexpected keyword" not in str(exc) and "positional" not in str(exc):
@@ -3764,6 +3769,8 @@ def create_daily_ai_digest_posts(
         include_pool_items=lookback_meta["mode"] == "auto_expand",
         force_search_backfill=lookback_meta["mode"] == "auto_expand",
         progress=progress,
+        source_health_path=Path("data") / "source_health" / "ai_digest.json",
+        persist_source_health=True,
     )
     candidate_meta = dict(candidate_meta or {})
     fetched_pool_items = list(candidate_meta.pop("_fetched_items", []) or [])
@@ -4247,6 +4254,7 @@ def create_daily_news_posts(
     used_title_keys: set[str] = set()
     failed_count = 0
     skipped_quality_count = 0
+    skipped_quota_count = 0
 
     def _is_fatal_image_config_error(errs: list[str]) -> bool:
         # Aliyun returns this when using image-to-image models without providing an init image.
@@ -4281,6 +4289,12 @@ def create_daily_news_posts(
 
     target_count = count
     posts: list[Post] = []
+    required_china_count = (
+        0
+        if single_material_mode
+        else _required_china_count_for_daily_news(target_count)
+    )
+    accepted_china_count = 0
 
     success_idx = 0
     for candidate_idx, picked in enumerate(picks, start=1):
@@ -4288,6 +4302,19 @@ def create_daily_news_posts(
             break
         picked, lookup_meta = _enrich_daily_news_item(picked)
         picked, focus_meta = _focus_daily_news_item(picked)
+        picked_is_china = _is_china_item(picked)
+        if required_china_count > 0 and not picked_is_china:
+            prospective_count = len(posts) + 1
+            prospective_required_china = _required_china_count_for_daily_news(
+                prospective_count
+            )
+            if accepted_china_count < prospective_required_china:
+                skipped_quota_count += 1
+                print(
+                    f"[daily_news] skip candidate={candidate_idx} reason=china_quota_reserved "
+                    f"title={(picked.title or '')[:30]} source={picked.domain or picked.source or 'unknown'}"
+                )
+                continue
         traced_news_meta = _daily_news_meta_with_trace(
             {**base_meta, **lookup_meta, **focus_meta},
             picked,
@@ -4473,13 +4500,17 @@ def create_daily_news_posts(
         save_post(post)
         save_revision(rev)
         posts.append(post)
+        if picked_is_china:
+            accepted_china_count += 1
         success_idx += 1
 
     if len(posts) < target_count:
         message = (
             f"daily news created only {len(posts)}/{target_count}; "
             f"candidates_tried={len(picks)}/{len(candidates)}, "
-            f"failed={failed_count}, skipped_quality={skipped_quality_count}. "
+            f"failed={failed_count}, skipped_quality={skipped_quality_count}, "
+            f"skipped_quota={skipped_quota_count}, "
+            f"china_quota={accepted_china_count}/{required_china_count}. "
             "Only candidates from today, yesterday, and the day before yesterday are allowed; "
             "configure another news provider/query if the three-day pool is too small; "
             "partial drafts will be returned for upload."

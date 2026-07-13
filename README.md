@@ -65,6 +65,8 @@ $env:JUHE_NEWS_APPKEY="YOUR_JUHE_NEWS_APPKEY"
 $env:PEXELS_API_KEY="YOUR_PEXELS_API_KEY"
 ```
 
+未配置新闻 API Key 时，自动模式会继续尝试内置的中文区域 Google News RSS（`google_rss_cn`）、国际 Google News RSS 和 BBC RSS。自动候选池还会通过公开 RSS 的站点限定查询补充新华社、人民网、央视网、中国政府网和中国新闻网的公开报道；该过程不绕过登录、验证码、付费墙或访问控制。需要排查某个无需 Key 的来源时，可设置 `$env:NEWS_PROVIDER="google_rss_cn"`、`$env:NEWS_PROVIDER="google_rss"` 或 `$env:NEWS_PROVIDER="bbc_rss"`；HotNews 仅作为最后的热度补充，无可解析发布时间的条目不会进入草稿候选池。
+
 也可以复制 `docs/*api-key.example.md` 为去掉 `.example` 的本地文件后填写真实 key，例如：
 
 ```powershell
@@ -227,6 +229,7 @@ Copy-Item docs\volcengine_api-key.example.md docs\volcengine_api-key.md
 ## 每日新闻规则
 
 - 生成 `x` 条草稿时，会先获取更多原始候选，再按提示词相关性、时效性、热度和来源多样性筛选。
+- 在线来源依次尝试已配置的 NewsAPI/GNews/聚合接口、中文区域 Google News RSS、国际 Google News RSS、BBC RSS 和最后的 HotNews；在扩展候选池时，会额外查询新华社、人民网、央视网、中国政府网和中国新闻网的公开内容。台湾及海外中文媒体不计入中国大陆新闻配额。某个提供商发生网络或认证错误时会立即切换到下一来源。
 - 默认只使用发帖日、昨天、前天的新闻；素材不足时按 3/7/14 天规则扩展。
 - 新闻 API 返回多条新闻时，会先聚焦最重要的一条故事，再生成标题、正文、评价和图片。
 - 正文使用简体中文，不再写入“原文标题”段落。

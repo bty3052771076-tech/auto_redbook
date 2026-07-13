@@ -72,6 +72,24 @@ def test_create_daily_ai_digest_posts_creates_post_with_rendered_cards(monkeypat
     assert post.platform["ai_digest"]["source_meta"]["sources"] == ["fixture"]
 
 
+def test_create_daily_ai_digest_passes_workspace_source_health_path_to_collector(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    collect_kwargs: list[dict] = []
+
+    def fake_collect(**kwargs):
+        collect_kwargs.append(kwargs)
+        return _updates(10), {"sources": ["fixture"], "social_backfill_used": False}
+
+    monkeypatch.setattr(create_post, "collect_ai_digest_updates", fake_collect)
+    monkeypatch.setattr(create_post, "load_llm_configs", lambda: (_ for _ in ()).throw(RuntimeError("no test llm")))
+
+    create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)
+
+    assert collect_kwargs
+    assert Path(collect_kwargs[0]["source_health_path"]) == Path("data") / "source_health" / "ai_digest.json"
+    assert collect_kwargs[0]["persist_source_health"] is True
+
+
 def test_create_daily_ai_digest_posts_uses_llm_brief_for_chinese_items(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AI_DIGEST_TARGET_ITEMS", raising=False)

@@ -273,6 +273,44 @@ def test_rank_ai_updates_dedupes_same_model_topic_from_distinct_urls():
     assert "OpenAI core dump infrastructure bug" in titles
 
 
+def test_rank_ai_updates_dedupes_same_model_family_variants_from_one_release():
+    preview = _item(
+        "DeepSeek-V4 预览版发布",
+        source_name="DeepSeek",
+        url="https://api-docs.deepseek.com/zh-cn/news/news260424",
+        published_at="2026-04-24",
+        product="DeepSeek-V4",
+        raw_excerpt="DeepSeek-V4 预览版发布 2026/04/24",
+    )
+    pro = _item(
+        "DeepSeek-V4-Pro：性能比肩顶级闭源模型",
+        source_name="DeepSeek",
+        url="https://api-docs.deepseek.com/zh-cn/news/news260424#deepseek-v4-pro",
+        published_at="2026-04-24",
+        product="DeepSeek-V4-Pro",
+        raw_excerpt="DeepSeek-V4-Pro Agent 能力大幅提高。",
+    )
+    flash = _item(
+        "DeepSeek-V4-Flash：更快捷高效的经济之选",
+        source_name="DeepSeek",
+        url="https://api-docs.deepseek.com/zh-cn/news/news260424#deepseek-v4-flash",
+        published_at="2026-04-24",
+        product="DeepSeek-V4-Flash",
+        raw_excerpt="DeepSeek-V4-Flash 展现接近的推理能力。",
+    )
+
+    ranked = rank_ai_updates(
+        [flash, pro, preview],
+        target_count=10,
+        min_official_count=1,
+        now=datetime(2026, 4, 25, 12, tzinfo=timezone.utc),
+        max_age_days=3,
+    )
+
+    titles = [item.title for item in ranked]
+    assert sum("DeepSeek-V4" in title for title in titles) == 1
+
+
 def test_rank_ai_updates_uses_beijing_three_calendar_days():
     now = datetime(2026, 7, 2, 16, 28, tzinfo=timezone(timedelta(hours=8)))
     beijing_day_before_yesterday = _item(

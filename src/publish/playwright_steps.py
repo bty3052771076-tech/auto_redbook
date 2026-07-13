@@ -618,6 +618,10 @@ def _classify_xhs_page_state(url: str, title: str, body_text: str) -> str:
         return "login"
     if any(hint in (body_text or "") for hint in READY_PAGE_HINTS):
         return "ready"
+    if "creator.xiaohongshu.com/new/note-manager" in haystack and any(
+        hint in (body_text or "") for hint in PUBLISHED_PAGE_TEXTS
+    ):
+        return "ready"
     if "creator.xiaohongshu.com/publish" in haystack and "target=" in haystack:
         return "unknown"
     return "unknown"

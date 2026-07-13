@@ -17,15 +17,32 @@ class AIDigestSource:
     vendor: str
     parser: str = "rss"
     enabled: bool = True
+    tier: str = ""
+    region: str = "global"
+    topics: tuple[str, ...] = ()
+    priority: int = 0
+
+    def __post_init__(self) -> None:
+        if self.tier:
+            return
+        if self.kind == "aggregator":
+            tier = "aggregator"
+        elif self.kind in {"social", "search"}:
+            tier = "social_backfill" if self.kind == "social" else "search_backfill"
+        elif self.kind == "github" or self.parser in {"rss", "github_releases"}:
+            tier = "official_stream"
+        else:
+            tier = "official_page"
+        object.__setattr__(self, "tier", tier)
 
 
 def default_ai_digest_sources() -> list[AIDigestSource]:
     return [
         AIDigestSource("openai", "official", "https://openai.com/news/rss.xml", "OpenAI", "rss"),
-        AIDigestSource("anthropic", "official", "https://www.anthropic.com/news/rss.xml", "Anthropic", "rss"),
+        AIDigestSource("anthropic", "official", "https://www.anthropic.com/news", "Anthropic", "html"),
         AIDigestSource("deepmind", "official", "https://deepmind.google/blog/rss.xml", "Google DeepMind", "rss"),
-        AIDigestSource("metaai", "official", "https://ai.meta.com/blog/rss/", "Meta AI", "rss"),
-        AIDigestSource("microsoft", "official", "https://blogs.microsoft.com/ai/feed/", "Microsoft AI", "rss"),
+        AIDigestSource("metaai", "official", "https://ai.meta.com/blog", "Meta AI", "html"),
+        AIDigestSource("microsoft", "official", "https://blogs.microsoft.com/", "Microsoft AI", "html"),
         AIDigestSource("nvidia", "official", "https://blogs.nvidia.com/blog/category/deep-learning/feed/", "NVIDIA", "rss"),
         AIDigestSource("mistral", "official", "https://mistral.ai/rss.xml", "Mistral AI", "rss"),
         AIDigestSource("xai", "official", "https://x.ai/news", "xAI", "html"),
@@ -57,7 +74,17 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
         ),
         AIDigestSource("zhipu-glm", "official", "https://docs.bigmodel.cn/cn/update/new-releases", "智谱 GLM", "html"),
         AIDigestSource("zcode", "official", "https://zcode.z.ai/cn", "智谱 ZCode", "html"),
-        AIDigestSource("deepseek", "official", "https://www.deepseek.com/", "DeepSeek", "html"),
+        AIDigestSource(
+            "deepseek",
+            "official",
+            "https://api-docs.deepseek.com/updates",
+            "DeepSeek",
+            "html",
+            tier="official_stream",
+            region="domestic",
+            topics=("model", "api"),
+            priority=10,
+        ),
         AIDigestSource("minimax", "official", "https://platform.minimax.io/docs/release-notes/models", "MiniMax", "html"),
         AIDigestSource("doubao", "official", "https://www.volcengine.com/docs/82379/1159178", "火山方舟/豆包", "html"),
         AIDigestSource("tencent-hunyuan", "official", "https://hy.tencent.com/", "腾讯混元", "html"),
@@ -65,9 +92,13 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
         AIDigestSource(
             "bytedance-seed",
             "official",
-            "https://seed.bytedance.com/en/blog/seed2-1-officially-released-advancing-ai-productivity",
+            "https://seed.bytedance.com/blog",
             "ByteDance Seed",
             "html",
+            tier="official_stream",
+            region="domestic",
+            topics=("model", "multimodal"),
+            priority=10,
         ),
         AIDigestSource("baidu-qianfan", "official", "https://cloud.baidu.com/doc/qianfan/s/Kmh4stnjp", "百度千帆/文心", "html"),
         AIDigestSource("moonshot-kimi", "official", "https://platform.moonshot.cn/blog/tags/announcement", "月之暗面 Kimi", "html"),

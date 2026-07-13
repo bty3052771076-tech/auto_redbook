@@ -25,6 +25,8 @@ from src.volcengine.quota import (
 )
 from src.analytics.post_sync import sync_published_metrics_to_posts
 from src.analytics.published_metrics import analyze_published_metrics, render_published_metrics_analysis
+from src.ai_digest.collect import collect_ai_digest_updates
+from src.news.daily_news import fetch_daily_news_candidates
 from src.publish.playwright_steps import (
     run_collect_published_metrics_sync,
     run_delete_drafts_sync,
@@ -987,6 +989,89 @@ def auto(
         f"skipped_invalid={skipped_invalid} upload_failed={upload_failed} requested={requested_count}"
     )
     _emit_progress_event("auto", "完成", "success", f"generated={len(posts)} uploaded={uploaded} failed={failed_total}")
+
+
+@app.command("check-sources")
+def check_sources(
+    collection: str = typer.Option(
+        "all",
+        "--collection",
+        help="source collection to check: all, daily_news, or ai_digest",
+    ),
+    prompt: str = typer.Option(
+        "technology",
+        "--prompt",
+        help="read-only daily-news search hint used when checking daily_news",
+    ),
+    max_age_days: int = typer.Option(
+        3,
+        "--max-age-days",
+        min=1,
+        max=14,
+        help="freshness window for the AI digest source check",
+    ),
+):
+    """Run read-only source checks and refresh local health snapshots; no LLM, image, post, or upload work."""
+    collection_norm = (collection or "all").strip().lower()
+    if collection_norm not in {"all", "daily_news", "ai_digest"}:
+        raise typer.BadParameter("collection must be one of: all, daily_news, ai_digest")
+
+    root = Path("data") / "source_health"
+    report: dict[str, dict] = {}
+    warnings: list[str] = []
+
+    if collection_norm in {"all", "daily_news"}:
+        _emit_progress_event("check-sources", "检查每日新闻信源", "in_progress")
+        try:
+            candidates, meta = fetch_daily_news_candidates(
+                (prompt or "technology").strip() or "technology",
+                max_records=20,
+                search_days=max_age_days,
+                source_health_path=root / "daily_news.json",
+                persist_source_health=True,
+            )
+            health = meta.get("source_health") if isinstance(meta, dict) else {}
+            report["daily_news"] = {
+                "candidates": len(candidates),
+                "attempts": len((health or {}).get("attempts") or []),
+                "snapshot": (health or {}).get("snapshot_path") or str(root / "daily_news.json"),
+            }
+            _emit_progress_event("check-sources", "检查每日新闻信源", "success", f"candidates={len(candidates)}")
+        except Exception as exc:
+            warnings.append(f"daily_news: {exc}")
+            report["daily_news"] = {"error": str(exc), "snapshot": str(root / "daily_news.json")}
+            _emit_progress_event("check-sources", "检查每日新闻信源", "warning", f"error={exc}")
+
+    if collection_norm in {"all", "ai_digest"}:
+        _emit_progress_event("check-sources", "检查每日AI讯息信源", "in_progress")
+        try:
+            updates, meta = collect_ai_digest_updates(
+                target_count=1,
+                min_official_count=1,
+                allow_social_backfill=False,
+                max_age_days=max_age_days,
+                source_health_path=root / "ai_digest.json",
+                persist_source_health=True,
+            )
+            health = meta.get("source_health") if isinstance(meta, dict) else {}
+            report["ai_digest"] = {
+                "candidates": len(updates),
+                "attempts": len((health or {}).get("attempts") or []),
+                "snapshot": (health or {}).get("snapshot_path") or str(root / "ai_digest.json"),
+            }
+            _emit_progress_event("check-sources", "检查每日AI讯息信源", "success", f"candidates={len(updates)}")
+        except Exception as exc:
+            warnings.append(f"ai_digest: {exc}")
+            report["ai_digest"] = {"error": str(exc), "snapshot": str(root / "ai_digest.json")}
+            _emit_progress_event("check-sources", "检查每日AI讯息信源", "warning", f"error={exc}")
+
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    if warnings:
+        typer.echo(f"warnings: {warnings}")
+        _emit_progress_event("check-sources", "检查完成", "warning", f"warnings={len(warnings)}")
+    else:
+        _emit_progress_event("check-sources", "检查完成", "success")
+    typer.echo("检查完成：已更新本地信源健康快照。")
 
 
 @app.command("aliyun-quota")
