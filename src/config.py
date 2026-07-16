@@ -71,6 +71,12 @@ VOLCENGINE_AVAILABLE_LLM_MODELS = [
 ]
 DEFAULT_VOLCENGINE_LLM_MODEL = VOLCENGINE_AVAILABLE_LLM_MODELS[0]
 
+# Ark exposes the user-facing DeepSeek V4 Pro name in the console catalog, but
+# the OpenAI-compatible endpoint currently requires the dated deployment ID.
+VOLCENGINE_LLM_ENDPOINT_ALIASES = {
+    "deepseek-v4-pro": "deepseek-v4-pro-260425",
+}
+
 
 def _parse_llm_key_file(path: Path) -> dict[str, str]:
     """
@@ -109,6 +115,11 @@ def _split_models(value: str) -> list[str]:
         out.append(m)
         seen.add(m)
     return out
+
+
+def _canonical_volcengine_model(value: str) -> str:
+    model = (value or "").strip()
+    return VOLCENGINE_LLM_ENDPOINT_ALIASES.get(model, model)
 
 
 def _load_fallback_llm_config(*, llm_file: Path | str) -> Optional[LLMConfig]:
@@ -205,7 +216,7 @@ def _load_volcengine_llm_configs() -> list[LLMConfig]:
 
     return [
         LLMConfig(
-            model=m,
+            model=_canonical_volcengine_model(m),
             api_key=api_key,
             base_url=base_url,
             provider="volcengine",

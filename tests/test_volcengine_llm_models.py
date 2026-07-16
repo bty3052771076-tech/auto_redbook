@@ -38,6 +38,18 @@ def test_volcengine_llm_provider_builds_multiple_configs(monkeypatch):
     assert all(c.base_url == DEFAULT_VOLCENGINE_LLM_BASE_URL for c in cfgs)
 
 
+def test_volcengine_deepseek_v4_pro_alias_uses_live_endpoint_id(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "volcengine")
+    monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volc")
+    monkeypatch.setenv("VOLCENGINE_LLM_MODEL", "deepseek-v4-pro")
+    monkeypatch.delenv("VOLCENGINE_LLM_MODELS", raising=False)
+
+    cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
+
+    assert len(cfgs) == 1
+    assert cfgs[0].model == "deepseek-v4-pro-260425"
+
+
 def test_ark_llm_provider_alias_uses_ark_api_key(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "ark")
     monkeypatch.delenv("VOLCENGINE_LLM_API_KEY", raising=False)

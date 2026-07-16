@@ -759,7 +759,7 @@ def test_create_daily_news_posts_stores_simplified_body_without_original_title(m
         url="https://example.com/tw-ai",
         source="聯合新聞網",
         domain="example.com",
-        seendate="2026-07-02",
+        seendate=_recent_news_seendate(0),
         description="臺灣AI產業發佈新規，資訊服務與平台門戶同步調整。",
         content="臺灣AI產業發佈新規，資訊服務與平台門戶同步調整。",
     )
@@ -777,7 +777,7 @@ def test_create_daily_news_posts_stores_simplified_body_without_original_title(m
                 original_title="臺灣AI產業發佈新規",
                 content="臺灣AI產業發佈新規，資訊服務與平台門戶同步調整。",
                 comment="這項規則的重點在於資訊透明、平台責任與產業協同。",
-                date="2026-07-02",
+                date=_recent_news_date(),
                 source="聯合新聞網",
             ),
             "topics": ["每日新闻", "臺灣AI", "資訊服務"],
@@ -798,6 +798,39 @@ def test_create_daily_news_posts_stores_simplified_body_without_original_title(m
     assert all(ch not in f"{post.title}\n{post.body}\n{' '.join(post.topics)}" for ch in "臺灣發佈資訊聯門戶項規則責產業協")
     assert "台湾AI产业发布新规" in post.title
     assert "台湾AI产业发布新规" in post.body
+
+
+def test_simplify_daily_news_draft_converts_common_taiwanese_source_characters():
+    simplified = create_post._simplify_daily_news_draft(
+        {
+            "title": "社群均質化危机當所有人開始用AI寫作",
+            "body": "品牌訊息越來越多，市場卻說不出你的品牌。",
+            "topics": ["行銷", "內容"],
+            "image_event": "企業導入AI行銷工具時的兩種極端",
+        }
+    )
+
+    assert simplified["title"] == "社群均质化危机当所有人开始用AI写作"
+    assert simplified["body"] == "品牌讯息越来越多，市场却说不出你的品牌。"
+    assert simplified["topics"] == ["行销", "内容"]
+    assert simplified["image_event"] == "企业导入AI行销工具时的两种极端"
+
+
+def test_daily_news_rejects_weather_comment_for_non_weather_story():
+    picked = NewsItem(
+        title="苹果公司起诉 OpenAI 涉及知识产权争议",
+        url="https://example.com/apple-openai",
+        source="Example",
+        domain="example.com",
+        seendate="2026-07-15",
+        description="诉讼围绕人才招聘和未发布产品信息展开。",
+        content="苹果指控 OpenAI 获取尚未发布产品的相关信息。",
+    )
+
+    assert create_post._daily_news_comment_is_irrelevant(
+        "这件事的现实价值在于把气象监测合作落到灾害预警、农业安排和公共安全等具体民生场景。",
+        picked,
+    )
 
 
 def test_daily_news_prompt_makes_comment_optional_and_forbids_generic_comment():
@@ -1972,7 +2005,7 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
             url="https://36kr.com/p/1",
             source="36氪",
             domain="36kr.com",
-            seendate="2026-07-02T09:00:00Z",
+            seendate=_recent_news_seendate(0, hour=9),
             description="公司政策调整引发行业关注。",
             content="公司政策调整引发行业关注。",
             sourcecountry="cn",
@@ -1982,7 +2015,7 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
             url="https://36kr.com/p/2",
             source="36氪",
             domain="36kr.com",
-            seendate="2026-07-02T08:50:00Z",
+            seendate=_recent_news_seendate(0, hour=8),
             description="平台企业发布新举措。",
             content="平台企业发布新举措。",
             sourcecountry="cn",
@@ -1992,7 +2025,7 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
             url="https://news.cn/politics/1",
             source="新华社",
             domain="news.cn",
-            seendate="2026-07-02T08:40:00Z",
+            seendate=_recent_news_seendate(0, hour=7),
             description="超龄劳动者权益保障新规施行。",
             content="超龄劳动者权益保障新规施行。",
             sourcecountry="cn",
@@ -2002,7 +2035,7 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
             url="https://news.cctv.com/china/1",
             source="央视新闻",
             domain="news.cctv.com",
-            seendate="2026-07-02T08:30:00Z",
+            seendate=_recent_news_seendate(0, hour=6),
             description="铁路暑运客流进入高峰。",
             content="铁路暑运客流进入高峰。",
             sourcecountry="cn",
@@ -2029,7 +2062,7 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
                 original_title=source_title,
                 content=f"{source_title}，相关公开信息已经披露，后续影响仍需观察。",
                 comment="这条新闻的价值在于提供了清晰的公共议题入口。",
-                date="2026-07-02",
+                date=_recent_news_date(),
                 source=source,
             ),
             "topics": ["每日新闻"],

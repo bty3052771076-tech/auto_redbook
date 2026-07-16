@@ -256,6 +256,31 @@ _COMMON_TRADITIONAL_TO_SIMPLIFIED = str.maketrans(
         "產": "产",
         "臺": "台",
         "灣": "湾",
+        # High-frequency traditional characters that occur in Taiwanese and
+        # Hong Kong source snippets. Keep this local fallback dependency-free.
+        "當": "当",
+        "開": "开",
+        "寫": "写",
+        "質": "质",
+        "為": "为",
+        "壓": "压",
+        "尋": "寻",
+        "雖": "虽",
+        "個": "个",
+        "卻": "却",
+        "聲": "声",
+        "識": "识",
+        "場": "场",
+        "說": "说",
+        "來": "来",
+        "銷": "销",
+        "時": "时",
+        "兩": "两",
+        "種": "种",
+        "極": "极",
+        "揮": "挥",
+        "淪": "沦",
+        "豐": "丰",
     }
 )
 _ALLOWED_TITLE_ASCII_WORDS = {"AI", "API", "NASA", "G7", "G20", "APEC", "CEO", "C919"}
@@ -1557,6 +1582,30 @@ def _daily_news_comment_is_irrelevant(comment: str, picked, content: str = "") -
     if any(marker in text for marker in sports_comment_markers):
         if any(marker in source for marker in ("NASA", "空间站", "航天", "太空", "阿耳忒弥斯")):
             return True
+    weather_comment_markers = (
+        "气象监测",
+        "灾害预警",
+        "防灾减灾",
+        "农业安排",
+        "基层防灾",
+        "设备能否长期运行",
+    )
+    if any(marker in text for marker in weather_comment_markers):
+        weather_source_markers = (
+            "气象",
+            "天气",
+            "台风",
+            "暴雨",
+            "洪水",
+            "灾害",
+            "预警",
+            "防灾",
+            "农业",
+            "weather",
+            "meteorological",
+            "disaster warning",
+        )
+        return not any(marker.lower() in source.lower() for marker in weather_source_markers)
     return False
 
 
@@ -1648,6 +1697,12 @@ def _daily_news_body_has_mismatched_comment(body: str) -> bool:
     comment = fields.get("评价", "")
     if any(marker in comment for marker in ("美股", "半导体设备")) and not any(
         marker in context for marker in ("美股", "半导体设备", "美国股票基金", "科技板块单周流入")
+    ):
+        return True
+    weather_comment_markers = ("气象监测", "灾害预警", "防灾减灾", "农业安排", "基层防灾")
+    weather_context_markers = ("气象", "天气", "台风", "暴雨", "洪水", "灾害", "预警", "防灾", "农业")
+    if any(marker in comment for marker in weather_comment_markers) and not any(
+        marker in context for marker in weather_context_markers
     ):
         return True
     return False
