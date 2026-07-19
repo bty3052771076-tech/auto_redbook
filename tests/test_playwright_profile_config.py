@@ -8,6 +8,7 @@ from src.publish.playwright_steps import (
     _context_default_timeout_ms,
     _format_progress_message,
     _html_for_contenteditable_text,
+    _goto_xhs_page,
     _locators_for_body,
     _matches_body_value,
     _resolve_headless,
@@ -58,6 +59,30 @@ def test_format_progress_message_includes_detail():
 def test_context_default_timeout_follows_wait_timeout():
     assert _context_default_timeout_ms(600000) == 600000
     assert _context_default_timeout_ms(1000) == 30000
+
+
+def test_goto_xhs_page_commits_without_waiting_for_domcontentloaded():
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+
+        def goto(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+
+    page = FakePage()
+
+    _goto_xhs_page(
+        page,
+        "https://creator.xiaohongshu.com/publish/publish?target=image",
+        timeout_ms=600000,
+    )
+
+    assert page.calls == [
+        (
+            "https://creator.xiaohongshu.com/publish/publish?target=image",
+            {"wait_until": "commit", "timeout": 60000},
+        )
+    ]
 
 
 def test_body_locators_include_rich_text_editors():

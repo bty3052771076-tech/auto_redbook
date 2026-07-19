@@ -30,6 +30,9 @@ from src.workflow.create_post import (
     _daily_news_body_has_prompt_leak,
     _daily_news_body_is_too_generic,
     _daily_news_context_is_incomplete,
+    _daily_news_comment_is_unsupported,
+    _daily_news_content_is_unsupported,
+    _daily_news_professional_reporting_instruction,
     _daily_news_quality_issue,
     _enrich_daily_news_item,
     _daily_news_offline_body,
@@ -266,6 +269,16 @@ def test_daily_news_skips_recent_failed_provider_before_rss_fallback(tmp_path, m
     monkeypatch.setenv("NEWS_HISTORY_DEDUPE", "0")
     monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
     monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(
+        daily_news,
+        "_load_additional_news_sources_config",
+        lambda: daily_news.AdditionalNewsSourcesConfig(None, None, None, None),
+    )
+    monkeypatch.setattr(
+        daily_news,
+        "_load_additional_news_source_key",
+        lambda _provider: (_ for _ in ()).throw(RuntimeError("missing")),
+    )
     calls: list[str] = []
 
     def fake_newsapi(**_kwargs):
@@ -701,6 +714,32 @@ def test_daily_news_prompt_requires_chinese_translation_no_url_and_target_length
     assert "理想约15字" in prompt
 
 
+def test_daily_news_prompt_uses_generic_professional_reporting_rules_without_news_examples():
+    picked = NewsItem(
+        title="A policy update affects a market",
+        url="https://example.com/update",
+        source="Example News",
+        domain="example.com",
+        seendate="2026-07-19T08:00:00Z",
+        description="A concise source summary.",
+        content="A source-bound article excerpt with enough facts for a short report.",
+    )
+
+    instruction = _daily_news_professional_reporting_instruction()
+    prompt = _daily_news_prompt(picked, "公司政策 市场变化")
+
+    assert "权威发布写法" in instruction
+    assert "首句直接交代最重要的已证实事件及当前状态" in instruction
+    assert "严格区分已发生事实、来源表述、计划安排和分析判断" in instruction
+    assert "发生时间、发布时点和当前状态" in instruction
+    assert "评价仅在材料能够支持时" in instruction
+    assert "新华社" not in instruction
+    assert "美联社" not in instruction
+    assert "路透社" not in instruction
+    assert instruction in prompt
+    assert "检索关键词（仅用于选题相关性，不得写入正文）" in prompt
+
+
 def test_render_daily_news_body_fields_omits_original_title_from_publishable_body():
     body = _render_daily_news_body_fields(
         {
@@ -769,6 +808,7 @@ def test_create_daily_news_posts_stores_simplified_body_without_original_title(m
         lambda _prompt, **_kwargs: ([picked], {"provider": "fake-news"}),
     )
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
 
     def fake_generate_draft(*_args, **_kwargs):
         return {
@@ -1045,6 +1085,62 @@ def test_daily_news_title_rewrites_truncated_llm_candidates_from_source_title():
 
         assert title == expected
         assert len(title) <= 18
+
+
+def test_daily_news_title_rejects_incomplete_action_tail_and_uses_source_summary():
+    picked = NewsItem(
+        title="重庆彭水山体垮塌救援持续，多部门启动响应",
+        url="https://example.com/rescue",
+        source="央视网",
+        domain="news.cctv.com",
+        description="重庆彭水县发生山体垮塌，救援、人员转移和风险排查同步推进。",
+        content="相关部门启动应急响应，现场持续开展搜救和地质灾害风险监测。",
+    )
+
+    title = _normalize_daily_news_title("重庆彭水山体垮塌救援持续多部门启动响", picked, "")
+
+    assert title == "重庆彭水山体垮塌救援持续"
+    assert not title.endswith("启动响")
+
+
+def test_daily_news_comment_rejects_numeric_claim_missing_from_material():
+    picked = NewsItem(
+        title="世界杯决赛将首次设置中场秀",
+        url="https://example.com/world-cup",
+        source="NPR",
+        domain="npr.org",
+        description="世界杯决赛将首次设置中场秀，已公布多位表演艺人。",
+        content="赛事将把音乐表演与公益教育项目联动，但公开材料未给出表演时长。",
+    )
+
+    assert _daily_news_comment_is_unsupported(
+        "表演时长仅约11分钟，实际效果和观众接受度有待观察。",
+        picked,
+    )
+    assert not _daily_news_comment_is_unsupported(
+        "赛事把体育转播、音乐娱乐与公益教育项目放在同一传播场景中。",
+        picked,
+    )
+
+
+def test_daily_news_content_rejects_unsupported_time_and_duration_claims():
+    picked = NewsItem(
+        title="世界杯决赛将首次设置中场秀",
+        url="https://example.com/world-cup",
+        source="NPR",
+        domain="npr.org",
+        description="世界杯决赛将首次设置中场秀，已公布多位表演艺人。",
+        content="赛事将把音乐表演与公益教育项目联动，但公开材料未给出表演时长。",
+    )
+
+    assert _daily_news_content_is_unsupported(
+        "中场秀预计于美国东部时间下午3:45开始，时长约11分钟。",
+        picked,
+    )
+    assert not _daily_news_content_is_unsupported(
+        "世界杯决赛将首次设置中场秀，节目与公益教育项目联动。",
+        picked,
+    )
 
 
 def test_daily_news_title_compresses_human_rights_governance_without_cutting_word():
@@ -1879,6 +1975,7 @@ def test_create_daily_news_posts_trims_multi_story_source_before_llm_and_image(m
         lambda _prompt: ([picked], {"provider": "fake-news"}),
     )
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
 
     seen: dict[str, str] = {}
 
@@ -2049,6 +2146,7 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
 
     monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
 
     def fake_generate_draft(*_args, **kwargs):
         prompt = kwargs["prompt_hint"]
@@ -3349,6 +3447,69 @@ def test_fetch_daily_news_candidates_juhe_toutiao_maps_articles_and_detail(monke
     assert calls[1][0].endswith("/content")
 
 
+def test_juhe_candidate_pool_skips_per_article_detail_requests(monkeypatch):
+    calls: list[str] = []
+
+    def fake_juhe_request_json(*, url, params, timeout_s):
+        calls.append(url)
+        if url.endswith("/index"):
+            return {
+                "error_code": 0,
+                "result": {
+                    "data": [
+                        {
+                            "title": "AI chip supply chain update",
+                            "url": "https://example.cn/aichip",
+                            "date": _recent_news_seendate(0),
+                            "uniquekey": "abc123",
+                        }
+                    ]
+                },
+            }
+        raise AssertionError("candidate-pool collection must not call the Juhe detail endpoint")
+
+    monkeypatch.setattr(daily_news, "_juhe_request_json", fake_juhe_request_json, raising=False)
+
+    candidates = daily_news._juhe_toutiao_fetch_articles(
+        api_key="fake-juhe-news-key",
+        base_url="https://v.juhe.cn/toutiao",
+        query="technology",
+        max_records=5,
+        timeout_s=1,
+        fetch_detail=False,
+    )
+
+    assert candidates[0].title == "AI chip supply chain update"
+    assert len(calls) == 1
+    assert calls[0].endswith("/index")
+
+
+def test_exhaustive_collection_uses_bounded_provider_timeouts(monkeypatch):
+    monkeypatch.setenv("NEWS_EXHAUSTIVE_PROVIDER_TIMEOUT_S", "7")
+    monkeypatch.setenv("NEWS_EXHAUSTIVE_RSS_TIMEOUT_S", "4")
+
+    assert daily_news._provider_request_timeout_s(
+        "newsdata",
+        requested_timeout_s=20,
+        exhaustive_sources=True,
+    ) == 7
+    assert daily_news._provider_request_timeout_s(
+        "google_rss_cn",
+        requested_timeout_s=20,
+        exhaustive_sources=True,
+    ) == 4
+    assert daily_news._provider_request_timeout_s(
+        "newsdata",
+        requested_timeout_s=3,
+        exhaustive_sources=True,
+    ) == 3
+    assert daily_news._provider_request_timeout_s(
+        "newsdata",
+        requested_timeout_s=20,
+        exhaustive_sources=False,
+    ) == 20
+
+
 def test_fetch_daily_news_candidates_juhe_uses_finance_endpoint_for_business_query(monkeypatch):
     monkeypatch.setenv("NEWS_PROVIDER", "juhe")
     monkeypatch.setenv("JUHE_NEWS_APPKEY", "fake-juhe-news-key")
@@ -3454,6 +3615,197 @@ def test_fetch_daily_news_candidates_auto_uses_gnews_when_newsapi_missing(monkey
 
     assert candidates[0].title == "Climate policy update"
     assert meta["provider_attempts"][0] == "gnews"
+
+
+def test_additional_news_source_config_reads_local_file_and_env(monkeypatch, tmp_path):
+    config_path = tmp_path / "news_sources_api-key.md"
+    config_path.write_text(
+        '\n'.join(
+            (
+                'newsdata_api_key="file-newsdata"',
+                'alphavantage_api_key="file-alpha"',
+                'thenewsapi_token="file-thenews"',
+                'finnhub_api_key="file-finnhub"',
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("NEWS_SOURCES_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("THENEWSAPI_TOKEN", "env-thenews")
+
+    config = daily_news._load_additional_news_sources_config()
+
+    assert config.newsdata_api_key == "file-newsdata"
+    assert config.alphavantage_api_key == "file-alpha"
+    assert config.thenewsapi_token == "env-thenews"
+    assert config.finnhub_api_key == "file-finnhub"
+
+
+def test_additional_news_provider_response_mapping(monkeypatch):
+    def fake_request(provider, _endpoint, _params, *, timeout_s):
+        assert timeout_s == 1
+        if provider == "NewsData":
+            return {
+                "status": "success",
+                "results": [
+                    {
+                        "title": "Domestic technology policy update",
+                        "link": "https://official.example.cn/newsdata",
+                        "source_name": "Official Example",
+                        "source_url": "https://official.example.cn",
+                        "description": "A traceable domestic technology update.",
+                        "pubDate": "2026-07-18 09:00:00",
+                        "language": "chinese",
+                        "country": ["china"],
+                        "image_url": "https://official.example.cn/image.jpg",
+                    }
+                ],
+            }
+        if provider == "Alpha Vantage":
+            return {
+                "feed": [
+                    {
+                        "title": "Chip company market update",
+                        "url": "https://market.example.com/alpha",
+                        "source": "Market Example",
+                        "source_domain": "market.example.com",
+                        "summary": "A market update about a chip company.",
+                        "time_published": "20260718T090000",
+                        "banner_image": "https://market.example.com/image.jpg",
+                        "relevance_score": "0.8",
+                    }
+                ]
+            }
+        if provider == "TheNewsAPI":
+            return {
+                "data": [
+                    {
+                        "title": "International company policy change",
+                        "url": "https://global.example.com/thenews",
+                        "source": "Global Example",
+                        "description": "A cross-border policy update.",
+                        "published_at": "2026-07-18T08:00:00.000000Z",
+                        "language": "en",
+                        "image_url": "https://global.example.com/image.jpg",
+                        "relevance_score": "0.7",
+                    }
+                ]
+            }
+        if provider == "Finnhub":
+            return [
+                {
+                    "headline": "Market reacts to company earnings",
+                    "url": "https://finance.example.com/finnhub",
+                    "source": "Finance Example",
+                    "summary": "A company earnings market reaction.",
+                    "datetime": 1784365200,
+                    "image": "https://finance.example.com/image.jpg",
+                }
+            ]
+        raise AssertionError(f"unexpected provider {provider}")
+
+    monkeypatch.setattr(daily_news, "_provider_request_json", fake_request)
+
+    newsdata = daily_news._newsdata_fetch_articles(
+        api_key="fake-newsdata", query="technology", max_records=5, timeout_s=1
+    )[0]
+    alpha = daily_news._alphavantage_fetch_articles(
+        api_key="fake-alpha",
+        query="chip market",
+        from_iso="2026-07-18T00:00:00Z",
+        to_iso="2026-07-18T12:00:00Z",
+        max_records=5,
+        timeout_s=1,
+    )[0]
+    thenews = daily_news._thenewsapi_fetch_articles(
+        api_token="fake-thenews", query="policy", max_records=5, timeout_s=1
+    )[0]
+    finnhub = daily_news._finnhub_fetch_articles(
+        api_key="fake-finnhub", query="market", max_records=5, timeout_s=1
+    )[0]
+
+    assert newsdata.domain == "official.example.cn"
+    assert newsdata.sourcecountry == "china"
+    assert alpha.seendate == "20260718T090000Z"
+    assert alpha.attention == 0.8
+    assert thenews.language == "en"
+    assert finnhub.source == "Finance Example"
+    assert finnhub.seendate.endswith("Z")
+
+
+def test_balanced_candidate_pool_keeps_later_provider_and_domain_diversity():
+    items = [
+        NewsItem(
+            title=f"Primary provider story {index}",
+            url=f"https://36kr.com/story-{index}",
+            domain="36kr.com",
+            provider="newsapi",
+        )
+        for index in range(30)
+    ]
+    items.extend(
+        NewsItem(
+            title=f"Later provider story {index}",
+            url=f"https://publisher-{index}.example.com/story",
+            domain=f"publisher-{index}.example.com",
+            provider="newsdata",
+        )
+        for index in range(30)
+    )
+
+    selected = daily_news._balanced_candidate_pool(items, max_records=20)
+
+    assert len(selected) == 20
+    assert any(item.provider == "newsdata" for item in selected)
+    assert sum(item.domain == "36kr.com" for item in selected) <= 4
+
+
+def test_auto_plan_includes_configured_additional_news_providers(monkeypatch):
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.delenv("NEWS_CANDIDATES_FILE", raising=False)
+    monkeypatch.setenv("NEWSDATA_API_KEY", "fake-newsdata")
+    monkeypatch.setenv("THENEWSAPI_TOKEN", "fake-thenews")
+    monkeypatch.setenv("ALPHAVANTAGE_API_KEY", "fake-alpha")
+    monkeypatch.setenv("FINNHUB_API_KEY", "fake-finnhub")
+    monkeypatch.setattr(daily_news, "_load_newsapi_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_google_rss_fetch_articles", lambda **_kwargs: [], raising=False)
+    monkeypatch.setattr(daily_news, "_bbc_rss_fetch_articles", lambda **_kwargs: [], raising=False)
+    monkeypatch.setattr(daily_news, "_hotnews_fetch_articles", lambda **_kwargs: [], raising=False)
+
+    def item(provider):
+        return NewsItem(
+            title=f"{provider} technology story",
+            url=f"https://{provider}.example.com/story",
+            domain=f"{provider}.example.com",
+            seendate=_recent_news_seendate(0),
+        )
+
+    monkeypatch.setattr(daily_news, "_newsdata_fetch_articles", lambda **_kwargs: [item("newsdata")])
+    monkeypatch.setattr(daily_news, "_thenewsapi_fetch_articles", lambda **_kwargs: [item("thenewsapi")])
+    monkeypatch.setattr(daily_news, "_alphavantage_fetch_articles", lambda **_kwargs: [item("alphavantage")])
+    monkeypatch.setattr(daily_news, "_finnhub_fetch_articles", lambda **_kwargs: [item("finnhub")])
+
+    candidates, meta = daily_news.fetch_daily_news_candidates(
+        "technology",
+        max_records=4,
+        timeout_s=1,
+        exhaustive_sources=True,
+    )
+
+    assert meta["provider_attempts"][:4] == [
+        "newsdata",
+        "thenewsapi",
+        "alphavantage",
+        "finnhub",
+    ]
+    assert {item.provider for item in candidates} == {
+        "newsdata",
+        "thenewsapi",
+        "alphavantage",
+        "finnhub",
+    }
 
 
 def test_fetch_daily_news_candidates_file_provider_reads_json(monkeypatch, tmp_path):
@@ -3803,6 +4155,140 @@ def test_single_news_material_falls_back_to_pexels_when_ai_image_fails(monkeypat
     assert posts[0].platform["images"][0]["provider"] == "pexels"
     assert posts[0].platform["image_fallback"]["from_provider"] == "aliyun"
     assert posts[0].platform["image_fallback"]["to_provider"] == "pexels"
+
+
+def test_online_daily_news_falls_back_to_pexels_when_ai_image_fails(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("IMAGE_PROVIDER", "volcengine")
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    picked = NewsItem(
+        title="国内企业发布算力调度新方案",
+        url="https://example.cn/compute-scheduling",
+        source="Example News",
+        domain="example.cn",
+        seendate=_recent_news_seendate(0),
+        description="国内企业公布面向工业场景的算力调度方案，并介绍了服务对象和应用范围。",
+        content=(
+            "国内企业公布面向工业场景的算力调度方案，并说明将面向多个生产环节提供服务。"
+            "公司表示，方案将结合现场任务变化分配计算资源，并在后续项目中持续评估运行效果，"
+            "同时会根据不同工厂的设备状态和生产节奏调整资源配置，进一步完善服务流程。"
+        ),
+        sourcecountry="cn",
+    )
+    monkeypatch.setattr(
+        create_post,
+        "fetch_daily_news_candidates",
+        lambda _prompt: ([picked], {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+
+    def fake_generate_draft(*_args, **_kwargs):
+        return {
+            "title": "国内企业发布算力调度方案",
+            "body": _test_daily_news_body(
+                original_title="国内企业发布算力调度新方案",
+                content="国内企业公布面向工业场景的算力调度方案，并说明将面向多个生产环节提供服务。公司表示将持续评估方案在具体项目中的运行效果。",
+                comment="这类方案的实际价值仍取决于落地场景和服务能力。",
+                date=_recent_news_date(),
+                source="Example News",
+            ),
+            "topics": ["每日新闻", "算力"],
+            "image_event": "国内企业展示工业场景算力调度方案",
+        }
+
+    providers: list[str | None] = []
+
+    def fake_images(*, dest_dir, provider=None, **_kwargs):
+        providers.append(provider)
+        if provider == "volcengine":
+            raise ImageGenerationAbandoned(provider="volcengine", attempts=3, errors=["timed out"])
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / "pexels.jpg"
+        out.write_bytes(b"image")
+        return [out], [{"provider": provider, "mode": "auto_image"}]
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+    monkeypatch.setattr(create_post, "fetch_and_download_related_images", fake_images)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="工业算力",
+        asset_paths=[],
+        count=1,
+        auto_image=True,
+    )
+
+    assert len(posts) == 1
+    assert providers == ["volcengine", "pexels"]
+    assert posts[0].platform["images"][0]["provider"] == "pexels"
+    assert posts[0].platform["image_fallback"]["from_provider"] == "volcengine"
+
+
+def test_online_daily_news_skips_headline_only_candidate_after_source_lookup(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    sparse = NewsItem(
+        title="只有标题的赛事消息",
+        url="https://example.cn/sparse",
+        source="Sparse Source",
+        domain="example.cn",
+        seendate=_recent_news_seendate(0),
+        description="赛事举行。",
+    )
+    detailed = NewsItem(
+        title="国内赛事公布新的青少年参赛安排",
+        url="https://example.cn/detailed",
+        source="Detailed Source",
+        domain="example.cn",
+        seendate=_recent_news_seendate(0),
+        description="赛事组织方公布青少年组别参赛安排，并说明报名和比赛将在多个阶段推进，参赛规则将同步更新。",
+        content=(
+            "赛事组织方公布青少年组别参赛安排，并说明报名和比赛将在多个阶段推进。"
+            "主办方表示，活动将覆盖多个城市的参赛队伍，具体日程、组别设置和报名规则以官方后续通知为准，"
+            "同时将为参赛家庭提供必要的赛事服务指引。"
+        ),
+        sourcecountry="cn",
+    )
+    monkeypatch.setattr(
+        create_post,
+        "fetch_daily_news_candidates",
+        lambda _prompt: ([sparse, detailed], {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+
+    def fake_generate_draft(*_args, **kwargs):
+        assert "国内赛事公布新的青少年参赛安排" in kwargs["prompt_hint"]
+        return {
+            "title": "国内赛事公布青少年参赛安排",
+            "body": _test_daily_news_body(
+                original_title="国内赛事公布新的青少年参赛安排",
+                content="赛事组织方公布青少年组别参赛安排，并说明报名和比赛将在多个阶段推进。",
+                comment="安排落地后，具体执行节奏仍值得持续关注。",
+                date=_recent_news_date(),
+                source="Detailed Source",
+            ),
+            "topics": ["每日新闻", "体育"],
+            "image_event": "青少年选手在体育赛事现场参赛",
+        }
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="体育",
+        asset_paths=[],
+        count=1,
+        auto_image=False,
+    )
+
+    assert len(posts) == 1
+    assert posts[0].platform["news"]["picked"]["title"] == detailed.title
 
 
 def test_normalize_news_url_key_removes_tracking_params_and_fragment():

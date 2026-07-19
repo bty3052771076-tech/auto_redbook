@@ -90,6 +90,7 @@ SAVE_OK_TEXTS = [
 DRAFT_BOX_TEXT = "\u8349\u7a3f\u7bb1"
 DRAFT_ITEM_SELECTOR = ".draft-item"
 WAIT_TIMEOUT_MS = 300000
+XHS_NAVIGATION_TIMEOUT_MS = 60000
 
 
 class XHSPageUnavailableError(RuntimeError):
@@ -98,6 +99,15 @@ class XHSPageUnavailableError(RuntimeError):
 
 def _context_default_timeout_ms(wait_timeout_ms: int) -> int:
     return max(30000, int(wait_timeout_ms or 0))
+
+
+def _goto_xhs_page(page, url: str, *, timeout_ms: int) -> None:
+    """Commit navigation promptly; the page-state wait owns editor readiness."""
+    navigation_timeout_ms = min(
+        XHS_NAVIGATION_TIMEOUT_MS,
+        max(30000, int(timeout_ms or 0)),
+    )
+    page.goto(url, wait_until="commit", timeout=navigation_timeout_ms)
 UPLOAD_COUNT_PATTERN = re.compile(r"(\d+)\s*/\s*18")
 GENERIC_DRAFT_TITLES = {"", "\u6682\u65e0\u7b14\u8bb0\u6807\u9898", "\u65e0\u6807\u9898"}
 READY_PAGE_HINTS = [
@@ -1683,6 +1693,13 @@ def _collect_draft_items(page, *, limit: Optional[int] = None) -> list[dict[str,
     return items
 
 
+def _filter_draft_items_by_title(items: list[dict[str, str]], title_contains: str = "") -> list[dict[str, str]]:
+    needle = (title_contains or "").strip()
+    if not needle:
+        return list(items)
+    return [item for item in items if needle in str(item.get("title") or "")]
+
+
 def _confirm_delete_dialog(page, timeout_s: float = 3.0) -> bool:
     selectors = [
         ".draft-delete-popconfirm .btn-footer-confirm",
@@ -2047,16 +2064,25 @@ def _wait_for_draft_cover(page, title: str, timeout_ms: int = 120000) -> bool:
     return False
 
 
-def _delete_first_draft_item(page) -> tuple[bool, str]:
+def _delete_first_draft_item(page, *, title_contains: str = "") -> tuple[bool, str]:
     locator = page.locator(DRAFT_ITEM_SELECTOR)
     if locator.count() == 0:
         return False, "no draft items"
-    item = locator.first
+    needle = (title_contains or "").strip()
+    item = None
     title = ""
-    try:
-        title = (item.locator(".draft-title-text").first.text_content() or "").strip()
-    except Exception:
-        title = ""
+    for index in range(locator.count()):
+        candidate = locator.nth(index)
+        try:
+            candidate_title = (candidate.locator(".draft-title-text").first.text_content() or "").strip()
+        except Exception:
+            candidate_title = ""
+        if not needle or needle in candidate_title:
+            item = candidate
+            title = candidate_title
+            break
+    if item is None:
+        return False, f"draft matching title not found: {needle}"
     btn = item.locator(".draft-actions .btn", has_text="删除")
     if btn.count() == 0:
         btn = item.locator(".btn", has_text="删除")
@@ -2079,17 +2105,21 @@ def _delete_first_draft_item(page) -> tuple[bool, str]:
             clicked = bool(
                 page.evaluate(
                     """
-                    () => {
+                    (needle) => {
                       const items = Array.from(document.querySelectorAll('.draft-item'));
                       if (!items.length) return false;
-                      const item = items[0];
+                      const item = needle
+                        ? items.find(entry => (entry.querySelector('.draft-title-text')?.textContent || '').includes(needle))
+                        : items[0];
+                      if (!item) return false;
                       const btns = Array.from(item.querySelectorAll('.draft-actions .btn, .draft-actions button, .draft-actions a'));
                       const target = btns.find(btn => btn.textContent && btn.textContent.includes('删除'));
                       if (!target) return false;
                       target.click();
                       return true;
                     }
-                    """
+                    """,
+                    needle,
                 )
             )
         except Exception:
@@ -2760,7 +2790,7 @@ def run_save_draft_sync(
                 # In CDP mode, avoid hijacking an existing tab (e.g. ChatGPT page); open a new one.
                 page = context.new_page() if not should_close_context else (context.pages[0] if context.pages else context.new_page())
                 _step("open_page", "in_progress", TARGET_URL)
-                page.goto(TARGET_URL, wait_until="domcontentloaded")
+                _goto_xhs_page(page, TARGET_URL, timeout_ms=wait_timeout_ms)
                 steps[-1].status = "success"
 
                 _step("login_check", "in_progress", f"login_hold={login_hold}s")
@@ -3080,6 +3110,7 @@ def run_delete_drafts_sync(
     draft_type: str = "image",
     draft_location: str = "publish",
     draft_url: str = "",
+    title_contains: str = "",
     limit: int = 0,
     dry_run: bool = False,
     login_hold: int = 0,
@@ -3090,6 +3121,7 @@ def run_delete_drafts_sync(
         "draft_type": draft_type,
         "draft_location": draft_location,
         "draft_url": draft_url or "",
+        "title_contains": title_contains or "",
         "total": 0,
         "deleted": 0,
         "items": [],
@@ -3186,7 +3218,9 @@ def run_delete_drafts_sync(
                 return _collect_draft_items(page, limit=None)
 
             if dry_run:
-                total_items = _collect_for_type(draft_type)
+                total_items = _filter_draft_items_by_title(
+                    _collect_for_type(draft_type), title_contains
+                )
                 result["total"] = len(total_items)
                 if limit and limit > 0:
                     result["items"] = total_items[:limit]
@@ -3195,7 +3229,9 @@ def run_delete_drafts_sync(
                 return result
 
             def _delete_for_type(dtype: str) -> None:
-                total_items = _collect_for_type(dtype)
+                total_items = _filter_draft_items_by_title(
+                    _collect_for_type(dtype), title_contains
+                )
                 result["total"] = len(total_items)
                 if limit and limit > 0:
                     result["items"] = total_items[:limit]
@@ -3204,19 +3240,11 @@ def run_delete_drafts_sync(
 
                 target = len(result["items"])
                 deleted_titles: list[str] = []
-                for _ in range(target):
+                for target_item in result["items"]:
                     before = page.locator(DRAFT_ITEM_SELECTOR).count()
                     if before == 0:
                         break
-                    try:
-                        before_title = (
-                            page.locator(DRAFT_ITEM_SELECTOR)
-                            .first.locator(".draft-title-text")
-                            .first.text_content()
-                            or ""
-                        ).strip()
-                    except Exception:
-                        before_title = ""
+                    before_title = str(target_item.get("title") or "").strip()
                     try:
                         before_time = (
                             page.locator(DRAFT_ITEM_SELECTOR)
@@ -3228,7 +3256,10 @@ def run_delete_drafts_sync(
                         before_time = ""
                     before_key = f"{before_title}|{before_time}" if before_title or before_time else ""
                     before_total = _extract_draft_count(page)
-                    ok, title = _delete_first_draft_item(page)
+                    ok, title = _delete_first_draft_item(
+                        page,
+                        title_contains=before_title,
+                    )
                     if not ok:
                         result["errors"].append(title)
                         _capture_delete_failure("delete_error")

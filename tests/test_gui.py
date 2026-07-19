@@ -14,6 +14,7 @@ from apps.gui import (
     ALIYUN_LLM_MODEL_OPTIONS,
     AUTO_IMAGE_ASSETS_GLOB,
     CommandRunner,
+    DebouncedCallback,
     DEFAULT_LOGIN_URL,
     DEFAULT_DRAFT_URL,
     DELETE_CONFIRM_AUTO,
@@ -28,6 +29,7 @@ from apps.gui import (
     RecentPostSummary,
     SourceHealthDashboardRow,
     UiEventQueue,
+    UiLogBuffer,
     build_xhs_login_launch_args,
     build_xhs_creator_launch_args,
     build_cli_args,
@@ -199,6 +201,42 @@ def test_ui_event_queue_drains_callbacks_in_order():
     assert ui_events.drain() == 2
     assert events == ["first", "second"]
     assert ui_events.drain() == 0
+
+
+def test_ui_log_buffer_batches_output_in_order_and_can_be_cleared():
+    buffer = UiLogBuffer()
+    buffer.write("first\n")
+    buffer.write("second\n")
+    buffer.write("third\n")
+
+    assert buffer.drain(max_items=2) == "first\nsecond\n"
+    assert buffer.drain() == "third\n"
+
+    buffer.write("discard\n")
+    buffer.clear()
+    assert buffer.drain() == ""
+
+
+def test_debounced_callback_keeps_only_the_latest_scheduled_refresh():
+    callbacks: dict[str, object] = {}
+    cancelled: list[str] = []
+    applied: list[str] = []
+
+    def fake_after(_delay: int, callback):
+        handle = f"job-{len(callbacks) + 1}"
+        callbacks[handle] = callback
+        return handle
+
+    def fake_after_cancel(handle: object) -> None:
+        cancelled.append(str(handle))
+
+    refresh = DebouncedCallback(fake_after, fake_after_cancel, applied.append, delay_ms=10)
+    refresh.schedule("first")
+    refresh.schedule("latest")
+
+    assert cancelled == ["job-1"]
+    callbacks["job-2"]()
+    assert applied == ["latest"]
 
 
 def test_command_runner_rejects_duplicate_while_process_is_starting(monkeypatch):
@@ -567,6 +605,28 @@ def test_list_recent_posts_includes_titles_and_status(tmp_path: Path):
     assert second_item.uploaded_at == "2026-06-19T12:34:56.000000Z"
     assert second_item.latest_execution_result == "saved_draft"
     assert second_item.asset_count == 1
+
+
+def test_list_recent_posts_only_hydrates_the_requested_recent_directories(tmp_path: Path, monkeypatch):
+    posts = tmp_path / "data" / "posts"
+    posts.mkdir(parents=True)
+    for index in range(4):
+        post_dir = posts / f"{index + 1:032x}"
+        post_dir.mkdir()
+        os.utime(post_dir, (100 + index, 100 + index))
+
+    hydrated: list[str] = []
+
+    def fake_summary(path: Path, *, include_execution: bool = True) -> RecentPostSummary:
+        hydrated.append(path.name)
+        return RecentPostSummary(post_id=path.name, title=path.name)
+
+    monkeypatch.setattr("apps.gui._read_post_summary", fake_summary)
+
+    items = list_recent_posts(project_root=tmp_path, limit=2)
+
+    assert [item.post_id for item in items] == [f"{4:032x}", f"{3:032x}"]
+    assert hydrated == [f"{4:032x}", f"{3:032x}"]
 
 
 def test_list_publishable_drafts_filters_uploaded_posts_by_beijing_date(tmp_path: Path):
@@ -1001,7 +1061,7 @@ def test_auto_tab_uses_multiple_prompt_entry_boxes():
     assert "prompt_entry_vars" in source
     assert "DEFAULT_PROMPT_ENTRY_COUNT" in source
     assert "combine_prompt_entries(var.get() for var in prompt_entry_vars)" in source
-    assert "split_prompt_entries_from_text(prompt_value" in source
+    assert "split_prompt_entries_from_text(keywords_value" in source
     assert "tk.Text(auto_grid" not in source
     assert "lookback_days_var" in source
     assert "AUTO_REDBOOK_GUI_LOOKBACK_DAYS" in source
@@ -1011,6 +1071,8 @@ def test_auto_tab_uses_multiple_prompt_entry_boxes():
     assert "--single-news-material-file" in source
     assert "news_materials_file_var" in source
     assert "--news-materials-file" in source
+    assert 'text="关键词"' in source
+    assert "--keywords" in source
 
 
 def test_build_cli_args_auto_daily_ai_digest_keeps_special_title():
@@ -1036,7 +1098,7 @@ def test_build_cli_args_auto():
         "auto",
         params={
             "title": "每日新闻",
-            "prompt": "美国时政",
+            "keywords": "美国时政",
             "evaluation_viewpoint": "产业政策视角",
             "assets_glob": "assets/pics/*",
             "count": 2,
@@ -1052,7 +1114,7 @@ def test_build_cli_args_auto():
     )
     assert args[1:4] == ["-m", "apps.cli", "auto"]
     assert "--title" in args and "每日新闻" in args
-    assert "--prompt" in args and "美国时政" in args
+    assert "--keywords" in args and "美国时政" in args
     assert "--evaluation-viewpoint" in args and "产业政策视角" in args
     assert "--lookback-days" in args and "7" in args
     assert "--news-materials-file" in args and "data/manual_news/today.md" in args
@@ -1068,7 +1130,7 @@ def test_build_cli_args_auto_single_news_material_forces_one_without_prompt_or_l
         "auto",
         params={
             "title": "每日新闻",
-            "prompt": "this should be ignored",
+            "keywords": "this should be ignored",
             "evaluation_viewpoint": "无视角评价",
             "assets_glob": "assets/pics/*",
             "count": 9,
@@ -1084,7 +1146,7 @@ def test_build_cli_args_auto_single_news_material_forces_one_without_prompt_or_l
     assert "--single-news-material-file" in args
     assert "data/manual_news/one.md" in args
     assert "--news-materials-file" not in args
-    assert "--prompt" not in args
+    assert "--keywords" not in args
     assert "--lookback-days" not in args
     count_idx = args.index("--count")
     assert args[count_idx + 1] == "1"

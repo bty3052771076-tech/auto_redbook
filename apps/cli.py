@@ -396,7 +396,12 @@ def _mark_posts_published(posts: list[Post], result: dict) -> None:
 
 def create(
     title: str = typer.Option(..., help="初始标题/题目"),
-    prompt: str = typer.Option("", help="提示词/要点（可选）"),
+    prompt: str = typer.Option(
+        "",
+        "--keywords",
+        "--prompt",
+        help="新闻检索关键词（可选；--prompt 保留为兼容别名）",
+    ),
     evaluation_viewpoint: str = typer.Option(
         DEFAULT_EVALUATION_VIEWPOINT,
         "--evaluation-viewpoint",
@@ -416,7 +421,7 @@ def create(
     single_news_material_file: str = typer.Option(
         "",
         "--single-news-material-file",
-        help="每日新闻单条材料文件；提供后只生成 1 条，并忽略提示词/数量/回溯筛选",
+        help="每日新闻单条材料文件；提供后只生成 1 条，并忽略关键词/数量/回溯筛选",
         show_default=False,
     ),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
@@ -709,7 +714,12 @@ def run(
 @app.command()
 def auto(
     title: str = typer.Option(..., help="初始标题/题目"),
-    prompt: str = typer.Option("", help="提示词要点（可选）"),
+    prompt: str = typer.Option(
+        "",
+        "--keywords",
+        "--prompt",
+        help="新闻检索关键词（可选；--prompt 保留为兼容别名）",
+    ),
     evaluation_viewpoint: str = typer.Option(
         DEFAULT_EVALUATION_VIEWPOINT,
         "--evaluation-viewpoint",
@@ -729,7 +739,7 @@ def auto(
     single_news_material_file: str = typer.Option(
         "",
         "--single-news-material-file",
-        help="每日新闻单条材料文件；提供后只生成 1 条，并忽略提示词/数量/回溯筛选",
+        help="每日新闻单条材料文件；提供后只生成 1 条，并忽略关键词/数量/回溯筛选",
         show_default=False,
     ),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
@@ -1000,8 +1010,9 @@ def check_sources(
     ),
     prompt: str = typer.Option(
         "technology",
+        "--keywords",
         "--prompt",
-        help="read-only daily-news search hint used when checking daily_news",
+        help="每日新闻信源检查使用的检索关键词（--prompt 保留为兼容别名）",
     ),
     max_age_days: int = typer.Option(
         3,
@@ -1538,6 +1549,11 @@ def delete_drafts(
         "", help="自定义草稿页面 URL（配合 --draft-location url）"
     ),
     all_types: bool = typer.Option(False, "--all", help="删除所有类型草稿"),
+    title_contains: str = typer.Option(
+        "",
+        "--title-contains",
+        help="只删除标题包含该文本的草稿",
+    ),
     limit: int = typer.Option(0, help="最多删除 N 条（0 表示不限制）"),
     dry_run: bool = typer.Option(False, help="只预览将删除的草稿"),
     headless: bool = typer.Option(
@@ -1577,11 +1593,17 @@ def delete_drafts(
 
     previews: list[dict] = []
     for t in types:
-        _emit_progress_event("delete-drafts", "预览草稿", "in_progress", f"type={t} limit={limit or 'all'}")
+        _emit_progress_event(
+            "delete-drafts",
+            "预览草稿",
+            "in_progress",
+            f"type={t} limit={limit or 'all'} title_contains={title_contains or 'all'}",
+        )
         preview = run_delete_drafts_sync(
             draft_type=t,
             draft_location=location,
             draft_url=draft_url,
+            title_contains=title_contains,
             limit=limit,
             dry_run=True,
             login_hold=login_hold,
@@ -1618,6 +1640,7 @@ def delete_drafts(
             draft_type=t,
             draft_location=location,
             draft_url=draft_url,
+            title_contains=title_contains,
             limit=limit,
             dry_run=False,
             login_hold=login_hold,

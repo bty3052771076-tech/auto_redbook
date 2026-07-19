@@ -12,7 +12,7 @@ from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from xml.etree import ElementTree
@@ -47,7 +47,16 @@ CROSS_DOMAIN_BONUS = 0.4
 NEWS_DEDUPE_SIM_THRESHOLD = 0.8
 DEFAULT_CHINA_RATIO = 0.6
 DEFAULT_CHINA_BONUS = 0.15
-DEFAULT_SOURCE_DOMAIN_MAX_RATIO = 0.5
+DEFAULT_SOURCE_DOMAIN_MAX_RATIO = 0.3
+DEFAULT_PROVIDER_CANDIDATE_MAX_RATIO = 0.35
+DEFAULT_COLLECTION_DOMAIN_MAX_RATIO = 0.2
+# Automatic collection intentionally visits multiple sources. Keep each source
+# bounded so a slow fallback cannot make the whole candidate-pool stage look
+# stalled in the CLI or GUI.
+DEFAULT_EXHAUSTIVE_PROVIDER_QUERY_LIMIT = 2
+DEFAULT_EXHAUSTIVE_PROVIDER_TIMEOUT_S = 14.0
+DEFAULT_EXHAUSTIVE_RSS_TIMEOUT_S = 8.0
+DEFAULT_EXHAUSTIVE_OFFICIAL_RSS_DOMAIN_LIMIT = 2
 LOW_QUALITY_NEWS_DOMAINS = {
     "pypi.org",
     "test.pypi.org",
@@ -73,6 +82,10 @@ NEWSAPI_BASE_URL = "https://newsapi.org"
 GNEWS_BASE_URL = "https://gnews.io/api/v4"
 JUHE_NEWS_BASE_URL = "https://v.juhe.cn/toutiao"
 JUHE_FINANCE_NEWS_BASE_URL = "https://apis.juhe.cn/fapigx/caijing"
+NEWSDATA_BASE_URL = "https://newsdata.io/api/1/latest"
+ALPHAVANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+THENEWSAPI_BASE_URL = "https://api.thenewsapi.com/v1/news/top"
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 HOTNEWS_BASE_URL = "https://orz.ai/api/v1/dailynews"
 GOOGLE_NEWS_RSS_BASE_URL = "https://news.google.com/rss/search"
 BBC_RSS_FEEDS = {
@@ -92,6 +105,40 @@ CN_OFFICIAL_NEWS_DOMAINS = (
     "gov.cn",
     "chinanews.com.cn",
 )
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return default
+
+
+def _positive_env_float(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if raw:
+        try:
+            return max(0.5, float(raw))
+        except ValueError:
+            pass
+    return default
+
+
+def _provider_request_timeout_s(
+    provider: str,
+    *,
+    requested_timeout_s: float,
+    exhaustive_sources: bool,
+) -> float:
+    if not exhaustive_sources:
+        return requested_timeout_s
+    is_rss_like = provider in {"google_rss", "google_rss_cn", "bbc_rss", "hotnews"}
+    env_name = "NEWS_EXHAUSTIVE_RSS_TIMEOUT_S" if is_rss_like else "NEWS_EXHAUSTIVE_PROVIDER_TIMEOUT_S"
+    default = DEFAULT_EXHAUSTIVE_RSS_TIMEOUT_S if is_rss_like else DEFAULT_EXHAUSTIVE_PROVIDER_TIMEOUT_S
+    return min(requested_timeout_s, _positive_env_float(env_name, default))
 
 
 def _news_health_timestamp() -> str:
@@ -116,6 +163,14 @@ def _news_provider_health_url(provider: str) -> str:
         return GNEWS_BASE_URL
     if provider == "juhe":
         return JUHE_NEWS_BASE_URL
+    if provider == "newsdata":
+        return NEWSDATA_BASE_URL
+    if provider == "alphavantage":
+        return ALPHAVANTAGE_BASE_URL
+    if provider == "thenewsapi":
+        return THENEWSAPI_BASE_URL
+    if provider == "finnhub":
+        return FINNHUB_BASE_URL
     if provider == "google_rss":
         return _google_news_rss_base_url()
     if provider == "google_rss_cn":
@@ -128,7 +183,15 @@ def _news_provider_health_url(provider: str) -> str:
 
 
 def _news_provider_health_tier(provider: str) -> str:
-    if provider in {"newsapi", "gnews", "juhe"}:
+    if provider in {
+        "newsapi",
+        "gnews",
+        "juhe",
+        "newsdata",
+        "alphavantage",
+        "thenewsapi",
+        "finnhub",
+    }:
         return "keyed_api"
     if provider in {"google_rss", "google_rss_cn", "bbc_rss"}:
         return "dated_rss"
@@ -253,6 +316,7 @@ class NewsItem:
     socialimage: Optional[str] = None
     sourcecountry: Optional[str] = None
     attention: Optional[float] = None
+    provider: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -261,6 +325,14 @@ class JuheConfig:
     finance_key: Optional[str]
     news_base_url: str
     finance_base_url: str
+
+
+@dataclass(frozen=True)
+class AdditionalNewsSourcesConfig:
+    newsdata_api_key: Optional[str]
+    alphavantage_api_key: Optional[str]
+    thenewsapi_token: Optional[str]
+    finnhub_api_key: Optional[str]
 
 
 def _resolve_tz(tz_name: str):
@@ -669,6 +741,91 @@ def _dedupe_candidates(items: list[NewsItem]) -> list[NewsItem]:
         seen.add(key)
         unique.append(item)
     return _dedupe_by_title(unique, max_count=len(unique))
+
+
+def _balanced_candidate_pool(items: list[NewsItem], *, max_records: int) -> list[NewsItem]:
+    """
+    Keep an exhaustive automatic fetch fair before ranking.
+
+    A large early provider used to fill the raw cap before later providers were
+    merged. Round-robin by provider and conservative domain caps preserve room
+    for independent sources while still filling from a strong source when the
+    rest of the plan is sparse.
+    """
+    unique = _dedupe_candidates(items)
+    limit = max(1, int(max_records))
+    if len(unique) <= limit:
+        return unique
+
+    provider_cap = max(1, int(math.ceil(limit * DEFAULT_PROVIDER_CANDIDATE_MAX_RATIO)))
+    domain_cap = max(1, int(math.ceil(limit * DEFAULT_COLLECTION_DOMAIN_MAX_RATIO)))
+    buckets: dict[str, list[NewsItem]] = {}
+    for item in unique:
+        provider = (item.provider or "unknown").strip().lower() or "unknown"
+        buckets.setdefault(provider, []).append(item)
+
+    selected: list[NewsItem] = []
+    overflow: list[NewsItem] = []
+    provider_counts: dict[str, int] = {}
+    domain_counts: dict[str, int] = {}
+    positions = {provider: 0 for provider in buckets}
+
+    # First pass: each provider receives turns; keep any one publisher from
+    # occupying the raw pool by itself.
+    while len(selected) < limit:
+        progressed = False
+        for provider, bucket in buckets.items():
+            pos = positions[provider]
+            if pos >= len(bucket):
+                continue
+            item = bucket[pos]
+            positions[provider] = pos + 1
+            progressed = True
+            domain = _canonical_domain(_domain_for_item(item)) or f"unknown:{provider}"
+            if provider_counts.get(provider, 0) >= provider_cap or domain_counts.get(domain, 0) >= domain_cap:
+                overflow.append(item)
+                continue
+            selected.append(item)
+            provider_counts[provider] = provider_counts.get(provider, 0) + 1
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+
+    # If several providers are thin, relax the provider cap but still protect
+    # the domain cap. This lets a later provider with many independent
+    # publishers fill the pool before an early single-domain source does.
+    if len(selected) < limit:
+        selected_urls = {item.url or item.title for item in selected}
+        for item in unique:
+            key = item.url or item.title
+            if key in selected_urls:
+                continue
+            provider = (item.provider or "unknown").strip().lower() or "unknown"
+            domain = _canonical_domain(_domain_for_item(item)) or f"unknown:{provider}"
+            if domain_counts.get(domain, 0) >= domain_cap:
+                continue
+            selected.append(item)
+            provider_counts[provider] = provider_counts.get(provider, 0) + 1
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            selected_urls.add(key)
+            if len(selected) >= limit:
+                break
+
+    # Availability wins over artificial scarcity if the configured sources do
+    # not provide enough distinct records.
+    if len(selected) < limit:
+        selected_urls = {item.url or item.title for item in selected}
+        for item in unique:
+            key = item.url or item.title
+            if key in selected_urls:
+                continue
+            selected.append(item)
+            selected_urls.add(key)
+            if len(selected) >= limit:
+                break
+    return selected[:limit]
 
 
 def _parse_seendate_utc(seendate: Optional[str]) -> Optional[datetime]:
@@ -1217,6 +1374,57 @@ def _load_juhe_config(
     )
 
 
+def _load_additional_news_sources_config(
+    *,
+    key_file: Path | str = Path("docs/news_sources_api-key.md"),
+) -> AdditionalNewsSourcesConfig:
+    configured_path = (os.getenv("NEWS_SOURCES_CONFIG_FILE") or "").strip()
+    file_cfg = _parse_kv_file(Path(configured_path) if configured_path else Path(key_file))
+
+    def first_value(*names: str) -> Optional[str]:
+        for name in names:
+            value = os.getenv(name) or file_cfg.get(name.lower())
+            if value and value.strip():
+                return value.strip()
+        return None
+
+    return AdditionalNewsSourcesConfig(
+        newsdata_api_key=first_value("NEWSDATA_API_KEY", "NEWSDATA_KEY"),
+        alphavantage_api_key=first_value(
+            "ALPHAVANTAGE_API_KEY",
+            "ALPHA_VANTAGE_API_KEY",
+        ),
+        thenewsapi_token=first_value(
+            "THENEWSAPI_TOKEN",
+            "THE_NEWS_API_TOKEN",
+            "THENEWS_API_TOKEN",
+        ),
+        finnhub_api_key=first_value("FINNHUB_API_KEY", "FINNHUB_TOKEN"),
+    )
+
+
+def _load_additional_news_source_key(provider: str) -> str:
+    config = _load_additional_news_sources_config()
+    values = {
+        "newsdata": config.newsdata_api_key,
+        "alphavantage": config.alphavantage_api_key,
+        "thenewsapi": config.thenewsapi_token,
+        "finnhub": config.finnhub_api_key,
+    }
+    value = values.get(provider)
+    if value:
+        return value
+    env_name = {
+        "newsdata": "NEWSDATA_API_KEY",
+        "alphavantage": "ALPHAVANTAGE_API_KEY",
+        "thenewsapi": "THENEWSAPI_TOKEN",
+        "finnhub": "FINNHUB_API_KEY",
+    }.get(provider, "API_KEY")
+    raise RuntimeError(
+        f"{provider} api_key missing: set {env_name} or docs/news_sources_api-key.md"
+    )
+
+
 def _split_news_queries(value: str | None) -> list[str]:
     text = (value or "").strip()
     if not text:
@@ -1480,6 +1688,316 @@ def _record_attention(record: dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _external_text(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(_external_text(item) for item in value if _external_text(item))
+    if isinstance(value, dict):
+        for key in ("name", "title", "label", "value"):
+            text = _external_text(value.get(key))
+            if text:
+                return text
+        return ""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _external_domain(url: str, fallback: str = "") -> Optional[str]:
+    for value in (url, fallback):
+        text = (value or "").strip()
+        if not text:
+            continue
+        parsed = urllib.parse.urlparse(text)
+        domain = parsed.netloc.strip()
+        if not domain and "://" not in text:
+            domain = urllib.parse.urlparse(f"https://{text}").netloc.strip()
+        if domain:
+            return domain
+    return None
+
+
+def _provider_request_json(
+    provider: str,
+    endpoint: str,
+    params: dict[str, str],
+    *,
+    timeout_s: float,
+) -> Any:
+    url = f"{endpoint}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (redbook_workflow)"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"{provider} HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"{provider} transport error") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(f"{provider} timeout") from exc
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{provider} returned invalid JSON") from exc
+
+
+def _compact_api_datetime(value: Any) -> str:
+    text = _external_text(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{10}(?:\.\d+)?", text):
+        try:
+            return datetime.fromtimestamp(float(text), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        except (OverflowError, ValueError):
+            return text
+    if re.fullmatch(r"\d{8}T\d{6}", text):
+        return f"{text}Z"
+    return text
+
+
+def _newsdata_fetch_articles(
+    *,
+    api_key: str,
+    query: str,
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    params = {
+        "apikey": api_key,
+        "q": query,
+        "language": (os.getenv("NEWSDATA_LANGUAGES") or "zh,en").strip(),
+        # The current free endpoint accepts at most 10 records per request.
+        # A paid account can opt in to a higher limit explicitly.
+        "size": str(_newsdata_max_results(max_records)),
+    }
+    data = _provider_request_json("NewsData", NEWSDATA_BASE_URL, params, timeout_s=timeout_s)
+    if not isinstance(data, dict) or str(data.get("status") or "").lower() not in {"success", "ok"}:
+        raise RuntimeError("NewsData API returned an unsuccessful response")
+    articles = data.get("results") or []
+    items: list[NewsItem] = []
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        title = _external_text(article.get("title"))
+        url_item = _external_text(article.get("link"))
+        if not title or not url_item:
+            continue
+        source_url = _external_text(article.get("source_url"))
+        items.append(
+            NewsItem(
+                title=title,
+                url=url_item,
+                source=_external_text(article.get("source_name") or article.get("source_id")) or None,
+                description=_external_text(article.get("description")) or None,
+                content=_external_text(article.get("content")) or None,
+                domain=_external_domain(source_url, url_item),
+                seendate=_compact_api_datetime(article.get("pubDate") or article.get("pubDateTZ")) or None,
+                language=_external_text(article.get("language")) or None,
+                socialimage=_external_text(article.get("image_url")) or None,
+                sourcecountry=_external_text(article.get("country")) or None,
+            )
+        )
+    return items[:max_records]
+
+
+def _newsdata_max_results(max_records: int) -> int:
+    raw = (os.getenv("NEWSDATA_MAX") or "").strip()
+    try:
+        configured = int(raw) if raw else 10
+    except ValueError:
+        configured = 10
+    return max(1, min(50, int(max_records), configured))
+
+
+def _alphavantage_topics_for_query(query: str) -> str:
+    text = (query or "").lower()
+    topics: list[str] = []
+    topic_checks = (
+        ("technology", ("technology", "ai", "chip", "tech", "科技", "人工智能", "芯片")),
+        ("finance", ("finance", "market", "stock", "财经", "金融", "市场", "股")),
+        ("economy_macro", ("economy", "macro", "经济", "宏观")),
+        ("economy_fiscal", ("policy", "fiscal", "税", "财政", "政策")),
+        ("mergers_and_acquisitions", ("merger", "acquisition", "并购", "收购")),
+        ("ipo", ("ipo", "上市")),
+        ("energy_transportation", ("energy", "transport", "能源", "汽车", "交通")),
+        ("manufacturing", ("manufacturing", "制造", "工业", "产业")),
+    )
+    for topic, keywords in topic_checks:
+        if any(keyword in text for keyword in keywords):
+            topics.append(topic)
+    return ",".join(dict.fromkeys(topics))
+
+
+def _alphavantage_fetch_articles(
+    *,
+    api_key: str,
+    query: str,
+    from_iso: Optional[str],
+    to_iso: Optional[str],
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    params = {
+        "function": "NEWS_SENTIMENT",
+        "apikey": api_key,
+        "sort": "LATEST",
+        "limit": str(max(1, min(50, int(max_records)))),
+    }
+    topics = _alphavantage_topics_for_query(query)
+    if topics:
+        params["topics"] = topics
+    for source, target in ((from_iso, "time_from"), (to_iso, "time_to")):
+        parsed = _parse_seendate_utc(source)
+        if parsed is not None:
+            params[target] = parsed.strftime("%Y%m%dT%H%M")
+    data = _provider_request_json("Alpha Vantage", ALPHAVANTAGE_BASE_URL, params, timeout_s=timeout_s)
+    if not isinstance(data, dict):
+        raise RuntimeError("Alpha Vantage returned an invalid response")
+    if any(data.get(key) for key in ("Error Message", "Information", "Note")):
+        raise RuntimeError("Alpha Vantage API returned an error response")
+    articles = data.get("feed") or []
+    items: list[NewsItem] = []
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        title = _external_text(article.get("title"))
+        url_item = _external_text(article.get("url"))
+        if not title or not url_item:
+            continue
+        items.append(
+            NewsItem(
+                title=title,
+                url=url_item,
+                source=_external_text(article.get("source")) or None,
+                description=_external_text(article.get("summary")) or None,
+                domain=_external_domain(_external_text(article.get("source_domain")), url_item),
+                seendate=_compact_api_datetime(article.get("time_published")) or None,
+                socialimage=_external_text(article.get("banner_image")) or None,
+                attention=_numeric_value(article.get("relevance_score")),
+            )
+        )
+    return items[:max_records]
+
+
+def _thenewsapi_fetch_articles(
+    *,
+    api_token: str,
+    query: str,
+    max_records: int,
+    timeout_s: float,
+    from_iso: Optional[str] = None,
+    to_iso: Optional[str] = None,
+) -> list[NewsItem]:
+    params = {
+        "api_token": api_token,
+        "search": query,
+        "limit": str(max(1, min(50, int(max_records)))),
+    }
+    categories = _thenewsapi_categories_for_query(query)
+    if categories:
+        params["categories"] = categories
+    for source, target in ((from_iso, "published_after"), (to_iso, "published_before")):
+        parsed = _parse_seendate_utc(source)
+        if parsed is not None:
+            params[target] = parsed.strftime("%Y-%m-%dT%H:%M:%S")
+    data = _provider_request_json("TheNewsAPI", THENEWSAPI_BASE_URL, params, timeout_s=timeout_s)
+    if not isinstance(data, dict):
+        raise RuntimeError("TheNewsAPI returned an invalid response")
+    if data.get("error") or data.get("errors"):
+        raise RuntimeError("TheNewsAPI returned an error response")
+    articles = data.get("data") or []
+    items: list[NewsItem] = []
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        title = _external_text(article.get("title"))
+        url_item = _external_text(article.get("url"))
+        if not title or not url_item:
+            continue
+        items.append(
+            NewsItem(
+                title=title,
+                url=url_item,
+                source=_external_text(article.get("source")) or None,
+                description=_external_text(article.get("description") or article.get("snippet")) or None,
+                domain=_external_domain(url_item),
+                seendate=_compact_api_datetime(article.get("published_at")) or None,
+                language=_external_text(article.get("language")) or None,
+                socialimage=_external_text(article.get("image_url")) or None,
+                attention=_numeric_value(article.get("relevance_score")),
+            )
+        )
+    return items[:max_records]
+
+
+def _thenewsapi_categories_for_query(query: str) -> str:
+    text = (query or "").lower()
+    categories: list[str] = []
+    category_checks = (
+        ("tech", ("technology", "ai", "chip", "tech", "科技", "人工智能", "芯片")),
+        ("business", ("finance", "market", "stock", "财经", "金融", "市场", "公司", "产业")),
+        ("politics", ("policy", "politics", "government", "政策", "政治", "监管", "外交")),
+        ("science", ("science", "research", "科学", "研究")),
+        ("sports", ("sport", "football", "soccer", "体育", "足球")),
+        ("entertainment", ("culture", "entertainment", "文化", "娱乐")),
+        ("health", ("health", "medical", "健康", "医疗")),
+    )
+    for category, keywords in category_checks:
+        if any(keyword in text for keyword in keywords):
+            categories.append(category)
+    return ",".join(dict.fromkeys(categories))
+
+
+def _finnhub_category_for_query(query: str) -> str:
+    text = (query or "").lower()
+    if any(token in text for token in ("crypto", "加密", "比特币", "bitcoin")):
+        return "crypto"
+    if any(token in text for token in ("forex", "汇率", "外汇", "currency")):
+        return "forex"
+    if any(token in text for token in ("merger", "acquisition", "并购", "收购")):
+        return "merger"
+    return "general"
+
+
+def _finnhub_fetch_articles(
+    *,
+    api_key: str,
+    query: str,
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    params = {
+        "category": _finnhub_category_for_query(query),
+        "token": api_key,
+    }
+    data = _provider_request_json("Finnhub", f"{FINNHUB_BASE_URL}/news", params, timeout_s=timeout_s)
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError("Finnhub returned an error response")
+    if not isinstance(data, list):
+        raise RuntimeError("Finnhub returned an invalid response")
+    items: list[NewsItem] = []
+    for article in data:
+        if not isinstance(article, dict):
+            continue
+        title = _external_text(article.get("headline"))
+        url_item = _external_text(article.get("url"))
+        if not title or not url_item:
+            continue
+        items.append(
+            NewsItem(
+                title=title,
+                url=url_item,
+                source=_external_text(article.get("source")) or None,
+                description=_external_text(article.get("summary")) or None,
+                domain=_external_domain(url_item),
+                seendate=_compact_api_datetime(article.get("datetime")) or None,
+                socialimage=_external_text(article.get("image")) or None,
+            )
+        )
+    return items[:max_records]
+
+
 def _juhe_first_text(record: dict[str, Any], keys: tuple[str, ...]) -> str:
     for key in keys:
         value = _juhe_text(record.get(key))
@@ -1669,6 +2187,7 @@ def _juhe_toutiao_fetch_articles(
     query: str,
     max_records: int,
     timeout_s: float,
+    fetch_detail: Optional[bool] = None,
 ) -> list[NewsItem]:
     news_type = _juhe_toutiao_type_for_query(query)
     data = _juhe_request_json(
@@ -1678,7 +2197,7 @@ def _juhe_toutiao_fetch_articles(
     )
     _juhe_ensure_success(data, context="toutiao")
     records = _juhe_records_from_data(data)[: max(1, max_records)]
-    detail_enabled = _juhe_fetch_detail_enabled()
+    detail_enabled = _juhe_fetch_detail_enabled() if fetch_detail is None else bool(fetch_detail)
     detail_limit = _juhe_detail_limit(max_records)
 
     items: list[NewsItem] = []
@@ -1780,6 +2299,7 @@ def _juhe_fetch_articles(
     query: str,
     max_records: int,
     timeout_s: float,
+    fetch_detail: Optional[bool] = None,
 ) -> list[NewsItem]:
     if _juhe_query_is_finance(query) and finance_key:
         return _juhe_finance_fetch_articles(
@@ -1795,6 +2315,7 @@ def _juhe_fetch_articles(
             query=query,
             max_records=max_records,
             timeout_s=timeout_s,
+            fetch_detail=fetch_detail,
         )
     if finance_key:
         return _juhe_finance_fetch_articles(
@@ -2438,9 +2959,20 @@ def fetch_daily_news_candidates(
         if file_path:
             provider_plan = ["file"]
         else:
-            # Auto: prefer keyed APIs when configured. Dated RSS sources are the
-            # no-key fallback; hot_news remains the final heat-list supplement.
+            # Auto: gather every configured keyed provider before RSS backfills.
+            # Final ranking sees a source-balanced pool, rather than whichever
+            # aggregator happened to respond first.
             provider_plan = []
+            try:
+                _load_juhe_config()
+                provider_plan.append("juhe")
+            except Exception:
+                pass
+            additional_sources = _load_additional_news_sources_config()
+            if additional_sources.newsdata_api_key:
+                provider_plan.append("newsdata")
+            if additional_sources.thenewsapi_token:
+                provider_plan.append("thenewsapi")
             try:
                 _load_newsapi_config()
                 provider_plan.append("newsapi")
@@ -2452,8 +2984,13 @@ def fetch_daily_news_candidates(
             except Exception:
                 pass
             try:
-                _load_juhe_config()
-                provider_plan.append("juhe")
+                _load_additional_news_source_key("alphavantage")
+                provider_plan.append("alphavantage")
+            except Exception:
+                pass
+            try:
+                _load_additional_news_source_key("finnhub")
+                provider_plan.append("finnhub")
             except Exception:
                 pass
             # CN regional Google News RSS is the primary no-key source for
@@ -2467,6 +3004,10 @@ def fetch_daily_news_candidates(
         "newsapi",
         "gnews",
         "juhe",
+        "newsdata",
+        "alphavantage",
+        "thenewsapi",
+        "finnhub",
         "google_rss",
         "google_rss_cn",
         "bbc_rss",
@@ -2482,7 +3023,7 @@ def fetch_daily_news_candidates(
     if not provider_plan:
         raise RuntimeError(
             "no news provider configured; set NEWS_PROVIDER=file with NEWS_CANDIDATES_FILE, "
-            "configure NEWS_API_KEY / GNEWS_API_KEY / JUHE_NEWS_APPKEY, or use NEWS_PROVIDER=hotnews"
+            "configure NEWS_API_KEY / GNEWS_API_KEY / JUHE_NEWS_APPKEY / NEWSDATA_API_KEY, or use NEWS_PROVIDER=hotnews"
         )
 
     hint_query = (prompt_hint or "").strip()
@@ -2544,16 +3085,35 @@ def fetch_daily_news_candidates(
         provider_dated_count = 0
         provider_url_count = 0
         provider_candidates: list[NewsItem] = []
-        provider_queries = queries[:1] if provider in ("file", "manual", "hotnews", "bbc_rss") else queries
+        provider_queries = (
+            queries[:1]
+            if provider in ("file", "manual", "hotnews", "bbc_rss", "alphavantage", "finnhub")
+            else queries
+        )
+        if exhaustive_sources:
+            provider_queries = provider_queries[: _positive_env_int(
+                "NEWS_EXHAUSTIVE_PROVIDER_QUERY_LIMIT",
+                DEFAULT_EXHAUSTIVE_PROVIDER_QUERY_LIMIT,
+            )]
         if provider == "google_rss_cn" and exhaustive_sources:
             # Keep the generic CN search, then explicitly ask for official
             # mainland newsrooms so a broad aggregator cannot crowd them out.
+            # Two domains per pass are enough for a diverse pool; the domain
+            # cap later preserves room for all other sources.
             official_queries = [
                 f"{q} site:{domain}"
-                for q in queries[: min(3, len(queries))]
-                for domain in CN_OFFICIAL_NEWS_DOMAINS
+                for q in provider_queries[:1]
+                for domain in CN_OFFICIAL_NEWS_DOMAINS[: _positive_env_int(
+                    "NEWS_EXHAUSTIVE_OFFICIAL_RSS_DOMAIN_LIMIT",
+                    DEFAULT_EXHAUSTIVE_OFFICIAL_RSS_DOMAIN_LIMIT,
+                )]
             ]
             provider_queries = [*provider_queries, *official_queries]
+        provider_timeout_s = _provider_request_timeout_s(
+            provider,
+            requested_timeout_s=timeout_s,
+            exhaustive_sources=exhaustive_sources,
+        )
         for q in provider_queries:
             if hint_query and q in default_queries and provider_candidates:
                 break
@@ -2572,9 +3132,9 @@ def fetch_daily_news_candidates(
                         to_iso=to_iso,
                         sort_by=sort_by,
                         page_size=max_records,
-                        timeout_s=timeout_s,
+                        timeout_s=provider_timeout_s,
                     )
-                    if not raw:
+                    if not raw and not exhaustive_sources:
                         # If today's time window yields no results (common in early hours),
                         # fall back to an unbounded search and filter locally.
                         raw = _newsapi_fetch_articles(
@@ -2585,7 +3145,7 @@ def fetch_daily_news_candidates(
                             to_iso=None,
                             sort_by=sort_by,
                             page_size=max_records,
-                            timeout_s=timeout_s,
+                            timeout_s=provider_timeout_s,
                         )
                     in_today = []
                     for item in raw:
@@ -2607,9 +3167,9 @@ def fetch_daily_news_candidates(
                         from_iso=from_iso,
                         to_iso=to_iso,
                         max_records=max_records,
-                        timeout_s=timeout_s,
+                        timeout_s=provider_timeout_s,
                     )
-                    if not raw:
+                    if not raw and not exhaustive_sources:
                         raw = _gnews_fetch_articles(
                             api_key=api_key,
                             base_url=base_url,
@@ -2617,7 +3177,7 @@ def fetch_daily_news_candidates(
                             from_iso=None,
                             to_iso=None,
                             max_records=max_records,
-                            timeout_s=timeout_s,
+                            timeout_s=provider_timeout_s,
                         )
                     in_today = []
                     for item in raw:
@@ -2642,13 +3202,86 @@ def fetch_daily_news_candidates(
                         finance_base_url=cfg.finance_base_url,
                         query=q,
                         max_records=max_records,
-                        timeout_s=timeout_s,
+                        timeout_s=provider_timeout_s,
+                        # Automatic multi-source collection only needs list
+                        # summaries at this stage. An explicitly selected Juhe
+                        # source, however, benefits from a bounded number of
+                        # article details before daily-news quality screening.
+                        fetch_detail=not exhaustive_sources or not auto_provider_selection,
                     )
                     in_today = []
                     for item in raw:
                         seen = _parse_seendate_utc(item.seendate)
                         if seen and start_dt <= seen <= end_dt:
                             in_today.append(item)
+                    candidates = in_today or raw
+                    used_time_range = bool(in_today)
+                elif provider == "newsdata":
+                    api_key = _load_additional_news_source_key("newsdata")
+                    chosen_source_api = {"provider": "newsdata", "base_url": NEWSDATA_BASE_URL}
+                    raw = _newsdata_fetch_articles(
+                        api_key=api_key,
+                        query=q,
+                        max_records=max_records,
+                        timeout_s=provider_timeout_s,
+                    )
+                    in_today = [
+                        item for item in raw
+                        if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                    ]
+                    candidates = in_today or raw
+                    used_time_range = bool(in_today)
+                    if hint_query and q not in default_queries and _best_relevance(candidates, q) <= 0.0:
+                        candidates = []
+                elif provider == "alphavantage":
+                    api_key = _load_additional_news_source_key("alphavantage")
+                    chosen_source_api = {"provider": "alphavantage", "base_url": ALPHAVANTAGE_BASE_URL}
+                    raw = _alphavantage_fetch_articles(
+                        api_key=api_key,
+                        query=q,
+                        from_iso=from_iso,
+                        to_iso=to_iso,
+                        max_records=max_records,
+                        timeout_s=provider_timeout_s,
+                    )
+                    in_today = [
+                        item for item in raw
+                        if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                    ]
+                    candidates = in_today or raw
+                    used_time_range = bool(in_today)
+                elif provider == "thenewsapi":
+                    api_token = _load_additional_news_source_key("thenewsapi")
+                    chosen_source_api = {"provider": "thenewsapi", "base_url": THENEWSAPI_BASE_URL}
+                    raw = _thenewsapi_fetch_articles(
+                        api_token=api_token,
+                        query=q,
+                        max_records=max_records,
+                        timeout_s=provider_timeout_s,
+                        from_iso=from_iso,
+                        to_iso=to_iso,
+                    )
+                    in_today = [
+                        item for item in raw
+                        if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                    ]
+                    candidates = in_today or raw
+                    used_time_range = bool(in_today)
+                    if hint_query and q not in default_queries and _best_relevance(candidates, q) <= 0.0:
+                        candidates = []
+                elif provider == "finnhub":
+                    api_key = _load_additional_news_source_key("finnhub")
+                    chosen_source_api = {"provider": "finnhub", "base_url": FINNHUB_BASE_URL}
+                    raw = _finnhub_fetch_articles(
+                        api_key=api_key,
+                        query=q,
+                        max_records=max_records,
+                        timeout_s=provider_timeout_s,
+                    )
+                    in_today = [
+                        item for item in raw
+                        if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                    ]
                     candidates = in_today or raw
                     used_time_range = bool(in_today)
                 elif provider in {"google_rss", "google_rss_cn"}:
@@ -2662,7 +3295,7 @@ def fetch_daily_news_candidates(
                     candidates = _google_rss_fetch_articles(
                         query=q,
                         max_records=max_records,
-                        timeout_s=timeout_s,
+                        timeout_s=provider_timeout_s,
                         language="zh-CN" if is_cn_rss else None,
                         country="CN" if is_cn_rss else None,
                     )
@@ -2675,7 +3308,7 @@ def fetch_daily_news_candidates(
                     candidates = _bbc_rss_fetch_articles(
                         prompt_hint=q,
                         max_records=max_records,
-                        timeout_s=timeout_s,
+                        timeout_s=provider_timeout_s,
                     )
                     used_time_range = False
                 elif provider == "hotnews":
@@ -2690,7 +3323,7 @@ def fetch_daily_news_candidates(
                         base_url=base_url,
                         platforms=platforms,
                         max_records=max_records,
-                        timeout_s=timeout_s,
+                        timeout_s=provider_timeout_s,
                     )
                     used_time_range = False
                 elif provider == "manual":
@@ -2712,6 +3345,7 @@ def fetch_daily_news_candidates(
                         max_records=max_records,
                     )
                     used_time_range = False
+                candidates = [replace(item, provider=provider) for item in candidates]
                 provider_item_count += len(candidates)
                 provider_dated_count += sum(1 for item in candidates if str(item.seendate or "").strip())
                 provider_url_count += sum(1 for item in candidates if str(item.url or "").strip())
@@ -2786,15 +3420,14 @@ def fetch_daily_news_candidates(
         if provider_pool:
             if first_success_provider is None:
                 first_success_provider = provider
-            collected_candidates = _dedupe_candidates(
-                [*collected_candidates, *provider_pool]
-            )[:max_records]
+            collected_candidates = _balanced_candidate_pool(
+                [*collected_candidates, *provider_pool],
+                max_records=max_records,
+            )
         if collected_candidates:
             candidates = collected_candidates
             if len(collected_candidates) >= max_records and not (
-                auto_provider_selection
-                and exhaustive_sources
-                and provider in {"newsapi", "gnews", "google_rss_cn"}
+                auto_provider_selection and exhaustive_sources
             ):
                 break
             # Automatic fallback is deliberately exhaustive up to the raw

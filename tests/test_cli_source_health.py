@@ -22,7 +22,7 @@ def test_check_sources_runs_daily_and_ai_collection_without_creating_posts(monke
     monkeypatch.setattr(cli, "fetch_daily_news_candidates", fake_daily, raising=False)
     monkeypatch.setattr(cli, "collect_ai_digest_updates", fake_ai, raising=False)
 
-    result = CliRunner().invoke(cli.app, ["check-sources", "--collection", "all", "--prompt", "World Cup"])
+    result = CliRunner().invoke(cli.app, ["check-sources", "--collection", "all", "--keywords", "World Cup"])
 
     assert result.exit_code == 0, result.output
     assert [name for name, _kwargs in calls] == ["daily_news", "ai_digest"]
@@ -46,3 +46,19 @@ def test_check_sources_can_limit_to_one_collection(monkeypatch, tmp_path: Path):
 
     assert result.exit_code == 0, result.output
     assert calls == ["ai_digest"]
+
+
+def test_check_sources_keeps_prompt_as_legacy_alias(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    seen: dict[str, str] = {}
+
+    def fake_daily(keywords, **_kwargs):
+        seen["keywords"] = keywords
+        return [], {"source_health": {"attempts": []}}
+
+    monkeypatch.setattr(cli, "fetch_daily_news_candidates", fake_daily, raising=False)
+
+    result = CliRunner().invoke(cli.app, ["check-sources", "--collection", "daily_news", "--prompt", "legacy"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["keywords"] == "legacy"

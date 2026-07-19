@@ -931,7 +931,7 @@ def _daily_news_title_has_incomplete_tail(text: str) -> bool:
     compact = re.sub(r"\s+", "", text or "")
     if re.search(r"[\u4e00-\u9fff].*\d$", compact):
         return True
-    return compact.endswith(("获", "补", "项", "按下", "缘何", "路线规", "正式"))
+    return compact.endswith(("获", "补", "项", "按下", "缘何", "路线规", "正式", "启动响"))
 
 
 def _daily_news_title_has_column_prefix(text: str) -> bool:
@@ -1162,9 +1162,9 @@ def _normalize_daily_news_title(
     if picked is not None:
         candidates.extend(
             [
+                (getattr(picked, "title", "") or "", False),
                 (getattr(picked, "description", "") or "", False),
                 (getattr(picked, "content", "") or "", False),
-                (getattr(picked, "title", "") or "", False),
             ]
         )
     candidates.append((prompt_norm, True))
@@ -1441,8 +1441,6 @@ _HUMANITARIAN_COMMENT_MARKERS = (
 
 def _daily_news_comment_is_unsupported(comment: str, picked, content: str = "") -> bool:
     text = comment or ""
-    if not any(marker in text for marker in _HUMANITARIAN_COMMENT_MARKERS):
-        return False
     raw = " ".join(
         str(part or "")
         for part in (
@@ -1452,6 +1450,10 @@ def _daily_news_comment_is_unsupported(comment: str, picked, content: str = "") 
             content,
         )
     )
+    if _daily_news_has_unsupported_numeric_claim(text, picked, content):
+        return True
+    if not any(marker in text for marker in _HUMANITARIAN_COMMENT_MARKERS):
+        return False
     support_markers = ("平民", "救援", "停火", "人道主义", "冲突地区", "生存需求")
     return sum(1 for marker in support_markers if marker in raw) < 2
 
@@ -1486,11 +1488,23 @@ def _daily_news_context_text(picked, content: str = "") -> str:
     )
 
 
+def _daily_news_has_unsupported_numeric_claim(text: str, picked, content: str = "") -> bool:
+    compact_text = re.sub(r"\s+", "", text or "")
+    compact_source = re.sub(r"\s+", "", _daily_news_context_text(picked, content))
+    claims = re.findall(
+        r"\d{1,2}:\d{2}|(?:\d+(?:\.\d+)?|[一二三四五六七八九十两]+)\s*(?:分钟|小时|天|周|月|年|个|名|项|次|%|％)",
+        compact_text,
+    )
+    return any(claim not in compact_source for claim in claims)
+
+
 def _daily_news_content_is_unsupported(content: str, picked) -> bool:
     text = content or ""
     if not text.strip():
         return False
     source = _daily_news_context_text(picked)
+    if _daily_news_has_unsupported_numeric_claim(text, picked):
+        return True
     hallucination_markers = (
         "对委内瑞拉",
         "对伊朗发起军事行动",
@@ -3035,6 +3049,21 @@ def _daily_news_evaluation_viewpoint_instruction(value: str | None) -> str:
     )
 
 
+def _daily_news_professional_reporting_instruction() -> str:
+    """Return generic, source-bound rules for an authoritative concise news style."""
+    return (
+        "权威发布写法：只写已核实、可追溯且与主题直接相关的事实；无法由提供材料支持的内容宁可删去，不得以猜测补全。"
+        "标题必须与正文的已核事实范围一致，准确概括核心变化，不夸大、不制造悬念、不写来源不明的结论。\n"
+        "采用重要性递减的短消息结构：首句直接交代最重要的已证实事件及当前状态；随后补充理解该事件所必需的主体、时间、变化、数据或背景；"
+        "结尾仅保留已核进展、明确的信息边界或必要的下一步安排。不以感叹、设问、口号、比喻或泛泛判断开场。\n"
+        "严格区分已发生事实、来源表述、计划安排和分析判断：计划要写明“计划/拟/将”，单方信息必须明确归因，推断要写明不确定性；"
+        "不得把预测、传闻、未完成核实的信息或单方观点写成既成事实。因果、动机、责任、影响和趋势只有在材料明确支持时才可归因转述。\n"
+        "准确区分发生时间、发布时点和当前状态，旧材料不得写成最新进展；改写不得改变原意或把结论写得更强。"
+        "评价仅在材料能够支持时写成有边界的影响分析：先说明已知变化，再说明仍待观察的变量；"
+        "不得把价值判断、投资建议、立场表达、情绪化或标签化措辞伪装成事实。\n"
+    )
+
+
 def _daily_news_prompt(
     picked,
     prompt_norm: str,
@@ -3051,6 +3080,7 @@ def _daily_news_prompt(
         "来源只写来源名称，网址只保存在本地 post.json 的 metadata 中；正文里不得出现链接、URL 或 http(s)。\n"
         "只允许使用下列已提供的新闻信息，不得新增事实或编造细节；内容不完整时，必须先查阅原新闻/原文摘录后再评价。\n"
         "如果原文摘录仍不足，不得推测数字、因果、人物关系或后续结果；没有可核验影响时省略点评，不要硬凑结论。\n\n"
+        f"{_daily_news_professional_reporting_instruction()}\n"
         "输出为严格 JSON（仅包含 keys: title, body, topics；可选 key: image_event），不要 Markdown/代码块。\n"
         "注意：外层 JSON 的 body 必须是字符串；body 字符串必须是可直接发布的正文，不要把 body 写成 JSON 对象文本。\n\n"
         "可用新闻信息（仅限以下字段，链接仅供参考不要输出）：\n"
@@ -3061,7 +3091,7 @@ def _daily_news_prompt(
         f"- 摘要：{_clip_text(picked.description, limit=300)}\n"
         f"- 原文正文：{_clip_text(picked.content, limit=2200)}\n"
         f"- 链接：{picked.url}\n"
-        f"- 用户关注点（可选）：{prompt_norm or '无'}\n\n"
+        f"- 检索关键词（仅用于选题相关性，不得写入正文）：{prompt_norm or '无'}\n\n"
         "JSON 字段要求：\n"
         "title：标题必须是12-18字的简体中文总结标题，理想约15字；必须由你基于新闻标题/摘要/原文摘录重新概括，不得直接照抄新闻原始标题；不得机械截断长标题；必须包含具体事件关键词；不要加“每日新闻｜”前缀，不得仅为“每日新闻”，不得出现日文假名；不得以“如/如果/若/一旦”等条件词开头，不能只写半句条件，必须写清新闻动作或结果。\n"
         "body：正文必须通顺，必须严格使用下面 4 个中文字段标签，不得增加字段，不得使用旧标签“原文标题/要点摘要/新闻内容/点评/发布时间”：\n"
@@ -4248,7 +4278,11 @@ def create_post_with_draft(
             prompt_hint=_preferred_image_hint(post, prompt_hint),
             dest_dir=dest_dir,
             exclude_ids=image_exclude_ids,
-            ai_first=bool(str(single_news_material_file or "").strip()),
+            # Every daily-news draft should prefer the configured AI image
+            # provider. A Pexels image is only a fallback when generation
+            # fails, including for online candidates rather than just manual
+            # single-news materials.
+            ai_first=True,
         )
         if image_fallback:
             post.platform["image_fallback"] = image_fallback
@@ -4357,6 +4391,13 @@ def create_daily_news_posts(
             break
         picked, lookup_meta = _enrich_daily_news_item(picked)
         picked, focus_meta = _focus_daily_news_item(picked)
+        if not single_material_mode and _daily_news_context_is_incomplete(picked):
+            skipped_quality_count += 1
+            print(
+                f"[daily_news] skip candidate={candidate_idx} reason=source_context_insufficient "
+                f"title={(picked.title or '')[:30]} source={picked.domain or picked.source or 'unknown'}"
+            )
+            continue
         picked_is_china = _is_china_item(picked)
         if required_china_count > 0 and not picked_is_china:
             prospective_count = len(posts) + 1
@@ -4504,7 +4545,7 @@ def create_daily_news_posts(
                     prompt_hint=image_prompt,
                     dest_dir=dest_dir,
                     exclude_ids=used_image_ids,
-                    ai_first=single_material_mode,
+                    ai_first=True,
                 )
                 if image_fallback:
                     post.platform["image_fallback"] = image_fallback
