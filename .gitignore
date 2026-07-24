@@ -15,6 +15,22 @@ exports/
 AGENT.md
 CODING_PROGRESS.md
 
+# Local development records and images
+docs/
+assets/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.avif
+*.svg
+*.ico
+*.tif
+*.tiff
+*.heic
+
 # Secrets (local-only)
 .env
 .env.*
