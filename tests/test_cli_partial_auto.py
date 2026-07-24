@@ -111,6 +111,53 @@ def test_auto_uploads_partial_daily_news_posts_before_reporting_failures(monkeyp
     assert "failed=2" in result.output
 
 
+def test_auto_allows_a_valid_replacement_after_an_invalid_duplicate(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "asset.png"
+    asset.write_bytes(b"fake image")
+    body = "内容：这是一条经过来源核验的测试新闻。\n\n评价：\n\n日期：2026-07-24\n\n来源：测试源"
+    invalid = Post(
+        title="财经政策出现新变化",
+        body=body,
+        assets=[AssetInfo(path=str(tmp_path / "missing.png"), kind="image")],
+    )
+    valid = Post(
+        title="财经政策出现新变化",
+        body=body,
+        assets=[AssetInfo(path=str(asset), kind="image")],
+    )
+    uploaded: list[str] = []
+
+    monkeypatch.setattr(cli, "create_daily_news_posts", lambda **_kwargs: [invalid, valid])
+    monkeypatch.setattr(
+        cli,
+        "run_save_draft_sync",
+        lambda post_arg, **_kwargs: uploaded.append(post_arg.id) or Execution(post_id=post_arg.id, result="saved_draft"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "auto",
+            "--title",
+            "每日新闻",
+            "--count",
+            "2",
+            "--assets-glob",
+            str(asset),
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert uploaded == [valid.id]
+    assert "skip invalid" in result.output
+    assert "skip duplicate" not in result.output
+
+
 def test_auto_daily_news_passes_news_materials_file(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     asset = tmp_path / "asset.png"

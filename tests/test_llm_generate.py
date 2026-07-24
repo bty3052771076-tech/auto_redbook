@@ -3,6 +3,7 @@ import json
 from src.config import LLMConfig
 import src.llm.generate as generate_mod
 from src.llm.generate import _coerce_text, _parse_json_text
+from src.text_integrity import repair_utf8_as_gbk_mojibake
 
 
 def test_parse_json_text_recovers_from_malformed_body_quotes():
@@ -90,3 +91,47 @@ def test_generate_draft_uses_60000_max_tokens(monkeypatch):
     )
 
     assert captured["kwargs"]["max_tokens"] == 60000
+    assert captured["kwargs"]["timeout"] == 240
+
+
+def test_repair_utf8_as_gbk_mojibake_handles_one_and_two_passes():
+    original = "\u6bcf\u65e5\u65b0\u95fb"
+    once = original.encode("utf-8").decode("gb18030")
+    twice = once.encode("utf-8").decode("gb18030")
+
+    assert repair_utf8_as_gbk_mojibake(once) == original
+    assert repair_utf8_as_gbk_mojibake(twice) == original
+    assert repair_utf8_as_gbk_mojibake(original) == original
+
+
+def test_generate_draft_repairs_model_mojibake_and_retries_rate_limit(monkeypatch):
+    calls = {"invoke": 0, "sleep": []}
+    original = "\u8d22\u7ecf\u4ea7\u4e1a\u5e02\u573a\u53d8\u5316\u901f\u89c8"
+    corrupted = original.encode("utf-8").decode("gb18030")
+
+    class FakeModel:
+        def invoke(self, _messages):
+            calls["invoke"] += 1
+            if calls["invoke"] == 1:
+                raise RuntimeError("429 RATE_LIMIT_EXCEEDED")
+            return type(
+                "FakeResponse",
+                (),
+                {"content": json.dumps({"title": corrupted, "body": corrupted, "topics": [corrupted]})},
+            )()
+
+    monkeypatch.setattr(generate_mod, "init_chat_model", lambda *_args, **_kwargs: FakeModel())
+    monkeypatch.setattr(generate_mod.time, "sleep", lambda seconds: calls["sleep"].append(seconds))
+
+    out = generate_mod.generate_draft(
+        LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.invalid/v1"),
+        title_hint="\u6d4b\u8bd5",
+        prompt_hint="\u6d4b\u8bd5",
+        asset_paths=[],
+    )
+
+    assert calls["invoke"] == 2
+    assert calls["sleep"] == [65]
+    assert out["title"] == original
+    assert out["body"] == original
+    assert out["topics"] == [original]

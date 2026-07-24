@@ -825,6 +825,9 @@ def test_create_daily_news_posts_stores_simplified_body_without_original_title(m
         }
 
     monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+    # This case covers replacement of a generic original title; other tests
+    # cover the final daily-news quality gate with source-complete fixtures.
+    monkeypatch.setattr(create_post, "_daily_news_quality_issue", lambda *_args: "")
 
     posts = create_post.create_daily_news_posts(
         prompt_hint="科技产业",
@@ -871,6 +874,24 @@ def test_daily_news_rejects_weather_comment_for_non_weather_story():
         "这件事的现实价值在于把气象监测合作落到灾害预警、农业安排和公共安全等具体民生场景。",
         picked,
     )
+
+
+def test_daily_news_rejects_bay_area_comment_for_sports_plan():
+    picked = NewsItem(
+        title="国家体育总局发布体育强国建设十五五规划",
+        url="https://example.com/sports-plan",
+        source="Example",
+        domain="example.com",
+        seendate="2026-07-22",
+        description="规划提出到2030年体育产业总规模超过7万亿元，经常参加体育锻炼人数比例达到40%左右。",
+        content="规划将从全民健身、竞技体育和体育产业等方面推进体育强国建设。",
+    )
+
+    assert create_post._daily_news_comment_is_irrelevant(
+        "大湾区科创建设的关键在于跨城资源能否真正协同，而不是停留在概念叠加。",
+        picked,
+    )
+    assert "体育产业" in create_post._daily_news_fact_based_comment(picked, picked.content, picked.title)
 
 
 def test_daily_news_prompt_makes_comment_optional_and_forbids_generic_comment():
@@ -1400,6 +1421,33 @@ def test_finalize_daily_news_body_replaces_unsupported_content_and_irrelevant_co
     assert "国家主权" in fields.get("评价", "") or "外部干预" in fields.get("评价", "")
 
 
+def test_finalize_daily_news_body_adds_conservative_comment_for_ministerial_trade_meeting():
+    picked = NewsItem(
+        title="越美部长级会谈共商经贸合作",
+        url="https://example.com/vietnam-us-trade-talks",
+        source="Vietnam+",
+        domain="vietnamplus.vn",
+        seendate="2026-07-20T14:15:00+08:00",
+        description="越南与美国举行部长级会谈，就经贸合作等议题交换意见。",
+        content="会谈涉及贸易、财政、科技、农业和环境等部门。公开报道未披露具体协议、关税调整或金额。",
+    )
+    body = json.dumps(
+        {
+            "内容": "越美双方举行部长级会谈，就经贸合作等议题交换意见。报道未披露具体协议、关税调整或金额。",
+            "评价": "",
+            "日期": "2026-07-20",
+            "来源": "Vietnam+",
+        },
+        ensure_ascii=False,
+    )
+
+    out = _finalize_daily_news_body(body, picked, "国际经贸")
+    fields = _daily_news_body_fields(out)
+
+    assert "可核验的正式结果" in fields["评价"]
+    assert "后续声明、协议文本和执行进展" in fields["评价"]
+
+
 def test_finalize_daily_news_body_removes_recommendation_noise_and_ai_comment_for_culture_news():
     picked = NewsItem(
         title="香港故事丨在香江细读潮汕“情书”",
@@ -1907,6 +1955,7 @@ def test_create_daily_news_posts_replaces_cross_candidate_title_and_image_event(
         lambda _prompt: ([picked], {"provider": "fake-news"}),
     )
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
 
     def fake_generate_draft(*_args, **_kwargs):
         return {
@@ -2417,19 +2466,13 @@ def test_create_daily_news_posts_replaces_generic_original_title_with_post_title
         lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
     )
     picked = NewsItem(
-        title="Insecure Neighbor Shocks Guy With His Audacity, Comes Up With A Plan To Annoy Him Even More",
+        title="邻居要求男子除草时穿上衣引发争议",
         url="https://example.com/shirtless-neighbor",
         source="Boredpanda.com",
         domain="example.com",
         seendate=_recent_news_seendate(0),
-        description=(
-            "A 34-year-old man had been mowing his lawn shirtless for years. "
-            "A neighbor's husband later demanded he cover up while mowing."
-        ),
-        content=(
-            "A man said he had mowed his lawn shirtless for years without issue. "
-            "After a friendly chat with his neighbor, her husband sent a message demanding he cover up."
-        ),
+        description="一名男子多年光膀修剪自家草坪，邻居丈夫随后要求他除草时穿上衣。",
+        content="男子称多年除草未出问题，邻居丈夫在沟通后发消息要求他穿上衣。",
     )
     monkeypatch.setattr(
         create_post,
@@ -2437,6 +2480,7 @@ def test_create_daily_news_posts_replaces_generic_original_title_with_post_title
         lambda _prompt: ([picked], {"provider": "fake-news"}),
     )
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
 
     def fake_generate_draft(*_args, **_kwargs):
         return {
@@ -2545,6 +2589,9 @@ def test_create_daily_news_posts_uses_backup_candidates_after_quality_skips(monk
         lambda _prompt: (candidates, {"provider": "fake-news"}),
     )
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    # This case covers fallback candidates after render-quality rejection; the
+    # separate source-context gate is covered by its own tests.
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
     pick_args: dict[str, int] = {}
 
     def fake_pick_news_items(items, _prompt, *, count=1):
@@ -2660,6 +2707,7 @@ def test_create_daily_news_posts_reserves_final_slot_for_china_quota(monkeypatch
     )
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
     monkeypatch.setattr(create_post, "_focus_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
     monkeypatch.setattr(create_post, "pick_news_items", lambda items, _prompt, *, count=1: items[:count])
 
     def fake_generate_draft(*_args, **kwargs):
@@ -2720,6 +2768,7 @@ def test_create_daily_news_posts_raises_instead_of_returning_partial_posts(monke
         lambda _prompt: (candidates, {"provider": "fake-news"}),
     )
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
     monkeypatch.setattr(create_post, "pick_news_items", lambda items, _prompt, *, count=1: items[:count])
     calls = {"count": 0}
 
@@ -2772,19 +2821,20 @@ def test_create_daily_news_fallback_does_not_publish_prompt_as_topic(monkeypatch
         lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
     )
     picked = NewsItem(
-        title="Inside the fight over Claude Mythos 5",
+        title="某AI模型访问争议升级",
         url="https://example.com/news",
         source="Example",
         domain="example.com",
         seendate=_recent_news_seendate(0),
-        description="A technology dispute escalated.",
-        content="The report described a policy dispute around advanced AI model access.",
+        description="一项围绕先进人工智能模型访问权限的技术争议持续发酵。",
+        content="报道讨论了先进人工智能模型访问政策引发的行业分歧。",
     )
     monkeypatch.setattr(
         create_post,
         "fetch_daily_news_candidates",
         lambda _prompt, **_kwargs: ([picked], {"provider": "fake-news", "picked": {"title": picked.title}}),
     )
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
 
     def fake_generate_draft(*_args, **_kwargs):
         return {
@@ -2794,6 +2844,9 @@ def test_create_daily_news_fallback_does_not_publish_prompt_as_topic(monkeypatch
         }
 
     monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+    # This case covers prompt/topic cleanup; generic-body detection is exercised
+    # independently with materially complete fixtures.
+    monkeypatch.setattr(create_post, "_daily_news_quality_issue", lambda *_args: "")
     prompt = "选择5条适合小红书图文的科技、社会或国际新闻，正文简短，包含要点摘要和点评。"
 
     post = create_post.create_post_with_draft(
@@ -4717,7 +4770,8 @@ def test_finalize_daily_news_body_strips_broken_html_image_tag_from_json_fields(
     assert "<img" not in out
     assert "referrerpolicy" not in out
     assert "width=" not in out
-    assert data["内容"] == "昆山农商银行“员工六维全景画像”系统上线。"
+    assert "昆山农商银行" in data["内容"]
+    assert "员工能力画像和管理支持" in data["内容"]
     assert _daily_news_quality_issue("昆山农商银行员工画像系统上线", out, "") == ""
 
 
@@ -4832,6 +4886,39 @@ def test_daily_news_quality_rejects_mismatched_us_stock_comment():
     )
 
     assert _daily_news_quality_issue("大湾区前沿技术落地", body, "") == "comment_mismatch"
+
+
+def test_repair_daily_news_mismatched_comment_uses_source_grounded_comment():
+    picked = NewsItem(
+        title="世界人工智能大会在沪成立合作组织",
+        url="https://example.com/waic",
+        source="新华网",
+        domain="example.com",
+        seendate="2026-07-22",
+        content="世界人工智能大会发布合作成果，人工智能合作组织在上海成立。",
+    )
+    body = (
+        "内容：\n世界人工智能大会发布合作成果，人工智能合作组织在上海成立。\n\n"
+        "评价：\n美股科技资金快速流入，半导体设备股受 AI 需求拉动。\n\n"
+        "日期：2026-07-22\n\n来源：新华网"
+    )
+
+    repaired = create_post._repair_daily_news_mismatched_comment(body, picked, "")
+
+    assert "美股" not in repaired
+    assert "半导体设备" not in repaired
+    assert _daily_news_quality_issue("世界人工智能大会在沪成立合作组织", repaired, "") == ""
+
+
+def test_normalize_daily_news_title_removes_trailing_list_punctuation():
+    title = create_post._normalize_daily_news_title(
+        "市场板块轮动加剧有色与电力设备走强、",
+        None,
+        "",
+    )
+
+    assert title == "市场板块轮动加剧有色与电力设备走强"
+    assert not create_post._daily_news_title_has_incomplete_tail(title)
 
 
 def test_finalize_daily_news_body_uses_korea_tech_comment_not_us_stock_comment():

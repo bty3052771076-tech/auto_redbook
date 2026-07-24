@@ -1234,6 +1234,7 @@ def _normalize_daily_news_title(
                 max_len=max_len,
             )
             cleaned = compressed or cleaned[:max_len].rstrip("，,。.!！?？:：|｜-—–")
+        cleaned = cleaned.rstrip("，,、。.!！?？:：|｜-—–")
         cleaned = _repair_unbalanced_title_quotes(cleaned)
         if _daily_news_title_has_incomplete_tail(cleaned):
             repaired = _compress_long_daily_news_title(
@@ -1468,10 +1469,10 @@ def _daily_news_safe_fact_comment(picked, content: str = "") -> str:
             content,
         )
     )
-    if "谈判" in raw:
+    if any(marker in raw for marker in ("谈判", "会谈", "部长级")):
         return (
-            "这类谈判新闻的看点在于各方是否形成可核验的正式结果。"
-            "当前公开信息主要是参会和抵达安排，判断影响还要看后续声明、谈判文本和执行细节。"
+            "这类谈判或会谈新闻的看点在于各方能否形成可核验的正式结果。"
+            "当前公开信息主要是参会和议题表述，判断实际影响还要看后续声明、协议文本和执行进展。"
         )
     return ""
 
@@ -1555,6 +1556,10 @@ def _daily_news_comment_is_irrelevant(comment: str, picked, content: str = "") -
     compact_text = re.sub(r"\s+", "", text)
     source = _daily_news_context_text(picked, content)
     compact_source = re.sub(r"\s+", "", source)
+    bay_area_comment_markers = ("大湾区科创", "跨城资源", "跨境规则衔接", "科技成果商业化")
+    if any(marker in text for marker in bay_area_comment_markers):
+        bay_area_source_markers = ("大湾区", "粤港澳", "科创资源", "跨城", "跨境规则", "科技成果商业化")
+        return not any(marker in source for marker in bay_area_source_markers)
     if any(marker in text for marker in ("美股", "半导体设备")) and not any(
         marker in source for marker in ("美股", "半导体设备", "美国股票基金", "科技板块单周流入")
     ):
@@ -1720,6 +1725,34 @@ def _daily_news_body_has_mismatched_comment(body: str) -> bool:
     ):
         return True
     return False
+
+
+def _repair_daily_news_mismatched_comment(
+    body: str,
+    picked,
+    prompt_norm: str,
+    title_hint: str = "",
+) -> str:
+    """Replace a final rendered cross-topic comment with a source-grounded one."""
+    fields = _daily_news_body_to_fields(body, picked, prompt_norm, title_hint=title_hint)
+    rendered = _render_daily_news_body_fields(fields)
+    if not _daily_news_body_has_mismatched_comment(rendered):
+        return rendered
+
+    fallback_comment = _daily_news_fact_based_comment(
+        picked,
+        fields.get("内容", ""),
+        _daily_news_fallback_subject(picked, prompt_norm),
+    )
+    if fallback_comment and not _daily_news_comment_is_irrelevant(
+        fallback_comment,
+        picked,
+        fields.get("内容", ""),
+    ):
+        fields["评价"] = fallback_comment
+    else:
+        fields["评价"] = ""
+    return _render_daily_news_body_fields(fields)
 
 
 def _daily_news_body_has_bad_language(body: str) -> bool:
@@ -3201,6 +3234,15 @@ def _daily_news_fact_based_comment(picked, context: str, subject: str) -> str:
     )
     lower = raw.lower()
 
+    if any(word in raw for word in ("谈判", "会谈", "部长级")):
+        return _daily_news_safe_fact_comment(picked, context)
+
+    if any(word in raw for word in ("体育强国", "全民健身", "体育产业总规模", "经常参加体育锻炼")):
+        return (
+            "规划把全民健身、竞技体育和体育产业放在同一框架下推进，重点在于目标能否转化为稳定的场地、赛事和服务供给。"
+            "后续可关注体育消费、基层设施和青少年参与等指标是否同步改善。"
+        )
+
     if any(word in raw for word in ("潮汕", "侨批", "红头船", "文化传承", "给阿嬷的情书", "香江")):
         return (
             "这条新闻的价值在于把地方文化记忆和当代城市生活连接起来。"
@@ -3308,7 +3350,7 @@ def _daily_news_fact_based_comment(picked, context: str, subject: str) -> str:
 
     if "世界杯" in raw and any(word in raw for word in ("NASA", "空间站", "航天", "太空", "阿耳忒弥斯")):
         return (
-            "这条新闻更像是体育 IP 与航天传播的一次结合。"
+            "这条新闻更像是体育 IP 与航天传播的一种结合。"
             "它能放大世界杯话题热度，也说明大型赛事正在借助科技和太空叙事拓展公众参与感，但实际价值仍主要在科普传播和品牌合作层面。"
         )
 
@@ -3384,7 +3426,7 @@ def _daily_news_fact_based_comment(picked, context: str, subject: str) -> str:
             "如果相关队伍能把比赛经验转化为稳定备战和青训投入，事件的价值会比短期热度更扎实。"
         )
 
-    if any(word in raw for word in ("外贸", "贸易额", "关税", "出口", "进口", "供应链")) or _english_any_keyword(
+    if any(word in raw for word in ("外贸", "经贸", "贸易", "贸易额", "关税", "出口", "进口", "供应链")) or _english_any_keyword(
         lower,
         ("trade", "tariff", "export", "import", "supply chain"),
     ):
@@ -4194,6 +4236,12 @@ def create_post_with_draft(
                 prompt_norm,
                 title_hint=str(draft.get("title") or ""),
             )
+            draft["body"] = _repair_daily_news_mismatched_comment(
+                draft["body"],
+                picked,
+                prompt_norm,
+                title_hint=str(draft.get("title") or ""),
+            )
             draft = _simplify_daily_news_draft(draft)
             quality_issue = _daily_news_quality_issue(
                 draft.get("title", ""),
@@ -4253,6 +4301,11 @@ def create_post_with_draft(
             prompt_hint=prompt_hint,
             asset_paths=asset_paths,
         )
+        if draft.get("_fallback_error"):
+            raise RuntimeError(
+                "LLM draft generation failed; the fallback placeholder will not be saved or uploaded: "
+                f"{draft.get('_fallback_error')}"
+            )
 
     post = Post(
         type="image",
@@ -4477,6 +4530,12 @@ def create_daily_news_posts(
         )
         draft["body"] = _finalize_daily_news_body(
             draft.get("body", ""),
+            picked,
+            prompt_norm,
+            title_hint=str(draft.get("title") or ""),
+        )
+        draft["body"] = _repair_daily_news_mismatched_comment(
+            draft["body"],
             picked,
             prompt_norm,
             title_hint=str(draft.get("title") or ""),

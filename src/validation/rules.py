@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from src.storage.models import Post, PostType
+from src.text_integrity import contains_recoverable_utf8_as_gbk_mojibake
 
 MAX_IMAGE_TITLE = 20
 MAX_IMAGE_BODY = 1000
@@ -46,6 +47,12 @@ def validate_post(post: Post) -> ValidationResult:
         errors.append("title is required")
     if not body:
         errors.append("body is required")
+
+    for field_name, value in (("title", title), ("body", body)):
+        if contains_recoverable_utf8_as_gbk_mojibake(value):
+            errors.append(f"{field_name} contains UTF-8/GBK mojibake")
+    if body in {"（生成失败，请稍后重试）", "(生成失败，请稍后重试)"}:
+        errors.append("body is a generation-failure placeholder")
 
     max_title = _limit_for_title(post.type)
     if len(title) > max_title:

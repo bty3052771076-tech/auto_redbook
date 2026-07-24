@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from typing import Any, Dict, List
 
 from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
 
 from src.config import LLMConfig
+from src.text_integrity import repair_utf8_as_gbk_mojibake
 
 
 DEFAULT_LLM_MAX_TOKENS = 60000
+DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS = 240
+DEFAULT_LLM_RATE_LIMIT_RETRY_SECONDS = 65
+DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES = 1
 
 
 def _truncate(text: str, max_len: int) -> str:
@@ -288,6 +294,19 @@ def _should_try_next_llm(exc: Exception) -> bool:
     return any(k in msg for k in keywords)
 
 
+def _is_rate_limited(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(marker in msg for marker in ("429", "rate_limit", "rate limit", "throttl", "限流"))
+
+
+def _rate_limit_retry_seconds() -> int:
+    raw = os.getenv("LLM_RATE_LIMIT_RETRY_SECONDS", str(DEFAULT_LLM_RATE_LIMIT_RETRY_SECONDS))
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_LLM_RATE_LIMIT_RETRY_SECONDS
+
+
 def _ensure_cfg_list(cfg: LLMConfig | list[LLMConfig]) -> list[LLMConfig]:
     if isinstance(cfg, list):
         return cfg
@@ -349,37 +368,55 @@ def generate_draft(
     )
 
     last_exc: Exception | None = None
+    generated_text: str | None = None
     for idx, llm_cfg in enumerate(cfg_list):
-        try:
-            model = init_chat_model(
-                llm_cfg.model,
-                model_provider="openai",  # use OpenAI-compatible API
-                base_url=llm_cfg.base_url,
-                api_key=llm_cfg.api_key,
-                temperature=0.4,
-                max_tokens=DEFAULT_LLM_MAX_TOKENS,
-            )
-            print(
-                f"[llm] provider={llm_cfg.provider} model={llm_cfg.model} base_url={llm_cfg.base_url}"
-            )
-            resp = model.invoke(messages)
-            text = resp.content if hasattr(resp, "content") else str(resp)
+        request_attempt = 0
+        while True:
+            try:
+                model = init_chat_model(
+                    llm_cfg.model,
+                    model_provider="openai",  # use OpenAI-compatible API
+                    base_url=llm_cfg.base_url,
+                    api_key=llm_cfg.api_key,
+                    temperature=0.4,
+                    max_tokens=DEFAULT_LLM_MAX_TOKENS,
+                    timeout=DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                )
+                print(
+                    f"[llm] provider={llm_cfg.provider} model={llm_cfg.model} base_url={llm_cfg.base_url}"
+                )
+                resp = model.invoke(messages)
+                generated_text = resp.content if hasattr(resp, "content") else str(resp)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if _is_rate_limited(exc) and request_attempt < DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES:
+                    request_attempt += 1
+                    wait_s = _rate_limit_retry_seconds()
+                    print(
+                        f"[llm] rate_limited | provider={llm_cfg.provider} model={llm_cfg.model} "
+                        f"retry={request_attempt}/{DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES} wait={wait_s}s"
+                    )
+                    time.sleep(wait_s)
+                    continue
+                break
+        if generated_text is not None:
             break
-        except Exception as exc:
-            last_exc = exc
-            if idx + 1 < len(cfg_list) and _should_try_next_llm(exc):
-                continue
-            text = json.dumps(
-                {
-                    "title": _truncate((title_hint or "标题").strip(), max_title),
-                    "body": "（生成失败，请稍后重试）",
-                    "topics": [],
-                    "image_event": "",
-                    "_fallback_error": str(exc),
-                },
-                ensure_ascii=False,
-            )
-            break
+        if idx + 1 < len(cfg_list) and _should_try_next_llm(last_exc or RuntimeError()):
+            continue
+        generated_text = json.dumps(
+            {
+                "title": _truncate((title_hint or "标题").strip(), max_title),
+                "body": "（生成失败，请稍后重试）",
+                "topics": [],
+                "image_event": "",
+                "_fallback_error": str(last_exc),
+            },
+            ensure_ascii=False,
+        )
+        break
+
+    text = generated_text or ""
 
     data = _parse_json_text(text)
     if data is None:
@@ -410,8 +447,13 @@ def generate_draft(
     if not raw_body:
         raw_body = prompt_hint
 
-    data["title"] = _truncate(raw_title, max_title)
-    data["body"] = _truncate(raw_body, max_body)
-    data["topics"] = _normalize_topics(data.get("topics"))
-    data.setdefault("image_event", "")
+    data["title"] = _truncate(repair_utf8_as_gbk_mojibake(raw_title), max_title)
+    data["body"] = _truncate(repair_utf8_as_gbk_mojibake(raw_body), max_body)
+    data["topics"] = [
+        repair_utf8_as_gbk_mojibake(topic)
+        for topic in _normalize_topics(data.get("topics"))
+    ]
+    data["image_event"] = repair_utf8_as_gbk_mojibake(
+        _coerce_text(data.get("image_event", ""))
+    )
     return data

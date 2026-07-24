@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import sys
 import webbrowser
 from pathlib import Path
@@ -43,6 +44,7 @@ from src.storage.files import (
 )
 from src.storage.models import Execution, Post, PostStatus, PostType, PublishedMetric, RunRecord, now_iso
 from src.validation import validate_post
+from src.text_integrity import repair_utf8_as_gbk_mojibake
 from src.workflow.create_post import (
     DEFAULT_EVALUATION_VIEWPOINT,
     PartialDailyNewsError,
@@ -101,6 +103,32 @@ def _resolve_asset_paths(post, assets_glob: str) -> list[str]:
     if not asset_paths:
         asset_paths = [a.path for a in post.assets if Path(a.path).is_file()]
     return asset_paths
+
+
+def _is_auto_image_sentinel_glob(pattern: str) -> bool:
+    normalized = (pattern or "").strip().replace("\\", "/").lower()
+    normalized = normalized.removeprefix("./")
+    return normalized in {"assets/empty/*", "assets/empty/**"}
+
+
+def _initial_asset_paths(assets_glob: str) -> list[str]:
+    """Keep the historic empty glob as an explicit auto-image sentinel."""
+    if _is_auto_image_sentinel_glob(assets_glob):
+        return []
+    return [p for p in glob.glob(assets_glob) if Path(p).is_file()]
+
+
+def _repair_cli_text(value: str, *, field: str) -> str:
+    repaired = repair_utf8_as_gbk_mojibake(value)
+    if repaired != value:
+        typer.echo(f"warn: repaired UTF-8/GBK mojibake in {field}")
+    return repaired
+
+
+def _post_upload_fingerprint(post) -> str:
+    title = re.sub(r"[^\w\u4e00-\u9fff]+", "", (post.title or "").lower())
+    body = re.sub(r"[^\w\u4e00-\u9fff]+", "", (post.body or "").lower())
+    return f"{title}|{body[:280]}"
 
 
 def _next_attempt(post_id: str) -> int:
@@ -429,8 +457,8 @@ def create(
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
 ):
     """生成草稿并落盘（post.json + revision）。"""
-    title_norm = (title or "").strip()
-    prompt_norm = (prompt or "").strip()
+    title_norm = _repair_cli_text((title or "").strip(), field="title")
+    prompt_norm = _repair_cli_text((prompt or "").strip(), field="prompt")
     news_materials_file_norm = (news_materials_file or "").strip()
     single_news_material_file_norm = (single_news_material_file or "").strip()
     if news_materials_file_norm and single_news_material_file_norm:
@@ -440,7 +468,7 @@ def create(
         prompt_norm = ""
         lookback_days = None
         count = 1
-    asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
+    asset_paths = _initial_asset_paths(assets_glob)
     if not asset_paths:
         _emit_missing_assets_hint(title_norm)
 
@@ -758,8 +786,8 @@ def auto(
     force: bool = typer.Option(False, help="run even if validation fails"),
 ):
     """Generate content then save draft in one command."""
-    title_norm = (title or "").strip()
-    prompt_norm = (prompt or "").strip()
+    title_norm = _repair_cli_text((title or "").strip(), field="title")
+    prompt_norm = _repair_cli_text((prompt or "").strip(), field="prompt")
     news_materials_file_norm = (news_materials_file or "").strip()
     single_news_material_file_norm = (single_news_material_file or "").strip()
     if news_materials_file_norm and single_news_material_file_norm:
@@ -769,7 +797,7 @@ def auto(
         prompt_norm = ""
         lookback_days = None
         count = 1
-    asset_paths = [p for p in glob.glob(assets_glob) if Path(p).is_file()]
+    asset_paths = _initial_asset_paths(assets_glob)
     if not asset_paths:
         _emit_missing_assets_hint(title_norm, dry_run=dry_run)
 
@@ -879,8 +907,24 @@ def auto(
     upload_failed = 0
 
     total_posts = len(posts)
+    seen_upload_fingerprints: dict[str, str] = {}
     for idx, post in enumerate(posts, start=1):
         _emit_progress_event("auto", "校验草稿", "in_progress", f"post_id={post.id} index={idx}/{total_posts}")
+        fingerprint = _post_upload_fingerprint(post)
+        duplicate_of = seen_upload_fingerprints.get(fingerprint) if fingerprint else None
+        if duplicate_of:
+            skipped_invalid += 1
+            post.status = PostStatus.failed
+            post.platform["validation"] = {
+                "errors": [f"duplicate draft content (same as {duplicate_of})"],
+                "warnings": [],
+            }
+            post.updated_at = now_iso()
+            save_post(post)
+            _emit_progress_event("auto", "校验草稿", "failed", f"post_id={post.id} duplicate_of={duplicate_of}")
+            run_errors.append(f"duplicate draft skipped post_id={post.id}: same as {duplicate_of}")
+            typer.echo(f"skip duplicate post_id={post.id} same_as={duplicate_of}")
+            continue
         result = validate_post(post)
         _emit_validation(result)
         if result.errors and not force:
@@ -926,6 +970,10 @@ def auto(
             run_errors.append(f"validation failed post_id={post.id}: {result.errors}")
             continue
 
+        # Only a draft that will enter the upload path reserves this content.
+        # An earlier invalid draft must not suppress a later valid replacement.
+        if fingerprint:
+            seen_upload_fingerprints[fingerprint] = post.id
         post.status = PostStatus.approved
         post.updated_at = now_iso()
         save_post(post)
