@@ -438,6 +438,18 @@ def _extract_charge_items(payloads: Iterable[dict[str, Any]]) -> list[dict[str, 
     return items
 
 
+def _charge_item_model_names(payloads: Iterable[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in _extract_charge_items(payloads):
+        model = str(item.get("FoundationModelName") or item.get("DisplayName") or "").strip()
+        if not model or model in seen:
+            continue
+        out.append(model)
+        seen.add(model)
+    return out
+
+
 def _status_from_charge_item(
     item: dict[str, Any] | None,
     *,
@@ -1020,10 +1032,11 @@ def run_collect_volcengine_quota_sync(
                 if not visible_only:
                     if all_free:
                         targeted_payloads = _fetch_all_charge_item_payloads(page, charge_item_request_headers)
+                        discovered_models = _charge_item_model_names(targeted_payloads)
                         targeted_payloads.extend(
                             _fetch_target_charge_item_payloads(
                                 page,
-                                volcengine_quota_model_candidates(),
+                                discovered_models or volcengine_quota_model_candidates(),
                                 charge_item_request_headers,
                             )
                         )

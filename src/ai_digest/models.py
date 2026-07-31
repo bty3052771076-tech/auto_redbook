@@ -8,8 +8,16 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-SourceType = Literal["official", "social", "search", "github"]
-VerificationStatus = Literal["official_only", "social_confirmed", "social_only", "rejected"]
+SourceType = Literal["official", "aggregator", "social", "search", "github"]
+VerificationStatus = Literal[
+    "official_only",
+    "aggregator_confirmed",
+    "social_confirmed",
+    "aggregator_only",
+    "social_only",
+    "search_only",
+    "rejected",
+]
 
 
 def _normalize_url(value: str) -> str:
@@ -84,10 +92,15 @@ class AIUpdateItem(BaseModel):
     def _normalize_status_and_score(self):
         if self.source_type == "social" and self.verification_status == "official_only":
             self.verification_status = "social_only"
+        if self.source_type == "aggregator" and self.verification_status == "official_only":
+            self.verification_status = "aggregator_only"
+        if self.source_type == "search" and self.verification_status == "official_only":
+            self.verification_status = "search_only"
         if self.confidence_score <= 0:
             base = {
                 "official": 0.85,
                 "github": 0.78,
+                "aggregator": 0.62,
                 "search": 0.55,
                 "social": 0.45,
             }.get(self.source_type, 0.4)
@@ -135,4 +148,3 @@ class AIDigestBrief(BaseModel):
     items: list[AIUpdateItem] = Field(default_factory=list)
     source_summary: str = ""
     generated_at: str = ""
-

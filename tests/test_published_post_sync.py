@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
 import apps.cli as cli
+import src.analytics.post_sync as post_sync
 from src.analytics.post_sync import sync_published_metrics_to_posts
+from src.storage.models import PostStatus
 
 
 def test_sync_published_metrics_to_posts_marks_uploaded_draft_published(tmp_path: Path):
@@ -133,6 +136,35 @@ def test_sync_published_metrics_to_posts_matches_actual_platform_title(tmp_path:
     assert result["matched"] == 1
     stored = json.loads((post_dir / "post.json").read_text(encoding="utf-8"))
     assert stored["platform"]["publish"]["match_reason"] == "actual_title"
+
+
+def test_sync_published_metrics_loads_local_posts_once_for_a_batch(monkeypatch, tmp_path: Path):
+    post = SimpleNamespace(
+        id="indexed-post",
+        title="Indexed local title",
+        uploaded=True,
+        status=PostStatus.saved_draft,
+        platform={"publish": {"url": "https://www.xiaohongshu.com/explore/indexed"}},
+    )
+    loads: list[Path] = []
+
+    def load_posts_once(*, base):
+        loads.append(base)
+        return iter([post])
+
+    monkeypatch.setattr(post_sync, "list_posts", load_posts_once)
+    monkeypatch.setattr(post_sync, "save_post", lambda *_args, **_kwargs: None)
+
+    result = sync_published_metrics_to_posts(
+        [
+            {"url": "https://www.xiaohongshu.com/explore/indexed", "title": "First title"},
+            {"title": "Indexed local title"},
+        ],
+        base=tmp_path,
+    )
+
+    assert result["matched"] == 2
+    assert loads == [tmp_path]
 
 
 def test_update_metrics_cli_syncs_matching_local_posts(monkeypatch, tmp_path: Path):

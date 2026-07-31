@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from src.ai_digest import collect as collect_mod
@@ -10,6 +12,7 @@ from src.ai_digest.fetchers import (
     parse_official_html,
     parse_rss_feed,
     parse_social_search_html,
+    parse_x_profile_html,
 )
 from src.ai_digest.sources import default_ai_digest_sources, resolve_ai_digest_sources
 
@@ -65,10 +68,23 @@ def test_default_sources_include_expandable_official_and_social_groups():
         "bytedance-seed",
     }.issubset(names)
     assert "aihot-daily" in names
+    assert next(source for source in sources if source.name == "aihot-daily").kind == "aggregator"
     assert any(source.kind == "official" for source in sources)
     assert any(source.kind == "social" for source in sources)
-    assert any(source.kind == "search" for source in sources)
     assert all(source.enabled for source in sources if source.kind == "official")
+    assert {
+        "x-openai",
+        "x-openai-devs",
+        "x-anthropic",
+        "x-claude-devs",
+        "x-sam-altman",
+        "x-tibo-maker",
+    }.issubset(names)
+    assert all(
+        source.kind == "social" and source.parser == "x_profile" and source.enabled
+        for source in sources
+        if source.name.startswith("x-")
+    )
 
 
 def test_default_sources_use_current_official_pages_when_legacy_rss_endpoints_are_retired():
@@ -145,7 +161,7 @@ def test_default_sources_include_all_extended_domestic_and_global_model_feeds():
         assert source.enabled is True
 
 
-def test_resolve_ai_digest_sources_places_huggingface_aggregators_last_by_default(monkeypatch):
+def test_resolve_ai_digest_sources_places_aggregators_before_social_sources_by_default(monkeypatch):
     monkeypatch.delenv("AI_DIGEST_PRIMARY_SOURCES", raising=False)
     monkeypatch.delenv("AI_DIGEST_SOCIAL_SOURCES", raising=False)
     monkeypatch.delenv("AI_DIGEST_AGGREGATOR_SOURCES", raising=False)
@@ -153,8 +169,23 @@ def test_resolve_ai_digest_sources_places_huggingface_aggregators_last_by_defaul
     names = [source.name for source in resolve_ai_digest_sources()]
 
     assert "aihot-daily" in names
-    assert names[-2:] == ["huggingface", "github-ai"]
     assert names.index("huggingface") > names.index("aihot-daily")
+    assert names.index("github-ai") > names.index("huggingface")
+    assert names.index("github-ai") < names.index("x-openai")
+    assert names[-1] == "x-tibo-maker"
+
+
+def test_resolve_ai_digest_sources_places_aggregators_before_social_sources(monkeypatch):
+    sources = resolve_ai_digest_sources(
+        {
+            "AI_DIGEST_SOCIAL_SOURCES": "x",
+            "AI_DIGEST_AGGREGATOR_SOURCES": "aihot-daily,huggingface",
+        }
+    )
+    names = [source.name for source in sources]
+
+    assert names.index("aihot-daily") < names.index("x")
+    assert names.index("huggingface") < names.index("x")
 
 
 def test_domestic_ai_sources_use_official_release_pages():
@@ -221,11 +252,67 @@ def test_parse_aihot_daily_html_maps_traceable_digest_items():
 
     assert len(items) == 2
     assert items[0].vendor == "美团 LongCat"
-    assert items[0].source_type == "search"
+    assert items[0].source_type == "aggregator"
+    assert items[0].verification_status == "aggregator_only"
     assert items[0].published_at == "2026-07-02T08:00:00+08:00"
-    assert items[0].evidence_urls == ["https://aihot.virxact.com/daily/2026-07-02"]
+    assert items[0].url == "https://aihot.virxact.com/daily/2026-07-02?item=1"
+    assert items[0].evidence_urls == []
     assert items[1].vendor == "Anthropic"
     assert all("7 日 GitHub" not in item.title for item in items)
+
+
+def test_parse_aihot_daily_html_promotes_embedded_official_url_to_primary_link():
+    html = """
+    <html><body>
+      <p>Claude 发现加密算法弱点，Anthropic 发布新研究</p>
+      <p>X：Anthropic (@AnthropicAI)</p>
+      <p>Anthropic 介绍 Claude 的密码学研究进展。了解更多：https://www.anthropic.com/research/cryptographic-weaknesses</p>
+    </body></html>
+    """
+
+    items = parse_aihot_daily_html(
+        html,
+        source_name="AI HOT",
+        vendor="AI HOT",
+        base_url="https://aihot.virxact.com/daily/2026-07-29",
+        published_date="2026-07-29",
+    )
+
+    assert items[0].source_type == "aggregator"
+    assert items[0].url == "https://www.anthropic.com/research/cryptographic-weaknesses"
+    assert items[0].source_name == "Anthropic 原始页面（AI HOT 汇总）"
+    assert items[0].evidence_urls == ["https://aihot.virxact.com/daily/2026-07-29?item=1"]
+
+
+def test_parse_aihot_next_payload_keeps_each_title_summary_and_source_together():
+    payload = """
+    ["$","div",{"className":"m-daily-entry-title","children":"xAI 发布 Grok CLI 并支持 /tutorial 命令"}]
+    ["$","p",{"className":"m-daily-entry-sum","children":"下载 Grok Build 并输入 /tutorial，可快速了解命令行工具。"}]
+    ["$","div",{"className":"m-daily-entry-src","children":"X：Elon Musk (@elonmusk, xAI)"}]
+    ["$","div",{"className":"m-daily-entry-title","children":"Suno 推出多项新功能，含 MIDI 导出"}]
+    ["$","p",{"className":"m-daily-entry-sum","children":"网页端和移动端新增高级音轨分离、MIDI 导出、歌词合写与自动保存。"}]
+    ["$","div",{"className":"m-daily-entry-src","children":"X：Suno (@suno)"}]
+    {"isoDate":"2026-07-20","headline":"Qwen3.8 开源发布，2.4T 参数模型上线"}
+    """
+    html = f"<script>self.__next_f.push({json.dumps([1, payload], ensure_ascii=False)})</script>"
+
+    items = parse_aihot_daily_html(
+        html,
+        source_name="AI HOT",
+        vendor="AI HOT",
+        base_url="https://aihot.virxact.com/daily/2026-07-27",
+        published_date="2026-07-27",
+    )
+
+    assert [item.title for item in items] == [
+        "xAI 发布 Grok CLI 并支持 /tutorial 命令",
+        "Suno 推出多项新功能，含 MIDI 导出",
+    ]
+    assert items[0].raw_excerpt.startswith("下载 Grok Build")
+    assert items[0].source_name == "X：Elon Musk (@elonmusk, xAI)"
+    assert items[1].raw_excerpt.startswith("网页端和移动端新增")
+    assert items[1].source_name == "X：Suno (@suno)"
+    assert all("Qwen3.8" not in item.title for item in items)
 
 
 def test_parse_rss_feed_maps_items_to_ai_updates():
@@ -249,6 +336,24 @@ def test_parse_rss_feed_maps_items_to_ai_updates():
     assert items[0].url == "https://openai.com/news/model"
     assert items[0].vendor == "OpenAI"
     assert items[0].published_at.startswith("2026-06-30T08:30:00")
+
+
+def test_fetch_aggregator_rss_preserves_aggregator_source_tier(monkeypatch):
+    xml = """<?xml version="1.0"?>
+    <rss><channel><item>
+      <title>Hugging Face 模型工具更新</title>
+      <link>https://huggingface.co/blog/model-update</link>
+      <pubDate>Wed, 29 Jul 2026 08:30:00 GMT</pubDate>
+      <description>Hugging Face 汇总模型与推理工具更新。</description>
+    </item></channel></rss>
+    """
+    source = next(source for source in default_ai_digest_sources() if source.name == "huggingface")
+    monkeypatch.setattr(collect_mod, "_http_get_text", lambda *_args, **_kwargs: xml)
+
+    items = collect_mod.fetch_ai_digest_source(source)
+
+    assert items[0].source_type == "aggregator"
+    assert items[0].verification_status == "aggregator_only"
 
 
 def test_parse_github_releases_json_maps_release_entries():
@@ -285,6 +390,40 @@ def test_parse_social_search_html_maps_public_links_as_social_candidates():
     assert items[0].source_type == "social"
     assert items[0].verification_status == "social_only"
     assert items[0].url == "https://x.com/OpenAI/status/123"
+
+
+def test_parse_x_profile_html_maps_public_tweets_with_real_publish_times():
+    payload = {
+        "props": {
+            "pageProps": {
+                "timeline": {
+                    "entries": [
+                        {
+                            "type": "tweet",
+                            "content": {
+                                "tweet": {
+                                    "created_at": "Wed Jul 29 00:35:31 +0000 2026",
+                                    "full_text": "We released the open-source Codex Security CLI for repository scanning.",
+                                    "permalink": "/OpenAI/status/2082263717916586117",
+                                    "user": {"name": "OpenAI", "screen_name": "OpenAI"},
+                                }
+                            },
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    html = f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(payload)}</script>'
+
+    items = parse_x_profile_html(html, source_name="OpenAI X", vendor="OpenAI")
+
+    assert len(items) == 1
+    assert items[0].source_type == "social"
+    assert items[0].verification_status == "social_only"
+    assert items[0].published_at == "2026-07-29T00:35:31Z"
+    assert items[0].url == "https://x.com/OpenAI/status/2082263717916586117"
+    assert items[0].source_name == "X：OpenAI (@OpenAI)"
 
 
 def test_parse_official_html_extracts_release_lines_as_official_candidates():
@@ -550,3 +689,26 @@ def test_parse_official_html_filters_marketing_and_release_note_page_titles():
     )
 
     assert items == []
+
+
+def test_parse_official_html_filters_legal_footer_and_keeps_model_release():
+    html = """
+    <html><body>
+      <p>Developer Terms of Service FLUX API Service Terms Self-Hosted Terms of Service
+      Non-Commercial License Terms Responsible AI Development Policy Training Data Disclosure</p>
+      <p>Select a category All Customer stories Models News Products Research</p>
+      <a href="/blog/flux-3">FLUX 3 multimodal frontier model released in Early Access July 23, 2026</a>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="Black Forest Labs",
+        vendor="Black Forest Labs",
+        base_url="https://bfl.ai/blog",
+    )
+
+    assert len(items) == 1
+    assert "FLUX 3" in items[0].title
+    assert "Terms of Service" not in items[0].title
+    assert items[0].published_at == "2026-07-23"

@@ -16,7 +16,7 @@ from src.text_integrity import repair_utf8_as_gbk_mojibake
 DEFAULT_LLM_MAX_TOKENS = 60000
 DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS = 240
 DEFAULT_LLM_RATE_LIMIT_RETRY_SECONDS = 65
-DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES = 1
+DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES = 3
 
 
 def _truncate(text: str, max_len: int) -> str:
@@ -279,6 +279,8 @@ def _should_try_next_llm(exc: Exception) -> bool:
         "permission",
         "no permission",
         "access denied",
+        "overdue",
+        "arrears",
         "model not found",
         "unsupported",
         "not support",
@@ -305,6 +307,14 @@ def _rate_limit_retry_seconds() -> int:
         return max(1, int(raw))
     except (TypeError, ValueError):
         return DEFAULT_LLM_RATE_LIMIT_RETRY_SECONDS
+
+
+def _rate_limit_max_retries() -> int:
+    raw = os.getenv("LLM_RATE_LIMIT_MAX_RETRIES", str(DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES))
+    try:
+        return max(0, min(10, int(raw)))
+    except (TypeError, ValueError):
+        return DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES
 
 
 def _ensure_cfg_list(cfg: LLMConfig | list[LLMConfig]) -> list[LLMConfig]:
@@ -371,6 +381,7 @@ def generate_draft(
     generated_text: str | None = None
     for idx, llm_cfg in enumerate(cfg_list):
         request_attempt = 0
+        max_rate_limit_retries = _rate_limit_max_retries()
         while True:
             try:
                 model = init_chat_model(
@@ -390,12 +401,12 @@ def generate_draft(
                 break
             except Exception as exc:
                 last_exc = exc
-                if _is_rate_limited(exc) and request_attempt < DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES:
+                if _is_rate_limited(exc) and request_attempt < max_rate_limit_retries:
                     request_attempt += 1
                     wait_s = _rate_limit_retry_seconds()
                     print(
                         f"[llm] rate_limited | provider={llm_cfg.provider} model={llm_cfg.model} "
-                        f"retry={request_attempt}/{DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES} wait={wait_s}s"
+                        f"retry={request_attempt}/{max_rate_limit_retries} wait={wait_s}s"
                     )
                     time.sleep(wait_s)
                     continue
@@ -457,3 +468,65 @@ def generate_draft(
         _coerce_text(data.get("image_event", ""))
     )
     return data
+
+
+def generate_json(
+    cfg: LLMConfig | list[LLMConfig],
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 6000,
+) -> Dict[str, Any]:
+    """Return one strict JSON response without applying draft-writing defaults."""
+    cfg_list = _ensure_cfg_list(cfg)
+    # Pass prompts as template values so literal JSON braces in a schema are
+    # treated as content instead of LangChain template variables.
+    messages = ChatPromptTemplate.from_messages(
+        [
+            ("system", "{system_prompt}"),
+            ("user", "{user_prompt}"),
+        ]
+    ).format_messages(system_prompt=system_prompt, user_prompt=user_prompt)
+    last_exc: Exception | None = None
+
+    for idx, llm_cfg in enumerate(cfg_list):
+        request_attempt = 0
+        max_rate_limit_retries = _rate_limit_max_retries()
+        while True:
+            try:
+                model = init_chat_model(
+                    llm_cfg.model,
+                    model_provider="openai",
+                    base_url=llm_cfg.base_url,
+                    api_key=llm_cfg.api_key,
+                    temperature=0.1,
+                    max_tokens=max(256, int(max_tokens)),
+                    timeout=DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                )
+                print(
+                    f"[llm-json] provider={llm_cfg.provider} model={llm_cfg.model} "
+                    f"base_url={llm_cfg.base_url}"
+                )
+                response = model.invoke(messages)
+                text = response.content if hasattr(response, "content") else str(response)
+                data = _parse_json_text(text)
+                if not isinstance(data, dict):
+                    raise RuntimeError("model did not return a parseable JSON object")
+                return data
+            except Exception as exc:
+                last_exc = exc
+                if _is_rate_limited(exc) and request_attempt < max_rate_limit_retries:
+                    request_attempt += 1
+                    wait_s = _rate_limit_retry_seconds()
+                    print(
+                        f"[llm-json] rate_limited | provider={llm_cfg.provider} model={llm_cfg.model} "
+                        f"retry={request_attempt}/{max_rate_limit_retries} wait={wait_s}s"
+                    )
+                    time.sleep(wait_s)
+                    continue
+                break
+        if idx + 1 < len(cfg_list) and _should_try_next_llm(last_exc or RuntimeError()):
+            continue
+        break
+
+    raise RuntimeError(f"LLM JSON generation failed: {last_exc}")

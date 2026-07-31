@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
@@ -19,6 +20,7 @@ from .fetchers import (
     parse_official_html,
     parse_rss_feed,
     parse_social_search_html,
+    parse_x_profile_html,
 )
 from .models import AIUpdateItem
 from .rank import ai_digest_quota_counts, dedupe_ai_updates, filter_recent_ai_updates, rank_ai_updates
@@ -210,14 +212,29 @@ def fetch_ai_digest_source(
         return fetch_aihot_daily_source(source, days=max_age_days)
     text = _http_get_text(source.url, timeout_s=timeout_s)
     if source.parser == "rss":
-        return parse_rss_feed(text, source_name=source.vendor, vendor=source.vendor)
-    if source.parser == "github_releases":
-        return parse_github_releases_json(text, source_name=source.vendor, vendor=source.vendor)
-    if source.parser == "social_html":
-        return parse_social_search_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
-    if source.parser == "html":
-        return parse_official_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
-    return []
+        items = parse_rss_feed(text, source_name=source.vendor, vendor=source.vendor)
+    elif source.parser == "github_releases":
+        items = parse_github_releases_json(text, source_name=source.vendor, vendor=source.vendor)
+    elif source.parser == "social_html":
+        items = parse_social_search_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
+    elif source.parser == "x_profile":
+        items = parse_x_profile_html(text, source_name=source.vendor, vendor=source.vendor)
+    elif source.parser == "html":
+        items = parse_official_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
+    else:
+        items = []
+    if source.kind != "aggregator":
+        return items
+    return [
+        AIUpdateItem.model_validate(
+            {
+                **item.model_dump(),
+                "source_type": "aggregator",
+                "verification_status": "aggregator_only",
+            }
+        )
+        for item in items
+    ]
 
 
 def _aihot_daily_dates(days: int = 3) -> list[date]:
@@ -305,6 +322,13 @@ def _news_item_to_ai_update(item, *, query: str) -> AIUpdateItem:
         )
         if part and part.strip()
     )
+    body = re.sub(
+        r"\bONLY\s+AVAILABLE\s+IN\s+PAID\s+PLANS\b",
+        " ",
+        body,
+        flags=re.IGNORECASE,
+    )
+    body = re.sub(r"\s+", " ", body).strip(" -|")
     return AIUpdateItem(
         title=str(getattr(item, "title", "") or "").strip(),
         summary=body[:220],
@@ -624,10 +648,6 @@ def collect_ai_digest_updates(
     aggregator_backfill_used = False
     search_backfill_meta: dict = {}
 
-    if allow_social_backfill and official_count < min_official_count:
-        social_backfill_used = True
-        _fetch_stage(social_sources)
-
     ranked = rank_ai_updates(
         fetched,
         target_count=target_count,
@@ -638,6 +658,28 @@ def collect_ai_digest_updates(
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
     )
+    if (
+        allow_social_backfill
+        and aggregator_sources
+        and _needs_search_backfill(
+            ranked,
+            target_count=target_count,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
+    ):
+        aggregator_backfill_used = True
+        _fetch_stage(aggregator_sources)
+        ranked = rank_ai_updates(
+            fetched,
+            target_count=target_count,
+            min_official_count=min_official_count,
+            allow_social_backfill=allow_social_backfill,
+            max_age_days=max_age_days,
+            now=now,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
     if (
         allow_social_backfill
         and _search_backfill_enabled()
@@ -673,7 +715,7 @@ def collect_ai_digest_updates(
         )
     if (
         allow_social_backfill
-        and aggregator_sources
+        and social_sources
         and _needs_search_backfill(
             ranked,
             target_count=target_count,
@@ -681,8 +723,8 @@ def collect_ai_digest_updates(
             min_foreign_ai_count=min_foreign_ai_count,
         )
     ):
-        aggregator_backfill_used = True
-        _fetch_stage(aggregator_sources)
+        social_backfill_used = True
+        _fetch_stage(social_sources)
         ranked = rank_ai_updates(
             fetched,
             target_count=target_count,

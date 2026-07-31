@@ -220,6 +220,27 @@ def test_wait_for_xhs_ready_fails_fast_when_headless_needs_login():
         )
 
 
+def test_wait_for_xhs_ready_rechecks_unknown_headless_page_for_delayed_login_redirect():
+    states = iter(
+        [
+            ("unknown", "state=unknown url=https://creator.xiaohongshu.com/new/note-manager"),
+            ("login", "state=login url=https://creator.xiaohongshu.com/login"),
+        ]
+    )
+    sleeps: list[float] = []
+
+    with pytest.raises(RuntimeError, match="headless"):
+        _wait_for_xhs_ready(
+            object(),
+            login_hold=0,
+            headless=True,
+            state_reader=lambda _page: next(states),
+            sleep_fn=sleeps.append,
+        )
+
+    assert sleeps == [1]
+
+
 def test_wait_for_xhs_ready_waits_until_manual_login_finishes():
     states = iter(
         [

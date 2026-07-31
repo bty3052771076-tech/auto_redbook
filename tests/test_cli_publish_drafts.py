@@ -168,6 +168,74 @@ def test_publish_drafts_accepts_legacy_saved_draft_without_uploaded_flag(monkeyp
     assert calls[0]["posts"][0].id == post_id
 
 
+def test_update_draft_updates_existing_platform_draft_without_changing_local_draft_status(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(tmp_path)
+    post_id = "cccccccccccccccccccccccccccccccc"
+    _write_uploaded_post(
+        tmp_path,
+        post_id,
+        title="已保存草稿",
+        uploaded_at="2026-06-29T01:00:00.000000Z",
+    )
+    calls: list[dict] = []
+
+    def fake_run_update_draft_sync(post, **kwargs):
+        calls.append({"post": post, **kwargs})
+        return cli.Execution(post_id=post.id, result="saved_draft")
+
+    monkeypatch.setattr(cli, "run_update_draft_sync", fake_run_update_draft_sync, raising=False)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["update-draft", post_id, "--headless", "--login-hold", "0", "--wait-timeout", "600"],
+    )
+
+    assert result.exit_code == 0
+    assert calls
+    assert calls[0]["post"].id == post_id
+    assert calls[0]["draft_type"] == "image"
+    assert calls[0]["headless"] is True
+    stored = json.loads((tmp_path / "data" / "posts" / post_id / "post.json").read_text(encoding="utf-8"))
+    assert stored["status"] == "saved_as_draft"
+    assert stored["uploaded"] is True
+    assert stored["platform"]["draft_update"]["result"] == "saved_draft"
+
+
+def test_update_draft_uses_saved_platform_title_when_local_title_changed(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    post_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    _write_uploaded_post(
+        tmp_path,
+        post_id,
+        title="每日AI|Claude发现加密弱点",
+        uploaded_at="2026-07-29T12:09:44.231880Z",
+    )
+    post_path = tmp_path / "data" / "posts" / post_id / "post.json"
+    payload = json.loads(post_path.read_text(encoding="utf-8"))
+    payload["platform"] = {"xhs_draft": {"title": "每日AI讯息"}}
+    post_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    calls: list[dict] = []
+
+    def fake_run_update_draft_sync(post, **kwargs):
+        calls.append({"post": post, **kwargs})
+        return cli.Execution(post_id=post.id, result="saved_draft")
+
+    monkeypatch.setattr(cli, "run_update_draft_sync", fake_run_update_draft_sync, raising=False)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["update-draft", post_id, "--headless", "--login-hold", "0", "--wait-timeout", "600"],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["existing_title"] == "每日AI讯息"
+    stored = json.loads(post_path.read_text(encoding="utf-8"))
+    assert stored["platform"]["xhs_draft"]["title"] == "每日AI|Claude发现加密弱点"
+
+
 def test_publish_drafts_dry_run_previews_without_updating_status(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     post_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

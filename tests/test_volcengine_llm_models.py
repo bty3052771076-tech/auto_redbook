@@ -38,6 +38,23 @@ def test_volcengine_llm_provider_builds_multiple_configs(monkeypatch):
     assert all(c.base_url == DEFAULT_VOLCENGINE_LLM_BASE_URL for c in cfgs)
 
 
+def test_auto_provider_does_not_assume_a_default_volcengine_model_has_free_quota(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LLM_PROVIDER", "auto")
+    monkeypatch.setenv("ALIYUN_LLM_API_KEY", "dummy-aliyun")
+    monkeypatch.setenv("ALIYUN_LLM_MODELS", "aliyun-free")
+    monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volcengine")
+    monkeypatch.delenv("VOLCENGINE_LLM_MODEL", raising=False)
+    monkeypatch.delenv("VOLCENGINE_LLM_MODELS", raising=False)
+    monkeypatch.delenv("ARK_LLM_MODEL", raising=False)
+    monkeypatch.delenv("ARK_LLM_MODELS", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+
+    cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
+
+    assert [(c.provider, c.model) for c in cfgs] == [("aliyun", "aliyun-free")]
+
+
 def test_volcengine_deepseek_v4_pro_alias_uses_live_endpoint_id(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "volcengine")
     monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volc")
@@ -48,6 +65,30 @@ def test_volcengine_deepseek_v4_pro_alias_uses_live_endpoint_id(monkeypatch):
 
     assert len(cfgs) == 1
     assert cfgs[0].model == "deepseek-v4-pro-260425"
+
+
+def test_volcengine_deepseek_v4_flash_alias_uses_live_endpoint_id(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "volcengine")
+    monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volc")
+    monkeypatch.setenv("VOLCENGINE_LLM_MODEL", "deepseek-v4-flash")
+    monkeypatch.delenv("VOLCENGINE_LLM_MODELS", raising=False)
+
+    cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
+
+    assert len(cfgs) == 1
+    assert cfgs[0].model == "deepseek-v4-flash-260425"
+
+
+def test_volcengine_glm_5_2_alias_uses_live_endpoint_id(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "volcengine")
+    monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volc")
+    monkeypatch.setenv("VOLCENGINE_LLM_MODEL", "glm-5.2")
+    monkeypatch.delenv("VOLCENGINE_LLM_MODELS", raising=False)
+
+    cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
+
+    assert len(cfgs) == 1
+    assert cfgs[0].model == "glm-5-2-260617"
 
 
 def test_ark_llm_provider_alias_uses_ark_api_key(monkeypatch):

@@ -89,30 +89,53 @@ def _post_title_candidates(post: Post) -> list[tuple[str, str]]:
     return out
 
 
+def _published_post_match_indexes(
+    posts: Iterable[Post],
+) -> tuple[dict[str, Post], dict[str, list[tuple[Post, str]]]]:
+    """Build stable URL and title indexes without changing match precedence."""
+    url_index: dict[str, Post] = {}
+    title_index: dict[str, list[tuple[Post, str]]] = {}
+    for post in posts:
+        for url in _post_url_candidates(post):
+            url_index.setdefault(url, post)
+        for reason, title in _post_title_candidates(post):
+            title_index.setdefault(title, []).append((post, reason))
+    return url_index, title_index
+
+
+def _find_post_in_published_indexes(
+    metric: Any,
+    *,
+    url_index: dict[str, Post],
+    title_index: dict[str, list[tuple[Post, str]]],
+) -> tuple[Optional[Post], str]:
+    data = _as_dict(metric)
+    metric_url = normalize_metric_url(_metric_url(data))
+    if metric_url:
+        post = url_index.get(metric_url)
+        if post is not None:
+            return post, "url"
+
+    metric_title = normalize_metric_title(str(data.get("title") or ""))
+    if metric_title:
+        for post, reason in title_index.get(metric_title, []):
+            if post.uploaded or post.status == PostStatus.published:
+                return post, reason
+    return None, ""
+
+
 def find_post_for_published_metric(
     metric: Any,
     *,
     base=DATA_ROOT,
 ) -> tuple[Optional[Post], str]:
-    data = _as_dict(metric)
-    metric_url = normalize_metric_url(_metric_url(data))
-    metric_title = normalize_metric_title(str(data.get("title") or ""))
-
     posts = list(list_posts(base=base))
-    if metric_url:
-        for post in posts:
-            if metric_url in _post_url_candidates(post):
-                return post, "url"
-
-    if metric_title:
-        for post in posts:
-            if not (post.uploaded or post.status == PostStatus.published):
-                continue
-            for reason, title in _post_title_candidates(post):
-                if title == metric_title:
-                    return post, reason
-
-    return None, ""
+    url_index, title_index = _published_post_match_indexes(posts)
+    return _find_post_in_published_indexes(
+        metric,
+        url_index=url_index,
+        title_index=title_index,
+    )
 
 
 def _metric_snapshot(metric: dict[str, Any]) -> dict[str, Any]:
@@ -137,10 +160,15 @@ def sync_published_metrics_to_posts(
     unmatched: list[str] = []
     updated_post_ids: list[str] = []
     now = now_iso()
+    url_index, title_index = _published_post_match_indexes(list_posts(base=base))
 
     for metric in metrics:
         data = _as_dict(metric)
-        post, reason = find_post_for_published_metric(data, base=base)
+        post, reason = _find_post_in_published_indexes(
+            data,
+            url_index=url_index,
+            title_index=title_index,
+        )
         if post is None:
             title = str(data.get("title") or "").strip()
             url = _metric_url(data)

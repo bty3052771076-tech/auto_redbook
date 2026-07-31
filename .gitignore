@@ -51,6 +51,7 @@ Thumbs.db
 # Debug artifacts
 tmp_*.png
 output/
+scripts/debug_*.py
 
 # PyInstaller
 build/

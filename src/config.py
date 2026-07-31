@@ -74,7 +74,9 @@ DEFAULT_VOLCENGINE_LLM_MODEL = VOLCENGINE_AVAILABLE_LLM_MODELS[0]
 # Ark exposes the user-facing DeepSeek V4 Pro name in the console catalog, but
 # the OpenAI-compatible endpoint currently requires the dated deployment ID.
 VOLCENGINE_LLM_ENDPOINT_ALIASES = {
+    "glm-5.2": "glm-5-2-260617",
     "deepseek-v4-pro": "deepseek-v4-pro-260425",
+    "deepseek-v4-flash": "deepseek-v4-flash-260425",
 }
 
 
@@ -122,6 +124,10 @@ def _canonical_volcengine_model(value: str) -> str:
     return VOLCENGINE_LLM_ENDPOINT_ALIASES.get(model, model)
 
 
+def _env_enabled(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _load_fallback_llm_config(*, llm_file: Path | str) -> Optional[LLMConfig]:
     env_model = os.getenv("LLM_MODEL")
     env_key = os.getenv("LLM_API_KEY")
@@ -151,11 +157,11 @@ def _load_fallback_llm_config(*, llm_file: Path | str) -> Optional[LLMConfig]:
         model=model.strip(),
         api_key=api_key.strip(),
         base_url=base_url.strip().rstrip("/"),
-        provider="fallback",
+        provider="ppinfra",
     )
 
 
-def _load_aliyun_llm_configs() -> list[LLMConfig]:
+def _load_aliyun_llm_configs(*, default_to_all_free_models: bool = False) -> list[LLMConfig]:
     env_key = (
         os.getenv("ALIYUN_LLM_API_KEY")
         or os.getenv("ALIYUN_IMAGE_API_KEY")
@@ -177,8 +183,13 @@ def _load_aliyun_llm_configs() -> list[LLMConfig]:
     base_url = (env_base or file_base or DEFAULT_ALIYUN_LLM_BASE_URL).strip().rstrip("/")
     models = _split_models(env_models or "")
     if not models:
-        single = (env_model or DEFAULT_ALIYUN_LLM_MODEL).strip()
-        models = [single] if single else []
+        if env_model:
+            models = [(env_model or "").strip()]
+        elif default_to_all_free_models:
+            models = list(ALIYUN_FREE_LLM_MODELS)
+        else:
+            single = DEFAULT_ALIYUN_LLM_MODEL.strip()
+            models = [single] if single else []
 
     return [
         LLMConfig(
@@ -192,7 +203,7 @@ def _load_aliyun_llm_configs() -> list[LLMConfig]:
     ]
 
 
-def _load_volcengine_llm_configs() -> list[LLMConfig]:
+def _load_volcengine_llm_configs(*, include_default_model: bool = True) -> list[LLMConfig]:
     env_key = (
         os.getenv("VOLCENGINE_LLM_API_KEY")
         or os.getenv("VOLCENGINE_API_KEY")
@@ -211,7 +222,7 @@ def _load_volcengine_llm_configs() -> list[LLMConfig]:
     base_url = (env_base or file_cfg.get("base_url") or DEFAULT_VOLCENGINE_LLM_BASE_URL).strip().rstrip("/")
     models = _split_models(env_models or "")
     if not models:
-        single = (env_model or DEFAULT_VOLCENGINE_LLM_MODEL).strip()
+        single = (env_model or (DEFAULT_VOLCENGINE_LLM_MODEL if include_default_model else "")).strip()
         models = [single] if single else []
 
     return [
@@ -257,14 +268,17 @@ def load_llm_configs(
 ) -> list[LLMConfig]:
     configs: list[LLMConfig] = []
     provider = _normalize_llm_provider(os.getenv("LLM_PROVIDER") or "auto")
+    allow_paid_fallback = provider == "auto" and _env_enabled("ALLOW_PAID_LLM_FALLBACK")
 
     if provider in ("auto", "aliyun"):
-        configs.extend(_load_aliyun_llm_configs())
+        configs.extend(
+            _load_aliyun_llm_configs(default_to_all_free_models=provider == "auto")
+        )
 
     if provider in ("auto", "volcengine"):
-        configs.extend(_load_volcengine_llm_configs())
+        configs.extend(_load_volcengine_llm_configs(include_default_model=provider != "auto"))
 
-    if provider in ("auto", "ppinfra"):
+    if provider == "ppinfra" or allow_paid_fallback:
         fallback_cfg = _load_fallback_llm_config(llm_file=llm_file)
         if fallback_cfg:
             # Avoid duplicates if the user reuses the same base_url/model/key.
@@ -277,6 +291,12 @@ def load_llm_configs(
                 configs.append(fallback_cfg)
 
     if not configs:
+        if provider == "auto":
+            raise RuntimeError(
+                "No Aliyun or Volcengine LLM configuration is available in free-first auto mode. "
+                "Configure ALIYUN_LLM_API_KEY or VOLCENGINE_API_KEY, explicitly set LLM_PROVIDER=ppinfra, "
+                "or set ALLOW_PAID_LLM_FALLBACK=1 to opt in to PPInfra after both platforms fail."
+            )
         raise RuntimeError(
             "LLM api_key missing: set ALIYUN_LLM_API_KEY (or ALIYUN_IMAGE_API_KEY/DASHSCOPE_API_KEY) "
             "or VOLCENGINE_API_KEY/ARK_API_KEY, or set LLM_API_KEY / docs/llm_api-key.md "

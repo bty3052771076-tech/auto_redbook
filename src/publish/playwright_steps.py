@@ -6,6 +6,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
@@ -99,6 +100,11 @@ class XHSPageUnavailableError(RuntimeError):
 
 def _context_default_timeout_ms(wait_timeout_ms: int) -> int:
     return max(30000, int(wait_timeout_ms or 0))
+
+
+def _metrics_operation_timeout_ms(wait_timeout_ms: int) -> int:
+    """Keep an individual metrics DOM operation from consuming the full sync wait."""
+    return min(_context_default_timeout_ms(wait_timeout_ms), 5000)
 
 
 def _goto_xhs_page(page, url: str, *, timeout_ms: int) -> None:
@@ -432,6 +438,15 @@ def _published_metrics_collect_cap() -> int:
     return max(1, value)
 
 
+def _published_metrics_max_scrolls() -> int:
+    raw = (os.getenv("XHS_METRICS_MAX_SCROLLS") or "").strip()
+    try:
+        value = int(raw) if raw else 1000
+    except ValueError:
+        value = 1000
+    return max(1, value)
+
+
 def _published_metrics_collection_status(*, collected: int, target_total: int, limit: int = 0) -> dict[str, Any]:
     collected_count = max(0, int(collected or 0))
     target_count = max(0, int(target_total or 0))
@@ -573,10 +588,8 @@ def _merge_published_metric_cards(cards: list[dict[str, str]], *, limit: int = 0
     return items
 
 
-def _scroll_published_metrics_page(page) -> dict[str, Any]:
-    try:
-        return page.evaluate(
-            """
+def _published_metrics_scroll_script() -> str:
+    return """
             () => {
               const candidates = Array.from(document.querySelectorAll('.content, .microapp-container, [class*="content"], [class*="list"], [class*="pane"]'))
                 .filter((el) => {
@@ -594,9 +607,13 @@ def _scroll_published_metrics_page(page) -> dict[str, Any]:
               const beforeTop = target.scrollTop || 0;
               const step = Math.max(300, Math.floor((target.clientHeight || window.innerHeight || 600) * 0.85));
               target.scrollTop = Math.min(beforeTop + step, Math.max(0, target.scrollHeight - target.clientHeight));
+              target.dispatchEvent(new Event('scroll', { bubbles: true }));
+              target.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: step }));
               if (!candidates.length) {
                 const beforeY = window.scrollY || 0;
                 window.scrollTo(0, beforeY + step);
+                window.dispatchEvent(new Event('scroll'));
+                window.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: step }));
               }
               const afterTop = target.scrollTop || 0;
               return {
@@ -609,7 +626,17 @@ def _scroll_published_metrics_page(page) -> dict[str, Any]:
               };
             }
             """
-        )
+
+
+def _scroll_published_metrics_page(page) -> dict[str, Any]:
+    try:
+        result = page.evaluate(_published_metrics_scroll_script())
+        try:
+            page.mouse.move(640, 640)
+            page.mouse.wheel(0, 720)
+        except Exception:
+            pass
+        return result
     except Exception as exc:
         return {"scrolled": False, "error": str(exc)}
 
@@ -686,6 +713,24 @@ def _wait_for_xhs_ready(
             "open GUI '登录/检查Profile' or run once without --headless"
         )
     if login_hold <= 0:
+        # The creator shell may commit before its auth redirect. Recheck a
+        # brief unknown state so headless runs fail clearly on expired login.
+        if state == "unknown":
+            for _ in range(2):
+                sleep_fn(1)
+                state, detail = reader(page)
+                if state == "not_found":
+                    raise XHSPageUnavailableError(
+                        f"xiaohongshu creator page unavailable; {detail}"
+                    )
+                if state == "ready":
+                    _emit_progress(progress_callback, "login_check", "success", detail)
+                    return detail
+                if headless and state == "login":
+                    raise RuntimeError(
+                        "xiaohongshu login required but browser is headless; "
+                        "open GUI '登录/检查Profile' or run once without --headless"
+                    )
         _emit_progress(progress_callback, "login_check", "skipped", detail)
         return detail
 
@@ -2326,6 +2371,115 @@ def _matches_body_value(actual: str, expected: str) -> bool:
     return any(term in (actual or "") for term in _body_match_terms(expected))
 
 
+@dataclass(frozen=True)
+class DraftReadbackResult:
+    ok: bool
+    title_ok: bool
+    body_ok: bool
+    image_ok: bool
+    actual_title: str
+    actual_body: str
+    actual_image_count: int
+    expected_image_count: int
+
+
+def _normalize_readback_text(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").strip())
+
+
+def _verify_draft_readback_snapshot(
+    snapshot: dict[str, str],
+    post: Post,
+    *,
+    actual_image_count: int,
+) -> DraftReadbackResult:
+    actual_title = str(snapshot.get("actual_title") or "").strip()
+    actual_body = str(snapshot.get("actual_body") or "").strip()
+    expected_title = _normalize_readback_text(post.title)
+    expected_body = _normalize_readback_text(post.body)
+    title_ok = bool(expected_title) and _normalize_readback_text(actual_title) == expected_title
+    body_ok = bool(expected_body) and _normalize_readback_text(actual_body) == expected_body
+    expected_image_count = sum(
+        1
+        for asset in post.assets or []
+        if (asset.kind or "image").strip().lower() == "image"
+    )
+    image_ok = (
+        actual_image_count >= expected_image_count
+        if expected_image_count > 0
+        else actual_image_count == 0
+    )
+    return DraftReadbackResult(
+        ok=title_ok and body_ok and image_ok,
+        title_ok=title_ok,
+        body_ok=body_ok,
+        image_ok=image_ok,
+        actual_title=actual_title,
+        actual_body=actual_body,
+        actual_image_count=max(0, int(actual_image_count)),
+        expected_image_count=expected_image_count,
+    )
+
+
+def _count_editor_images(page) -> int:
+    upload_count = _extract_upload_count(page)
+    if upload_count is not None:
+        return max(0, int(upload_count))
+    try:
+        value = page.evaluate(
+            """
+            () => {
+              const selectors = [
+                '.upload-item img',
+                '.image-item img',
+                '.img-preview img',
+                '.preview-item img',
+                '[class*="upload"] [class*="preview"] img',
+                '[class*="image"] [class*="preview"] img'
+              ];
+              const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 8 && rect.height > 8 &&
+                  style.visibility !== 'hidden' && style.display !== 'none';
+              };
+              const sources = new Set();
+              for (const selector of selectors) {
+                for (const image of document.querySelectorAll(selector)) {
+                  if (!visible(image)) continue;
+                  const source = image.currentSrc || image.getAttribute('src') || '';
+                  if (source) sources.add(source);
+                }
+              }
+              return sources.size;
+            }
+            """
+        )
+        return max(0, int(value or 0))
+    except Exception:
+        return 0
+
+
+def _read_back_saved_draft(
+    page,
+    post: Post,
+    *,
+    wait_timeout_ms: int,
+) -> DraftReadbackResult:
+    _open_draft_editor_for_post(page, post)
+    _wait_for_any_locator(
+        page,
+        ["input[placeholder*='标题']", "textarea", "[contenteditable='true']"],
+        min(max(30_000, int(wait_timeout_ms)), 120_000),
+    )
+    snapshot = _read_editor_draft_snapshot(page)
+    return _verify_draft_readback_snapshot(
+        snapshot,
+        post,
+        actual_image_count=_count_editor_images(page),
+    )
+
+
 def _processing_visible(page) -> bool:
     for text in PROCESSING_TEXTS:
         try:
@@ -3089,6 +3243,30 @@ def run_save_draft_sync(
                 if not verified_title:
                     raise RuntimeError("draft title not found after save")
                 steps[-1].status = "success"
+
+                _step("readback_saved_draft", "in_progress", "")
+                readback = _read_back_saved_draft(
+                    page,
+                    post,
+                    wait_timeout_ms=wait_timeout_ms,
+                )
+                steps[-1].detail = (
+                    f"title={readback.title_ok} body={readback.body_ok} "
+                    f"images={readback.actual_image_count}/{readback.expected_image_count}"
+                )
+                if not readback.ok:
+                    failed_parts = []
+                    if not readback.title_ok:
+                        failed_parts.append("title")
+                    if not readback.body_ok:
+                        failed_parts.append("body")
+                    if not readback.image_ok:
+                        failed_parts.append("images")
+                    raise RuntimeError(
+                        "draft readback verification failed: "
+                        + ",".join(failed_parts or ["unknown"])
+                    )
+                steps[-1].status = "success"
                 exec_rec.result = "saved_draft"
                 _emit_progress(progress_callback, "save_draft_chain", "success", post.id)
             finally:
@@ -3101,6 +3279,173 @@ def run_save_draft_sync(
     finally:
         exec_rec.steps = steps
         save_execution(exec_rec)
+
+    return exec_rec
+
+
+def run_update_draft_sync(
+    post: Post,
+    *,
+    existing_title: str = "",
+    draft_type: str = "image",
+    dry_run: bool = False,
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    execution: Optional[Execution] = None,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Execution:
+    """Update an existing platform draft without uploading a second copy."""
+    exec_rec = execution or Execution(post_id=post.id, result="pending")
+    steps: List[StepResult] = []
+
+    def _step(name: str, status: str, detail: str = "") -> None:
+        steps.append(StepResult(name=name, status=status, detail=detail))
+        _emit_progress(progress_callback, name, status, detail)
+
+    context = None
+    browser = None
+    should_close_context = True
+
+    try:
+        profile_dir, channel, args = _resolve_profile_config()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        headless_value = _resolve_headless(headless)
+        if headless_value and login_hold > 0:
+            _emit_progress(
+                progress_callback,
+                "headless_login",
+                "warning",
+                "headless requires an already logged-in profile; login_hold cannot show QR/captcha",
+            )
+
+        _step("launch", "in_progress", f"{profile_dir} | headless={headless_value}")
+        with sync_playwright() as p:
+            cdp_url = _resolve_cdp_url()
+            if cdp_url:
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                should_close_context = False
+                steps[-1].detail = f"cdp={cdp_url}"
+            else:
+                launch_kwargs = {"headless": headless_value}
+                if channel:
+                    launch_kwargs["channel"] = channel
+                if args:
+                    launch_kwargs["args"] = args
+                context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
+            context.set_default_timeout(_context_default_timeout_ms(wait_timeout_ms))
+            steps[-1].status = "success"
+
+            page = context.new_page() if not should_close_context else (context.pages[0] if context.pages else context.new_page())
+            _step("open_draft_list", "in_progress", f"type={draft_type}")
+            _open_platform_draft_list(
+                page,
+                draft_type=draft_type,
+                login_hold=login_hold,
+                wait_timeout_ms=wait_timeout_ms,
+                headless=headless_value,
+                progress_callback=progress_callback,
+            )
+            steps[-1].status = "success"
+
+            lookup_title = (existing_title or post.title).strip()
+            lookup_post = post.model_copy(update={"title": lookup_title})
+            _step("open_existing_draft", "in_progress", f"post_id={post.id} title={lookup_title}")
+            _open_draft_editor_for_post(page, lookup_post)
+            _wait_for_any_locator(
+                page,
+                ["input[placeholder*='标题']", "textarea", "[contenteditable='true']"],
+                60000,
+            )
+            steps[-1].status = "success"
+
+            if dry_run:
+                _step("update_title_body", "skipped", "dry_run")
+                _step("save_draft", "skipped", "dry_run")
+                exec_rec.result = "pending"
+                return exec_rec
+
+            _step("update_title_body", "in_progress", "")
+            title_ok, body_ok = _fill_text_fields(page, post.title, post.body)
+            steps[-1].detail = f"title={title_ok} body={body_ok}"
+            if not (title_ok and body_ok):
+                raise RuntimeError("title/body not filled while updating draft")
+            steps[-1].status = "success"
+
+            _step("verify_title_body", "in_progress", "")
+            verified_title, verified_body = _verify_title_body(page, post.title, post.body)
+            fill_settle_s = float(os.getenv("XHS_FILL_SETTLE_S") or 2.0)
+            if verified_title and verified_body and fill_settle_s > 0:
+                time.sleep(fill_settle_s)
+                verified_title, verified_body = _verify_title_body(page, post.title, post.body)
+            steps[-1].detail = f"title={verified_title} body={verified_body}"
+            if not (verified_title and verified_body):
+                raise RuntimeError("title/body verification failed while updating draft")
+            steps[-1].status = "success"
+
+            _step("save_draft", "in_progress", "")
+            clicked, detail = _click_draft(page)
+            steps[-1].detail = detail
+            if not clicked:
+                raise RuntimeError(detail)
+            steps[-1].status = "success"
+
+            _step("confirm_leave", "in_progress", "")
+            leave_clicked = False
+            for text in ("暂存离开", "确定", "继续离开"):
+                if _click_first(page.get_by_role("button", name=text), timeout_ms=2000):
+                    leave_clicked = True
+                    break
+                if _click_first(page.locator(f"button:has-text('{text}')"), timeout_ms=2000):
+                    leave_clicked = True
+                    break
+            steps[-1].detail = f"clicked={leave_clicked}"
+            steps[-1].status = "success"
+
+            _step("verify_updated_draft", "in_progress", "")
+            _open_platform_draft_list(
+                page,
+                draft_type=draft_type,
+                login_hold=0,
+                wait_timeout_ms=wait_timeout_ms,
+                headless=headless_value,
+                progress_callback=progress_callback,
+            )
+            _open_draft_editor_for_post(page, post)
+            _wait_for_any_locator(
+                page,
+                ["input[placeholder*='标题']", "textarea", "[contenteditable='true']"],
+                60000,
+            )
+            snapshot = _read_editor_draft_snapshot(page)
+            actual_title = snapshot.get("actual_title", "")
+            actual_body = snapshot.get("actual_body", "")
+            verified_title = _draft_title_matches_expected(actual_title, post.title)
+            verified_body = _matches_body_value(actual_body, post.body)
+            steps[-1].detail = f"title={verified_title} body={verified_body}"
+            if not (verified_title and verified_body):
+                raise RuntimeError("updated draft verification failed")
+            steps[-1].status = "success"
+            exec_rec.result = "saved_draft"
+            _emit_progress(progress_callback, "update_draft_chain", "success", post.id)
+    except Exception as exc:  # pragma: no cover
+        exec_rec.result = "failed"
+        exec_rec.error = {"message": str(exc)}
+        _emit_progress(progress_callback, "update_draft_chain", "failed", str(exc))
+    finally:
+        exec_rec.steps = steps
+        save_execution(exec_rec)
+        try:
+            if context is not None and should_close_context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None and not should_close_context:
+                browser.close()
+        except Exception:
+            pass
 
     return exec_rec
 
@@ -3324,7 +3669,7 @@ def run_collect_published_metrics_sync(
     profile_dir, channel, args = _resolve_profile_config()
     profile_dir.mkdir(parents=True, exist_ok=True)
     headless_value = _resolve_headless(headless)
-    max_scrolls = max(1, int(os.getenv("XHS_METRICS_MAX_SCROLLS") or "240"))
+    max_scrolls = _published_metrics_max_scrolls()
     raw_stagnant = (os.getenv("XHS_METRICS_STAGNANT_ROUNDS") or "").strip()
     try:
         stagnant_round_limit = int(raw_stagnant) if raw_stagnant else 90
@@ -3340,7 +3685,7 @@ def run_collect_published_metrics_sync(
             if args:
                 launch_kwargs["args"] = args
             context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
-            context.set_default_timeout(_context_default_timeout_ms(wait_timeout_ms))
+            context.set_default_timeout(_metrics_operation_timeout_ms(wait_timeout_ms))
             page = context.pages[0] if context.pages else context.new_page()
             collected_cards: list[dict[str, str]] = []
 
@@ -3349,7 +3694,7 @@ def run_collect_published_metrics_sync(
                     result["urls_tried"].append(url)
                     _emit_progress(progress_callback, "open_metrics_page", "in_progress", url)
                     try:
-                        page.goto(url, wait_until="domcontentloaded")
+                        _goto_xhs_page(page, url, timeout_ms=wait_timeout_ms)
                         _wait_for_xhs_ready(
                             page,
                             login_hold=login_hold,

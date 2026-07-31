@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import textwrap
+import re
 from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 from .models import AIDigestBrief, AIUpdateItem
-from .rank import ai_update_attention_score, ai_update_beijing_day_key, ai_update_category_priority
+from .rank import featured_ai_update
 
 
 CARD_SIZE = (1104, 1472)
@@ -39,6 +40,62 @@ def _wrap_text(text: str, width: int, *, max_lines: int | None = None) -> list[s
     if max_lines is not None and len(lines) > max_lines:
         lines = lines[:max_lines]
         lines[-1] = lines[-1].rstrip("，,。；; ") + "…"
+    return lines
+
+
+def _text_width(draw: ImageDraw.ImageDraw, text: str, font) -> int:
+    left, _top, right, _bottom = draw.textbbox((0, 0), text or "", font=font)
+    return max(0, right - left)
+
+
+def _fit_text(draw: ImageDraw.ImageDraw, text: str, font, *, max_width_px: int) -> str:
+    value = re.sub(r"\s+", " ", text or "").strip()
+    if _text_width(draw, value, font) <= max_width_px:
+        return value
+    suffix = "…"
+    while value and _text_width(draw, f"{value}{suffix}", font) > max_width_px:
+        value = value[:-1].rstrip()
+    return f"{value}{suffix}" if value else suffix
+
+
+def _wrap_text_pixels(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font,
+    *,
+    max_width_px: int,
+    max_lines: int | None = None,
+) -> list[str]:
+    value = (text or "").strip()
+    if not value:
+        return []
+    lines: list[str] = []
+    for paragraph in value.splitlines() or [value]:
+        tokens = re.findall(r"[A-Za-z0-9@._+:/()\-]+|\s+|.", paragraph.strip())
+        line = ""
+        for token in tokens:
+            candidate = f"{line}{token}"
+            if line and _text_width(draw, candidate, font) > max_width_px:
+                lines.append(line.rstrip())
+                line = token.lstrip()
+            else:
+                line = candidate
+            while line and _text_width(draw, line, font) > max_width_px:
+                split_at = len(line) - 1
+                while split_at > 1 and _text_width(draw, line[:split_at], font) > max_width_px:
+                    split_at -= 1
+                lines.append(line[:split_at].rstrip())
+                line = line[split_at:].lstrip()
+        if line:
+            lines.append(line.rstrip())
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = _fit_text(
+            draw,
+            f"{lines[-1].rstrip('，,。；; ')}…",
+            font,
+            max_width_px=max_width_px,
+        )
     return lines
 
 
@@ -82,10 +139,22 @@ def _draw_wrapped(
     fill: str,
     line_gap: int = 10,
     max_lines: int | None = None,
+    max_width_px: int | None = None,
 ) -> int:
     x, y = xy
     line_height = max(24, int(font.size * 1.35)) if hasattr(font, "size") else 28
-    for line in _wrap_text(text, width, max_lines=max_lines):
+    lines = (
+        _wrap_text_pixels(
+            draw,
+            text,
+            font,
+            max_width_px=max_width_px,
+            max_lines=max_lines,
+        )
+        if max_width_px is not None
+        else _wrap_text(text, width, max_lines=max_lines)
+    )
+    for line in lines:
         draw.text((x, y), line, font=font, fill=fill)
         y += line_height + line_gap
     return y
@@ -105,24 +174,8 @@ def _format_published_at(value: str) -> str:
         return text[:16]
 
 
-def _source_priority(item: AIUpdateItem) -> int:
-    return {"official": 4, "github": 3, "search": 2, "social": 1}.get(item.source_type, 0)
-
-
 def _featured_item(brief: AIDigestBrief) -> AIUpdateItem | None:
-    items = list(brief.items or [])
-    if not items:
-        return None
-    return max(
-        items,
-        key=lambda item: (
-            ai_update_beijing_day_key(item),
-            ai_update_category_priority(item),
-            ai_update_attention_score(item),
-            item.timestamp_sort_key,
-            _source_priority(item),
-        ),
-    )
+    return featured_ai_update(list(brief.items or []))
 
 
 def _render_cover(brief: AIDigestBrief, path: Path) -> None:
@@ -136,7 +189,17 @@ def _render_cover(brief: AIDigestBrief, path: Path) -> None:
     draw.text((96, 300), brief.title or "每日AI讯息", font=title_font, fill="#1f292e")
     draw.text((100, 402), brief.date or "", font=subtitle_font, fill="#b75f35")
     subtitle = brief.subtitle or "AI平台、模型、工具和开源动态简报"
-    _draw_wrapped(draw, (100, 492), subtitle, subtitle_font, width=25, fill="#39454b", line_gap=12)
+    _draw_wrapped(
+        draw,
+        (100, 492),
+        subtitle,
+        subtitle_font,
+        width=25,
+        fill="#39454b",
+        line_gap=12,
+        max_lines=3,
+        max_width_px=CARD_SIZE[0] - 200,
+    )
 
     featured = _featured_item(brief)
     draw.rounded_rectangle([100, 690, CARD_SIZE[0] - 100, 920], radius=30, fill="#1f292e")
@@ -151,6 +214,7 @@ def _render_cover(brief: AIDigestBrief, path: Path) -> None:
             fill="#fff7e8",
             line_gap=8,
             max_lines=2,
+            max_width_px=CARD_SIZE[0] - 264,
         )
         meta = " · ".join(
             part
@@ -161,10 +225,25 @@ def _render_cover(brief: AIDigestBrief, path: Path) -> None:
             if part
         )
         if meta:
-            draw.text((132, 872), meta, font=small_font, fill="#d7c4a7")
+            draw.text(
+                (132, 872),
+                _fit_text(draw, meta, small_font, max_width_px=CARD_SIZE[0] - 264),
+                font=small_font,
+                fill="#d7c4a7",
+            )
 
     source = brief.source_summary or "官方源为主，社交源用于补充与验证。"
-    _draw_wrapped(draw, (100, 990), source, body_font, width=30, fill="#4e5a60", line_gap=12)
+    _draw_wrapped(
+        draw,
+        (100, 990),
+        source,
+        body_font,
+        width=30,
+        fill="#4e5a60",
+        line_gap=12,
+        max_lines=6,
+        max_width_px=CARD_SIZE[0] - 200,
+    )
     img.save(path, format="PNG")
 
 
@@ -186,7 +265,12 @@ def _render_items_page(brief: AIDigestBrief, page_items: list[AIUpdateItem], pat
         box_bottom = y + box_height
         draw.rounded_rectangle([86, y - 12, CARD_SIZE[0] - 86, box_bottom], radius=28, fill="#f2eadc")
         vendor = item.vendor or item.source_name or "AI"
-        draw.text((116, y + 20), f"{vendor}", font=meta_font, fill="#b75f35")
+        draw.text(
+            (116, y + 20),
+            _fit_text(draw, vendor, meta_font, max_width_px=CARD_SIZE[0] - 232),
+            font=meta_font,
+            fill="#b75f35",
+        )
         text_y = y + 62
         text_y = _draw_wrapped(
             draw,
@@ -197,6 +281,7 @@ def _render_items_page(brief: AIDigestBrief, page_items: list[AIUpdateItem], pat
             fill="#1f292e",
             line_gap=6,
             max_lines=2,
+            max_width_px=CARD_SIZE[0] - 232,
         )
         text_y += 8
         status_y = box_bottom - 38
@@ -211,15 +296,28 @@ def _render_items_page(brief: AIDigestBrief, page_items: list[AIUpdateItem], pat
             fill="#334047",
             line_gap=6,
             max_lines=max_summary_lines,
+            max_width_px=CARD_SIZE[0] - 232,
         )
         status = "官方源"
         if item.verification_status == "social_confirmed":
-            status = "官方源 + 社交验证"
+            status = "交叉核验"
+        elif item.verification_status == "aggregator_confirmed":
+            status = "整合站核验"
+        elif item.source_type == "aggregator":
+            status = "资讯整合站"
+        elif item.verification_status == "search_only":
+            status = "搜索来源"
         elif item.source_type == "social":
             status = "社交补充"
         published = _format_published_at(item.published_at) or brief.date or "待核验"
         source_name = item.source_name or item.vendor or "公开来源"
-        draw.text((116, status_y), f"发布时间：{published}  来源：{source_name}  {status}", font=meta_font, fill="#756e62")
+        meta = f"发布时间：{published} · 来源：{source_name} · {status}"
+        draw.text(
+            (116, status_y),
+            _fit_text(draw, meta, meta_font, max_width_px=CARD_SIZE[0] - 232),
+            font=meta_font,
+            fill="#756e62",
+        )
         y = box_bottom + gap
     img.save(path, format="PNG")
 

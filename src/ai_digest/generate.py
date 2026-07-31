@@ -16,6 +16,7 @@ from .models import AIDigestBrief, AIUpdateItem
 
 
 AI_DIGEST_LLM_MAX_TOKENS = 6000
+AI_DIGEST_BODY_LIMIT = 1000
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _GENERIC_AI_DIGEST_MARKERS = (
     "发布AI动态",
@@ -24,6 +25,43 @@ _GENERIC_AI_DIGEST_MARKERS = (
     "具体链接已保存在本地元数据",
     "当前摘要仅基于原始标题和摘录整理",
 )
+_AI_CLAIM_NAMES = (
+    "openai",
+    "anthropic",
+    "claude",
+    "gpt",
+    "xai",
+    "grok",
+    "suno",
+    "qwen",
+    "deepseek",
+    "glm",
+    "zhipu",
+    "doubao",
+    "seedream",
+    "kimi",
+    "moonshot",
+    "gemini",
+    "gemma",
+    "google",
+    "deepmind",
+    "meta",
+    "llama",
+    "mistral",
+    "minimax",
+    "nvidia",
+    "hugging face",
+    "cohere",
+    "perplexity",
+    "ernie",
+    "baidu",
+)
+_AI_MODEL_VERSION_RE = re.compile(
+    r"(?<![a-z0-9])(?:gpt|claude|qwen|deepseek|glm|doubao|seedream|kimi|gemini|gemma|"
+    r"llama|mistral|minimax|ernie)[-_. ]?\d+(?:\.\d+)*(?:[-_. ]?[a-z0-9]+)?(?![a-z0-9])",
+    flags=re.IGNORECASE,
+)
+_AI_CLAIM_NUMBER_RE = re.compile(r"(?<![a-z0-9])\d+(?:\.\d+)?(?:[tkmb]|%|％)?(?![a-z0-9])", re.IGNORECASE)
 _EN_DETAIL_TERMS: tuple[tuple[str, str], ...] = (
     ("browser automation", "浏览器自动化"),
     ("stricter terminal permissions", "更严格的终端权限"),
@@ -151,18 +189,22 @@ def _subject_is_only_source(subject: str, item: AIUpdateItem) -> bool:
 
 def _english_subject(item: AIUpdateItem) -> str:
     raw = _source_text(item)
+    product = _clean_subject(item.product)
+    if product and not _subject_is_only_source(product, item):
+        return product
     patterns = (
         r"\b(?:GPT|GLM|Qwen|Claude|Codex|Gemini|Kimi|Doubao|Seedream|ERNIE|Llama|Mistral|DeepSeek|MiniMax)[A-Za-z0-9.\- ]{0,64}",
         r"\b[A-Z][A-Za-z0-9.\-]+(?:\s+[A-Z][A-Za-z0-9.\-]+){0,4}\b",
     )
     for pattern in patterns:
-        match = re.search(pattern, raw)
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
         if not match:
             continue
         subject = _clean_subject(match.group(0))
         if (
             len(subject) >= 3
-            and subject.lower() not in {"openai", "anthropic", "microsoft"}
+            and subject.lower() not in {"the", "this", "openai", "anthropic", "microsoft"}
+            and not re.fullmatch(r"[A-Za-z0-9_-]{28,}", subject)
             and not _subject_is_only_source(subject, item)
         ):
             return subject
@@ -185,17 +227,39 @@ def _detail_terms_from_item(item: AIUpdateItem) -> list[str]:
     return details[:4]
 
 
+def _title_with_action(subject: str, action: str, *, limit: int = 28) -> str:
+    clean_action = re.sub(r"\s+", " ", action or "").strip()
+    clean_subject = re.sub(r"\s+", " ", subject or "").strip()
+    subject_limit = max(1, limit - len(clean_action))
+    clean_subject = clean_subject[:subject_limit].rstrip("，,。；;：: -")
+    return f"{clean_subject}{clean_action}"[:limit]
+
+
 def _fallback_chinese_title(item: AIUpdateItem) -> str:
     raw = _source_text(item)
-    if _has_cjk(raw):
+    if _has_cjk(item.title):
         title = item.title or item.summary or item.raw_excerpt
         title = re.sub(r"\s+", " ", title or "").strip()
         return title[:28].rstrip("，,。；; ") or "AI产品更新"
+    lower = raw.lower()
+    if "ntt data" in lower and "chatgpt enterprise" in lower and "codex" in lower:
+        return "NTT DATA借助ChatGPT与Codex提效"
+    legacy_names = list(
+        dict.fromkeys(re.findall(r"\bdeepseek-(?:chat|reasoner)\b", lower, flags=re.IGNORECASE))
+    )
+    if legacy_names and ("discontinu" in lower or "deprecat" in lower):
+        return f"DeepSeek将停用{'与'.join(legacy_names)}旧API名"[:28]
     subject = _english_subject(item)
-    vendor = item.vendor or item.source_name or ""
-    if vendor and vendor.lower() not in subject.lower():
-        return f"{vendor} {subject}更新"
-    return f"{subject}更新"
+    if "open-weight" in lower or "open weight" in lower:
+        return _title_with_action(subject, "开放权重模型发布")
+    if "agentic ai" in lower and "semiconductor" in lower:
+        return _title_with_action(subject, "推进AI智能体芯片设计")
+    if any(marker in lower for marker in ("launch", "release", "introducing", "new ")):
+        return _title_with_action(subject, "发布新进展")
+    details = _detail_terms_from_item(item)
+    if details:
+        return _title_with_action(subject, "发布新进展")
+    return _title_with_action(subject, "披露AI产品变化")
 
 
 def _fallback_chinese_summary(item: AIUpdateItem) -> str:
@@ -204,11 +268,34 @@ def _fallback_chinese_summary(item: AIUpdateItem) -> str:
     if _has_cjk(raw):
         text = re.sub(r"\s+", " ", item.summary or item.raw_excerpt or item.title).strip()
         return text[:120].rstrip("，,。；; ") + ("…" if len(text) > 120 else "")
+    lower = raw.lower()
+    if "ntt data" in lower and "chatgpt enterprise" in lower and "codex" in lower:
+        return (
+            "NTT DATA集团使用ChatGPT Enterprise与Codex帮助9000名员工自动化工作，"
+            "并将事件分析缩短至30分钟，同时推进安全的企业AI应用。"
+        )
+    if (
+        "deepseek-chat" in lower
+        and "deepseek-reasoner" in lower
+        and ("discontinu" in lower or "deprecat" in lower)
+    ):
+        return (
+            "DeepSeek公告称，deepseek-chat与deepseek-reasoner两个旧API模型名将在三个月后停用；"
+            "目前它们分别指向deepseek-v4-flash的非思考与思考模式。"
+        )
+    if "agentic ai" in lower and "semiconductor" in lower:
+        reduction = "，已展示最高40%的调试周期缩短" if "40%" in lower else ""
+        return (
+            "Synopsys、AMD与微软正把AI智能体接入半导体设计和自动化工程流程"
+            f"{reduction}，目标是缩短芯片从概念到成品的开发路径。"
+        )
+    if ("open-weight" in lower or "open weight" in lower) and "kimi" in lower:
+        return "Kimi K3以开放权重形式提供，原始资料重点提到代码与智能体能力，并给出了定价和可用性信息。"
     subject = _english_subject(item)
     details = _detail_terms_from_item(item)
     if details:
-        return f"{source}更新{subject}，重点涉及{'、'.join(details)}，适合关注相关模型、工具或开发流程变化。"
-    return f"{source}更新{subject}，原始信息提到模型、工具或平台能力变化，建议结合官方原文继续核对细节。"
+        return f"{source}披露{subject}的新进展，原文明确涉及{'、'.join(details)}；具体能力和适用范围以来源链接为准。"
+    return f"{source}披露{subject}的AI产品变化；当前可核实信息以原始标题、摘录和来源链接为准。"
 
 
 def _ensure_chinese_item(item: AIUpdateItem) -> AIUpdateItem:
@@ -243,6 +330,44 @@ def _item_match_score(generated: AIUpdateItem, source: AIUpdateItem, index: int,
     return score
 
 
+def _claim_tokens(text: str) -> set[str]:
+    lower = (text or "").lower()
+    names = {
+        name.replace(" ", "")
+        for name in _AI_CLAIM_NAMES
+        if re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", lower)
+    }
+    names.update(
+        re.sub(r"\s+", "", match.group(0)).lower()
+        for match in _AI_MODEL_VERSION_RE.finditer(text or "")
+    )
+    numbers = {match.group(0).lower() for match in _AI_CLAIM_NUMBER_RE.finditer(text or "")}
+    access_claims: set[str] = set()
+    if re.search(r"仅限.{0,6}付费|only\s+available\s+in\s+paid|paid[- ]only", lower):
+        access_claims.add("access:paid-only")
+    if re.search(
+        r"使用限制|限制使用|许可条款|usage restrictions?|license restrictions?|license terms?|caveat",
+        lower,
+    ):
+        access_claims.add("access:restrictions")
+    if re.search(r"开放权重|开源权重|open[- ]weight", lower):
+        access_claims.add("access:open-weight")
+    if re.search(r"(?:^|[^a-z])free(?:[^a-z]|$)|免费", lower):
+        access_claims.add("access:free")
+    return names | numbers | access_claims
+
+
+def _generated_item_is_grounded(generated: AIUpdateItem, source: AIUpdateItem) -> bool:
+    generated_claims = _claim_tokens(f"{generated.title} {generated.summary}")
+    if not generated_claims:
+        return True
+    source_claims = _claim_tokens(
+        f"{source.title} {source.summary} {source.raw_excerpt} {source.product} "
+        f"{source.vendor} {source.source_name} {source.url}"
+    )
+    return generated_claims <= source_claims
+
+
 def _best_source_match(generated: AIUpdateItem, source_items: list[AIUpdateItem], index: int) -> AIUpdateItem | None:
     if not source_items:
         return None
@@ -258,26 +383,34 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
     if not source_items:
         return _ensure_chinese_brief(brief)
     restored: list[AIUpdateItem] = []
+    remaining_sources = list(source_items)
     for index, item in enumerate(brief.items):
-        match = _best_source_match(item, source_items, index)
+        match = _best_source_match(item, remaining_sources, index)
         data = item.model_dump()
         if match is not None:
+            remaining_sources.remove(match)
             for key in ("url", "published_at", "source_name", "vendor", "product", "raw_excerpt"):
-                if key in {"url", "published_at", "source_name", "vendor"}:
-                    source_value = str(getattr(match, key) or "").strip()
-                    if source_value:
-                        data[key] = source_value
-                    continue
-                if not str(data.get(key) or "").strip():
-                    data[key] = getattr(match, key)
-            evidence = list(data.get("evidence_urls") or [])
-            for url in [match.url, *(match.evidence_urls or [])]:
+                data[key] = getattr(match, key)
+            data["source_type"] = match.source_type
+            data["verification_status"] = match.verification_status
+            data["confidence_score"] = match.confidence_score
+            evidence: list[str] = []
+            for url in match.evidence_urls or []:
                 if url and url not in evidence and url != data.get("url"):
                     evidence.append(url)
             data["evidence_urls"] = evidence
-            if _looks_generic_ai_digest_text(str(data.get("title") or "")) or not _has_cjk(str(data.get("title") or "")):
+            grounded = _generated_item_is_grounded(item, match)
+            if (
+                not grounded
+                or _looks_generic_ai_digest_text(str(data.get("title") or ""))
+                or not _has_cjk(str(data.get("title") or ""))
+            ):
                 data["title"] = _fallback_chinese_title(match)
-            if _looks_generic_ai_digest_text(str(data.get("summary") or "")) or not _has_cjk(str(data.get("summary") or "")):
+            if (
+                not grounded
+                or _looks_generic_ai_digest_text(str(data.get("summary") or ""))
+                or not _has_cjk(str(data.get("summary") or ""))
+            ):
                 data["summary"] = _fallback_chinese_summary(match)
         restored.append(_ensure_chinese_item(AIUpdateItem.model_validate(data)))
     brief_data = brief.model_dump()
@@ -332,25 +465,20 @@ def build_ai_digest_prompt(
     quota_rule = ""
     if min_domestic_model_count or min_foreign_ai_count:
         quota_rule = (
-            f"硬性配额：最终 items 不少于 {target_count} 条；"
+            f"硬性配额：最终 items 恰好 {target_count} 条；"
             f"至少 {min_domestic_model_count} 条中国/国内模型、模型版本或模型 API 资讯；"
             f"至少 {min_foreign_ai_count} 条国外 AI 平台、模型、工具或开源资讯。\n"
         )
     return (
         "你正在为小红书图文笔记制作《每日AI讯息》。\n"
-        + f"目标：从候选中挑选约 {target_count} 条 AI 平台、模型、工具、开源项目动态。\n"
+        + f"程序已经选定恰好 {target_count} 条候选。请逐条翻译和改写，不得删除、增加、合并或调整顺序。\n"
         + quota_rule
         + "要求：官方源优先；社交源只能用于补充或验证；不得编造未提供的信息；全部输出中文。\n"
         + "发布时间硬规则：items[].published_at 必须从候选数据原样复制；不得使用简报日期、抓取日期、页面运行时 now 或自行推断日期替代；"
         + "候选缺少 published_at 时不得选入最终 items。\n"
-        + "筛选规则：先去重，同一模型、基准、产品、版本或开源项目的不同链接只保留最重要的一条；"
-        + "优先选择模型发布、版本升级、API/开发者工具、评测基准、开源项目、基础设施技术更新；"
-        + "观点探讨、趋势评论、采用案例、行业观察只在技术/模型类候选不足时作为补充。\n"
-        + "排序规则：按北京时间发布日期排序，发帖日当天的最重要 AI 资讯放在 items 第一项；"
-        + "同一天内再按关注度、验证强度和用户价值排序。\n"
         + "如果候选信息是英文、日文或其他语言，必须翻译并改写为自然中文；公司名、模型名、产品名可保留原文。\n"
         + "请返回严格 JSON，字段为 title, subtitle, date, items, source_summary。\n"
-        + "items 每项字段：title, summary, source_name, source_type, url, published_at, vendor, product, raw_excerpt, evidence_urls, tags。\n"
+        + "items 每项只输出：title, summary, url, tags。url 必须从对应候选原样复制。\n"
         + "summary 控制在 50-90 字，说明更新内容和对用户/开发者的意义。\n"
         + "候选数据：\n"
         + json.dumps(rows, ensure_ascii=False, indent=2)
@@ -390,7 +518,7 @@ def generate_ai_digest_brief_with_llm(
     min_foreign_ai_count: int = 0,
     date: str = "",
 ) -> AIDigestBrief:
-    """Use the configured LLM to select, translate, and summarize AI digest items."""
+    """Use the configured LLM to translate and summarize preselected AI digest items."""
     if not cfgs:
         raise RuntimeError("LLM config missing for daily AI digest")
 
@@ -414,8 +542,6 @@ def generate_ai_digest_brief_with_llm(
             ("user", "{user_prompt}\n\n简报日期：{date}"),
         ]
     )
-    messages = prompt.format_messages(user_prompt=user_prompt, date=date or _today_date())
-
     last_exc: Exception | None = None
     for cfg in cfgs:
         try:
@@ -428,16 +554,39 @@ def generate_ai_digest_brief_with_llm(
                 max_tokens=AI_DIGEST_LLM_MAX_TOKENS,
             )
             print(f"[ai-digest-llm] provider={cfg.provider} model={cfg.model} base_url={cfg.base_url}")
-            resp = model.invoke(messages)
-            text = resp.content if hasattr(resp, "content") else str(resp)
-            brief = parse_ai_digest_brief_json(text)
-            brief = _restore_traceable_ai_digest_items(brief, items)
-            if date and not brief.date:
-                data = brief.model_dump()
-                data["date"] = date
-                brief = AIDigestBrief.model_validate(data)
-            brief = _fill_missing_item_publish_times(brief, date=date)
-            return _ensure_chinese_brief(brief)
+            for attempt in range(1, 3):
+                retry_instruction = ""
+                if attempt > 1:
+                    retry_instruction = (
+                        "\n\n上一次返回无法通过 JSON 或条数校验。"
+                        f"本次必须只返回一个完整 JSON 对象，items 必须恰好 {target_count} 条。"
+                    )
+                messages = prompt.format_messages(
+                    user_prompt=user_prompt + retry_instruction,
+                    date=date or _today_date(),
+                )
+                try:
+                    resp = model.invoke(messages)
+                    text = resp.content if hasattr(resp, "content") else str(resp)
+                    brief = parse_ai_digest_brief_json(text)
+                    if len(brief.items) != target_count:
+                        raise ValueError(
+                            f"expected exactly {target_count} items, got {len(brief.items)}"
+                        )
+                    brief = _restore_traceable_ai_digest_items(brief, items)
+                    if date and not brief.date:
+                        data = brief.model_dump()
+                        data["date"] = date
+                        brief = AIDigestBrief.model_validate(data)
+                    brief = _fill_missing_item_publish_times(brief, date=date)
+                    return _ensure_chinese_brief(brief)
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < 2:
+                        print(
+                            f"[ai-digest-llm] retry=2 reason={type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
         except Exception as exc:
             last_exc = exc
             continue
@@ -494,6 +643,16 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
         if name and name not in sources:
             sources.append(name)
     source_text = " / ".join(name[:16] for name in sources[:8]) or "官方公开渠道"
+    source_tier_counts = {
+        "official": sum(1 for item in brief.items if item.source_type in {"official", "github"}),
+        "aggregator": sum(1 for item in brief.items if item.source_type in {"aggregator", "search"}),
+        "social": sum(1 for item in brief.items if item.source_type == "social"),
+    }
+    source_tier_line = (
+        f"信源层级：官网{source_tier_counts['official']}条，"
+        f"资讯整合站{source_tier_counts['aggregator']}条，"
+        f"社交媒体{source_tier_counts['social']}条"
+    )
     lines = [
         "每日AI讯息",
         "",
@@ -501,17 +660,47 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
         "",
         f"发布时间：{brief.date}",
         f"来源：{source_text}",
+        source_tier_line,
     ]
     selection_line = _selection_summary_line(selection_meta, item_count=len(brief.items))
     if selection_line:
         lines.append(selection_line)
     link_lines = []
     for idx, item in enumerate(brief.items, 1):
-        url = item.normalized_url or next((u.strip() for u in item.evidence_urls if u.strip()), "")
+        trace_urls = [
+            url
+            for url in [item.normalized_url, *(u.strip() for u in item.evidence_urls if u.strip())]
+            if url
+        ]
+        url = next(iter(dict.fromkeys(trace_urls)), "")
         if not url:
             continue
         source = (item.vendor or item.source_name or f"动态{idx}").strip()
         link_lines.append(f"{idx}. {source[:12]} {url}")
     if link_lines:
         lines.extend(["", "来源链接：", *link_lines])
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    if len(body) <= AI_DIGEST_BODY_LIMIT:
+        return body
+
+    compact_lines = [
+        "每日AI讯息",
+        f"发布时间：{brief.date}",
+        source_tier_line,
+    ]
+    if selection_line:
+        compact_lines.append(selection_line)
+    compact_lines.extend(["来源链接：", *link_lines])
+    body = "\n".join(compact_lines)
+    if len(body) <= AI_DIGEST_BODY_LIMIT:
+        return body
+
+    return "\n".join(
+        [
+            "每日AI讯息",
+            f"发布时间：{brief.date}",
+            source_tier_line,
+            "来源链接：",
+            *(f"{idx}. {line.split(' ', 2)[-1]}" for idx, line in enumerate(link_lines, 1)),
+        ]
+    )

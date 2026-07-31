@@ -48,8 +48,45 @@ def test_aliyun_llm_models_list_builds_multiple_configs(monkeypatch, tmp_path: P
 
     cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
 
-    assert [c.provider for c in cfgs[:3]] == ["aliyun", "aliyun", "fallback"]
+    assert [c.provider for c in cfgs] == ["aliyun", "aliyun"]
     assert [c.model for c in cfgs[:2]] == ["m1", "m2"]
+
+
+def test_auto_provider_excludes_ppinfra_without_explicit_paid_fallback(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LLM_PROVIDER", "auto")
+    monkeypatch.setenv("ALIYUN_LLM_API_KEY", "dummy-aliyun")
+    monkeypatch.setenv("ALIYUN_LLM_MODELS", "aliyun-free")
+    monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volcengine")
+    monkeypatch.setenv("VOLCENGINE_LLM_MODELS", "volcengine-free")
+    monkeypatch.setenv("LLM_API_KEY", "dummy-paid-fallback")
+    monkeypatch.delenv("ALLOW_PAID_LLM_FALLBACK", raising=False)
+
+    cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
+
+    assert [(c.provider, c.model) for c in cfgs] == [
+        ("aliyun", "aliyun-free"),
+        ("volcengine", "volcengine-free"),
+    ]
+
+
+def test_auto_provider_adds_ppinfra_only_after_explicit_paid_fallback_opt_in(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LLM_PROVIDER", "auto")
+    monkeypatch.setenv("ALIYUN_LLM_API_KEY", "dummy-aliyun")
+    monkeypatch.setenv("ALIYUN_LLM_MODELS", "aliyun-free")
+    monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volcengine")
+    monkeypatch.setenv("VOLCENGINE_LLM_MODELS", "volcengine-free")
+    monkeypatch.setenv("LLM_API_KEY", "dummy-paid-fallback")
+    monkeypatch.setenv("ALLOW_PAID_LLM_FALLBACK", "1")
+
+    cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
+
+    assert [(c.provider, c.model) for c in cfgs] == [
+        ("aliyun", "aliyun-free"),
+        ("volcengine", "volcengine-free"),
+        ("ppinfra", "deepseek/deepseek-v3-0324"),
+    ]
 
 
 def test_aliyun_llm_models_list_overrides_single_model(monkeypatch, tmp_path: Path):
@@ -88,7 +125,7 @@ def test_llm_provider_ppinfra_skips_aliyun_even_when_key_exists(monkeypatch):
 
     cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
 
-    assert [c.provider for c in cfgs] == ["fallback"]
+    assert [c.provider for c in cfgs] == ["ppinfra"]
     assert [c.model for c in cfgs] == ["deepseek/deepseek-v3-0324"]
 
 

@@ -76,6 +76,7 @@ def test_auto_daily_ai_digest_title_uploads_one_digest_post(monkeypatch, tmp_pat
         cli.app,
         [
             "auto",
+            "--no-preflight",
             "--title",
             "每日AI讯息",
             "--count",
@@ -116,6 +117,7 @@ def test_auto_daily_ai_digest_missing_assets_explains_local_card_rendering(monke
         cli.app,
         [
             "auto",
+            "--no-preflight",
             "--title",
             "每日AI讯息",
             "--assets-glob",

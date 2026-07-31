@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from xml.etree import ElementTree as ET
 
 from .models import AIUpdateItem
@@ -290,6 +290,12 @@ _OFFICIAL_HTML_HARD_NOISE = (
     "服务协议",
     "监控告警",
     "release notes",
+    "terms of service",
+    "license terms",
+    "responsible ai development policy",
+    "training data disclosure",
+    "select a category",
+    "customer stories models news products research",
 )
 
 _OFFICIAL_HTML_RELEASE_SIGNALS = (
@@ -538,6 +544,60 @@ def parse_social_search_html(
     return items
 
 
+def parse_x_profile_html(
+    html_text: str,
+    *,
+    source_name: str,
+    vendor: str,
+) -> list[AIUpdateItem]:
+    """Parse X public syndication timelines without a logged-in browser."""
+    match = re.search(
+        r'(?is)<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(?P<payload>.*?)</script>',
+        html_text or "",
+    )
+    if not match:
+        return []
+    try:
+        payload = json.loads(unescape(match.group("payload")))
+        entries = payload["props"]["pageProps"]["timeline"]["entries"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+    items: list[AIUpdateItem] = []
+    seen_urls: set[str] = set()
+    for entry in entries if isinstance(entries, list) else []:
+        tweet = ((entry or {}).get("content") or {}).get("tweet") or {}
+        if not isinstance(tweet, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(tweet.get("full_text") or tweet.get("text") or "")).strip()
+        permalink = str(tweet.get("permalink") or "").strip()
+        if not text or not permalink:
+            continue
+        url = urljoin("https://x.com", permalink)
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        user = tweet.get("user") or {}
+        display_name = str(user.get("name") or source_name).strip()
+        screen_name = str(user.get("screen_name") or "").strip()
+        profile_name = f"X：{display_name} (@{screen_name})" if screen_name else f"X：{display_name}"
+        items.append(
+            AIUpdateItem(
+                title=text[:120],
+                summary=text[:220],
+                source_name=profile_name,
+                source_type="social",
+                url=url,
+                published_at=_parse_datetime(str(tweet.get("created_at") or "")),
+                vendor=vendor,
+                raw_excerpt=text,
+                verification_status="social_only",
+                tags=["AI", "social", vendor],
+            )
+        )
+    return items
+
+
 _AIHOT_SOURCE_LINE_RE = re.compile(
     r"(?:官方|公众号|RSS|GitHub|News|网页|博客|Blog|X：|MarkTechPost|The Decoder|TechCrunch|IT之家|Google|Claude Code)",
     re.IGNORECASE,
@@ -553,6 +613,53 @@ _AIHOT_NOISE_TITLES = (
     "月报",
     "更多",
 )
+
+
+def _next_flight_payload_text(html_text: str) -> str:
+    chunks: list[str] = []
+    pattern = re.compile(
+        r"(?is)<script[^>]*>\s*self\.__next_f\.push\((?P<payload>\[.*?\])\)\s*</script>"
+    )
+    for match in pattern.finditer(html_text or ""):
+        try:
+            payload = json.loads(unescape(match.group("payload")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, list) and len(payload) > 1 and isinstance(payload[1], str):
+            chunks.append(payload[1])
+    return "\n".join(chunks)
+
+
+def _decode_embedded_json_string(value: str) -> str:
+    try:
+        return str(json.loads(f'"{value}"')).strip()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return value.strip()
+
+
+def _aihot_structured_entries(html_text: str) -> list[tuple[str, str, str]]:
+    payload = _next_flight_payload_text(html_text)
+    if not payload:
+        return []
+    field_pattern = re.compile(
+        r'"className":"m-daily-entry-(?P<kind>title|sum|src)",'
+        r'"children":"(?P<value>(?:\\.|[^"\\])*)"'
+    )
+    entries: list[tuple[str, str, str]] = []
+    pending: dict[str, str] = {}
+    for match in field_pattern.finditer(payload):
+        kind = match.group("kind")
+        value = _decode_embedded_json_string(match.group("value"))
+        if kind == "title":
+            pending = {"title": value}
+            continue
+        if kind == "sum" and pending.get("title"):
+            pending["summary"] = value
+            continue
+        if kind == "src" and pending.get("title") and pending.get("summary"):
+            entries.append((pending["title"], value, pending["summary"]))
+            pending = {}
+    return entries
 
 
 def _aihot_vendor(title: str, source_line: str) -> str:
@@ -590,6 +697,16 @@ def _aihot_vendor(title: str, source_line: str) -> str:
     return source_line[:40].strip() or "AI HOT"
 
 
+def _aihot_external_url(text: str, *, aggregator_url: str) -> str:
+    aggregator_host = urlsplit(aggregator_url).netloc.lower()
+    for match in re.finditer(r"https?://[^\s，。；;）)】\]<>\"']+", text or ""):
+        url = match.group(0).rstrip(".,;:!?")
+        if urlsplit(url).netloc.lower() == aggregator_host:
+            continue
+        return url
+    return ""
+
+
 def parse_aihot_daily_html(
     html_text: str,
     *,
@@ -598,13 +715,25 @@ def parse_aihot_daily_html(
     base_url: str,
     published_date: str,
 ) -> list[AIUpdateItem]:
-    lines = _html_lines(html_text)
+    structured_entries = _aihot_structured_entries(html_text)
+    uses_structured_entries = bool(structured_entries)
+    if structured_entries:
+        candidates = structured_entries
+    else:
+        lines = _html_lines(html_text)
+        candidates = []
+        for idx in range(0, max(0, len(lines) - 2)):
+            title = lines[idx].strip()
+            second = lines[idx + 1].strip()
+            third = lines[idx + 2].strip()
+            if _AIHOT_SOURCE_LINE_RE.search(second):
+                candidates.append((title, second, third))
     items: list[AIUpdateItem] = []
     seen_titles: set[str] = set()
-    for idx in range(0, max(0, len(lines) - 2)):
-        title = lines[idx].strip()
-        source_line = lines[idx + 1].strip()
-        summary = lines[idx + 2].strip()
+    for title, source_line, summary in candidates:
+        title = title.strip()
+        source_line = source_line.strip()
+        summary = summary.strip()
         if not (6 <= len(title) <= 120):
             continue
         if title.startswith("#") or title.startswith("##"):
@@ -615,27 +744,40 @@ def parse_aihot_daily_html(
             continue
         if not _AIHOT_SOURCE_LINE_RE.search(source_line):
             continue
-        if len(summary) < 28 or (len(summary) < 50 and _AIHOT_SOURCE_LINE_RE.search(summary)):
+        if len(summary) < 28 or (
+            not uses_structured_entries
+            and len(summary) < 50
+            and _AIHOT_SOURCE_LINE_RE.search(summary)
+        ):
             continue
         title_key = re.sub(r"\s+", "", title).lower()
         if title_key in seen_titles:
             continue
         seen_titles.add(title_key)
         item_vendor = _aihot_vendor(title, source_line) or vendor
+        entry_url = f"{base_url}?item={len(items) + 1}"
+        primary_url = _aihot_external_url(
+            f"{summary} {source_line}",
+            aggregator_url=base_url,
+        )
         items.append(
             AIUpdateItem(
                 title=title,
                 summary=summary[:220],
-                source_name=source_line[:80],
-                source_type="search",
-                url=f"{base_url}?item={len(items) + 1}",
+                source_name=(
+                    f"{item_vendor} 原始页面（AI HOT 汇总）"
+                    if primary_url
+                    else source_line[:80]
+                ),
+                source_type="aggregator",
+                url=primary_url or entry_url,
                 published_at=f"{published_date}T08:00:00+08:00",
                 vendor=item_vendor,
                 product="",
                 raw_excerpt=summary,
                 confidence_score=0.72,
-                verification_status="social_confirmed",
-                evidence_urls=[base_url],
+                verification_status="aggregator_only",
+                evidence_urls=[entry_url] if primary_url else [],
                 tags=["AI", source_name, item_vendor],
             )
         )

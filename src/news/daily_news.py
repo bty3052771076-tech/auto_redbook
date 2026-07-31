@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -70,6 +70,13 @@ LOW_QUALITY_NEWS_DOMAINS = {
 }
 LOW_QUALITY_NEWS_TITLE_PATTERNS = (
     re.compile(r"^\s*watch\s*:", re.IGNORECASE),
+    re.compile(r"^\s*[A-Z]{1,8}\|[^|]{2,80}\|price:\s*\d", re.IGNORECASE),
+    re.compile(
+        r"^\s*(?:(?:it|\u79d1\u6280|\u8d22\u7ecf|\u65b0\u95fb|\u5e02\u573a)\s*)?"
+        r"(?:\u65e9\u62a5|\u665a\u62a5|\u65e5\u62a5|\u6668\u62a5|\u5348\u62a5|\u5feb\u8baf|\u8981\u95fb)"
+        r"(?:\s*\d{2,8})?\s*[:\uff1a].*[;\uff1b]",
+        re.IGNORECASE,
+    ),
     re.compile(r"\bnews in brief\b", re.IGNORECASE),
     re.compile(r"\badded to pypi\b", re.IGNORECASE),
     re.compile(r"\bpublished to pypi\b", re.IGNORECASE),
@@ -225,6 +232,30 @@ HOTNEWS_CHINA_PLATFORMS = {
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
 _CJK_RE = re.compile(r"^[\u4e00-\u9fff]+$")
 _ENTITY_RE = re.compile(r"[a-z]{2,}|\d{1,3}", re.IGNORECASE)
+_CJK_STORY_EVENT_TOKENS = frozenset(
+    "\u5904\u7f5a \u7f5a\u6b3e \u5784\u65ad \u6536\u8d2d \u878d\u8d44 \u53d1\u5e03 \u8d77\u8bc9 \u8c03\u67e5 \u88c1\u5458 \u7834\u4ea7 \u4e0a\u5e02 \u7b7e\u7ea6 \u6da8\u4ef7 \u964d\u4ef7 \u53ec\u56de \u505c\u706b \u5236\u88c1 \u5173\u7a0e \u9884\u8b66 \u53f0\u98ce \u5730\u9707 \u706b\u707e \u4e8b\u6545".split()
+)
+_CJK_STORY_EVENT_FAMILIES = {
+    "\u4e0a\u5e02": ("\u4e0a\u5e02", "\u767b\u9646", "\u6302\u724c", "\u9996\u65e5"),
+}
+_CJK_STORY_GENERIC_TOKENS = frozenset(
+    "\u65b0\u95fb \u539f\u6587 \u6458\u5f55 \u4e0b\u8f7d \u5ba2\u6237\u7aef \u4e2d\u56fd \u56fd\u5bb6 \u7ecf\u6d4e \u5e02\u573a \u5e73\u53f0 \u884c\u4e1a \u4f01\u4e1a \u516c\u53f8 \u96c6\u56e2 \u7528\u6237 \u76d1\u7ba1 \u6267\u6cd5 \u53d1\u5c55 \u670d\u52a1 \u7ecf\u8425 \u7ade\u4e89 \u884c\u4e3a \u4fe1\u606f \u76f8\u5173 \u5f71\u54cd \u5065\u5eb7 \u89c4\u8303 \u7ef4\u62a4 \u63a8\u52a8 \u4f9d\u6cd5 \u6280\u672f \u6570\u636e \u6d41\u91cf \u5408\u4f5c \u4ef7\u683c".split()
+)
+_CJK_STORY_ENTITY_SUFFIXES = (
+    "\u96c6\u56e2",
+    "\u516c\u53f8",
+    "\u6cd5\u9662",
+    "\u603b\u5c40",
+    "\u59d4\u5458\u4f1a",
+    "\u94f6\u884c",
+    "\u57fa\u91d1",
+    "\u5927\u5b66",
+    "\u533b\u9662",
+    "\u79d1\u6280",
+)
+_CJK_STORY_GENERIC_ENTITIES = frozenset(
+    "\u4eba\u6c11\u6cd5\u9662 \u5e02\u573a\u76d1\u7ba1\u603b\u5c40 \u76d1\u7ba1\u603b\u5c40".split()
+)
 _ENTITY_STOPWORDS = {
     # Common function words
     "a",
@@ -412,6 +443,57 @@ def _entity_similar(tokens_a: set[str], tokens_b: set[str]) -> bool:
     if len(inter) >= 2 and any(not t.isdigit() for t in inter):
         return True
     return False
+
+
+def _cjk_story_event_signature(item: NewsItem) -> tuple[set[str], set[str]]:
+    """Return shared-event and specific-subject signals from Chinese news context."""
+    text = " ".join(
+        part
+        for part in (
+            item.title,
+            item.description,
+        )
+        if part
+    )
+    tokens = _tokens(text)
+    events = tokens & _CJK_STORY_EVENT_TOKENS
+    for canonical_event, markers in _CJK_STORY_EVENT_FAMILIES.items():
+        if any(marker in text for marker in markers):
+            events.add(canonical_event)
+    subjects = {
+        token
+        for token in tokens
+        if 3 <= len(token) <= 12
+        and _CJK_RE.fullmatch(token)
+        and token not in _CJK_STORY_EVENT_TOKENS
+        and token not in _CJK_STORY_GENERIC_TOKENS
+    }
+    for part in _TOKEN_RE.findall(text):
+        if not _CJK_RE.fullmatch(part):
+            continue
+        for suffix in _CJK_STORY_ENTITY_SUFFIXES:
+            start = 0
+            while True:
+                pos = part.find(suffix, start)
+                if pos < 0:
+                    break
+                if pos >= 2:
+                    for prefix_len in (2, 3, 4):
+                        if pos < prefix_len:
+                            continue
+                        entity = part[pos - prefix_len : pos + len(suffix)]
+                        if entity not in _CJK_STORY_GENERIC_ENTITIES:
+                            subjects.add(entity)
+                start = pos + len(suffix)
+    return events, subjects
+
+
+def _same_cjk_story_event(
+    left: tuple[set[str], set[str]], right: tuple[set[str], set[str]]
+) -> bool:
+    left_events, left_subjects = left
+    right_events, right_subjects = right
+    return bool(left_events & right_events) and bool(left_subjects & right_subjects)
 
 
 def _domain_for_item(item: NewsItem) -> str:
@@ -691,7 +773,8 @@ def _dedupe_by_title(items: list[NewsItem], *, max_count: int) -> list[NewsItem]
 def _dedupe_by_story(items: list[NewsItem], *, max_count: int) -> list[NewsItem]:
     """
     More aggressive than title-only dedupe: also attempts to dedupe cross-language stories
-    by overlapping ASCII "entity-ish" tokens (names/abbreviations/numbers).
+    by overlapping ASCII "entity-ish" tokens (names/abbreviations/numbers), plus Chinese
+    stories that share both a concrete subject and an event signal in their context.
 
     This is used when selecting multiple items to publish. We keep fetch-time candidate
     dedupe conservative to preserve cross-domain evidence for scoring.
@@ -699,9 +782,11 @@ def _dedupe_by_story(items: list[NewsItem], *, max_count: int) -> list[NewsItem]
     picked: list[NewsItem] = []
     picked_title_tokens: list[set[str]] = []
     picked_entity_tokens: list[set[str]] = []
+    picked_cjk_signatures: list[tuple[set[str], set[str]]] = []
     for item in items:
         title_tokens = _tokens(item.title)
         entity_tokens = _entity_tokens(f"{item.title} {item.description or ''}")
+        cjk_signature = _cjk_story_event_signature(item)
         if any(
             _title_similar(title_tokens, t, threshold=NEWS_DEDUPE_SIM_THRESHOLD)
             for t in picked_title_tokens
@@ -722,9 +807,12 @@ def _dedupe_by_story(items: list[NewsItem], *, max_count: int) -> list[NewsItem]
             and any(_entity_similar(entity_tokens, e) for e in picked_entity_tokens)
         ):
             continue
+        if any(_same_cjk_story_event(cjk_signature, signature) for signature in picked_cjk_signatures):
+            continue
         picked.append(item)
         picked_title_tokens.append(title_tokens)
         picked_entity_tokens.append(entity_tokens)
+        picked_cjk_signatures.append(cjk_signature)
         if len(picked) >= max_count:
             break
     return picked
@@ -2890,6 +2978,9 @@ def fetch_daily_news_candidates(
     source_cooldown_seconds: int | None = None,
     persist_source_health: bool | None = None,
     exhaustive_sources: bool = False,
+    progress_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
+    minimum_qualified_records: int | None = None,
+    qualified_count_callback: Callable[[list[NewsItem]], int] | None = None,
 ) -> tuple[list[NewsItem], dict[str, Any]]:
     """
     Fetch today's news via an external API.
@@ -3052,7 +3143,23 @@ def fetch_daily_news_candidates(
     # ranking applies freshness, relevance, history, country and domain rules.
     collected_candidates: list[NewsItem] = []
     first_success_provider: str | None = None
-    for provider in provider_plan:
+    successful_providers: list[str] = []
+    collection_stop_reason = "provider_plan_exhausted"
+    qualified_count_at_stop: int | None = None
+    minimum_qualified = max(0, int(minimum_qualified_records or 0))
+    min_diverse_sources = _positive_env_int("NEWS_MIN_DIVERSE_PROVIDERS", 3)
+    provider_total = len(provider_plan)
+    for provider_index, provider in enumerate(provider_plan, start=1):
+        if progress_callback is not None:
+            progress_callback(
+                "信源采集",
+                "in_progress",
+                {
+                    "provider": provider,
+                    "source_index": provider_index,
+                    "source_total": provider_total,
+                },
+            )
         if provider not in provider_attempts:
             provider_attempts.append(provider)
         previous_attempt = persisted_health_attempts.get(provider)
@@ -3077,6 +3184,17 @@ def fetch_daily_news_candidates(
                     http_status=previous_attempt.http_status if previous_attempt is not None else None,
                 )
             )
+            if progress_callback is not None:
+                progress_callback(
+                    "信源采集",
+                    "skipped",
+                    {
+                        "provider": provider,
+                        "source_index": provider_index,
+                        "source_total": provider_total,
+                        "reason": "recent_failure_cooldown",
+                    },
+                )
             continue
         provider_started = time.perf_counter()
         provider_checked_at = _news_health_timestamp()
@@ -3413,6 +3531,20 @@ def fetch_daily_news_candidates(
             )
         health_attempts.append(health_attempt)
         persisted_health_attempts[provider] = health_attempt
+        if progress_callback is not None:
+            progress_callback(
+                "信源采集",
+                "failed" if provider_error is not None else "success",
+                {
+                    "provider": provider,
+                    "source_index": provider_index,
+                    "source_total": provider_total,
+                    "items": provider_item_count,
+                    "dated": provider_dated_count,
+                    "elapsed_seconds": round(elapsed_seconds, 1),
+                    "error": str(provider_error)[:180] if provider_error is not None else "",
+                },
+            )
         if (aggregate_empty_prompt or hint_query) and provider_candidates:
             candidates = _dedupe_candidates(provider_candidates)[:max_records]
             chosen_query = ",".join(queries_used) if queries_used else chosen_query
@@ -3420,16 +3552,67 @@ def fetch_daily_news_candidates(
         if provider_pool:
             if first_success_provider is None:
                 first_success_provider = provider
+            if provider not in successful_providers:
+                successful_providers.append(provider)
             collected_candidates = _balanced_candidate_pool(
                 [*collected_candidates, *provider_pool],
                 max_records=max_records,
             )
         if collected_candidates:
             candidates = collected_candidates
-            if len(collected_candidates) >= max_records and not (
-                auto_provider_selection and exhaustive_sources
+            raw_target_met = len(collected_candidates) >= max_records
+            enough_diversity = len(successful_providers) >= min(min_diverse_sources, provider_total)
+            qualified_target_met = True
+            if qualified_count_callback is not None and minimum_qualified > 0:
+                qualified_count_at_stop = max(0, int(qualified_count_callback(collected_candidates)))
+                qualified_target_met = qualified_count_at_stop >= minimum_qualified
+            if (
+                raw_target_met
+                and (not (auto_provider_selection and exhaustive_sources) or enough_diversity)
+                and qualified_target_met
             ):
+                collection_stop_reason = (
+                    "raw_and_qualified_pool_targets_reached"
+                    if qualified_count_callback is not None and minimum_qualified > 0
+                    else "raw_pool_target_reached"
+                )
+                if progress_callback is not None and auto_provider_selection and exhaustive_sources:
+                    progress_callback(
+                        "信源采集",
+                        "success",
+                        {
+                            "provider": provider,
+                            "source_index": provider_index,
+                            "source_total": provider_total,
+                            "items": len(collected_candidates),
+                            "dated": sum(1 for item in collected_candidates if str(item.seendate or "").strip()),
+                            "qualified": qualified_count_at_stop,
+                            "min_qualified": minimum_qualified or None,
+                            "reason": collection_stop_reason,
+                        },
+                    )
                 break
+            if (
+                raw_target_met
+                and enough_diversity
+                and not qualified_target_met
+                and progress_callback is not None
+                and auto_provider_selection
+                and exhaustive_sources
+            ):
+                progress_callback(
+                    "信源采集",
+                    "in_progress",
+                    {
+                        "provider": provider,
+                        "source_index": provider_index,
+                        "source_total": provider_total,
+                        "items": len(collected_candidates),
+                        "qualified": qualified_count_at_stop,
+                        "min_qualified": minimum_qualified,
+                        "reason": "qualified_pool_below_target",
+                    },
+                )
             # Automatic fallback is deliberately exhaustive up to the raw
             # pool target. Explicit NEWS_PROVIDER remains single-provider.
             if auto_provider_selection and exhaustive_sources:
@@ -3459,6 +3642,10 @@ def fetch_daily_news_candidates(
         "provider_plan": provider_plan,
         "provider_attempts": provider_attempts,
         "provider_errors": provider_errors[-10:],
+        "collection_stop_reason": collection_stop_reason,
+        "qualified_count_at_stop": qualified_count_at_stop,
+        "minimum_qualified_records": minimum_qualified or None,
+        "successful_providers": successful_providers,
         "tz": tz_name,
         "query": chosen_query,
         "query_variants": queries,

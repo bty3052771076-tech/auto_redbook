@@ -1,5 +1,6 @@
 import json
 import re
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from src.workflow.create_post import (
     _has_japanese_kana,
     _limit_daily_news_content,
     _normalize_daily_news_title,
+    _normalize_daily_news_image_event,
     _normalize_daily_news_topics,
     _render_daily_news_body_fields,
 )
@@ -665,6 +667,7 @@ def test_create_daily_news_falls_back_when_llm_echoes_prompt(monkeypatch, tmp_pa
     assert "请依据下面提供的新闻信息" not in post.body
     assert "输出为严格 JSON" not in post.body
     assert "AI写作工具引发内容行业讨论" in post.body
+    assert "评价：" in post.body
 
 
 def test_daily_news_offline_body_does_not_echo_user_prompt_hint():
@@ -786,6 +789,198 @@ def test_focus_daily_news_item_selects_important_story_from_generic_bundle():
     assert meta["multi_story_filter"]["selected_title"] == "国务院发布超龄劳动者权益保障新规"
 
 
+def test_daily_news_rejects_chinese_multi_story_roundup_before_generation():
+    item = NewsItem(
+        title="IT早报 0726：携程公布整改措施；手机厂商抵制内存涨价；高通宣布芯片涨价",
+        url="https://example.com/it-daily-brief",
+        source="IT之家",
+        domain="ithome.com",
+        seendate=_recent_news_seendate(0),
+        description="包含多条彼此无关的科技新闻摘要。",
+    )
+
+    assert daily_news._is_low_quality_daily_news_candidate(item) is True
+
+
+def test_daily_news_rejects_stock_quote_page_before_generation():
+    item = NewsItem(
+        title="SSYS|Stratasys Ltd|Price:8.030|Chg%:+0.030",
+        url="https://www.tradingkey.com/markets/stocks/ssys/company",
+        source="TradingKey",
+        domain="tradingkey.com",
+        seendate=_recent_news_seendate(0),
+        description="Company profile and latest quote.",
+    )
+
+    assert daily_news._is_low_quality_daily_news_candidate(item) is True
+
+
+def test_daily_news_story_dedupe_matches_same_chinese_company_penalty_event():
+    items = [
+        NewsItem(
+            title="经济日报：制止在线酒店预订平台服务市场垄断行为",
+            url="https://example.com/company-penalty-1",
+            source="经济日报",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description="市场监管总局依法对携程集团垄断行为作出行政处罚。",
+        ),
+        NewsItem(
+            title="新华时评：依法惩治行业垄断，护航平台经济发展",
+            url="https://example.com/company-penalty-2",
+            source="新华社",
+            domain="example.org",
+            seendate=_recent_news_seendate(0),
+            description="市场监管总局对携程集团滥用市场支配地位实施垄断行为作出行政处罚。",
+        ),
+    ]
+
+    deduped = daily_news._dedupe_by_story(items, max_count=len(items))
+
+    assert [item.url for item in deduped] == ["https://example.com/company-penalty-1"]
+
+
+def test_daily_news_story_dedupe_matches_same_company_listing_first_day_reports():
+    items = [
+        NewsItem(
+            title="长鑫科技上市首日私募浮盈65亿",
+            url="https://example.com/changxin-private",
+            source="Source A",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+        ),
+        NewsItem(
+            title="长鑫科技上市首日公募浮盈超500亿",
+            url="https://example.org/changxin-public",
+            source="Source B",
+            domain="example.org",
+            seendate=_recent_news_seendate(0),
+        ),
+        NewsItem(
+            title="长鑫科技科创板首日平稳交易",
+            url="https://example.net/changxin-market",
+            source="Source C",
+            domain="example.net",
+            seendate=_recent_news_seendate(0),
+        ),
+    ]
+
+    deduped = daily_news._dedupe_by_story(items, max_count=len(items))
+
+    assert [item.url for item in deduped] == ["https://example.com/changxin-private"]
+
+
+def test_daily_news_story_dedupe_keeps_distinct_news_with_shared_publish_word():
+    items = [
+        NewsItem(
+            title="\u95f5\u884c\u53d1\u5e03\u5bb6\u653f\u5973\u804c\u5de5\u6210\u957f\u8d4b\u80fd\u884c\u52a8",
+            url="https://example.com/home-service",
+            source="\u4e0a\u89c2\u65b0\u95fb",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description=(
+                "\u4e0a\u6d77\u95f5\u884c\u533a\u5728\u5bb6\u653f\u6280\u80fd\u7ade\u8d5b\u73b0\u573a\u6b63\u5f0f\u53d1\u5e03"
+                "\u5bb6\u653f\u5973\u804c\u5de5\u6210\u957f\u8d4b\u80fd\u4e09\u5927\u884c\u52a8\u3002"
+            ),
+        ),
+        NewsItem(
+            title="\u7236\u4eb2\u7fa4\u53d1\u5bb6\u4e8b\u88ab\u8ba4\u5b9a\u6784\u6210\u5bb6\u66b4",
+            url="https://example.org/family-violence",
+            source="\u65b0\u4eac\u62a5",
+            domain="example.org",
+            seendate=_recent_news_seendate(0),
+            description=(
+                "\u4e0a\u6d77\u6d66\u4e1c\u65b0\u533a\u4eba\u6c11\u6cd5\u9662\u4f9d\u6cd5\u53d1\u5e03\u4eba\u8eab\u5b89\u5168\u4fdd\u62a4\u4ee4\uff0c"
+                "\u8ba4\u5b9a\u7236\u4eb2\u5728\u7fa4\u804a\u4e2d\u516c\u5f00\u7f9e\u8fb1\u5b50\u5973\u6784\u6210\u7cbe\u795e\u5bb6\u66b4\u3002"
+            ),
+        ),
+    ]
+
+    deduped = daily_news._dedupe_by_story(items, max_count=len(items))
+
+    assert [item.url for item in deduped] == [
+        "https://example.com/home-service",
+        "https://example.org/family-violence",
+    ]
+
+
+def test_create_daily_news_posts_dedupes_same_event_after_source_enrichment(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    candidates = [
+        NewsItem(
+            title="\u7ecf\u6d4e\u65e5\u62a5\u89e3\u8bfb\u5728\u7ebf\u9152\u5e97\u5e73\u53f0\u5784\u65ad\u5904\u7f5a",
+            url="https://example.com/company-penalty-1",
+            source="\u7ecf\u6d4e\u65e5\u62a5",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+        ),
+        NewsItem(
+            title="\u65b0\u534e\u8bc4\u8bba\uff1a\u4f9d\u6cd5\u6574\u6cbb\u5e73\u53f0\u5784\u65ad\u884c\u4e3a",
+            url="https://example.org/company-penalty-2",
+            source="\u65b0\u534e\u793e",
+            domain="example.org",
+            seendate=_recent_news_seendate(0),
+        ),
+    ]
+    monkeypatch.setattr(
+        create_post,
+        "_fetch_daily_news_candidates_for_upload",
+        lambda *_args, **_kwargs: (candidates, {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "pick_news_items", lambda items, _prompt, *, count=1: items[:count])
+
+    def fake_enrich(item):
+        return (
+            replace(
+                item,
+                content=(
+                    "2026\u5e747\u670825\u65e5\uff0c\u5e02\u573a\u76d1\u7ba1\u603b\u5c40\u4f9d\u6cd5\u5bf9\u643a\u7a0b\u96c6\u56e2"
+                    "\u6ee5\u7528\u5e02\u573a\u652f\u914d\u5730\u4f4d\u5b9e\u65bd\u5784\u65ad\u884c\u4e3a\u4f5c\u51fa\u884c\u653f\u5904\u7f5a\u3002"
+                ),
+            ),
+            {},
+        )
+
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", fake_enrich)
+    monkeypatch.setattr(create_post, "_focus_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(create_post, "_daily_news_quality_issue", lambda *_args: "")
+    calls = {"count": 0}
+
+    def fake_generate_draft(*_args, **_kwargs):
+        calls["count"] += 1
+        return {
+            "title": "\u643a\u7a0b\u5784\u65ad\u6848\u88ab\u4f9d\u6cd5\u5904\u7f5a",
+            "body": _test_daily_news_body(
+                original_title="\u643a\u7a0b\u5784\u65ad\u6848\u88ab\u4f9d\u6cd5\u5904\u7f5a",
+                content="\u5e02\u573a\u76d1\u7ba1\u603b\u5c40\u5bf9\u643a\u7a0b\u96c6\u56e2\u7684\u5784\u65ad\u884c\u4e3a\u4f5c\u51fa\u884c\u653f\u5904\u7f5a\u3002",
+                comment="\u5e73\u53f0\u7ecf\u6d4e\u7ade\u4e89\u4ecd\u9700\u4f9d\u9760\u53ef\u89c2\u5bdf\u7684\u76d1\u7ba1\u548c\u5408\u89c4\u884c\u52a8\u3002",
+                date=_recent_news_date(),
+                source="\u7ecf\u6d4e\u65e5\u62a5",
+            ),
+            "topics": ["\u6bcf\u65e5\u65b0\u95fb"],
+            "image_event": "\u643a\u7a0b\u5784\u65ad\u6848\u884c\u653f\u5904\u7f5a",
+        }
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+
+    with pytest.raises(create_post.PartialDailyNewsError) as exc_info:
+        create_post.create_daily_news_posts(
+            prompt_hint="\u8d22\u7ecf\u4ea7\u4e1a",
+            asset_paths=[],
+            count=2,
+            auto_image=False,
+        )
+
+    assert len(exc_info.value.posts) == 1
+    assert calls["count"] == 1
+
+
 def test_create_daily_news_posts_stores_simplified_body_without_original_title(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -894,7 +1089,7 @@ def test_daily_news_rejects_bay_area_comment_for_sports_plan():
     assert "体育产业" in create_post._daily_news_fact_based_comment(picked, picked.content, picked.title)
 
 
-def test_daily_news_prompt_makes_comment_optional_and_forbids_generic_comment():
+def test_daily_news_prompt_requires_a_fact_bound_comment_and_forbids_generic_comment():
     picked = NewsItem(
         title="Madagascar receives weather monitoring equipment",
         url="https://example.com/weather",
@@ -908,10 +1103,61 @@ def test_daily_news_prompt_makes_comment_optional_and_forbids_generic_comment():
     prompt = _daily_news_prompt(picked, "国际新闻")
 
     assert "评价" in prompt
-    assert "可为空字符串" in prompt
-    assert "没有可核验影响时省略点评" in prompt
+    assert "不得留空" in prompt
+    assert "评价须明确现有事实边界" in prompt
     assert "不得写“这类新闻适合先看事实，再看影响”" in prompt
     assert "正文必须通顺" in prompt
+
+
+def test_daily_news_fact_comment_covers_earnings_rating_and_partnership_signals():
+    picked = NewsItem(
+        title="The Club's top 10 things to watch in the stock market Friday",
+        url="https://example.com/market-watch",
+        source="CNBC",
+        domain="example.com",
+        seendate="2026-07-24T13:06:26Z",
+        description="Intel shares gained after a blockbuster quarter, while Amkor was upgraded by UBS after an Nvidia partnership.",
+    )
+
+    comment = create_post._daily_news_fact_based_comment(picked, picked.description, picked.title)
+
+    assert "正式财报" in comment
+    assert "单日股价波动" in comment
+    assert not create_post._daily_news_comment_is_unsupported(comment, picked, picked.description)
+
+
+def test_daily_news_fact_comment_covers_youth_study_visit():
+    picked = NewsItem(
+        title="体育总局水上中心组织青年参观见学",
+        url="https://example.com/youth-study-visit",
+        source="国家体育总局",
+        domain="sport.gov.cn",
+        seendate="2026-07-24T09:00:00Z",
+        description="青年干部前往中央礼品文物管理中心参观见学，观看外交礼品并学习相关历史。",
+    )
+
+    comment = create_post._daily_news_fact_based_comment(picked, picked.description, picked.title)
+
+    assert "青年培养" in comment
+    assert "参观层面" in comment
+    assert not create_post._daily_news_comment_is_unsupported(comment, picked, picked.description)
+
+
+def test_daily_news_fact_comment_covers_f1_business_and_sport_balance():
+    picked = NewsItem(
+        title="F1 needs better balance between business and sport, says Norris",
+        url="https://example.com/f1-balance",
+        source="Reuters",
+        domain="reuters.com",
+        seendate="2026-07-24T18:36:00Z",
+        description="Norris said Formula 1 needs a better balance between commercial interests and the sporting side.",
+    )
+
+    comment = create_post._daily_news_fact_based_comment(picked, picked.description, picked.title)
+
+    assert "商业化" in comment
+    assert "赛事组织方" in comment
+    assert not create_post._daily_news_comment_is_unsupported(comment, picked, picked.description)
 
 
 def test_daily_news_prompt_defaults_to_no_viewpoint_and_accepts_custom_viewpoint():
@@ -1930,6 +2176,36 @@ def test_create_daily_news_posts_scrubs_url_and_persists_source_url(monkeypatch,
     assert posts[0].platform["news"]["source_api"]["item_source"] == "Example Wire"
 
 
+def test_daily_news_image_event_includes_artwork_scene_details_from_body():
+    picked = NewsItem(
+        title="\u5b87\u90fd\u5bab\u7f8e\u672f\u9986\u5c55\u51fa\u9a6c\u683c\u91cc\u7279\u300a\u5927\u5bb6\u65cf\u300b",
+        url="https://example.com/artwork",
+        source="Example",
+        domain="example.com",
+        seendate=_recent_news_seendate(0),
+        description="\u5c55\u89c8\u4ecb\u7ecd\u6bd4\u5229\u65f6\u8d85\u73b0\u5b9e\u4e3b\u4e49\u753b\u5bb6\u4f5c\u54c1\u3002",
+        content="\u753b\u4f5c\u63cf\u7ed8\u4e86\u9634\u5929\u6d77\u5cb8\u80cc\u666f\uff0c\u753b\u9762\u4e2d\u592e\u6709\u9e1f\u5f62\u526a\u5f71\u900f\u51fa\u84dd\u5929\u767d\u4e91\u3002",
+    )
+    body = (
+        "\u5185\u5bb9\uff1a\n"
+        "\u5b87\u90fd\u5bab\u7f8e\u672f\u9986\u5c55\u51fa\u6bd4\u5229\u65f6\u753b\u5bb6\u96f7\u5c3c\u00b7\u9a6c\u683c\u91cc\u7279\u7684\u540d\u4f5c\u300a\u5927\u5bb6\u65cf\u300b\u3002"
+        "\u753b\u4f5c\u63cf\u7ed8\u4e86\u9634\u5929\u6d77\u5cb8\u80cc\u666f\uff0c\u753b\u9762\u4e2d\u592e\u6709\u9e1f\u5f62\u526a\u5f71\u900f\u51fa\u84dd\u5929\u767d\u4e91\u3002\n\n"
+        "\u8bc4\u4ef7\uff1a\n\u8fd9\u4ef6\u4f5c\u54c1\u4ee5\u89c6\u89c9\u9519\u4f4d\u8425\u9020\u8d85\u73b0\u5b9e\u611f\u3002\n\n"
+        "\u65e5\u671f\uff1a2026-07-27\n\n\u6765\u6e90\uff1aExample"
+    )
+
+    event = _normalize_daily_news_image_event(
+        "\u5b87\u90fd\u5bab\u7f8e\u672f\u9986\u5c55\u51fa\u8d85\u73b0\u5b9e\u4e3b\u4e49\u540d\u753b\u300a\u5927\u5bb6\u65cf\u300b",
+        picked=picked,
+        title="\u5b87\u90fd\u5bab\u7f8e\u672f\u9986\u5c55\u51fa\u9a6c\u683c\u91cc\u7279\u300a\u5927\u5bb6\u65cf\u300b",
+        body=body,
+        prompt_norm="\u6587\u5316\u827a\u672f",
+    )
+
+    assert "\u9634\u5929\u6d77\u5cb8" in event
+    assert "\u9e1f\u5f62\u526a\u5f71" in event
+
+
 def test_create_daily_news_posts_replaces_cross_candidate_title_and_image_event(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -2140,6 +2416,7 @@ def test_create_daily_news_posts_keeps_normal_multi_paragraph_source(monkeypatch
 
 def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     monkeypatch.setattr(
         create_post,
         "load_llm_configs",
@@ -2226,17 +2503,175 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
     )
 
     picked_domains = [post.platform["news"]["picked"]["domain"] for post in posts]
-    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["max_records"] == 20
     assert len(posts) == 2
     assert picked_domains.count("36kr.com") <= 1
     assert len(set(picked_domains)) == 2
     for post in posts:
         assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 2
-        assert post.platform["news"]["selection_pool"]["raw_fetch_count"] == 40
+        assert post.platform["news"]["selection_pool"]["raw_fetch_count"] == 20
         assert post.platform["news"]["selection_pool"]["requested_count"] == 2
 
 
+def test_daily_news_upload_uses_ten_qualified_candidates_per_requested_draft_by_default(monkeypatch):
+    monkeypatch.delenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", raising=False)
+
+    assert create_post._daily_news_candidate_fetch_limit(1) == 1
+    assert create_post._daily_news_candidate_fetch_limit(3) == 30
+    assert create_post._daily_news_raw_candidate_fetch_limit(30) == 60
+
+
+def test_daily_news_llm_supervisor_reorders_candidates_once(monkeypatch):
+    candidates = [
+        NewsItem(
+            title="First candidate",
+            url="https://example.com/first",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description="First candidate summary.",
+        ),
+        NewsItem(
+            title="Second candidate",
+            url="https://example.com/second",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description="Second candidate summary.",
+        ),
+    ]
+    calls: list[dict[str, object]] = []
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_generate_json(*_args, **kwargs):
+        calls.append(kwargs)
+        return {"ranked_ids": [2, 1], "rejected_ids": [], "reason": "Second item is newer and more specific."}
+
+    monkeypatch.setattr(create_post, "generate_json", fake_generate_json)
+    cfgs = [LLMConfig(model="supervisor-model", api_key="fake-key", base_url="https://example.com")]
+    ranked, meta = create_post._supervise_daily_news_candidates(
+        candidates,
+        cfgs=cfgs,
+        prompt_hint="market policy",
+        target_count=2,
+        required_china_count=0,
+        progress_callback=lambda stage, status, detail: events.append((stage, status, detail)),
+    )
+
+    assert [item.url for item in ranked] == ["https://example.com/second", "https://example.com/first"]
+    assert len(calls) == 1
+    assert meta["status"] == "success"
+    assert any(stage == "模型审校候选" and status == "success" for stage, status, _ in events)
+
+
+def test_daily_news_llm_supervisor_rejects_ranking_shorter_than_requested_count(monkeypatch):
+    candidates = [
+        NewsItem(
+            title=f"Candidate {index}",
+            url=f"https://example.com/{index}",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description=f"Candidate {index} summary.",
+        )
+        for index in range(1, 4)
+    ]
+    monkeypatch.setattr(
+        create_post,
+        "generate_json",
+        lambda *_args, **_kwargs: {"ranked_ids": [1, 2], "rejected_ids": [], "reason": "Only two."},
+    )
+    cfgs = [LLMConfig(model="supervisor-model", api_key="fake-key", base_url="https://example.com")]
+
+    ranked, meta = create_post._supervise_daily_news_candidates(
+        candidates,
+        cfgs=cfgs,
+        prompt_hint="market policy",
+        target_count=3,
+        required_china_count=0,
+        progress_callback=None,
+    )
+
+    assert ranked == candidates
+    assert meta["status"] == "fallback_local_ranking"
+    assert "at least 3" in meta["error"]
+
+
+def test_daily_news_batch_uses_successful_supervisor_order_for_drafts(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
+    first = NewsItem(
+        title="本地热度更高但不应排在前面的候选",
+        url="https://example.com/first",
+        source="First Source",
+        domain="first.example.com",
+        seendate=_recent_news_seendate(0),
+        description="第一条候选新闻的完整摘要。",
+        content="第一条候选新闻的完整正文，包含明确主体、行动和可核验信息。",
+        attention=100,
+    )
+    second = NewsItem(
+        title="模型判定更重要且更新的候选",
+        url="https://example.com/second",
+        source="Second Source",
+        domain="second.example.com",
+        seendate=_recent_news_seendate(0),
+        description="第二条候选新闻的完整摘要。",
+        content="第二条候选新闻的完整正文，包含明确主体、行动和可核验信息。",
+        attention=1,
+    )
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="supervisor-model", api_key="fake-key", base_url="https://example.com")],
+    )
+    monkeypatch.setattr(
+        create_post,
+        "fetch_daily_news_candidates",
+        lambda _prompt, **_kwargs: ([first, second], {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_focus_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(
+        create_post,
+        "generate_json",
+        lambda *_args, **_kwargs: {"ranked_ids": [2, 1], "rejected_ids": [], "reason": "更具体且更新。"},
+    )
+
+    def fake_generate_draft(*_args, **kwargs):
+        source_title = re.search(r"- 新闻标题：(.+)", kwargs["prompt_hint"]).group(1).strip()
+        source_name = re.search(r"- 来源名称：(.+)", kwargs["prompt_hint"]).group(1).strip()
+        return {
+            "title": source_title,
+            "body": _test_daily_news_body(
+                original_title=source_title,
+                content=f"{source_title}，相关公开信息已经披露，后续影响仍需观察。",
+                comment="这条新闻的价值在于提供了清晰的公共议题入口。",
+                date=_recent_news_date(),
+                source=source_name,
+            ),
+            "topics": ["每日新闻"],
+            "image_event": source_title,
+        }
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="",
+        asset_paths=[],
+        count=2,
+        auto_image=False,
+    )
+
+    assert [post.platform["news"]["picked"]["url"] for post in posts] == [
+        "https://example.com/second",
+        "https://example.com/first",
+    ]
+
+
 def test_daily_news_upload_filters_candidates_to_beijing_three_day_window(monkeypatch):
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
             title="今天的财经政策新闻",
@@ -2284,7 +2719,7 @@ def test_daily_news_upload_filters_candidates_to_beijing_three_day_window(monkey
 
     filtered, meta = create_post._fetch_daily_news_candidates_for_upload("新闻", count=2)
 
-    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["max_records"] == 20
     assert [item.url for item in filtered] == [
         "https://example.com/today",
         "https://example.com/yesterday",
@@ -2293,7 +2728,7 @@ def test_daily_news_upload_filters_candidates_to_beijing_three_day_window(monkey
     pool = meta["selection_pool"]
     assert pool["requested_count"] == 2
     assert pool["target_fetch_count"] == 2
-    assert pool["raw_fetch_count"] == 40
+    assert pool["raw_fetch_count"] == 20
     assert pool["raw_candidate_count"] == 5
     assert pool["recent_candidate_count"] == 3
     assert pool["actual_candidate_count"] == 3
@@ -2303,6 +2738,7 @@ def test_daily_news_upload_filters_candidates_to_beijing_three_day_window(monkey
 
 
 def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(monkeypatch):
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
             title="AI startup raises new funding",
@@ -2351,7 +2787,7 @@ def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(
 
     selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
 
-    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["max_records"] == 20
     assert fetch_kwargs["search_days"] == 14
     assert [item.url for item in selected] == [
         "https://example.org/world-cup-sponsors",
@@ -2360,7 +2796,7 @@ def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(
     pool = meta["selection_pool"]
     assert pool["requested_count"] == 2
     assert pool["target_fetch_count"] == 2
-    assert pool["raw_fetch_count"] == 40
+    assert pool["raw_fetch_count"] == 20
     assert pool["recent_candidate_count"] == 3
     assert pool["prompt_relevant_candidate_count"] == 2
     assert pool["actual_candidate_count"] == 2
@@ -2369,6 +2805,7 @@ def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(
 
 
 def test_daily_news_upload_auto_expands_to_seven_day_window(monkeypatch):
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
             title="World Cup match schedule update",
@@ -2408,7 +2845,7 @@ def test_daily_news_upload_auto_expands_to_seven_day_window(monkeypatch):
 
     selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
 
-    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["max_records"] == 20
     assert fetch_kwargs["search_days"] == 14
     assert {item.url for item in selected} == {
         "https://example.com/world-cup-today",
@@ -2423,6 +2860,7 @@ def test_daily_news_upload_auto_expands_to_seven_day_window(monkeypatch):
 
 
 def test_daily_news_upload_fixed_lookback_days_does_not_expand(monkeypatch):
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
             title="World Cup match schedule update",
@@ -2454,7 +2892,7 @@ def test_daily_news_upload_fixed_lookback_days_does_not_expand(monkeypatch):
     with pytest.raises(RuntimeError, match="daily news material insufficient"):
         create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2, lookback_days=3)
 
-    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["max_records"] == 20
     assert fetch_kwargs["search_days"] == 3
 
 
@@ -2745,6 +3183,7 @@ def test_create_daily_news_posts_reserves_final_slot_for_china_quota(monkeypatch
 
 def test_create_daily_news_posts_raises_instead_of_returning_partial_posts(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     monkeypatch.setattr(
         create_post,
         "load_llm_configs",
@@ -2811,6 +3250,52 @@ def test_create_daily_news_posts_raises_instead_of_returning_partial_posts(monke
 
     assert calls["count"] == 6
     assert len(list((tmp_path / "data" / "posts").glob("*/post.json"))) == 1
+
+
+def test_create_daily_news_posts_rejects_llm_fallback_placeholder(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    candidate = NewsItem(
+        title="Verified policy update",
+        url="https://example.com/policy",
+        source="Example News",
+        domain="example.com",
+        seendate=_recent_news_seendate(0),
+        description="A verified policy update with specific public details.",
+        content="The public notice sets out the policy change and implementation timing.",
+    )
+    monkeypatch.setattr(
+        create_post,
+        "fetch_daily_news_candidates",
+        lambda _prompt: ([candidate], {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(
+        create_post,
+        "generate_draft",
+        lambda *_args, **_kwargs: {
+            "title": "Fallback placeholder",
+            "body": "Generated draft placeholder.",
+            "topics": [],
+            "_fallback_error": "403 AccountOverdueError",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="模型不可用"):
+        create_post.create_daily_news_posts(
+            prompt_hint="policy",
+            asset_paths=[],
+            count=1,
+            auto_image=False,
+        )
+
+    assert not list((tmp_path / "data" / "posts").glob("*/post.json"))
 
 
 def test_create_daily_news_fallback_does_not_publish_prompt_as_topic(monkeypatch, tmp_path):
@@ -3260,6 +3745,78 @@ def test_fetch_daily_news_candidates_auto_aggregates_fallback_sources_until_raw_
     assert len(candidates) == 3
     assert meta["provider_attempts"][:3] == ["google_rss_cn", "google_rss", "bbc_rss"]
     assert meta["provider"] == "google_rss_cn"
+    assert meta["collection_stop_reason"] == "raw_pool_target_reached"
+
+
+def test_fetch_daily_news_candidates_continues_after_raw_target_until_qualified_target(monkeypatch):
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.delenv("NEWS_CANDIDATES_FILE", raising=False)
+    for name in (
+        "NEWS_API_KEY",
+        "NEWSAPI_API_KEY",
+        "GNEWS_API_KEY",
+        "GNEWS_TOKEN",
+        "JUHE_NEWS_APPKEY",
+        "JUHE_FINANCE_NEWS_APPKEY",
+        "NEWSDATA_API_KEY",
+        "THENEWSAPI_TOKEN",
+        "ALPHAVANTAGE_API_KEY",
+        "FINNHUB_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(daily_news, "_load_newsapi_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_load_gnews_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_load_juhe_config", lambda: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(daily_news, "_build_prompt_news_queries", lambda _hint: ["query"])
+
+    def item(index: int, provider: str, *, qualified: bool = False) -> NewsItem:
+        marker = "qualified" if qualified else "background"
+        return NewsItem(
+            title=f"query {marker} story {index}",
+            url=f"https://{provider}/story-{index}",
+            source=provider,
+            domain=provider,
+            description="A dated, traceable story.",
+            seendate=_recent_news_seendate(0),
+            language="en",
+        )
+
+    monkeypatch.setattr(
+        daily_news,
+        "_google_rss_fetch_articles",
+        lambda **kwargs: (
+            [item(1, "cn.example", qualified=True), item(2, "cn.example")]
+            if kwargs.get("country") == "CN"
+            else [item(3, "global.example"), item(4, "global.example")]
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daily_news,
+        "_bbc_rss_fetch_articles",
+        lambda **_kwargs: [item(5, "bbc.example")],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daily_news,
+        "_hotnews_fetch_articles",
+        lambda **_kwargs: [item(6, "hot.example", qualified=True)],
+        raising=False,
+    )
+
+    candidates, meta = daily_news.fetch_daily_news_candidates(
+        "query",
+        max_records=4,
+        timeout_s=1,
+        exhaustive_sources=True,
+        minimum_qualified_records=2,
+        qualified_count_callback=lambda pool: sum("qualified" in candidate.title for candidate in pool),
+    )
+
+    assert len(candidates) == 4
+    assert meta["provider_attempts"] == ["google_rss_cn", "google_rss", "bbc_rss", "hotnews"]
+    assert sum("qualified" in candidate.title for candidate in candidates) == 2
+    assert meta["collection_stop_reason"] == "raw_and_qualified_pool_targets_reached"
 
 
 def test_fetch_daily_news_candidates_auto_does_not_fallback_to_gdelt(monkeypatch):
@@ -5037,6 +5594,17 @@ def test_daily_news_quality_rejects_missing_content_section():
     )
 
     assert _daily_news_quality_issue("多项重大水运工程提速", body, "") == "missing_body_fields"
+
+
+def test_daily_news_quality_rejects_missing_evaluation_section():
+    body = (
+        "\u5185\u5bb9\uff1a\n"
+        "\u8fd9\u662f\u4e00\u6761\u6709\u660e\u786e\u4e8b\u5b9e\u57fa\u7840\u7684\u6d4b\u8bd5\u65b0\u95fb\u3002\n\n"
+        "\u65e5\u671f\uff1a2026-06-21\n\n"
+        "\u6765\u6e90\uff1a\u6d4b\u8bd5\u6e90"
+    )
+
+    assert _daily_news_quality_issue("\u6d4b\u8bd5\u65b0\u95fb\u6807\u9898", body, "") == "missing_body_fields"
 
 
 def test_daily_news_quality_rejects_incomplete_tail_title():

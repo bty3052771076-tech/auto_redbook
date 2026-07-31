@@ -22,6 +22,7 @@ from apps.gui import (
     DELETE_MODE_DELETE,
     DELETE_MODE_PREVIEW,
     DEFAULT_IMAGE_PROVIDER,
+    DEFAULT_LLM_PROVIDER,
     IMAGE_SOURCE_OPTIONS,
     LLM_PROVIDER_OPTIONS,
     PublishedMetricTableRow,
@@ -70,6 +71,7 @@ from apps.gui import (
     resolve_assets_glob_for_image_source,
     resolve_delete_mode_flags,
     save_env_file,
+    selected_models_from_progress_status,
     split_prompt_entries_from_text,
     sort_published_metric_table_rows,
     VOLCENGINE_IMAGE_MODEL_OPTIONS,
@@ -80,6 +82,10 @@ from src.sources.health import SourceAttempt, SourceHealthSnapshot, save_source_
 
 def test_gui_default_image_provider_prefers_ai_generation():
     assert DEFAULT_IMAGE_PROVIDER == "aliyun"
+
+
+def test_gui_default_llm_provider_uses_free_first_auto_strategy():
+    assert DEFAULT_LLM_PROVIDER == "auto"
 
 
 def test_load_latest_source_health_snapshots_skips_missing_and_invalid_files(tmp_path: Path):
@@ -170,7 +176,7 @@ def test_build_cli_args_check_sources():
 
 def test_gui_exposes_llm_and_image_provider_model_options():
     assert LLM_PROVIDER_OPTIONS == ["aliyun", "volcengine", "ppinfra", "auto"]
-    assert IMAGE_SOURCE_OPTIONS == ["local", "aliyun", "volcengine", "pexels"]
+    assert IMAGE_SOURCE_OPTIONS == ["local", "auto", "aliyun", "volcengine", "pexels"]
     assert "qwen3.7-plus" in ALIYUN_LLM_MODEL_OPTIONS
     assert "deepseek-v4-flash" in ALIYUN_LLM_MODEL_OPTIONS
     assert "doubao-seed-2-1-turbo-260628" in VOLCENGINE_LLM_MODEL_OPTIONS
@@ -456,6 +462,20 @@ def test_build_provider_env_overrides_for_volcengine_models():
     assert "ALIYUN_IMAGE_MODEL" not in env
 
 
+def test_auto_llm_mode_clears_stale_model_lists_for_quota_preflight():
+    env = build_provider_env_overrides(
+        {"VOLCENGINE_LLM_MODELS": "confirmed-free-volcengine"},
+        llm_provider="auto",
+        llm_model="自动模型列表（顺序回退）",
+        image_provider="aliyun",
+        image_model="wan2.7-image",
+    )
+
+    assert env["LLM_PROVIDER"] == "auto"
+    assert "VOLCENGINE_LLM_MODELS" not in env
+    assert "ALIYUN_LLM_MODELS" not in env
+
+
 def test_build_provider_env_overrides_invalid_image_provider_falls_back_to_aliyun():
     env = build_provider_env_overrides(
         {},
@@ -479,6 +499,23 @@ def test_build_provider_env_overrides_local_image_source_disables_auto_image():
     )
 
     assert env["AUTO_IMAGE"] == "0"
+    assert "IMAGE_PROVIDER" not in env
+    assert "ALIYUN_IMAGE_MODEL" not in env
+
+
+def test_build_provider_env_overrides_auto_image_leaves_model_to_quota_preflight():
+    env = build_provider_env_overrides(
+        {
+            "IMAGE_PROVIDER": "aliyun",
+            "ALIYUN_IMAGE_MODEL": "old-default",
+        },
+        llm_provider="auto",
+        llm_model="自动模型列表（顺序回退）",
+        image_provider="auto",
+        image_model="old-default",
+    )
+
+    assert env["AUTO_IMAGE"] == "1"
     assert "IMAGE_PROVIDER" not in env
     assert "ALIYUN_IMAGE_MODEL" not in env
 
@@ -525,6 +562,21 @@ def test_parse_command_progress_line_reads_generic_stage_events():
         "stage": "生成草稿",
         "status": "in_progress",
         "detail": "count=3",
+    }
+
+
+def test_selected_models_from_progress_status_reads_pipeline_plan():
+    status = (
+        "运行中：auto / 选择免费模型 / success / "
+        "LLM=volcengine/glm-5.2 "
+        "image=volcengine/doubao-seedream-4-5-251128 "
+        "VLM=volcengine/doubao-seed-1-6-vision"
+    )
+
+    assert selected_models_from_progress_status(status) == {
+        "llm": ("volcengine", "glm-5.2"),
+        "image": ("volcengine", "doubao-seedream-4-5-251128"),
+        "vlm": ("volcengine", "doubao-seed-1-6-vision"),
     }
 
 

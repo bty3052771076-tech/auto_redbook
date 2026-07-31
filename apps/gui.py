@@ -77,7 +77,7 @@ FILTER_REFRESH_DEBOUNCE_MS = 140
 
 LLM_PROVIDER_OPTIONS = ["aliyun", "volcengine", "ppinfra", "auto"]
 IMAGE_SOURCE_LOCAL = "local"
-IMAGE_PROVIDER_OPTIONS = ["aliyun", "volcengine", "pexels"]
+IMAGE_PROVIDER_OPTIONS = ["auto", "aliyun", "volcengine", "pexels"]
 IMAGE_SOURCE_OPTIONS = [IMAGE_SOURCE_LOCAL] + IMAGE_PROVIDER_OPTIONS
 
 ALIYUN_LLM_MODEL_OPTIONS = list(ALIYUN_FREE_LLM_MODELS)
@@ -85,9 +85,9 @@ VOLCENGINE_LLM_MODEL_OPTIONS = list(VOLCENGINE_AVAILABLE_LLM_MODELS)
 PPINFRA_LLM_MODEL_OPTIONS = [DEFAULT_LLM_MODEL]
 AUTO_LLM_MODEL_OPTION = "自动模型列表（顺序回退）"
 
-DEFAULT_LLM_PROVIDER = "aliyun"
+DEFAULT_LLM_PROVIDER = "auto"
 DEFAULT_IMAGE_PROVIDER = "aliyun"
-DEFAULT_IMAGE_SOURCE = DEFAULT_IMAGE_PROVIDER
+DEFAULT_IMAGE_SOURCE = "auto"
 
 ALIYUN_IMAGE_MODEL_OPTIONS = [
     "wan2.7-image",
@@ -1794,8 +1794,11 @@ def build_provider_env_overrides(
         env.pop("ALIYUN_LLM_MODELS", None)
     else:
         if model == AUTO_LLM_MODEL_OPTION or not model:
-            env["ALIYUN_LLM_MODELS"] = ",".join(ALIYUN_LLM_MODEL_OPTIONS)
-            env["VOLCENGINE_LLM_MODELS"] = ",".join(VOLCENGINE_LLM_MODEL_OPTIONS)
+            env.pop("ALIYUN_LLM_MODEL", None)
+            env.pop("ALIYUN_LLM_MODELS", None)
+            env.pop("VOLCENGINE_LLM_MODEL", None)
+            env.pop("VOLCENGINE_LLM_MODELS", None)
+            env.pop("LLM_MODEL", None)
         elif model in ALIYUN_LLM_MODEL_OPTIONS:
             env["ALIYUN_LLM_MODEL"] = model
             env["ALIYUN_LLM_MODELS"] = model
@@ -1822,6 +1825,13 @@ def build_provider_env_overrides(
     if img_provider not in IMAGE_PROVIDER_OPTIONS:
         img_provider = DEFAULT_IMAGE_PROVIDER
     env["AUTO_IMAGE"] = "1"
+    if img_provider == "auto":
+        env.pop("IMAGE_PROVIDER", None)
+        env.pop("ALIYUN_IMAGE_MODEL", None)
+        env.pop("ALIYUN_IMAGE_MODELS", None)
+        env.pop("VOLCENGINE_IMAGE_MODEL", None)
+        env.pop("VOLCENGINE_IMAGE_MODELS", None)
+        return env
     env["IMAGE_PROVIDER"] = img_provider
 
     if img_provider == "aliyun":
@@ -2034,6 +2044,18 @@ def progress_status_from_event(event: Mapping[str, str]) -> str:
     return f"运行中：{' / '.join(parts)}" if parts else "运行中：等待当前步骤"
 
 
+def selected_models_from_progress_status(
+    status: str,
+) -> dict[str, tuple[str, str]]:
+    selected: dict[str, tuple[str, str]] = {}
+    for role, provider, model in re.findall(
+        r"\b(LLM|VLM|image)=([A-Za-z0-9_-]+)/([^\s/]+)",
+        status or "",
+    ):
+        selected[role.lower()] = (provider.lower(), model.rstrip("；;,"))
+    return selected
+
+
 def _heartbeat_line(elapsed_seconds: float) -> str:
     return (
         f"[gui] 仍在运行，已耗时 {_format_elapsed(elapsed_seconds)}；"
@@ -2096,10 +2118,14 @@ class CommandRunner:
             sentinel = object()
             try:
                 self._on_line(f"[cmd] {' '.join(args)}\n")
+                child_env = dict(env)
+                # CLI progress is useful only if the child flushes it while
+                # network and model calls are still in flight.
+                child_env["PYTHONUNBUFFERED"] = "1"
                 proc = subprocess.Popen(
                     args,
                     cwd=str(PROJECT_ROOT),
-                    env=env,
+                    env=child_env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -2307,6 +2333,7 @@ def main() -> None:
 
     quota_dashboard_all_rows: list[QuotaDashboardRow] = []
     quota_dashboard_rows: list[QuotaDashboardRow] = []
+    current_run_selected_models: dict[str, tuple[str, str]] = {}
     quota_status_var = tk.StringVar(value="读取本地额度快照中...")
     quota_search_var = tk.StringVar(value="")
     quota_sort_var = tk.StringVar(value=QUOTA_DASHBOARD_SORT_OPTIONS[0][1])
@@ -2434,12 +2461,20 @@ def main() -> None:
                 last_provider = row.provider
 
             name = quota_dashboard_row_title(row, layout["model_width"])
+            is_current_run_model = any(
+                provider == row.provider and model == row.model
+                for provider, model in current_run_selected_models.values()
+            )
             click_target = quota_dashboard_selection_target(row)
             row_tag = f"quota-row-{idx}"
             item_tags = ("quota_model_button", row_tag) if click_target else (row_tag,)
             if click_target:
                 quota_dashboard_click_lookup[row_tag] = row
-            row_fill = palette["soft"] if click_target else ("#F8FBFC" if idx % 2 else palette["panel"])
+            row_fill = (
+                "#E4F2EF"
+                if is_current_run_model
+                else (palette["soft"] if click_target else ("#F8FBFC" if idx % 2 else palette["panel"]))
+            )
             quota_rows_canvas.create_rectangle(
                 x0 - 6,
                 y - 4,
@@ -2449,13 +2484,13 @@ def main() -> None:
                 outline="",
                 tags=(*item_tags, "quota_row_hit"),
             )
-            if click_target:
+            if click_target or is_current_run_model:
                 quota_rows_canvas.create_rectangle(
                     x0 - 6,
                     y - 4,
                     x0 - 2,
                     y + 24,
-                    fill=palette["accent"],
+                    fill=palette["signal_warn"] if is_current_run_model else palette["accent"],
                     outline="",
                     tags=item_tags,
                 )
@@ -2463,7 +2498,7 @@ def main() -> None:
                 x0,
                 y,
                 anchor="nw",
-                fill=palette["accent"] if click_target else palette["muted"],
+                fill=palette["ink"] if is_current_run_model else (palette["accent"] if click_target else palette["muted"]),
                 font=("Microsoft YaHei UI", 9, "underline") if click_target else ("Microsoft YaHei UI", 9),
                 text=name,
                 tags=item_tags,
@@ -2633,6 +2668,16 @@ def main() -> None:
 
     def _set_status(status: str) -> None:
         status_var.set(f"状态：{status}")
+        selected = selected_models_from_progress_status(status)
+        if selected:
+            current_run_selected_models.clear()
+            current_run_selected_models.update(selected)
+            summary = "；".join(
+                f"{role.upper()}={provider}/{model}"
+                for role, (provider, model) in selected.items()
+            )
+            quota_status_var.set(f"本次使用：{summary}")
+            _draw_quota_dashboard()
 
     def log_status(status: str) -> None:
         ui_events.put(_set_status, status)
@@ -3050,12 +3095,17 @@ def main() -> None:
         row=0, column=0, columnspan=4, sticky="w", pady=(0, 5)
     )
 
-    llm_provider_var = tk.StringVar(value=_env_default("LLM_PROVIDER", DEFAULT_LLM_PROVIDER))
+    initial_llm_provider = _env_default("LLM_PROVIDER", DEFAULT_LLM_PROVIDER)
+    llm_provider_var = tk.StringVar(value=initial_llm_provider)
     initial_llm_model = (
-        _env_default("ALIYUN_LLM_MODEL")
-        or _env_default("VOLCENGINE_LLM_MODEL")
-        or _env_default("LLM_MODEL")
-        or DEFAULT_ALIYUN_LLM_MODEL
+        AUTO_LLM_MODEL_OPTION
+        if initial_llm_provider == "auto"
+        else (
+            _env_default("ALIYUN_LLM_MODEL")
+            or _env_default("VOLCENGINE_LLM_MODEL")
+            or _env_default("LLM_MODEL")
+            or DEFAULT_ALIYUN_LLM_MODEL
+        )
     )
     llm_model_var = tk.StringVar(value=initial_llm_model)
     initial_image_source = (
@@ -3131,7 +3181,9 @@ def main() -> None:
 
     def _sync_image_model_state(*_args) -> None:
         source = normalize_image_source(image_provider_var.get())
-        if source == "aliyun":
+        if source == "auto":
+            image_model_box.configure(state="disabled")
+        elif source == "aliyun":
             image_model_box["values"] = ALIYUN_IMAGE_MODEL_OPTIONS
             if image_model_var.get() not in ALIYUN_IMAGE_MODEL_OPTIONS:
                 image_model_var.set(DEFAULT_ALIYUN_IMAGE_MODELS)

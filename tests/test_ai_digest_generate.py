@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from src.ai_digest.generate import (
     build_ai_digest_prompt,
     build_fallback_brief,
@@ -70,9 +72,69 @@ def test_build_ai_digest_prompt_mentions_daily_digest_quota_rules():
     )
 
     assert "硬性配额" in prompt
-    assert "不少于 8 条" in prompt
+    assert "恰好 8 条" in prompt
     assert "至少 3 条中国/国内模型" in prompt
     assert "至少 3 条国外 AI" in prompt
+
+
+def test_build_ai_digest_prompt_requires_exact_compact_rewrite():
+    prompt = build_ai_digest_prompt(_updates(8), target_count=8)
+
+    assert "恰好 8 条" in prompt
+    assert "不得删除、增加、合并或调整顺序" in prompt
+    assert "items 每项只输出" in prompt
+
+
+def test_generate_ai_digest_brief_retries_malformed_json(monkeypatch):
+    item = _updates(1)[0]
+
+    class FakeModel:
+        calls = 0
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return type("Resp", (), {"content": '{"title":"每日AI讯息","items":['})()
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": """
+                    {
+                      "title": "每日AI讯息",
+                      "subtitle": "模型与工具更新",
+                      "date": "2026-06-30",
+                      "items": [
+                        {
+                          "title": "OpenAI更新ChatGPT开发能力",
+                          "summary": "OpenAI更新ChatGPT相关模型与开发工具，说明能力变化及其对开发者工作流的实际影响。",
+                          "url": "https://example.com/0",
+                          "tags": ["AI工具"]
+                        }
+                      ],
+                      "source_summary": "主要来源：OpenAI。"
+                    }
+                    """
+                },
+            )()
+
+    model = FakeModel()
+    monkeypatch.setattr(
+        "src.ai_digest.generate.init_chat_model",
+        lambda *_args, **_kwargs: model,
+    )
+
+    brief = generate_ai_digest_brief_with_llm(
+        [LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.com", provider="test")],
+        [item],
+        target_count=1,
+        date="2026-06-30",
+    )
+
+    assert model.calls == 2
+    assert len(brief.items) == 1
+    assert brief.items[0].url == item.url
+    assert brief.items[0].published_at == item.published_at
 
 
 def test_generate_ai_digest_brief_with_llm_returns_chinese_items(monkeypatch):
@@ -135,6 +197,192 @@ def test_generate_ai_digest_brief_with_llm_returns_chinese_items(monkeypatch):
     assert "翻译" in captured["messages"]
     assert brief.items[0].title == "OpenAI发布开发者工具更新"
     assert "开发者工具" in brief.items[0].summary
+
+
+def test_generate_ai_digest_brief_restores_search_provenance_and_rejects_cross_item_claims(monkeypatch):
+    item = AIUpdateItem(
+        title="Suno 推出多项新功能，含 MIDI 导出",
+        summary="网页端和移动端新增高级音轨分离、MIDI 导出、歌词合写与自动保存。",
+        source_name="X：Suno (@suno)",
+        source_type="search",
+        url="https://aihot.virxact.com/daily/2026-07-27?item=2",
+        published_at="2026-07-27T08:00:00+08:00",
+        vendor="Suno",
+        product="",
+        raw_excerpt="Suno 推出 MIDI 导出、音轨分离和歌词合写功能。",
+        confidence_score=0.72,
+        verification_status="social_confirmed",
+        evidence_urls=["https://aihot.virxact.com/daily/2026-07-27"],
+        tags=["AI", "AI HOT"],
+    )
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": """
+                    {
+                      "title": "每日AI讯息",
+                      "subtitle": "模型与工具更新",
+                      "date": "2026-07-27",
+                      "items": [
+                        {
+                          "title": "xAI发布Grok CLI，Suno同步推出MIDI导出",
+                          "summary": "xAI发布Grok CLI并加入tutorial命令，Suno同时上线MIDI导出和音轨分离功能。",
+                          "url": "https://aihot.virxact.com/daily/2026-07-27?item=2",
+                          "tags": ["AI工具"]
+                        }
+                      ],
+                      "source_summary": "主要来源：AI HOT。"
+                    }
+                    """
+                },
+            )()
+
+    monkeypatch.setattr("src.ai_digest.generate.init_chat_model", lambda *_args, **_kwargs: FakeModel())
+
+    out = generate_ai_digest_brief_with_llm(
+        [LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.com", provider="test")],
+        [item],
+        target_count=1,
+        date="2026-07-27",
+    ).items[0]
+
+    assert out.source_type == "search"
+    assert out.verification_status == "social_confirmed"
+    assert out.confidence_score == 0.72
+    assert "xAI" not in out.title
+    assert "Grok" not in out.title
+    assert "xAI" not in out.summary
+    assert "Grok" not in out.summary
+    assert "Suno" in out.title
+
+
+def test_generate_ai_digest_brief_restores_each_llm_item_to_a_distinct_source(monkeypatch):
+    sources = [
+        AIUpdateItem(
+            title="OpenAI 发布科研智能体报告",
+            summary="OpenAI 展示 AI 编程智能体如何帮助科学计算。",
+            source_name="OpenAI",
+            source_type="official",
+            url="https://openai.com/index/scientific-computing-agentic-ai",
+            published_at="2026-07-28T17:00:00Z",
+            vendor="OpenAI",
+            raw_excerpt="AI coding agents modernize scientific computing.",
+            tags=["AI"],
+        ),
+        AIUpdateItem(
+            title="DeepSeek 将停用旧 API 模型名",
+            summary="deepseek-chat 与 deepseek-reasoner 将在三个月后停用。",
+            source_name="DeepSeek",
+            source_type="official",
+            url="https://api-docs.deepseek.com/updates",
+            published_at="2026-07-24",
+            vendor="DeepSeek",
+            raw_excerpt="The legacy API model names will be discontinued.",
+            tags=["AI"],
+        ),
+    ]
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": """
+                    {
+                      "title": "每日AI讯息",
+                      "subtitle": "模型与工具更新",
+                      "date": "2026-07-29",
+                      "items": [
+                        {
+                          "title": "OpenAI发布科研智能体报告",
+                          "summary": "OpenAI展示AI编程智能体如何帮助科学计算。",
+                          "url": "https://openai.com/index/scientific-computing-agentic-ai",
+                          "tags": ["AI工具"]
+                        },
+                        {
+                          "title": "OpenAI科研智能体报告更新",
+                          "summary": "OpenAI继续介绍AI编程智能体与科学计算。",
+                          "url": "https://openai.com/index/scientific-computing-agentic-ai",
+                          "tags": ["AI工具"]
+                        }
+                      ],
+                      "source_summary": "主要来源：OpenAI、DeepSeek。"
+                    }
+                    """
+                },
+            )()
+
+    monkeypatch.setattr("src.ai_digest.generate.init_chat_model", lambda *_args, **_kwargs: FakeModel())
+
+    brief = generate_ai_digest_brief_with_llm(
+        [LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.com", provider="test")],
+        sources,
+        target_count=2,
+        date="2026-07-29",
+    )
+
+    assert {item.url for item in brief.items} == {source.url for source in sources}
+
+
+@pytest.mark.parametrize(
+    "unsupported_claim",
+    ["仅限付费计划使用", "附带使用限制，企业需关注许可条款"],
+)
+def test_generate_ai_digest_brief_rejects_unsupported_access_claim(monkeypatch, unsupported_claim):
+    source = AIUpdateItem(
+        title="What is Kimi K3? New open-weight model explained",
+        summary="Moonshot AI released Kimi K3 for coding and agent workflows.",
+        source_name="Tom's Guide",
+        source_type="search",
+        url="https://example.com/kimi-k3",
+        published_at="2026-07-28T08:45:00Z",
+        vendor="Tom's Guide",
+        raw_excerpt="Kimi K3 is available as an open-weight model.",
+        tags=["AI"],
+    )
+
+    class FakeModel:
+        def invoke(self, _messages):
+            content = """
+                {
+                  "title": "每日AI讯息",
+                  "items": [
+                    {
+                      "title": "Kimi K3开放权重模型发布",
+                      "summary": "Kimi K3面向编程和智能体任务，但目前仅限付费计划使用。",
+                      "source_name": "Tom's Guide",
+                      "source_type": "search",
+                      "url": "https://example.com/kimi-k3",
+                      "published_at": "2026-07-28T08:45:00Z",
+                      "vendor": "Tom's Guide",
+                      "raw_excerpt": "",
+                      "tags": ["AI模型"]
+                    }
+                  ]
+                }
+                """.replace("仅限付费计划使用", unsupported_claim)
+            return type(
+                "Resp",
+                (),
+                {"content": content},
+            )()
+
+    monkeypatch.setattr("src.ai_digest.generate.init_chat_model", lambda *_args, **_kwargs: FakeModel())
+
+    out = generate_ai_digest_brief_with_llm(
+        [LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.com", provider="test")],
+        [source],
+        target_count=1,
+        date="2026-07-29",
+    ).items[0]
+
+    assert unsupported_claim not in out.summary
+    assert "open-weight" in out.summary or "开放权重" in out.summary
 
 
 def test_generate_ai_digest_brief_rewrites_generic_llm_items_from_source_trace(monkeypatch):
@@ -326,6 +574,55 @@ def test_build_fallback_brief_uses_specific_source_content_for_english_updates()
     assert "后台智能体" in out.summary
 
 
+def test_build_fallback_brief_preserves_chinese_action_after_long_english_subject():
+    item = AIUpdateItem(
+        title="Scientific computing in the age of agentic AI",
+        summary="A field report shows how scientists use AI coding agents in genomics.",
+        source_name="OpenAI",
+        source_type="official",
+        url="https://openai.com/index/scientific-computing-agentic-ai",
+        published_at="2026-07-28T17:00:00Z",
+        vendor="OpenAI",
+        product="",
+        raw_excerpt="AI coding agents modernize scientific computing and genomics.",
+        tags=["AI"],
+    )
+
+    out = build_fallback_brief([item], target_count=1, date="2026-07-29").items[0]
+
+    assert len(out.title) <= 28
+    assert "发布新进展" in out.title
+    assert any("\u4e00" <= char <= "\u9fff" for char in out.title)
+
+
+def test_build_fallback_brief_translates_ntt_data_enterprise_adoption_case():
+    item = AIUpdateItem(
+        title="NTT DATA Group uses ChatGPT Enterprise and Codex",
+        summary=(
+            "NTT DATA Group uses ChatGPT Enterprise and Codex to help 9,000 employees "
+            "automate work and cut incident analysis to 30 minutes."
+        ),
+        source_name="OpenAI",
+        source_type="official",
+        url="https://openai.com/index/ntt-data",
+        published_at="2026-07-22T00:00:00Z",
+        vendor="OpenAI",
+        raw_excerpt=(
+            "NTT DATA Group uses ChatGPT Enterprise and Codex to help 9,000 employees "
+            "automate work, cut incident analysis to 30 minutes, and scale secure AI adoption."
+        ),
+        tags=["AI"],
+    )
+
+    out = build_fallback_brief([item], target_count=1, date="2026-07-29").items[0]
+
+    assert out.title == "NTT DATA借助ChatGPT与Codex提效"
+    assert "9000名员工" in out.summary
+    assert "30分钟" in out.summary
+    assert " uses " not in out.title
+    assert " uses " not in out.summary
+
+
 def test_build_fallback_brief_does_not_fabricate_missing_publish_time_from_brief_date():
     item = AIUpdateItem(
         title="GLM-5.2 模型发布，强化多模态理解、代码生成和复杂推理能力。",
@@ -368,14 +665,65 @@ def test_build_fallback_brief_uses_url_slug_when_source_title_is_vendor_only():
     assert "语音" in out.summary
 
 
+def test_build_fallback_brief_describes_deepseek_api_deprecation_instead_of_the_update():
+    item = AIUpdateItem(
+        title="The two legacy API model names will be discontinued",
+        summary="",
+        source_name="DeepSeek",
+        source_type="official",
+        url="https://api-docs.deepseek.com/updates",
+        published_at="2026-07-24",
+        vendor="DeepSeek",
+        product="",
+        raw_excerpt=(
+            "The two legacy API model names, deepseek-chat and deepseek-reasoner, "
+            "will be discontinued in three months. They currently point to the "
+            "non-thinking and thinking modes of deepseek-v4-flash."
+        ),
+        tags=["AI"],
+    )
+
+    out = build_fallback_brief([item], target_count=1, date="2026-07-29").items[0]
+
+    assert "The更新" not in out.title
+    assert "DeepSeek" in out.title
+    assert "停用" in out.title
+    assert "deepseek-chat" in out.summary
+    assert "deepseek-reasoner" in out.summary
+
+
 def test_render_ai_digest_body_includes_source_links_for_each_item():
     body = render_ai_digest_body(build_fallback_brief(_updates(2), date="2026-06-30"))
 
     assert "每日AI讯息" in body
     assert "发布时间：2026-06-30" in body
     assert "来源链接：" in body
+    assert "信源层级：官网2条，资讯整合站0条，社交媒体0条" in body
     assert "1. OpenAI https://example.com/0" in body
     assert "2. OpenAI https://example.com/1" in body
+
+
+def test_render_ai_digest_body_keeps_primary_url_before_shorter_evidence_url():
+    official_url = "https://www.anthropic.com/research/discovering-cryptographic-weaknesses-with-claude"
+    aggregator_url = "https://aihot.virxact.com/daily/2026-07-29?item=1"
+    item = AIUpdateItem(
+        title="Claude 发现加密算法弱点",
+        summary="Anthropic 介绍 Claude 在密码学研究中的新进展。",
+        source_name="AI HOT",
+        source_type="search",
+        url=official_url,
+        published_at="2026-07-29T08:00:00+08:00",
+        vendor="Anthropic",
+        product="Claude",
+        raw_excerpt="Claude cryptographic research.",
+        evidence_urls=[aggregator_url],
+        tags=["AI"],
+    )
+
+    body = render_ai_digest_body(build_fallback_brief([item], target_count=1, date="2026-07-29"))
+
+    assert official_url in body
+    assert aggregator_url not in body
 
 
 def test_render_ai_digest_body_keeps_eight_links_under_platform_limit_with_long_sources():

@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from typer.testing import CliRunner
+from typer.main import get_command
 
 import apps.cli as cli
 from src.storage.models import AssetInfo, Execution, Post
@@ -13,8 +14,39 @@ def test_auto_help_uses_keywords_and_keeps_prompt_alias():
 
     assert result.exit_code == 0, result.output
     assert "--keywords" in result.output
-    assert "--prompt" in result.output
+    auto_command = get_command(cli.app).commands["auto"]
+    prompt_option = next(param for param in auto_command.params if param.name == "prompt")
+    assert "--prompt" in prompt_option.opts
+    assert "--allow-partial" in result.output
     assert "新闻检索关键词" in result.output
+
+
+def test_daily_news_progress_reason_uses_plain_chinese_for_known_quality_codes():
+    assert cli._humanize_daily_news_progress_reason("bad_body_language") == "正文未达到简体中文表达要求"
+    assert cli._humanize_daily_news_progress_reason("source_context_insufficient") == "原文信息不足，无法可靠生成"
+    assert cli._humanize_daily_news_progress_reason("provider-specific-detail") == "provider-specific-detail"
+
+
+def test_daily_news_progress_omits_blank_candidate_total(monkeypatch):
+    emitted: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        cli,
+        "_emit_progress_event",
+        lambda command, stage, status, message: emitted.append((command, stage, status, message)),
+    )
+
+    cli._daily_news_generation_progress(
+        "原文核验",
+        "skipped",
+        {
+            "candidate_index": 4,
+            "completed": 3,
+            "target": 10,
+            "reason": "duplicate_story_after_enrichment",
+        },
+    )
+
+    assert emitted[-1][-1] == "原文核验：候选 4，已完成 3/10 条，原因：与已选新闻重复"
 
 
 def test_auto_passes_keywords_to_daily_news_generation(monkeypatch, tmp_path):
@@ -43,6 +75,7 @@ def test_auto_passes_keywords_to_daily_news_generation(monkeypatch, tmp_path):
         cli.app,
         [
             "auto",
+            "--no-preflight",
             "--title",
             "每日新闻",
             "--keywords",
@@ -60,7 +93,7 @@ def test_auto_passes_keywords_to_daily_news_generation(monkeypatch, tmp_path):
     assert seen["prompt_hint"] == "财经产业 公司政策"
 
 
-def test_auto_uploads_partial_daily_news_posts_before_reporting_failures(monkeypatch, tmp_path):
+def test_auto_refuses_partial_daily_news_batch_before_upload_by_default(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     asset = tmp_path / "asset.png"
     asset.write_bytes(b"fake image")
@@ -91,6 +124,7 @@ def test_auto_uploads_partial_daily_news_posts_before_reporting_failures(monkeyp
         cli.app,
         [
             "auto",
+            "--no-preflight",
             "--title",
             "每日新闻",
             "--count",
@@ -104,11 +138,61 @@ def test_auto_uploads_partial_daily_news_posts_before_reporting_failures(monkeyp
         ],
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
+    assert uploaded == []
+    assert "batch incomplete" in result.output
+    assert "uploaded=0" in result.output
+    assert "requested=3" in result.output
+
+
+def test_auto_can_explicitly_upload_partial_daily_news_batch(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "asset.png"
+    asset.write_bytes(b"fake image")
+    post = Post(
+        title="Partial draft",
+        body="Content: verified test news.\n\nComment: test.\n\nDate: 2026-07-28\n\nSource: Test",
+        assets=[AssetInfo(path=str(asset), kind="image")],
+    )
+
+    def fake_create_daily_news_posts(**_kwargs):
+        raise PartialDailyNewsError(
+            "quota exhausted after partial generation",
+            posts=[post],
+            requested_count=3,
+            failed_count=2,
+        )
+
+    uploaded: list[str] = []
+    monkeypatch.setattr(cli, "create_daily_news_posts", fake_create_daily_news_posts)
+    monkeypatch.setattr(
+        cli,
+        "run_save_draft_sync",
+        lambda post_arg, **_kwargs: uploaded.append(post_arg.id) or Execution(post_id=post_arg.id, result="saved_draft"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "auto",
+            "--no-preflight",
+            "--title",
+            "每日新闻",
+            "--count",
+            "3",
+            "--allow-partial",
+            "--assets-glob",
+            str(asset),
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
     assert uploaded == [post.id]
     assert "partial daily news" in result.output
-    assert "uploaded=1" in result.output
-    assert "failed=2" in result.output
 
 
 def test_auto_allows_a_valid_replacement_after_an_invalid_duplicate(monkeypatch, tmp_path):
@@ -139,10 +223,12 @@ def test_auto_allows_a_valid_replacement_after_an_invalid_duplicate(monkeypatch,
         cli.app,
         [
             "auto",
+            "--no-preflight",
             "--title",
             "每日新闻",
             "--count",
             "2",
+            "--allow-partial",
             "--assets-glob",
             str(asset),
             "--login-hold",
@@ -185,6 +271,7 @@ def test_auto_daily_news_passes_news_materials_file(monkeypatch, tmp_path):
         cli.app,
         [
             "auto",
+            "--no-preflight",
             "--title",
             "每日新闻",
             "--count",
@@ -234,6 +321,7 @@ def test_auto_daily_news_passes_single_news_material_file(monkeypatch, tmp_path)
         cli.app,
         [
             "auto",
+            "--no-preflight",
             "--title",
             "每日新闻",
             "--prompt",
@@ -288,6 +376,7 @@ def test_auto_news_material_options_do_not_leak_process_environment(monkeypatch,
         cli.app,
         [
             "auto",
+            "--no-preflight",
             "--title",
             "每日新闻",
             "--assets-glob",
@@ -304,3 +393,48 @@ def test_auto_news_material_options_do_not_leak_process_environment(monkeypatch,
     assert result.exit_code == 0
     assert "NEWS_MATERIALS_FILE" not in os.environ
     assert "SINGLE_NEWS_MATERIAL_FILE" not in os.environ
+
+
+def test_auto_returns_failure_when_generated_draft_was_not_saved(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "asset.png"
+    asset.write_bytes(b"fake image")
+    post = Post(
+        title="测试新闻",
+        body="内容：测试正文。\n\n评价：测试评价。\n\n日期：2026-07-29\n\n来源：测试源",
+        assets=[AssetInfo(path=str(asset), kind="image")],
+    )
+    monkeypatch.setattr(
+        cli,
+        "create_daily_news_posts",
+        lambda **_kwargs: [post],
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_save_draft_sync",
+        lambda post_arg, **_kwargs: Execution(
+            post_id=post_arg.id,
+            result="failed",
+            error={"message": "xiaohongshu login required"},
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "auto",
+            "--no-preflight",
+            "--title",
+            "每日新闻",
+            "--assets-glob",
+            str(asset),
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "uploaded=0" in result.output
+    assert "[auto] stage=完成 | failed" in result.output

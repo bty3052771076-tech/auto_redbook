@@ -748,6 +748,32 @@ def _extract_console_text(page) -> str:
     return "\n".join(part for part in [row_text, body_text] if part)
 
 
+def _aliyun_quota_data_ready(
+    body_text: str,
+    api_payloads: Iterable[dict[str, Any]],
+    *,
+    model_names: Iterable[str],
+    all_free: bool,
+    visible_only: bool,
+) -> bool:
+    text = body_text or ""
+    if not visible_only and _extract_aliyun_free_tier_quota_items(api_payloads):
+        return True
+
+    has_balance = bool(
+        re.search(
+            r"(?:\u5269)?\s*\d[\d,]*(?:\.\d+)?\s*/\s*(?:\u5171)?\s*\d[\d,]*(?:\.\d+)?",
+            text,
+        )
+    )
+    if not has_balance:
+        return "\u6682\u65e0\u7b26\u5408\u6761\u4ef6\u7684\u8d44\u6e90" in text
+    if all_free:
+        return True
+    targets = [str(model).strip().lower() for model in model_names if str(model).strip()]
+    return any(model in text.lower() for model in targets)
+
+
 def _click_text(page, text: str) -> bool:
     try:
         return bool(
@@ -772,13 +798,20 @@ def _click_text(page, text: str) -> bool:
 def _collect_free_quota_text_across_tabs(page) -> str:
     parts = [_extract_console_text(page)]
     for tab in ("大语言模型", "视觉模型", "全模态模型", "语音模型", "向量模型", "全部模型"):
+        before = _extract_console_text(page)
         if not _click_text(page, tab):
             continue
-        try:
-            page.wait_for_timeout(1500)
-        except Exception:
-            pass
-        parts.append(_extract_console_text(page))
+        current = before
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                break
+            current = _extract_console_text(page)
+            if current != before:
+                break
+        parts.append(current)
     seen: set[str] = set()
     out: list[str] = []
     for part in parts:
@@ -789,6 +822,42 @@ def _collect_free_quota_text_across_tabs(page) -> str:
             out.append(item)
             seen.add(item)
     return "\n".join(out)
+
+
+def _wait_for_aliyun_quota_capture(
+    page,
+    api_payloads: list[dict[str, Any]],
+    *,
+    timeout_ms: int = 6000,
+    poll_ms: int = 250,
+    stable_polls: int = 3,
+) -> int:
+    """Wait until late console responses stop adding free-tier quota rows."""
+
+    poll_ms = max(1, int(poll_ms))
+    stable_polls = max(1, int(stable_polls))
+    max_polls = max(1, int(timeout_ms) // poll_ms)
+    last_signature: tuple[int, int] | None = None
+    stable_count = 0
+
+    for _ in range(max_polls):
+        signature = (
+            len(api_payloads),
+            len(_extract_aliyun_free_tier_quota_items(api_payloads)),
+        )
+        if signature[1] > 0 and signature == last_signature:
+            stable_count += 1
+            if stable_count >= stable_polls:
+                return signature[1]
+        else:
+            stable_count = 0
+        last_signature = signature
+        try:
+            page.wait_for_timeout(poll_ms)
+        except Exception:
+            break
+
+    return len(_extract_aliyun_free_tier_quota_items(api_payloads))
 
 
 def _capture_json_response(resp, captured: list[dict[str, Any]]) -> None:
@@ -896,14 +965,20 @@ def run_collect_aliyun_quota_sync(
                             )
                         time.sleep(1)
                         continue
-                    if model_names and any(model.lower() in body_text.lower() for model in model_names):
-                        break
-                    if any(hint in body_text for hint in ("模型名称", "剩余额度", "暂无符合条件的资源")):
+                    if _aliyun_quota_data_ready(
+                        body_text,
+                        console_api_payloads,
+                        model_names=model_names,
+                        all_free=all_free,
+                        visible_only=visible_only,
+                    ):
                         break
                     time.sleep(1)
 
                 _emit(progress_callback, "read_console_text", "in_progress", "")
                 raw_text = _collect_free_quota_text_across_tabs(page)
+                if not visible_only:
+                    _wait_for_aliyun_quota_capture(page, console_api_payloads)
                 result["raw_text"] = raw_text
                 result["console_api_payloads"] = console_api_payloads
                 text_records = parse_aliyun_quota_text(raw_text, model_names, source_url=quota_url) if model_names else []
@@ -945,6 +1020,8 @@ def run_collect_aliyun_quota_sync(
                     except Exception:
                         pass
                     raw_text = _collect_free_quota_text_across_tabs(page)
+                    if not visible_only:
+                        _wait_for_aliyun_quota_capture(page, console_api_payloads)
                     result["raw_text"] = raw_text
                     result["console_api_payloads"] = console_api_payloads
                     text_records = (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from src.volcengine.quota import (
+    _charge_item_model_names,
     _complete_volcengine_visible_only_records,
     _capture_charge_item_request_headers,
     _fetch_all_charge_item_payloads,
@@ -12,6 +13,25 @@ from src.volcengine.quota import (
     parse_volcengine_quota_text,
     volcengine_quota_model_candidates,
 )
+
+
+def test_charge_item_model_names_discovers_models_outside_static_candidates():
+    payloads = [
+        {
+            "Result": {
+                "Items": [
+                    {"FoundationModelName": "doubao-seed-1-6-vision"},
+                    {"DisplayName": "new-vision-model"},
+                    {"FoundationModelName": "doubao-seed-1-6-vision"},
+                ]
+            }
+        }
+    ]
+
+    assert _charge_item_model_names(payloads) == [
+        "doubao-seed-1-6-vision",
+        "new-vision-model",
+    ]
 
 
 def test_parse_volcengine_quota_text_extracts_llm_and_image_values():

@@ -2,7 +2,7 @@ import json
 
 from src.config import LLMConfig
 import src.llm.generate as generate_mod
-from src.llm.generate import _coerce_text, _parse_json_text
+from src.llm.generate import _coerce_text, _parse_json_text, _should_try_next_llm, generate_json
 from src.text_integrity import repair_utf8_as_gbk_mojibake
 
 
@@ -94,6 +94,26 @@ def test_generate_draft_uses_60000_max_tokens(monkeypatch):
     assert captured["kwargs"]["timeout"] == 240
 
 
+def test_generate_json_keeps_literal_json_schema_in_prompt(monkeypatch):
+    captured = {}
+
+    class FakeModel:
+        def invoke(self, messages):
+            captured["messages"] = messages
+            return type("FakeResponse", (), {"content": '{"ranked_ids":[2,1]}'})()
+
+    monkeypatch.setattr(generate_mod, "init_chat_model", lambda *_args, **_kwargs: FakeModel())
+
+    result = generate_json(
+        LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.invalid/v1"),
+        system_prompt='Return exactly {"ranked_ids":[1]}.',
+        user_prompt='{"candidates":[1,2]}',
+    )
+
+    assert result == {"ranked_ids": [2, 1]}
+    assert any('"ranked_ids"' in str(message.content) for message in captured["messages"])
+
+
 def test_repair_utf8_as_gbk_mojibake_handles_one_and_two_passes():
     original = "\u6bcf\u65e5\u65b0\u95fb"
     once = original.encode("utf-8").decode("gb18030")
@@ -102,6 +122,10 @@ def test_repair_utf8_as_gbk_mojibake_handles_one_and_two_passes():
     assert repair_utf8_as_gbk_mojibake(once) == original
     assert repair_utf8_as_gbk_mojibake(twice) == original
     assert repair_utf8_as_gbk_mojibake(original) == original
+
+
+def test_provider_account_overdue_error_allows_the_next_configured_candidate():
+    assert _should_try_next_llm(RuntimeError("403 AccountOverdue: account is overdue"))
 
 
 def test_generate_draft_repairs_model_mojibake_and_retries_rate_limit(monkeypatch):
@@ -135,3 +159,33 @@ def test_generate_draft_repairs_model_mojibake_and_retries_rate_limit(monkeypatc
     assert out["title"] == original
     assert out["body"] == original
     assert out["topics"] == [original]
+
+
+def test_generate_draft_allows_configured_multiple_rate_limit_retries(monkeypatch):
+    calls = {"invoke": 0, "sleep": []}
+    monkeypatch.setenv("LLM_RATE_LIMIT_MAX_RETRIES", "3")
+
+    class FakeModel:
+        def invoke(self, _messages):
+            calls["invoke"] += 1
+            if calls["invoke"] <= 3:
+                raise RuntimeError("429 RATE_LIMIT_EXCEEDED")
+            return type(
+                "FakeResponse",
+                (),
+                {"content": '{"title":"测试标题","body":"测试正文","topics":[]}'},
+            )()
+
+    monkeypatch.setattr(generate_mod, "init_chat_model", lambda *_args, **_kwargs: FakeModel())
+    monkeypatch.setattr(generate_mod.time, "sleep", lambda seconds: calls["sleep"].append(seconds))
+
+    out = generate_mod.generate_draft(
+        LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.invalid/v1"),
+        title_hint="测试",
+        prompt_hint="测试",
+        asset_paths=[],
+    )
+
+    assert calls["invoke"] == 4
+    assert calls["sleep"] == [65, 65, 65]
+    assert out["title"] == "测试标题"

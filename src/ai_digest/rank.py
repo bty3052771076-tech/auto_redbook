@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import date, datetime, timedelta, timezone
 import re
 from urllib.parse import unquote, urlsplit
@@ -98,6 +98,44 @@ _MODEL_RELEASE_MARKERS = (
     "llama",
 )
 _BENCHMARK_MARKERS = ("benchmark", "bench", "eval", "评测", "基准", "测试集")
+_FINANCIAL_MODEL_MARKERS = (
+    "discounted cash flow",
+    "dcf model",
+    "valuation model",
+    "intrinsic value",
+    "price target",
+    "earnings forecast",
+    "估值模型",
+    "现金流折现",
+    "内在价值",
+    "目标价",
+    "盈利预测",
+)
+_FINANCIAL_NEWS_MARKERS = (
+    "stock",
+    "stocks",
+    "shares",
+    "share price",
+    "banking",
+    "bank valuation",
+    "earnings",
+    "investor",
+    "investment risk",
+    "price target",
+    "portfolio",
+    "sec filing",
+    "sec-filings",
+    "current report",
+    "6-k",
+    "股票",
+    "股价",
+    "银行",
+    "财报",
+    "投资者",
+    "估值",
+    "目标价",
+    "投资组合",
+)
 _TECHNICAL_MARKERS = (
     "api",
     "sdk",
@@ -239,6 +277,66 @@ _DISCUSSION_MARKERS = (
     "普及",
     "案例",
     "行业观察",
+)
+_EXPLICIT_AI_TOPIC_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:ai|llm|vlm|model|models)(?:[^a-z0-9]|$)|"
+    r"artificial intelligence|generative ai|agentic ai|machine learning|"
+    r"人工智能|生成式\s*AI|大模型|模型|智能体",
+    flags=re.IGNORECASE,
+)
+_AI_CHANGE_MARKERS = (
+    "更新",
+    "发布",
+    "推出",
+    "上线",
+    "升级",
+    "新增",
+    "开放",
+    "开源",
+    "停用",
+    "下线",
+    "支持",
+    "修复",
+    "集成",
+    "接入",
+    "评测",
+    "进展",
+    "动态",
+    "release",
+    "released",
+    "launch",
+    "launched",
+    "introducing",
+    "introduces",
+    "update",
+    "updated",
+    "adds",
+    "added",
+    "available",
+    "open source",
+    "open-source",
+    "open weight",
+    "open-weight",
+    "deprecat",
+    "discontinu",
+    "integrat",
+    "collaborat",
+    "improv",
+    "new ",
+    "debug",
+    "bug",
+    "core dump",
+    "why",
+    "opinion",
+    "analysis",
+    "trend",
+    "inevitable",
+    "case study",
+    "探讨",
+    "讨论",
+    "观点",
+    "趋势",
+    "案例",
 )
 _CATEGORY_PRIORITY = {
     "model_release": 5,
@@ -444,13 +542,13 @@ def _trace_url(item: AIUpdateItem) -> str:
 
 
 def _source_priority(item: AIUpdateItem) -> int:
-    return {"official": 4, "github": 3, "search": 2, "social": 1}.get(item.source_type, 0)
+    return {"official": 4, "github": 4, "aggregator": 2, "search": 2, "social": 1}.get(item.source_type, 0)
 
 
 def ai_update_attention_score(item: AIUpdateItem) -> float:
     score = float(item.confidence_score or 0.0)
     score += min(0.15, len(item.evidence_urls or []) * 0.03)
-    if item.verification_status == "social_confirmed":
+    if item.verification_status in {"aggregator_confirmed", "social_confirmed"}:
         score += 0.08
     score += _source_priority(item) * 0.005
     return round(score, 6)
@@ -459,6 +557,12 @@ def ai_update_attention_score(item: AIUpdateItem) -> float:
 def ai_update_category(item: AIUpdateItem) -> str:
     blob = _text_blob(item).lower()
     headline_blob = f"{item.title} {_url_topic_text(item.url)} {item.product}".lower()
+    financial_model_context = any(marker in blob for marker in _FINANCIAL_MODEL_MARKERS)
+    explicit_ai_context = bool(_MODEL_TOPIC_RE.search(blob)) or bool(
+        re.search(r"(?:^|[^a-z])ai(?:[^a-z]|$)|artificial intelligence|人工智能|大模型|智能体", blob)
+    )
+    if financial_model_context and not explicit_ai_context:
+        return "other"
     has_discussion_marker = any(marker in headline_blob for marker in _DISCUSSION_MARKERS)
     has_named_model_or_benchmark = bool(_MODEL_TOPIC_RE.search(headline_blob)) or any(
         marker in headline_blob for marker in _BENCHMARK_MARKERS
@@ -482,6 +586,39 @@ def ai_update_category(item: AIUpdateItem) -> str:
 
 def ai_update_category_priority(item: AIUpdateItem) -> int:
     return _CATEGORY_PRIORITY.get(ai_update_category(item), 0)
+
+
+def ai_update_is_relevant(item: AIUpdateItem) -> bool:
+    """Reject query matches that mention AI only incidentally in article text."""
+    content_parts = [
+        re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", part.lower())
+        for part in (item.title, item.summary, item.raw_excerpt)
+        if part and part.strip()
+    ]
+    content_blob = f"{item.title} {item.summary} {item.raw_excerpt}".lower()
+    if (
+        content_parts
+        and len(set(content_parts)) == 1
+        and not _contains_any_marker(content_blob, _AI_CHANGE_MARKERS)
+    ):
+        return False
+    if item.source_type != "search":
+        return True
+    if not (item.summary.strip() or item.raw_excerpt.strip()):
+        return False
+
+    headline_blob = " ".join(
+        part.strip()
+        for part in (item.title, item.product, _url_topic_text(item.url))
+        if part and part.strip()
+    ).lower()
+    content_blob = f"{headline_blob} {item.summary} {item.raw_excerpt}".lower()
+    financial_blob = f"{content_blob} {item.source_name} {item.url}".lower()
+    if _contains_any_marker(financial_blob, _FINANCIAL_NEWS_MARKERS):
+        return False
+    headline_has_ai = bool(_MODEL_TOPIC_RE.search(headline_blob) or _EXPLICIT_AI_TOPIC_RE.search(headline_blob))
+    has_concrete_change = _contains_any_marker(content_blob, _AI_CHANGE_MARKERS)
+    return headline_has_ai and has_concrete_change
 
 
 def ai_update_region(item: AIUpdateItem) -> str:
@@ -510,6 +647,12 @@ def ai_update_region(item: AIUpdateItem) -> str:
 def ai_update_is_model_news(item: AIUpdateItem) -> bool:
     if ai_update_category(item) in {"model_release", "benchmark"}:
         return True
+    blob = _text_blob(item).lower()
+    if any(marker in blob for marker in _FINANCIAL_MODEL_MARKERS) and not (
+        _MODEL_TOPIC_RE.search(blob)
+        or re.search(r"(?:^|[^a-z])ai(?:[^a-z]|$)|artificial intelligence|人工智能|大模型|智能体", blob)
+    ):
+        return False
     return _contains_any_marker(_topic_blob(item).lower(), _MODEL_NEWS_MARKERS)
 
 
@@ -564,26 +707,31 @@ def _merge_items(primary: AIUpdateItem, other: AIUpdateItem) -> AIUpdateItem:
         if tag and tag not in tags:
             tags.append(tag)
     data["tags"] = tags
-    if primary.source_type in {"official", "github"} and other.source_type in {"social", "search"}:
+    if primary.source_type in {"official", "github"} and other.source_type in {"aggregator", "search"}:
+        data["verification_status"] = "aggregator_confirmed"
+        data["confidence_score"] = max(primary.confidence_score, 0.9)
+    elif primary.source_type in {"official", "github"} and other.source_type == "social":
         data["verification_status"] = "social_confirmed"
         data["confidence_score"] = max(primary.confidence_score, 0.9)
     elif (
         primary.source_type in {"official", "github"}
-        and other.verification_status == "social_confirmed"
+        and other.verification_status in {"aggregator_confirmed", "social_confirmed"}
     ):
-        data["verification_status"] = "social_confirmed"
+        data["verification_status"] = other.verification_status
         data["confidence_score"] = max(primary.confidence_score, other.confidence_score, 0.9)
     return AIUpdateItem.model_validate(data)
 
 
 def _prefer_item(a: AIUpdateItem, b: AIUpdateItem) -> AIUpdateItem:
-    priority = {"official": 4, "github": 3, "search": 2, "social": 1}
+    priority = {"official": 4, "github": 4, "aggregator": 2, "search": 2, "social": 1}
+    if priority.get(b.source_type, 0) > priority.get(a.source_type, 0):
+        return b
+    if priority.get(b.source_type, 0) < priority.get(a.source_type, 0):
+        return a
     if ai_update_category_priority(b) > ai_update_category_priority(a):
         return b
     if ai_update_category_priority(b) < ai_update_category_priority(a):
         return a
-    if priority.get(b.source_type, 0) > priority.get(a.source_type, 0):
-        return b
     if b.confidence_score > a.confidence_score:
         return b
     if (
@@ -673,6 +821,12 @@ def _rank_sort_key(item: AIUpdateItem):
     )
 
 
+def featured_ai_update(items: list[AIUpdateItem]) -> AIUpdateItem | None:
+    if not items:
+        return None
+    return max(items, key=_rank_sort_key)
+
+
 def _interleave_by_vendor_for_same_day(items: list[AIUpdateItem], *, target_count: int) -> list[AIUpdateItem]:
     by_day: OrderedDict[str, list[AIUpdateItem]] = OrderedDict()
     for item in items:
@@ -744,6 +898,57 @@ def _can_drop_for_quota(
     return True
 
 
+def _rebalance_vendor_concentration(
+    ranked: list[AIUpdateItem],
+    selected: list[AIUpdateItem],
+    *,
+    max_per_vendor: int,
+    min_domestic_model_count: int,
+    min_foreign_ai_count: int,
+) -> list[AIUpdateItem]:
+    if len(selected) < 2 or max_per_vendor < 1:
+        return selected
+
+    def source_key(item: AIUpdateItem) -> str:
+        value = (item.vendor or item.source_name or "").strip().lower()
+        return value or _selection_key(item)
+
+    balanced = list(selected)
+    selected_keys = {_selection_key(item) for item in balanced}
+    counts = Counter(source_key(item) for item in balanced)
+    for candidate in ranked:
+        candidate_key = _selection_key(candidate)
+        candidate_source = source_key(candidate)
+        if candidate_key in selected_keys or counts[candidate_source] >= max_per_vendor:
+            continue
+        overloaded = {key for key, count in counts.items() if count > max_per_vendor}
+        if not overloaded:
+            break
+        replace_index = next(
+            (
+                index
+                for index in range(len(balanced) - 1, -1, -1)
+                if source_key(balanced[index]) in overloaded
+                and _meets_ai_digest_quotas(
+                    [*balanced[:index], candidate, *balanced[index + 1 :]],
+                    min_domestic_model_count=min_domestic_model_count,
+                    min_foreign_ai_count=min_foreign_ai_count,
+                )
+            ),
+            None,
+        )
+        if replace_index is None:
+            continue
+        removed = balanced[replace_index]
+        removed_source = source_key(removed)
+        selected_keys.discard(_selection_key(removed))
+        counts[removed_source] -= 1
+        balanced[replace_index] = candidate
+        selected_keys.add(candidate_key)
+        counts[candidate_source] += 1
+    return balanced
+
+
 def _select_with_ai_digest_quotas(
     ranked: list[AIUpdateItem],
     *,
@@ -791,6 +996,13 @@ def _select_with_ai_digest_quotas(
 
     ensure_quota(ai_update_is_domestic_model_news, min_domestic_model_count)
     ensure_quota(ai_update_is_foreign_ai_news, min_foreign_ai_count)
+    selected = _rebalance_vendor_concentration(
+        ranked,
+        selected,
+        max_per_vendor=2,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+    )
 
     selected_keys = {_selection_key(item) for item in selected}
     return [item for item in ranked if _selection_key(item) in selected_keys][:target]
@@ -808,18 +1020,25 @@ def rank_ai_updates(
     min_foreign_ai_count: int = 0,
 ) -> list[AIUpdateItem]:
     target = max(1, int(target_count or 10))
-    deduped = _dedupe_updates(
-        filter_recent_ai_updates(
+    relevant = [
+        item
+        for item in filter_recent_ai_updates(
             items,
             max_age_days=max_age_days,
             now=now,
             require_url=True,
         )
+        if ai_update_is_relevant(item)
+    ]
+    deduped = _dedupe_updates(
+        relevant
     )
     official_like = [item for item in deduped if item.source_type in {"official", "github"}]
-    social_like = [item for item in deduped if item.source_type in {"social", "search"}]
+    aggregator_like = [item for item in deduped if item.source_type in {"aggregator", "search"}]
+    social_like = [item for item in deduped if item.source_type == "social"]
 
     official_like = sorted(official_like, key=_rank_sort_key, reverse=True)
+    aggregator_like = sorted(aggregator_like, key=_rank_sort_key, reverse=True)
     social_like = sorted(social_like, key=_rank_sort_key, reverse=True)
 
     if len(official_like) >= min_official_count:
@@ -848,8 +1067,10 @@ def rank_ai_updates(
             min_foreign_ai_count=min_foreign_ai_count,
         )
 
-    combined = sorted([*official_like, *social_like], key=_rank_sort_key, reverse=True)
-    combined_ranked = _interleave_by_vendor_for_same_day(combined, target_count=len(combined))
+    official_ranked = _interleave_by_vendor_for_same_day(official_like, target_count=len(official_like))
+    aggregator_ranked = _interleave_by_vendor_for_same_day(aggregator_like, target_count=len(aggregator_like))
+    social_ranked = _interleave_by_vendor_for_same_day(social_like, target_count=len(social_like))
+    combined_ranked = [*official_ranked, *aggregator_ranked, *social_ranked]
     return _select_with_ai_digest_quotas(
         combined_ranked,
         target_count=target,

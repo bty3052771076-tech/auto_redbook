@@ -161,7 +161,7 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
             "Kling AI",
             "html",
         ),
-        AIDigestSource("aihot-daily", "search", "https://aihot.virxact.com/daily", "AI HOT", "aihot_daily"),
+        AIDigestSource("aihot-daily", "aggregator", "https://aihot.virxact.com/daily", "AI HOT", "aihot_daily"),
         AIDigestSource("huggingface", "aggregator", "https://huggingface.co/blog/feed.xml", "Hugging Face", "rss"),
         AIDigestSource(
             "github-ai",
@@ -170,6 +170,12 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
             "Hugging Face",
             "github_releases",
         ),
+        AIDigestSource("x-openai", "social", "https://syndication.twitter.com/srv/timeline-profile/screen-name/OpenAI", "OpenAI", "x_profile"),
+        AIDigestSource("x-openai-devs", "social", "https://syndication.twitter.com/srv/timeline-profile/screen-name/OpenAIDevs", "OpenAI Developers", "x_profile"),
+        AIDigestSource("x-anthropic", "social", "https://syndication.twitter.com/srv/timeline-profile/screen-name/AnthropicAI", "Anthropic", "x_profile"),
+        AIDigestSource("x-claude-devs", "social", "https://syndication.twitter.com/srv/timeline-profile/screen-name/ClaudeDevs", "Claude Developers", "x_profile"),
+        AIDigestSource("x-sam-altman", "social", "https://syndication.twitter.com/srv/timeline-profile/screen-name/sama", "Sam Altman", "x_profile"),
+        AIDigestSource("x-tibo-maker", "social", "https://syndication.twitter.com/srv/timeline-profile/screen-name/tibo_maker", "Tibo", "x_profile"),
         AIDigestSource("x", "social", "https://x.com/search?q=AI%20model%20release&f=live", "X", "social_html", enabled=False),
         AIDigestSource("hackernews", "social", "https://hn.algolia.com/?q=AI%20model", "Hacker News", "social_html", enabled=False),
     ]
@@ -201,7 +207,7 @@ def resolve_ai_digest_sources(env: dict[str, str] | None = None) -> list[AIDiges
         primary = [by_name[name] for name in primary_names if name in by_name]
 
     if not social_names:
-        social = [source for source in sources if source.kind == "search" and source.enabled]
+        social = [source for source in sources if source.kind == "social" and source.enabled]
     else:
         social = [by_name[name] for name in social_names if name in by_name]
 
@@ -211,4 +217,4 @@ def resolve_ai_digest_sources(env: dict[str, str] | None = None) -> list[AIDiges
         fallback = [by_name[name] for name in aggregator_names if name in by_name]
     else:
         fallback = [source for source in sources if source.kind == "aggregator" and source.enabled]
-    return [*primary, *social, *fallback]
+    return [*primary, *fallback, *social]

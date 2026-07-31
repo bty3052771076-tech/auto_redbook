@@ -1,3 +1,4 @@
+import src.publish.playwright_steps as playwright_steps
 from src.publish.playwright_steps import (
     _classify_xhs_page_state,
     _published_metrics_collection_status,
@@ -5,10 +6,14 @@ from src.publish.playwright_steps import (
     _parse_published_metric_text,
     _parse_published_total_text,
     _published_metrics_collect_cap,
+    _published_metrics_max_scrolls,
     _published_url_candidates,
     _wait_for_xhs_ready,
     _merge_published_metric_cards,
     _remember_published_note_target,
+    _metrics_operation_timeout_ms,
+    _published_metrics_scroll_script,
+    _scroll_published_metrics_page,
 )
 import pytest
 
@@ -95,12 +100,114 @@ def test_published_metrics_default_routes_exclude_legacy_and_editor_pages():
     assert all("/publish/publish" not in url for url in candidates)
 
 
+def test_collect_published_metrics_uses_committed_navigation(monkeypatch, tmp_path):
+    class FakePage:
+        pass
+
+    class FakeContext:
+        def __init__(self):
+            self.pages = [FakePage()]
+
+        def set_default_timeout(self, _timeout):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def __init__(self, context):
+            self.context = context
+
+        def launch_persistent_context(self, *_args, **_kwargs):
+            return self.context
+
+    class FakePlaywrightManager:
+        def __init__(self, context):
+            self.chromium = FakeChromium(context)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeMetric:
+        def model_dump(self):
+            return {"title": "Fresh note", "published_at": "2026-07-28"}
+
+    page = FakePage()
+    context = FakeContext()
+    context.pages = [page]
+    navigations = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(playwright_steps, "sync_playwright", lambda: FakePlaywrightManager(context))
+    monkeypatch.setattr(playwright_steps, "_resolve_profile_config", lambda: (tmp_path / "profile", None, []))
+    monkeypatch.setattr(playwright_steps, "_resolve_headless", lambda _headless: True)
+    monkeypatch.setattr(playwright_steps, "_published_url_candidates", lambda: ["https://example.com/metrics"])
+    monkeypatch.setattr(
+        playwright_steps,
+        "_goto_xhs_page",
+        lambda actual_page, url, *, timeout_ms: navigations.append((actual_page, url, timeout_ms)),
+    )
+    monkeypatch.setattr(playwright_steps, "_wait_for_xhs_ready", lambda *_args, **_kwargs: "ready")
+    monkeypatch.setattr(playwright_steps, "_wait_for_any_text", lambda *_args, **_kwargs: "notes")
+    monkeypatch.setattr(playwright_steps, "_extract_published_note_total", lambda _page: 1)
+    monkeypatch.setattr(playwright_steps, "_collect_published_metric_cards", lambda _page: [{"text": "fresh"}])
+    monkeypatch.setattr(playwright_steps, "_merge_published_metric_cards", lambda _cards, *, limit=0: [FakeMetric()])
+
+    result = playwright_steps.run_collect_published_metrics_sync(limit=0, wait_timeout_ms=600000, headless=True)
+
+    assert navigations == [(page, "https://example.com/metrics", 600000)]
+    assert result["complete"] is True
+    assert result["total"] == 1
+
+
 def test_published_metrics_collect_cap_is_configurable(monkeypatch):
     assert _published_metrics_collect_cap() >= 1000
 
     monkeypatch.setenv("XHS_METRICS_MAX_ITEMS", "25")
 
     assert _published_metrics_collect_cap() == 25
+
+
+def test_published_metrics_default_scroll_budget_supports_large_creator_accounts(monkeypatch):
+    monkeypatch.delenv("XHS_METRICS_MAX_SCROLLS", raising=False)
+    assert _published_metrics_max_scrolls() == 1000
+
+    monkeypatch.setenv("XHS_METRICS_MAX_SCROLLS", "275")
+    assert _published_metrics_max_scrolls() == 275
+
+
+def test_published_metrics_operation_timeout_caps_each_dom_operation():
+    assert _metrics_operation_timeout_ms(600000) == 5000
+    assert _metrics_operation_timeout_ms(5000) == 5000
+
+
+def test_published_metrics_scroll_script_dispatches_events_for_incremental_loading():
+    script = _published_metrics_scroll_script()
+
+    assert "dispatchEvent(new Event('scroll'" in script
+    assert "WheelEvent('wheel'" in script
+
+
+def test_published_metrics_scroll_uses_trusted_playwright_wheel_input():
+    calls = []
+
+    class Mouse:
+        def move(self, x, y):
+            calls.append(("move", x, y))
+
+        def wheel(self, x, y):
+            calls.append(("wheel", x, y))
+
+    class Page:
+        mouse = Mouse()
+
+        def evaluate(self, _script):
+            return {"scrolled": True}
+
+    assert _scroll_published_metrics_page(Page()) == {"scrolled": True}
+    assert ("wheel", 0, 720) in calls
 
 
 def test_parse_published_total_text():

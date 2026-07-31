@@ -7,7 +7,7 @@ from PIL import Image
 from src.ai_digest.models import AIDigestBrief
 from src.ai_digest.generate import build_fallback_brief
 from src.ai_digest.models import AIUpdateItem
-from src.ai_digest.render import _paginate_items, render_ai_digest_cards
+from src.ai_digest.render import CARD_SIZE, _paginate_items, render_ai_digest_cards
 
 
 def _item(
@@ -147,3 +147,59 @@ def test_render_ai_digest_item_pages_show_publish_time_and_source_without_footer
     assert "来源：OpenAI" in joined
     assert "来源链接已保存至本地 metadata" not in joined
     assert "长链接不写入图片，完整来源保存在本地" not in joined
+
+
+def test_render_ai_digest_long_text_stays_inside_card_bounds(monkeypatch, tmp_path: Path):
+    from PIL import ImageDraw
+
+    drawn: list[tuple[tuple[int, int], str, object]] = []
+    real_text = ImageDraw.ImageDraw.text
+
+    def capture_text(self, xy, text, *args, **kwargs):
+        font = kwargs.get("font")
+        drawn.append((xy, str(text), font))
+        return real_text(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", capture_text)
+    items = [
+        AIUpdateItem(
+            title=f"Gemini API Managed Agents 默认升级并新增开发者环境钩子与预算控制功能{i}",
+            summary=(
+                "这是一条较长的模型与开发工具更新摘要，用于验证中文、EnglishModelName、"
+                "数字参数和长来源名称都不会越过卡片边界或遮挡后续内容。"
+            ),
+            source_name="Hacker News 热门（buzzing.cc 中文翻译）",
+            source_type="search",
+            url=f"https://example.com/long-{i}",
+            published_at="2026-07-29T08:00:00+08:00",
+            vendor="Hacker News 热门（buzzing.cc 中文翻译）",
+            raw_excerpt="AI model release with long metadata.",
+            verification_status="social_confirmed",
+            tags=["AI"],
+        )
+        for i in range(8)
+    ]
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        subtitle=(
+            "2026年7月29日：Claude发现加密弱点、OpenAI转录模型API、"
+            "Kimi K3开源、豆包搜索服务上线"
+        ),
+        date="2026-07-29",
+        items=items,
+        source_summary=(
+            "本期资讯来源涵盖 Anthropic 官方社交账号、MarkTechPost、Hacker News 热门、"
+            "OpenAI Developers、Google Blog RSS、火山引擎公众号及月之暗面公众号，"
+            "均经公开来源交叉核验确认。"
+        ),
+    )
+
+    render_ai_digest_cards(brief, tmp_path / "digest")
+
+    assert drawn
+    for (x, y), text, font in drawn:
+        if font is None:
+            continue
+        left, top, right, bottom = font.getbbox(text)
+        assert x + (right - left) <= CARD_SIZE[0] - 50
+        assert y + (bottom - top) <= CARD_SIZE[1] - 100

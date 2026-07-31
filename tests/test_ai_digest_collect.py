@@ -315,11 +315,44 @@ def test_collect_ai_digest_updates_uses_social_backfill_when_official_sources_ar
     assert any(item.source_type == "social" for item in items)
 
 
-def test_collect_ai_digest_updates_uses_huggingface_aggregator_as_final_fallback(monkeypatch):
+def test_collect_ai_digest_uses_aggregator_before_social_and_stops_when_pool_is_full(monkeypatch):
+    monkeypatch.setenv("AI_DIGEST_SEARCH_BACKFILL_ENABLED", "0")
+    calls: list[str] = []
+    sources = [
+        AIDigestSource("official", "official", "https://example.com/rss", "Official", "rss"),
+        AIDigestSource("aihot", "aggregator", "https://aihot.example/daily", "AI HOT", "aihot_daily"),
+        AIDigestSource("x", "social", "https://x.com/search", "X", "social_html"),
+    ]
+
+    def fake_fetch(source):
+        calls.append(source.name)
+        if source.kind == "official":
+            return [_item("official-1")]
+        if source.kind == "aggregator":
+            return [_item(f"aggregator-{i}", "aggregator") for i in range(7)]
+        return [_item(f"social-{i}", "social") for i in range(10)]
+
+    items, meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=8,
+        min_official_count=6,
+        allow_social_backfill=True,
+        max_age_days=3,
+        now=datetime(2026, 6, 30, 9, tzinfo=timezone.utc),
+    )
+
+    assert calls == ["official", "aihot"]
+    assert [item.source_type for item in items] == ["official", *(["aggregator"] * 7)]
+    assert meta["aggregator_backfill_used"] is True
+    assert meta["social_backfill_used"] is False
+
+
+def test_collect_ai_digest_updates_uses_aggregators_before_search_and_social(monkeypatch):
     calls: list[str] = []
     sources = [
         AIDigestSource("official", "official", "https://example.com/rss", "OpenAI", "rss"),
-        AIDigestSource("aihot-daily", "search", "https://aihot.example/daily", "AI HOT", "aihot_daily"),
+        AIDigestSource("aihot-daily", "aggregator", "https://aihot.example/daily", "AI HOT", "aihot_daily"),
         AIDigestSource("huggingface", "aggregator", "https://huggingface.co/blog/feed.xml", "Hugging Face", "rss"),
     ]
 
@@ -345,7 +378,7 @@ def test_collect_ai_digest_updates_uses_huggingface_aggregator_as_final_fallback
                     title="智谱 GLM-5.2 模型发布",
                     summary="智谱发布 GLM-5.2 模型更新。",
                     source_name="AI HOT",
-                    source_type="search",
+                    source_type="aggregator",
                     url="https://aihot.example/daily/1",
                     published_at="2026-07-02T09:00:00Z",
                     vendor="智谱 GLM",
@@ -358,7 +391,7 @@ def test_collect_ai_digest_updates_uses_huggingface_aggregator_as_final_fallback
                 title=f"Hugging Face 模型发布合集 {i}",
                 summary="Hugging Face 社区模型发布和推理工具更新。",
                 source_name="Hugging Face",
-                source_type="official",
+                source_type="aggregator",
                 url=f"https://huggingface.co/blog/model-{i}",
                 published_at=f"2026-07-02T1{i}:00:00Z",
                 vendor="Hugging Face",
@@ -386,9 +419,9 @@ def test_collect_ai_digest_updates_uses_huggingface_aggregator_as_final_fallback
         min_foreign_ai_count=3,
     )
 
-    assert calls == ["official", "aihot-daily", "search-backfill", "huggingface"]
+    assert calls == ["official", "aihot-daily", "huggingface"]
     assert meta["aggregator_backfill_used"] is True
-    assert meta["search_backfill_used"] is True
+    assert meta["search_backfill_used"] is False
     assert any(item.vendor == "Hugging Face" for item in items)
     assert meta["quota_counts"]["foreign_ai"] >= 3
 
@@ -528,3 +561,41 @@ def test_search_backfill_disables_daily_news_query_expansion(monkeypatch):
     assert len(items) == 1
     assert calls[0]["expand_query_variants"] is False
     assert meta["queries"][0]["converted_count"] == 1
+
+
+def test_search_backfill_removes_provider_paid_plan_boilerplate(monkeypatch):
+    def fake_fetch_daily_news_candidates(_query, **_kwargs):
+        return [
+            NewsItem(
+                title="What is Kimi K3? New open-weight model explained",
+                url="https://example.com/kimi-k3",
+                source="Example",
+                domain="example.com",
+                seendate="2026-07-28T08:45:00Z",
+                description=(
+                    "Moonshot AI released Kimi K3 for coding and agent workflows. "
+                    "ONLY AVAILABLE IN PAID PLANS"
+                ),
+            ),
+            NewsItem(
+                title="Why your AI resume sounds generic",
+                url="https://example.com/ai-resume",
+                source="Example",
+                domain="example.com",
+                seendate="2026-07-27T21:44:10Z",
+                description="ONLY AVAILABLE IN PAID PLANS",
+            ),
+        ], {"tz": "Asia/Shanghai"}
+
+    monkeypatch.setattr("src.news.daily_news.fetch_daily_news_candidates", fake_fetch_daily_news_candidates)
+
+    items, _meta = collect_mod.fetch_ai_digest_search_backfill(
+        max_age_days=3,
+        now=datetime(2026, 7, 29, 12, tzinfo=timezone.utc),
+        queries=["AI model release"],
+        max_records=5,
+    )
+
+    assert "PAID PLANS" not in items[0].raw_excerpt
+    assert items[0].raw_excerpt == "Moonshot AI released Kimi K3 for coding and agent workflows."
+    assert items[1].raw_excerpt == ""

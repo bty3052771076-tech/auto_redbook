@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import src.aliyun.quota as quota_module
 from src.aliyun.quota import (
+    _aliyun_quota_data_ready,
     _complete_aliyun_visible_only_records,
     _make_aliyun_not_visible_records,
     _should_retry_aliyun_quota_after_login_transition,
@@ -12,6 +14,101 @@ from src.aliyun.quota import (
     parse_aliyun_console_api_quota,
     parse_aliyun_quota_text,
 )
+
+
+def test_wait_for_aliyun_quota_capture_waits_until_api_items_stop_growing():
+    payloads: list[dict] = []
+
+    class FakePage:
+        waits = 0
+
+        def wait_for_timeout(self, _milliseconds: int) -> None:
+            self.waits += 1
+            if self.waits <= 2:
+                payloads.append(
+                    {
+                        "data": {
+                            "freeTierQuotas": [
+                                {
+                                    "model": f"model-{self.waits}",
+                                    "quotaInitTotal": 100,
+                                    "quotaTotal": 100,
+                                }
+                            ]
+                        }
+                    }
+                )
+
+    page = FakePage()
+
+    item_count = quota_module._wait_for_aliyun_quota_capture(
+        page,
+        payloads,
+        timeout_ms=20,
+        poll_ms=1,
+        stable_polls=2,
+    )
+
+    assert item_count == 2
+    assert page.waits >= 4
+
+
+def test_aliyun_quota_data_ready_rejects_sidebar_and_empty_table_shell():
+    text = "\n".join(
+        [
+            "\u7528\u91cf & \u8d39\u7528",
+            "\u514d\u8d39\u989d\u5ea6",
+            "\u6a21\u578bCode",
+            "\u514d\u8d39\u989d\u5ea6\u5269\u4f59\u91cf",
+        ]
+    )
+
+    assert not _aliyun_quota_data_ready(
+        text,
+        [],
+        model_names=[],
+        all_free=True,
+        visible_only=False,
+    )
+
+
+def test_aliyun_quota_data_ready_accepts_visible_balance_row():
+    text = (
+        "\u6a21\u578bCode\nqwen3.7-plus\n"
+        "\u52691,000,000/\u51711,000,000\n2026/09/01"
+    )
+
+    assert _aliyun_quota_data_ready(
+        text,
+        [],
+        model_names=[],
+        all_free=True,
+        visible_only=True,
+    )
+
+
+def test_aliyun_quota_data_ready_accepts_console_api_quota_items():
+    payloads = [
+        {
+            "data": {
+                "freeTierQuotas": [
+                    {
+                        "model": "qwen3.7-plus",
+                        "quotaInitTotal": 1_000_000,
+                        "quotaTotal": 900_000,
+                    }
+                ]
+            }
+        }
+    ]
+
+    assert _aliyun_quota_data_ready(
+        "",
+        payloads,
+        model_names=[],
+        all_free=True,
+        visible_only=False,
+    )
 
 
 def test_parse_aliyun_quota_text_extracts_llm_and_image_remaining_values():

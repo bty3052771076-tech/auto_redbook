@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from src.ai_digest.models import AIUpdateItem
@@ -83,6 +84,36 @@ def test_rank_ai_updates_backfills_with_social_when_official_sources_are_too_few
     assert len(ranked) == 10
     assert sum(1 for item in ranked if item.source_type == "official") == 3
     assert sum(1 for item in ranked if item.source_type == "social") == 7
+
+
+def test_rank_ai_updates_uses_official_then_aggregator_then_social_tiers():
+    official = _item(
+        "OpenAI API 工具更新",
+        source_type="official",
+        source_name="OpenAI",
+        confidence_score=0.2,
+    )
+    aggregator = _item(
+        "Claude 模型工具更新",
+        source_type="aggregator",
+        source_name="AI HOT",
+        confidence_score=0.95,
+    )
+    social = _item(
+        "Gemini 模型工具更新",
+        source_type="social",
+        source_name="X",
+        confidence_score=0.99,
+    )
+
+    ranked = rank_ai_updates(
+        [social, aggregator, official],
+        target_count=3,
+        min_official_count=6,
+        allow_social_backfill=True,
+    )
+
+    assert [item.source_type for item in ranked] == ["official", "aggregator", "social"]
 
 
 def test_rank_ai_updates_excludes_social_only_when_official_sources_are_enough():
@@ -508,6 +539,233 @@ def test_ai_update_category_keeps_opinion_discussion_as_supplement_even_with_gen
     )
 
     assert rank_mod.ai_update_category(item) == "discussion"
+
+
+def test_ai_update_category_does_not_treat_financial_valuation_model_as_ai_release():
+    item = _item(
+        "Motorola Solutions faces fresh valuation debate before Q2 earnings",
+        source_name="Yahoo Finance Singapore",
+        url="https://sg.finance.yahoo.com/news/motorola-solutions-valuation.html",
+        published_at="2026-07-29T02:08:22Z",
+        summary=(
+            "A discounted cash flow model estimates intrinsic value while analysts compare "
+            "earnings forecasts, share price, and valuation assumptions."
+        ),
+        raw_excerpt="DCF model valuation estimate ahead of quarterly earnings.",
+        product="Motorola Solutions",
+    )
+
+    assert rank_mod.ai_update_category(item) == "other"
+    assert not rank_mod.ai_update_is_model_news(item)
+
+
+def test_rank_ai_updates_rejects_search_noise_without_ai_in_the_headline():
+    relevant = _item(
+        "Synopsys, AMD, and Microsoft push agentic AI further",
+        source_type="search",
+        source_name="Redmondmag.com",
+        url="https://redmondmag.com/blogs/redmond-dispatch/2026/07/synopsys-amd-and-microsoft-push-agentic-ai-further.aspx",
+        published_at="2026-07-29T05:49:14Z",
+        product="",
+        raw_excerpt=(
+            "Synopsys, AMD, and Microsoft are integrating agentic AI into "
+            "semiconductor design workflows."
+        ),
+    )
+    earnings_noise = _item(
+        "CoStar Group Inc reports record Q2 2026 results",
+        source_type="search",
+        source_name="Yahoo Finance UK",
+        url="https://uk.finance.yahoo.com/news/costar-group-inc-csgp-q2-050122904.html",
+        published_at="2026-07-29T05:01:34Z",
+        product="",
+        raw_excerpt="The company reported record revenue and mentioned leveraging AI for efficiency gains.",
+    )
+    unrelated_noise = _item(
+        "EXCLUSIVE: Iran to get Chinese shoulder-launched missile systems",
+        source_type="search",
+        source_name="Reuters",
+        url="https://news.google.com/rss/articles/unrelated",
+        published_at="2026-07-29T03:04:00Z",
+        product="",
+        raw_excerpt="Iran will receive shoulder-launched missile systems, sources say.",
+    )
+
+    ranked = rank_ai_updates(
+        [earnings_noise, unrelated_noise, relevant],
+        target_count=8,
+        min_official_count=1,
+        max_age_days=3,
+        now=datetime(2026, 7, 29, 16, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    assert [item.title for item in ranked] == [relevant.title]
+
+
+def test_rank_ai_updates_rejects_official_item_that_only_repeats_product_name():
+    empty = _item(
+        "Qwen Code",
+        source_type="official",
+        source_name="Qwen",
+        url="https://qwenlm.github.io/qwen-code-docs/blog/updates/",
+        published_at="2026-07-29T03:00:00Z",
+        summary="Qwen Code",
+        raw_excerpt="Qwen Code",
+        product="Qwen Code",
+    )
+    substantive = _item(
+        "Qwen Code 发布每周更新",
+        source_type="official",
+        source_name="Qwen",
+        url="https://qwenlm.github.io/qwen-code-docs/blog/updates/weekly-update-2026-07-23/",
+        published_at="2026-07-29T03:00:00Z",
+        summary="Qwen Code 新增任务继续运行、压缩历史与提示词补全功能。",
+        raw_excerpt="The weekly update adds resilient task continuation and prompt completion.",
+        product="Qwen Code",
+    )
+
+    ranked = rank_ai_updates(
+        [empty, substantive],
+        target_count=8,
+        min_official_count=1,
+        max_age_days=3,
+        now=datetime(2026, 7, 29, 16, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    assert [item.url for item in ranked] == [substantive.url]
+
+
+def test_rank_ai_updates_rejects_search_results_about_stocks_banking_and_filings():
+    financial_items = [
+        _item(
+            "Global Mofy AI Ltd files 6-K current report",
+            source_type="search",
+            source_name="Stock Titan",
+            url="https://www.stocktitan.net/sec-filings/GMM/6-k-current-report.html",
+            published_at="2026-07-29T10:41:44Z",
+            summary="The company filed a current report for foreign investors.",
+            raw_excerpt="Global Mofy AI Ltd SEC filing and stock disclosure.",
+        ),
+        _item(
+            "Does BMO's AI-driven retail banking recognition reshape the stock?",
+            source_type="search",
+            source_name="Simply Wall St",
+            url="https://simplywall.st/stocks/ca/banks/bmo/news/ai-driven-retail-banking",
+            published_at="2026-07-29T10:27:29Z",
+            summary="The analysis discusses shares, earnings and bank valuation.",
+            raw_excerpt="AI investment may improve operations but increases spending.",
+        ),
+        _item(
+            "Oracle stock and 2 AI infrastructure picks worth a closer look",
+            source_type="search",
+            source_name="Simply Wall St",
+            url="https://simplywall.st/stocks/us/semiconductors/news/oracle-stock-ai-infrastructure",
+            published_at="2026-07-29T10:25:03Z",
+            summary="An investor analysis compares three AI infrastructure stocks.",
+            raw_excerpt="The article reviews financial health, valuation and investment risks.",
+        ),
+    ]
+
+    ranked = rank_ai_updates(
+        financial_items,
+        target_count=8,
+        min_official_count=1,
+        max_age_days=3,
+        now=datetime(2026, 7, 29, 16, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    assert ranked == []
+    assert all(item.verification_status == "search_only" for item in financial_items)
+
+
+def test_rank_ai_updates_limits_single_vendor_when_diverse_quota_safe_sources_exist():
+    now = datetime(2026, 7, 29, 16, tzinfo=timezone(timedelta(hours=8)))
+    items = [
+        _item(
+            f"OpenAI GPT 工具更新{i}",
+            source_name="OpenAI",
+            url=f"https://openai.com/index/update-{i}",
+            published_at=f"2026-07-{29 - i:02d}T02:00:00Z",
+            summary="OpenAI 发布 GPT 模型、API 与开发工具更新。",
+            raw_excerpt="OpenAI releases GPT model and developer tool updates.",
+            product=f"GPT-tool-{i}",
+        )
+        for i in range(5)
+    ]
+    items.extend(
+        [
+            _item(
+                "百度千帆 ERNIE 模型服务升级",
+                source_name="百度千帆",
+                url="https://cloud.baidu.com/qianfan/ernie-update",
+                published_at="2026-07-28T02:00:00Z",
+                summary="百度千帆升级 ERNIE 模型和 Agent API 服务。",
+                raw_excerpt="百度千帆 ERNIE 模型服务升级。",
+                product="ERNIE",
+            ),
+            _item(
+                "DeepSeek V4 API 模型更新",
+                source_name="DeepSeek",
+                url="https://api-docs.deepseek.com/v4-update",
+                published_at="2026-07-27T02:00:00Z",
+                summary="DeepSeek 更新 V4 模型 API 和推理模式。",
+                raw_excerpt="DeepSeek V4 model API update.",
+                product="DeepSeek-V4",
+            ),
+            _item(
+                "Qwen3 Coder 开源模型更新",
+                source_name="Qwen",
+                url="https://qwen.ai/blog/qwen3-coder-update",
+                published_at="2026-07-26T02:00:00Z",
+                summary="Qwen3 Coder 发布开源权重和代码能力更新。",
+                raw_excerpt="Qwen3 Coder open-weight model release.",
+                product="Qwen3-Coder",
+            ),
+            _item(
+                "Anthropic Claude Code 工具更新",
+                source_name="Anthropic",
+                url="https://anthropic.com/news/claude-code-update",
+                published_at="2026-07-25T02:00:00Z",
+                summary="Anthropic 发布 Claude Code 开发者工具更新。",
+                raw_excerpt="Anthropic releases Claude Code developer tool update.",
+                product="Claude Code",
+            ),
+            _item(
+                "Google Gemini 推理模型更新",
+                source_name="Google DeepMind",
+                url="https://deepmind.google/blog/gemini-update",
+                published_at="2026-07-24T02:00:00Z",
+                summary="Google DeepMind 发布 Gemini 推理模型更新。",
+                raw_excerpt="Google DeepMind releases a Gemini reasoning model update.",
+                product="Gemini",
+            ),
+            _item(
+                "Meta Llama 开放权重模型更新",
+                source_name="Meta AI",
+                url="https://ai.meta.com/blog/llama-update",
+                published_at="2026-07-23T02:00:00Z",
+                summary="Meta 发布 Llama 开放权重模型与推理工具更新。",
+                raw_excerpt="Meta releases a Llama open-weight model and inference tool update.",
+                product="Llama",
+            ),
+        ]
+    )
+
+    ranked = rank_ai_updates(
+        items,
+        target_count=8,
+        min_official_count=6,
+        max_age_days=14,
+        now=now,
+        min_domestic_model_count=3,
+        min_foreign_ai_count=3,
+    )
+    source_counts = Counter(item.source_name for item in ranked)
+
+    assert len(ranked) == 8
+    assert source_counts["OpenAI"] <= 2
+    assert ai_digest_quota_counts(ranked)["domestic_model"] >= 3
+    assert ai_digest_quota_counts(ranked)["foreign_ai"] >= 3
 
 
 def test_rank_ai_updates_interleaves_vendors_only_within_same_category_tier():
