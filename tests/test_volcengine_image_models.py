@@ -92,3 +92,35 @@ def test_volcengine_image_model_list_fallback_on_quota(monkeypatch, tmp_path: Pa
 
     assert calls == ["doubao-seedream-5-0-260128", "doubao-seedream-4-5-251128"]
     assert res.meta["model"] == "doubao-seedream-4-5-251128"
+
+
+def test_volcengine_image_model_list_fallback_on_transient_generation_failure(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("VOLCENGINE_IMAGE_API_KEY", "dummy")
+    monkeypatch.setenv("VOLCENGINE_IMAGE_BASE_URL", "https://ark.example/api/v3")
+    monkeypatch.setenv(
+        "VOLCENGINE_IMAGE_MODELS",
+        "doubao-seedream-4-5-251128,doubao-seedream-4-0-250828",
+    )
+
+    calls: list[str] = []
+
+    def fake_post_json(*, url, payload, headers, timeout_s):
+        model = str(payload.get("model"))
+        calls.append(model)
+        if model == "doubao-seedream-4-5-251128":
+            raise RuntimeError("Volcengine image request failed: timed out")
+        return {"data": [{"url": "https://example.com/out.png"}]}
+
+    monkeypatch.setattr(volcengine_images, "_http_post_json", fake_post_json)
+    monkeypatch.setattr(
+        volcengine_images,
+        "_download_bytes",
+        lambda *, url, timeout_s, api_key=None: b"\x89PNG\r\n\x1a\n" + b"x" * 64,
+    )
+
+    res = volcengine_images.generate_volcengine_image(post_id="p", prompt="hi", dest_dir=tmp_path)
+
+    assert calls == ["doubao-seedream-4-5-251128", "doubao-seedream-4-0-250828"]
+    assert res.meta["model"] == "doubao-seedream-4-0-250828"

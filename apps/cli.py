@@ -445,6 +445,10 @@ def _apply_scoped_environment(context: typer.Context, values: Mapping[str, str])
     context.call_on_close(restore)
 
 
+def _vision_review_passes(result: VisionReviewResult) -> bool:
+    return bool(result.ok and result.score >= 70)
+
+
 def _review_with_bounded_image_repair(
     post: Post,
     *,
@@ -463,7 +467,7 @@ def _review_with_bounded_image_repair(
     is_daily_news = isinstance(post.platform.get("news"), dict)
     limit = max(0, int(max_repairs))
 
-    while not result.ok and is_daily_news and repair_count < limit:
+    while not _vision_review_passes(result) and is_daily_news and repair_count < limit:
         attempt = repair_count + 1
         retry_prompt = (result.retry_prompt or "").strip()
         if progress_fn is not None:
@@ -612,10 +616,10 @@ def _run_auto_quality_gate(
             _emit_progress_event(
                 "auto",
                 "视觉复核修复",
-                "success" if result.ok else "failed",
+                "success" if _vision_review_passes(result) else "failed",
                 f"index={index}/{len(posts)} repairs={repair_count} final_score={result.score}",
             )
-        if not result.ok:
+        if not _vision_review_passes(result):
             message = (
                 f"第 {index} 条图片与文字不一致（得分 {result.score}）："
                 f"{'；'.join(result.issues) or '视觉模型未给出详细说明'}"
@@ -1900,6 +1904,12 @@ def auto(
         post.status = _apply_execution_status(post.status, exec_rec.result)
         _mark_post_uploaded(post, exec_rec.result)
         post.updated_at = now_iso()
+        if exec_rec.result == "saved_draft":
+            post.platform["xhs_draft"] = {
+                "title": post.title,
+                "saved_at": post.updated_at,
+                "execution_id": exec_rec.id,
+            }
         save_post(post)
 
         typer.echo(f"post_id={post.id} result: {exec_rec.result}")

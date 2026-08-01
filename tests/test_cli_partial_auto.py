@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -91,6 +92,52 @@ def test_auto_passes_keywords_to_daily_news_generation(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert seen["prompt_hint"] == "财经产业 公司政策"
+
+
+def test_auto_records_xhs_draft_metadata_after_successful_upload(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "asset.png"
+    asset.write_bytes(b"fake image")
+    post = Post(
+        title="草稿元数据测试",
+        body="这是用于验证自动上传草稿元数据的测试正文。",
+        assets=[AssetInfo(path=str(asset), kind="image")],
+    )
+    saved_posts: list[Post] = []
+
+    monkeypatch.setattr(cli, "create_daily_news_posts", lambda **_kwargs: [post])
+    monkeypatch.setattr(
+        cli,
+        "run_save_draft_sync",
+        lambda post_arg, **_kwargs: Execution(
+            post_id=post_arg.id,
+            result="saved_draft",
+            id="execution-test-id",
+        ),
+    )
+    monkeypatch.setattr(cli, "save_post", lambda value: saved_posts.append(deepcopy(value)))
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "auto",
+            "--no-preflight",
+            "--title",
+            "每日新闻",
+            "--assets-glob",
+            str(asset),
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    final_post = saved_posts[-1]
+    assert final_post.platform["xhs_draft"]["title"] == post.title
+    assert final_post.platform["xhs_draft"]["execution_id"] == "execution-test-id"
+    assert final_post.platform["xhs_draft"]["saved_at"]
 
 
 def test_auto_refuses_partial_daily_news_batch_before_upload_by_default(monkeypatch, tmp_path):

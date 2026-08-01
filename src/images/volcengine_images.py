@@ -210,6 +210,13 @@ def _should_try_next_model(exc: Exception) -> bool:
         "限流",
         "不足",
         "超限",
+        "timeout",
+        "timed out",
+        "connection",
+        "network",
+        "download failed",
+        "response parse failed",
+        "missing data",
     )
     return any(k in code or k in msg for k in keywords)
 

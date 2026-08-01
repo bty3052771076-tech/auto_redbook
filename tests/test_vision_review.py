@@ -170,6 +170,56 @@ def test_bounded_image_repair_rechecks_daily_news_once():
     assert [item.score for item in history] == [48, 91]
 
 
+def test_bounded_image_repair_retries_inconsistent_zero_score_even_if_ok_flag_is_true():
+    post = Post(
+        title="测试新闻",
+        body="测试正文",
+        platform={"news": {"source_url": "https://example.com/news"}},
+    )
+    config = LLMConfig(
+        provider="volcengine",
+        model="doubao-seed-1-6-vision",
+        api_key="test-key",
+        base_url="https://example.com/v1",
+    )
+    results = iter(
+        [
+            VisionReviewResult(
+                ok=True,
+                score=0,
+                issues=("图片与新闻事件不一致",),
+                retry_prompt="改为与新闻主体相关的无文字场景",
+                provider="volcengine",
+                model=config.model,
+            ),
+            VisionReviewResult(
+                ok=True,
+                score=90,
+                issues=(),
+                retry_prompt="",
+                provider="volcengine",
+                model=config.model,
+            ),
+        ]
+    )
+    repairs: list[str] = []
+
+    result, repair_count, repair_errors, history = _review_with_bounded_image_repair(
+        post,
+        config=config,
+        viewpoint="无视角评价",
+        max_repairs=1,
+        review_fn=lambda *_args, **_kwargs: next(results),
+        regenerate_fn=lambda _post, retry_prompt: repairs.append(retry_prompt) or True,
+    )
+
+    assert result.score == 90
+    assert repair_count == 1
+    assert repair_errors == []
+    assert repairs == ["改为与新闻主体相关的无文字场景"]
+    assert [item.score for item in history] == [0, 90]
+
+
 def test_bounded_image_repair_does_not_redraw_non_news_cards():
     post = Post(title="每日AI讯息", body="测试正文", platform={})
     config = LLMConfig(
