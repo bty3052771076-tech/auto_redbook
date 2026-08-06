@@ -48,6 +48,23 @@ def test_ai_update_item_normalizes_url_key_and_source_type():
     assert item.verification_status == "official_only"
 
 
+def test_ai_digest_official_count_requires_a_direct_official_url():
+    direct_official = _item(
+        "OpenAI model release",
+        url="https://openai.com/index/model-release",
+        source_type="official",
+        source_name="OpenAI",
+    )
+    mislabeled_aggregator = _item(
+        "OpenAI model release mirror",
+        url="https://aihot.virxact.com/daily/2026-08-01?item=1",
+        source_type="official",
+        source_name="AI HOT",
+    )
+
+    assert rank_mod.ai_digest_official_count([direct_official, mislabeled_aggregator]) == 1
+
+
 def test_rank_ai_updates_dedupes_by_url_and_title_prefers_official():
     official = _item("Claude Code 更新", url="https://anthropic.com/news/code", source_name="Anthropic")
     social_duplicate = _item(
@@ -65,6 +82,29 @@ def test_rank_ai_updates_dedupes_by_url_and_title_prefers_official():
     assert ranked[0].source_name == "Anthropic"
     assert ranked[0].verification_status == "social_confirmed"
     assert "https://x.com/AnthropicAI/status/1" in ranked[0].evidence_urls
+
+
+def test_rank_ai_updates_keeps_distinct_official_updates_from_one_release_page():
+    shared_url = "https://example.com/official/model-release-notes"
+    qwen = _item(
+        "Qwen model service update",
+        url=shared_url,
+        source_name="Baidu Qianfan",
+        product="Qwen",
+    )
+    ernie = _item(
+        "ERNIE model service update",
+        url=shared_url,
+        source_name="Baidu Qianfan",
+        product="ERNIE",
+    )
+
+    ranked = rank_ai_updates([qwen, ernie], target_count=2, min_official_count=1)
+
+    assert {item.title for item in ranked} == {
+        "Qwen model service update",
+        "ERNIE model service update",
+    }
 
 
 def test_rank_ai_updates_backfills_with_social_when_official_sources_are_too_few():

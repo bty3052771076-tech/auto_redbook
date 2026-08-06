@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 import urllib.request
 from typing import Any, Callable
 
@@ -42,6 +43,32 @@ DEFAULT_SEARCH_BACKFILL_QUERIES = (
     "AI API developer tools model release open source",
 )
 BEIJING_TZ = timezone(timedelta(hours=8))
+_AIHOT_HOST = "aihot.virxact.com"
+_VENDOR_OFFICIAL_HOSTS = {
+    "openai": ("openai.com",),
+    "anthropic": ("anthropic.com",),
+    "google deepmind": ("deepmind.google", "google.com", "google.dev", "googleblog.com"),
+    "google": ("google.com", "google.dev", "googleblog.com"),
+    "deepseek": ("deepseek.com",),
+    "minimax": ("minimax.io",),
+    "qwen": ("qwen.ai", "aliyun.com"),
+    "阿里/qwen": ("qwen.ai", "aliyun.com"),
+    "月之暗面 kimi": ("moonshot.cn",),
+    "火山方舟/豆包": ("volcengine.com", "bytedance.com"),
+    "智谱 glm": ("bigmodel.cn", "z.ai"),
+    "xai": ("x.ai",),
+    "meta ai": ("meta.com",),
+    "mistral ai": ("mistral.ai",),
+    "nvidia": ("nvidia.com",),
+    "thinking machines lab": ("thinkingmachines.ai",),
+    "runway": ("runwayml.com",),
+    "langchain": ("langchain.com",),
+    "sierra": ("sierra.ai",),
+    "cloudflare blog": ("cloudflare.com",),
+    "github blog": ("github.blog", "github.com"),
+    "apple machine learning research（rss）": ("apple.com",),
+    "cursor blog": ("cursor.com",),
+}
 
 
 def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
@@ -202,6 +229,69 @@ def _http_get_text(url: str, *, timeout_s: float = 12.0) -> str:
         return resp.read(1_500_000).decode(charset, errors="replace")
 
 
+def _is_aihot_detail_url(url: str) -> bool:
+    parts = urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    return (host == _AIHOT_HOST or host.endswith(f".{_AIHOT_HOST}")) and parts.path.startswith("/items/")
+
+
+def _aihot_detail_external_url(html_text: str) -> str:
+    html_match = re.search(
+        r'(?is)<a(?=[^>]*\bdata-track\s*=\s*["\']click_external["\'])[^>]*\bhref\s*=\s*["\'](?P<url>https?://[^"\']+)',
+        html_text or "",
+    )
+    if html_match:
+        return html_match.group("url").strip()
+    payload_match = re.search(
+        r'(?is)"href":"(?P<url>https?://(?:\\.|[^"\\])+?)".{0,900}?"data-track":"click_external"',
+        html_text or "",
+    )
+    if payload_match:
+        try:
+            return str(json.loads(f'"{payload_match.group("url")}"')).strip()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return payload_match.group("url").strip()
+    return ""
+
+
+def _matches_vendor_official_host(item: AIUpdateItem, url: str) -> bool:
+    host = (urlsplit(url or "").hostname or "").lower()
+    vendor = (item.vendor or "").strip().lower()
+    expected_hosts = _VENDOR_OFFICIAL_HOSTS.get(vendor, ())
+    return any(host == expected or host.endswith(f".{expected}") for expected in expected_hosts)
+
+
+def resolve_aihot_detail_source(item: AIUpdateItem, *, timeout_s: float = 8.0) -> AIUpdateItem:
+    """Attach the original source linked by an AI HOT detail page when it is verifiable."""
+    if item.source_type != "aggregator" or not _is_aihot_detail_url(item.url):
+        return item
+    try:
+        external_url = _aihot_detail_external_url(_http_get_text(item.url, timeout_s=timeout_s))
+    except Exception:
+        return item
+    if not external_url:
+        return item
+
+    data = item.model_dump()
+    evidence = [item.url, *(item.evidence_urls or [])]
+    data["url"] = external_url
+    data["evidence_urls"] = list(dict.fromkeys(url for url in evidence if url and url != external_url))
+    if _matches_vendor_official_host(item, external_url):
+        data["source_type"] = "official"
+        data["verification_status"] = "aggregator_confirmed"
+        # The public-facing source is the verified official page.  Keep the
+        # AI HOT detail URL only in evidence_urls for local traceability.
+        data["source_name"] = f"{item.vendor} 官网"
+        data["confidence_score"] = max(float(item.confidence_score or 0.0), 0.9)
+    elif (urlsplit(external_url).hostname or "").lower() in {"x.com", "twitter.com", "www.twitter.com"}:
+        data["source_type"] = "social"
+        data["verification_status"] = "social_only"
+        data["source_name"] = f"{item.vendor} 社交动态（AI HOT 索引）"
+    else:
+        data["verification_status"] = "aggregator_confirmed"
+    return AIUpdateItem.model_validate(data)
+
+
 def fetch_ai_digest_source(
     source: AIDigestSource,
     *,
@@ -223,6 +313,16 @@ def fetch_ai_digest_source(
         items = parse_official_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
     else:
         items = []
+    if source.region in {"domestic", "foreign"}:
+        items = [
+            AIUpdateItem.model_validate(
+                {
+                    **item.model_dump(),
+                    "tags": [*item.tags, f"region:{source.region}"],
+                }
+            )
+            for item in items
+        ]
     if source.kind != "aggregator":
         return items
     return [
@@ -647,6 +747,7 @@ def collect_ai_digest_updates(
     search_backfill_used = False
     aggregator_backfill_used = False
     search_backfill_meta: dict = {}
+    detail_source_resolution = {"considered": 0, "resolved": 0, "official": 0, "social": 0}
 
     ranked = rank_ai_updates(
         fetched,
@@ -670,6 +771,45 @@ def collect_ai_digest_updates(
     ):
         aggregator_backfill_used = True
         _fetch_stage(aggregator_sources)
+        detail_candidates = rank_ai_updates(
+            [item for item in fetched if _is_aihot_detail_url(item.url)],
+            target_count=max(24, target_count * 3),
+            min_official_count=1,
+            allow_social_backfill=True,
+            max_age_days=max_age_days,
+            now=now,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
+        detail_limit = _env_int("AI_DIGEST_AGGREGATOR_DETAIL_LIMIT", 24, min_value=1, max_value=80)
+        detail_candidates = detail_candidates[:detail_limit]
+        detail_source_resolution["considered"] = len(detail_candidates)
+        if detail_candidates:
+            detail_timeout_s = _env_float("AI_DIGEST_AGGREGATOR_DETAIL_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
+            detail_concurrency = _env_int("AI_DIGEST_AGGREGATOR_DETAIL_CONCURRENCY", 6, min_value=1, max_value=12)
+            with ThreadPoolExecutor(max_workers=min(detail_concurrency, len(detail_candidates))) as executor:
+                resolved_detail_items = list(
+                    executor.map(
+                        lambda item: resolve_aihot_detail_source(item, timeout_s=detail_timeout_s),
+                        detail_candidates,
+                    )
+                )
+            resolved_by_original_url = {
+                original.url: resolved_item
+                for original, resolved_item in zip(detail_candidates, resolved_detail_items)
+            }
+            fetched = [
+                resolved_by_original_url.get(item.url, item)
+                for item in fetched
+            ]
+            changed = [
+                resolved_item
+                for original, resolved_item in zip(detail_candidates, resolved_detail_items)
+                if resolved_item.url != original.url
+            ]
+            detail_source_resolution["resolved"] = len(changed)
+            detail_source_resolution["official"] = sum(item.source_type == "official" for item in changed)
+            detail_source_resolution["social"] = sum(item.source_type == "social" for item in changed)
         ranked = rank_ai_updates(
             fetched,
             target_count=target_count,
@@ -766,6 +906,7 @@ def collect_ai_digest_updates(
         "social_backfill_used": social_backfill_used,
         "search_backfill_used": search_backfill_used,
         "aggregator_backfill_used": aggregator_backfill_used,
+        "detail_source_resolution": detail_source_resolution,
         "search_backfill": search_backfill_meta,
         "quota_counts": ai_digest_quota_counts(ranked),
         "sources": [source.name for source in resolved],

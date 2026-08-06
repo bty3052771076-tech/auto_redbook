@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from src.ai_digest import collect as collect_mod
+from src.ai_digest.collect import collect_ai_digest_updates, fetch_ai_digest_source
 from src.ai_digest import fetchers
+from src.ai_digest.models import AIUpdateItem
 from src.ai_digest.fetchers import (
     parse_aihot_daily_html,
     parse_github_releases_json,
@@ -14,7 +17,8 @@ from src.ai_digest.fetchers import (
     parse_social_search_html,
     parse_x_profile_html,
 )
-from src.ai_digest.sources import default_ai_digest_sources, resolve_ai_digest_sources
+from src.ai_digest.sources import AIDigestSource, default_ai_digest_sources, resolve_ai_digest_sources
+from src.ai_digest.rank import ai_update_region
 
 
 def test_curl_transport_enforces_connect_and_total_time_limits(monkeypatch):
@@ -51,6 +55,33 @@ def test_curl_transport_surfaces_http_status(monkeypatch):
         collect_mod._curl_get_text("https://example.com/missing", timeout_s=5.0, executable="curl.exe")
 
     assert exc_info.value.code == 404
+
+
+def test_source_region_is_preserved_on_fetched_items(monkeypatch):
+    source = AIDigestSource(
+        "fixture-domestic",
+        "official",
+        "https://example.com/releases.xml",
+        "Fixture Vendor",
+        "rss",
+        region="domestic",
+    )
+    monkeypatch.setattr(
+        collect_mod,
+        "_http_get_text",
+        lambda *_args, **_kwargs: """
+        <rss><channel><item>
+          <title>Model service update</title>
+          <link>https://example.com/releases/1</link>
+          <pubDate>Fri, 31 Jul 2026 08:00:00 GMT</pubDate>
+        </item></channel></rss>
+        """,
+    )
+
+    items = fetch_ai_digest_source(source)
+
+    assert items[0].tags[-1] == "region:domestic"
+    assert ai_update_region(items[0]) == "domestic"
 
 
 def test_default_sources_include_expandable_official_and_social_groups():
@@ -315,6 +346,48 @@ def test_parse_aihot_next_payload_keeps_each_title_summary_and_source_together()
     assert all("Qwen3.8" not in item.title for item in items)
 
 
+def test_parse_aihot_next_payload_keeps_detail_page_url_for_source_resolution():
+    payload = """
+    ["$","a",null,{"className":"m-daily-entry-title","href":"/items/minimax-h3","children":"MiniMax H3 发布"}]
+    ["$","p",{"className":"m-daily-entry-sum","children":"MiniMax 发布多模态视频生成模型，支持文本、图像、视频和音频输入。"}]
+    ["$","div",{"className":"m-daily-entry-src","children":"MiniMax：Blog（网页）"}]
+    """
+    html = f"<script>self.__next_f.push({json.dumps([1, payload], ensure_ascii=False)})</script>"
+
+    items = parse_aihot_daily_html(
+        html,
+        source_name="AI HOT",
+        vendor="AI HOT",
+        base_url="https://aihot.virxact.com/daily/2026-08-01",
+        published_date="2026-08-01",
+    )
+
+    assert items[0].url == "https://aihot.virxact.com/items/minimax-h3"
+    assert items[0].evidence_urls == []
+
+
+def test_parse_aihot_daily_html_merges_rendered_detail_href_with_structured_entry():
+    payload = """
+    ["$","div",{"className":"m-daily-entry-title","children":"MiniMax H3 发布"}]
+    ["$","p",{"className":"m-daily-entry-sum","children":"MiniMax 发布多模态视频生成模型，支持文本、图像、视频和音频输入。"}]
+    ["$","div",{"className":"m-daily-entry-src","children":"MiniMax：Blog（网页）"}]
+    """
+    html = (
+        '<a class="m-daily-entry-title" href="/items/minimax-h3">MiniMax H3 发布</a>'
+        f"<script>self.__next_f.push({json.dumps([1, payload], ensure_ascii=False)})</script>"
+    )
+
+    items = parse_aihot_daily_html(
+        html,
+        source_name="AI HOT",
+        vendor="AI HOT",
+        base_url="https://aihot.virxact.com/daily/2026-08-01",
+        published_date="2026-08-01",
+    )
+
+    assert items[0].url == "https://aihot.virxact.com/items/minimax-h3"
+
+
 def test_parse_rss_feed_maps_items_to_ai_updates():
     xml = """<?xml version="1.0"?>
     <rss><channel>
@@ -354,6 +427,99 @@ def test_fetch_aggregator_rss_preserves_aggregator_source_tier(monkeypatch):
 
     assert items[0].source_type == "aggregator"
     assert items[0].verification_status == "aggregator_only"
+
+
+def test_resolve_aihot_detail_source_promotes_matching_vendor_official_url(monkeypatch):
+    candidate = AIUpdateItem(
+        title="MiniMax H3 发布",
+        summary="MiniMax 发布全能多模态生成模型。",
+        source_name="MiniMax：Blog（网页）",
+        source_type="aggregator",
+        url="https://aihot.virxact.com/items/minimax-h3",
+        published_at="2026-08-01T08:00:00+08:00",
+        vendor="MiniMax",
+        verification_status="aggregator_only",
+    )
+    monkeypatch.setattr(
+        collect_mod,
+        "_http_get_text",
+        lambda *_args, **_kwargs: (
+            '<a href="https://www.minimax.io/blog/minimax-h3" '
+            'class="dt-readtop" data-track="click_external">阅读原文</a>'
+        ),
+    )
+
+    resolved = collect_mod.resolve_aihot_detail_source(candidate)
+
+    assert resolved.source_type == "official"
+    assert resolved.verification_status == "aggregator_confirmed"
+    assert resolved.source_name == "MiniMax 官网"
+    assert resolved.url == "https://www.minimax.io/blog/minimax-h3"
+    assert resolved.evidence_urls == ["https://aihot.virxact.com/items/minimax-h3"]
+
+
+def test_resolve_aihot_detail_source_promotes_vendor_blog_subdomain(monkeypatch):
+    candidate = AIUpdateItem(
+        title="Gemini Agent 评测服务正式可用",
+        summary="Google Developers 发布 Agent 与模型评测服务更新。",
+        source_name="Google：Blog（网页）",
+        source_type="aggregator",
+        url="https://aihot.virxact.com/items/gemini-agent-evals",
+        published_at="2026-08-01T08:00:00+08:00",
+        vendor="Google",
+        verification_status="aggregator_only",
+    )
+    monkeypatch.setattr(
+        collect_mod,
+        "_http_get_text",
+        lambda *_args, **_kwargs: (
+            '<a href="https://developers.googleblog.com/agent-evaluations" '
+            'class="dt-readtop" data-track="click_external">阅读原文</a>'
+        ),
+    )
+
+    resolved = collect_mod.resolve_aihot_detail_source(candidate)
+
+    assert resolved.source_type == "official"
+    assert resolved.verification_status == "aggregator_confirmed"
+    assert resolved.source_name == "Google 官网"
+
+
+def test_collect_ai_digest_updates_uses_resolved_aihot_official_source(monkeypatch):
+    candidate = AIUpdateItem(
+        title="MiniMax H3 发布",
+        summary="MiniMax 发布全能多模态生成模型。",
+        source_name="MiniMax：Blog（网页）",
+        source_type="aggregator",
+        url="https://aihot.virxact.com/items/minimax-h3",
+        published_at="2026-08-01T08:00:00+08:00",
+        vendor="MiniMax",
+        verification_status="aggregator_only",
+    )
+    source = AIDigestSource("aihot-daily", "aggregator", "https://aihot.virxact.com/daily", "AI HOT", "aihot_daily")
+    monkeypatch.setenv("AI_DIGEST_SEARCH_BACKFILL", "0")
+    monkeypatch.setattr(
+        collect_mod,
+        "_http_get_text",
+        lambda *_args, **_kwargs: (
+            '<a href="https://www.minimax.io/blog/minimax-h3" '
+            'class="dt-readtop" data-track="click_external">阅读原文</a>'
+        ),
+    )
+
+    ranked, meta = collect_ai_digest_updates(
+        sources=[source],
+        fetch_source=lambda _source: [candidate],
+        target_count=1,
+        min_official_count=1,
+        max_age_days=3,
+        now=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        persist_source_health=False,
+    )
+
+    assert ranked[0].source_type == "official"
+    assert ranked[0].url == "https://www.minimax.io/blog/minimax-h3"
+    assert meta["detail_source_resolution"] == {"considered": 1, "resolved": 1, "official": 1, "social": 0}
 
 
 def test_parse_github_releases_json_maps_release_entries():
@@ -452,6 +618,30 @@ def test_parse_official_html_extracts_release_lines_as_official_candidates():
     assert items[0].source_type == "official"
     assert items[0].source_name == "百度千帆"
     assert "ERNIE X1.1" in " ".join(item.title for item in items)
+
+
+def test_parse_official_html_ignores_navigation_when_an_official_article_body_exists():
+    html = """
+    <html><body>
+      <nav><p>2026年7月28日 Qwen Code 产品升级公告</p></nav>
+      <div class="post__body">
+        <h2>2026年7月9日</h2>
+        <p>Kimi-K2.5 推理服务 API V2 版本下线，推荐替换模型请查看升级机制。</p>
+      </div>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="百度千帆",
+        vendor="百度千帆",
+        base_url="https://cloud.baidu.com/doc/qianfan/s/Kmh4stnjp",
+    )
+
+    assert [item.title for item in items] == [
+        "Kimi-K2.5 推理服务 API V2 版本下线，推荐替换模型请查看升级机制。"
+    ]
+    assert items[0].published_at == "2026-07-09"
 
 
 def test_parse_official_html_extracts_publish_date_from_release_line():

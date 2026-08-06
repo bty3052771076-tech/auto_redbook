@@ -334,6 +334,29 @@ def _html_lines(html_text: str) -> list[str]:
     return lines
 
 
+def _official_article_body_html(html_text: str) -> str:
+    """Return a site's explicit article body, without nearby navigation chrome."""
+    raw = html_text or ""
+    match = re.search(
+        r"(?is)<(?P<tag>div|article|main)\b(?=[^>]*\bclass\s*=\s*(?:\"[^\"]*\bpost__body\b[^\"]*\"|'[^']*\bpost__body\b[^']*'))[^>]*>",
+        raw,
+    )
+    if not match:
+        return raw
+
+    tag = match.group("tag")
+    depth = 1
+    token_pattern = re.compile(rf"(?is)</?{re.escape(tag)}\b[^>]*>")
+    for token in token_pattern.finditer(raw, match.end()):
+        if token.group(0).lstrip().startswith("</"):
+            depth -= 1
+            if depth == 0:
+                return raw[match.end() : token.start()]
+        elif not token.group(0).rstrip().endswith("/>"):
+            depth += 1
+    return raw[match.end() :]
+
+
 def _looks_like_official_ai_update(text: str, vendor: str) -> bool:
     value = re.sub(r"\s+", " ", text or "").strip()
     if len(value) < 8 or len(value) > 260:
@@ -419,8 +442,9 @@ def parse_official_html(
     seen_titles: set[str] = set()
     current_date = ""
     page_release_date = _extract_page_release_date(html_text)
+    article_html = _official_article_body_html(html_text)
 
-    for line in _html_lines(html_text):
+    for line in _html_lines(article_html):
         line_date = _extract_release_date(line)
         if line_date:
             current_date = line_date
@@ -637,27 +661,32 @@ def _decode_embedded_json_string(value: str) -> str:
         return value.strip()
 
 
-def _aihot_structured_entries(html_text: str) -> list[tuple[str, str, str]]:
+def _aihot_structured_entries(html_text: str) -> list[tuple[str, str, str, str]]:
     payload = _next_flight_payload_text(html_text)
     if not payload:
         return []
     field_pattern = re.compile(
-        r'"className":"m-daily-entry-(?P<kind>title|sum|src)",'
+        r'"className":"m-daily-entry-(?P<kind>title|sum|src)"'
+        r'(?P<attrs>(?:(?!"className":"m-daily-entry-).){0,600}?)'
         r'"children":"(?P<value>(?:\\.|[^"\\])*)"'
     )
-    entries: list[tuple[str, str, str]] = []
+    entries: list[tuple[str, str, str, str]] = []
     pending: dict[str, str] = {}
     for match in field_pattern.finditer(payload):
         kind = match.group("kind")
         value = _decode_embedded_json_string(match.group("value"))
         if kind == "title":
-            pending = {"title": value}
+            href_match = re.search(r'"href":"(?P<href>(?:\\.|[^"\\])*)"', match.group("attrs"))
+            pending = {
+                "title": value,
+                "detail_href": _decode_embedded_json_string(href_match.group("href")) if href_match else "",
+            }
             continue
         if kind == "sum" and pending.get("title"):
             pending["summary"] = value
             continue
         if kind == "src" and pending.get("title") and pending.get("summary"):
-            entries.append((pending["title"], value, pending["summary"]))
+            entries.append((pending["title"], value, pending["summary"], pending.get("detail_href", "")))
             pending = {}
     return entries
 
@@ -707,6 +736,18 @@ def _aihot_external_url(text: str, *, aggregator_url: str) -> str:
     return ""
 
 
+def _aihot_rendered_detail_hrefs(html_text: str) -> dict[str, str]:
+    parser = _LinkCollector()
+    parser.feed(html_text or "")
+    detail_hrefs: dict[str, str] = {}
+    for href, text in parser.links:
+        path = urlsplit(href or "").path
+        title_key = re.sub(r"\s+", "", text or "").lower()
+        if path.startswith("/items/") and title_key:
+            detail_hrefs.setdefault(title_key, href)
+    return detail_hrefs
+
+
 def parse_aihot_daily_html(
     html_text: str,
     *,
@@ -716,6 +757,7 @@ def parse_aihot_daily_html(
     published_date: str,
 ) -> list[AIUpdateItem]:
     structured_entries = _aihot_structured_entries(html_text)
+    rendered_detail_hrefs = _aihot_rendered_detail_hrefs(html_text)
     uses_structured_entries = bool(structured_entries)
     if structured_entries:
         candidates = structured_entries
@@ -727,10 +769,10 @@ def parse_aihot_daily_html(
             second = lines[idx + 1].strip()
             third = lines[idx + 2].strip()
             if _AIHOT_SOURCE_LINE_RE.search(second):
-                candidates.append((title, second, third))
+                candidates.append((title, second, third, ""))
     items: list[AIUpdateItem] = []
     seen_titles: set[str] = set()
-    for title, source_line, summary in candidates:
+    for title, source_line, summary, detail_href in candidates:
         title = title.strip()
         source_line = source_line.strip()
         summary = summary.strip()
@@ -755,7 +797,8 @@ def parse_aihot_daily_html(
             continue
         seen_titles.add(title_key)
         item_vendor = _aihot_vendor(title, source_line) or vendor
-        entry_url = f"{base_url}?item={len(items) + 1}"
+        detail_href = detail_href or rendered_detail_hrefs.get(title_key, "")
+        entry_url = urljoin(base_url, detail_href) if detail_href else f"{base_url}?item={len(items) + 1}"
         primary_url = _aihot_external_url(
             f"{summary} {source_line}",
             aggregator_url=base_url,

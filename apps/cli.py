@@ -28,7 +28,7 @@ from src.volcengine.quota import (
 from src.analytics.post_sync import sync_published_metrics_to_posts
 from src.analytics.published_metrics import analyze_published_metrics, render_published_metrics_analysis
 from src.ai_digest.collect import collect_ai_digest_updates
-from src.news.daily_news import fetch_daily_news_candidates
+from src.news.daily_news import fetch_daily_news_candidates, _required_china_count_for_daily_news
 from src.publish.playwright_steps import (
     run_collect_published_metrics_sync,
     run_delete_drafts_sync,
@@ -36,6 +36,8 @@ from src.publish.playwright_steps import (
     run_save_draft_sync,
     run_update_draft_sync,
 )
+from src.publish.targets import normalize_publish_platform, publish_targets
+from src.publish.toutiao_steps import adapt_post_for_toutiao, run_save_toutiao_draft_sync
 from src.storage.files import (
     append_run_record,
     list_executions,
@@ -63,7 +65,12 @@ from src.workflow.pipeline import (
     load_quota_records,
 )
 from src.workflow.quality_gate import validate_post_batch
-from src.workflow.vision_review import load_vision_review_config, review_post_image
+from src.workflow.vision_review import (
+    VisionReviewResult,
+    configured_vision_review_model,
+    load_vision_review_config,
+    review_post_image,
+)
 
 app = typer.Typer(
     help="小红书自动发帖（生成并保存草稿）CLI",
@@ -196,6 +203,7 @@ def _refresh_quotas_for_preflight(
     login_hold: int,
     wait_timeout: int,
     quota_dir: Path,
+    providers: tuple[str, ...] = ("aliyun", "volcengine"),
 ) -> list[str]:
     warnings: list[str] = []
 
@@ -228,7 +236,10 @@ def _refresh_quotas_for_preflight(
             ),
         ),
     )
+    enabled = {str(provider or "").strip().lower() for provider in providers}
     for provider, collect in collectors:
+        if provider not in enabled:
+            continue
         try:
             result = collect()
             _save_quota_snapshot(provider, result, snapshot_dir=quota_dir)
@@ -270,6 +281,24 @@ def _selected_model_from_environment(kind: str, provider: str) -> str:
         ]
     selected = [model for model in candidates if model]
     return selected[0] if len(selected) == 1 else ""
+
+
+def _explicit_quota_providers() -> set[str]:
+    aliases = {
+        "aliyun": "aliyun",
+        "dashscope": "aliyun",
+        "bailian": "aliyun",
+        "volcengine": "volcengine",
+        "ark": "volcengine",
+        "doubao": "volcengine",
+        "seedream": "volcengine",
+    }
+    values = (
+        os.getenv("LLM_PROVIDER"),
+        os.getenv("IMAGE_PROVIDER"),
+        os.getenv("VLM_REVIEW_PROVIDER"),
+    )
+    return {aliases[value.strip().lower()] for value in values if value and value.strip().lower() in aliases}
 
 
 def _prepare_auto_pipeline(
@@ -328,6 +357,11 @@ def _prepare_auto_pipeline(
     configured_providers = [
         provider for provider in ("aliyun", "volcengine") if key_states.get(provider, False)
     ]
+    explicit_providers = _explicit_quota_providers()
+    if explicit_providers:
+        configured_providers = [
+            provider for provider in configured_providers if provider in explicit_providers
+        ]
     _emit_progress_event("auto", "检查免费额度", "in_progress")
     fresh_states = [
         load_latest_quota_snapshot(
@@ -342,13 +376,36 @@ def _prepare_auto_pipeline(
         snapshot is None or not snapshot.fresh for snapshot in fresh_states
     )
     if quota_refresh_needed:
-        _emit_progress_event("auto", "同步免费额度", "in_progress", "阿里云 + 火山引擎")
+        quota_refresh_timeout = wait_timeout
+        if headless:
+            try:
+                configured_quota_timeout = int(
+                    (os.getenv("AUTO_QUOTA_SYNC_TIMEOUT_S") or "60").strip()
+                )
+            except ValueError:
+                configured_quota_timeout = 60
+            quota_refresh_timeout = min(
+                wait_timeout,
+                max(10, min(configured_quota_timeout, 300)),
+            )
+        refresh_providers = tuple(configured_providers or ("aliyun", "volcengine"))
+        provider_label = " + ".join(
+            "阿里云" if provider == "aliyun" else "火山引擎"
+            for provider in refresh_providers
+        )
+        _emit_progress_event(
+            "auto",
+            "同步免费额度",
+            "in_progress",
+            f"{provider_label} timeout={quota_refresh_timeout}s",
+        )
         warnings.extend(
             _refresh_quotas_for_preflight(
                 headless=headless,
                 login_hold=login_hold,
-                wait_timeout=wait_timeout,
+                wait_timeout=quota_refresh_timeout,
                 quota_dir=quota_dir,
+                providers=refresh_providers,
             )
         )
         quota_mode = "refreshed"
@@ -449,6 +506,15 @@ def _vision_review_passes(result: VisionReviewResult) -> bool:
     return bool(result.ok and result.score >= 70)
 
 
+def _vision_review_is_inconclusive(result: VisionReviewResult) -> bool:
+    return bool(
+        result.ok
+        and result.score == 0
+        and not result.issues
+        and not (result.retry_prompt or "").strip()
+    )
+
+
 def _review_with_bounded_image_repair(
     post: Post,
     *,
@@ -457,6 +523,7 @@ def _review_with_bounded_image_repair(
     max_repairs: int,
     review_fn: Callable,
     regenerate_fn: Callable,
+    fallback_regenerate_fn: Optional[Callable] = None,
     progress_fn: Optional[Callable[[int, int, str], None]] = None,
 ):
     history = []
@@ -464,12 +531,18 @@ def _review_with_bounded_image_repair(
     repair_count = 0
     result = review_fn(post, config=config, viewpoint=viewpoint)
     history.append(result)
+    if _vision_review_is_inconclusive(result):
+        result = review_fn(post, config=config, viewpoint=viewpoint)
+        history.append(result)
     is_daily_news = isinstance(post.platform.get("news"), dict)
     limit = max(0, int(max_repairs))
+    latest_retry_prompt = ""
 
     while not _vision_review_passes(result) and is_daily_news and repair_count < limit:
         attempt = repair_count + 1
         retry_prompt = (result.retry_prompt or "").strip()
+        if retry_prompt:
+            latest_retry_prompt = retry_prompt
         if progress_fn is not None:
             progress_fn(attempt, limit, retry_prompt)
         try:
@@ -484,6 +557,32 @@ def _review_with_bounded_image_repair(
         result = review_fn(post, config=config, viewpoint=viewpoint)
         history.append(result)
 
+    # A successful image API response can still be a semantic failure. Once an
+    # AI redraw was reviewed and rejected, use the configured stock-photo
+    # provider as the final bounded fallback and review that replacement too.
+    if (
+        not _vision_review_passes(result)
+        and is_daily_news
+        and repair_count > 0
+        and fallback_regenerate_fn is not None
+    ):
+        fallback_prompt = (result.retry_prompt or latest_retry_prompt or "").strip()
+        if progress_fn is not None:
+            progress_fn(repair_count + 1, repair_count + 1, fallback_prompt)
+        try:
+            regenerated = bool(fallback_regenerate_fn(post, fallback_prompt))
+        except Exception as exc:
+            repair_errors.append(f"Pexels fallback failed: {exc}")
+        else:
+            if not regenerated:
+                repair_errors.append("Pexels fallback returned no usable asset")
+            else:
+                result = review_fn(post, config=config, viewpoint=viewpoint)
+                history.append(result)
+                if _vision_review_is_inconclusive(result):
+                    result = review_fn(post, config=config, viewpoint=viewpoint)
+                    history.append(result)
+
     return result, repair_count, repair_errors, history
 
 
@@ -493,6 +592,7 @@ def _run_auto_quality_gate(
     expected_count: int,
     evaluation_viewpoint: str,
     require_vision: bool,
+    reuse_vision_results: bool = False,
 ) -> list[str]:
     _emit_progress_event(
         "auto",
@@ -512,10 +612,15 @@ def _run_auto_quality_gate(
             {"code": issue.code, "message": issue.message}
         )
     for post in posts:
-        post.platform["quality_gate"] = {
+        previous_gate = post.platform.get("quality_gate") if isinstance(post.platform, dict) else None
+        previous_vision = previous_gate.get("vision") if isinstance(previous_gate, dict) else None
+        quality_gate = {
             "deterministic_ok": post.id not in issues_by_post,
             "issues": issues_by_post.get(post.id, []),
         }
+        if reuse_vision_results and isinstance(previous_vision, dict):
+            quality_gate["vision"] = previous_vision
+        post.platform["quality_gate"] = quality_gate
         save_post(post)
     if errors:
         _emit_progress_event(
@@ -535,7 +640,33 @@ def _run_auto_quality_gate(
     if not review_enabled:
         _emit_progress_event("auto", "视觉一致性复核", "warning", "用户显式关闭")
         return []
-    if not (os.getenv("VLM_REVIEW_MODEL") or "").strip():
+    posts_to_review: list[Post] = []
+    reused_count = 0
+    for post in posts:
+        gate = post.platform.get("quality_gate") if isinstance(post.platform, dict) else None
+        vision = gate.get("vision") if isinstance(gate, dict) else None
+        if reuse_vision_results and isinstance(vision, dict):
+            previous_result = VisionReviewResult(
+                ok=bool(vision.get("ok")),
+                score=int(vision.get("score") or 0),
+                issues=tuple(str(item) for item in (vision.get("issues") or [])),
+                retry_prompt=str(vision.get("retry_prompt") or ""),
+                provider=str(vision.get("provider") or ""),
+                model=str(vision.get("model") or ""),
+            )
+            if _vision_review_passes(previous_result):
+                reused_count += 1
+                continue
+        posts_to_review.append(post)
+    if not posts_to_review:
+        _emit_progress_event(
+            "auto",
+            "批次质量检查",
+            "success",
+            f"posts={len(posts)} vision_reused={reused_count}",
+        )
+        return []
+    if not configured_vision_review_model():
         message = "没有具备可信免费额度的视觉模型，无法完成图文一致性复核。"
         if require_vision:
             _emit_progress_event("auto", "视觉一致性复核", "failed", message)
@@ -547,7 +678,7 @@ def _run_auto_quality_gate(
         "auto",
         "视觉一致性复核",
         "in_progress",
-        f"posts={len(posts)}",
+        f"posts={len(posts_to_review)} reused={reused_count}",
     )
     try:
         config = load_vision_review_config()
@@ -560,7 +691,7 @@ def _run_auto_quality_gate(
         repair_limit = max(0, min(3, int(raw_repair_limit)))
     except ValueError:
         repair_limit = 1
-    for index, post in enumerate(posts, start=1):
+    for index, post in enumerate(posts_to_review, start=1):
         try:
             result, repair_count, repair_errors, review_history = _review_with_bounded_image_repair(
                 post,
@@ -569,11 +700,16 @@ def _run_auto_quality_gate(
                 max_repairs=repair_limit,
                 review_fn=review_post_image,
                 regenerate_fn=regenerate_daily_news_post_image,
+                fallback_regenerate_fn=lambda post, prompt: regenerate_daily_news_post_image(
+                    post,
+                    prompt,
+                    provider="pexels",
+                ),
                 progress_fn=lambda attempt, limit, _prompt, index=index: _emit_progress_event(
                     "auto",
                     "视觉复核修复",
                     "in_progress",
-                    f"index={index}/{len(posts)} attempt={attempt}/{limit}",
+                    f"index={index}/{len(posts_to_review)} attempt={attempt}/{limit}",
                 ),
             )
         except Exception as exc:
@@ -590,7 +726,7 @@ def _run_auto_quality_gate(
                 "auto",
                 "视觉一致性复核",
                 "failed",
-                f"index={index}/{len(posts)} error={exc}",
+                f"index={index}/{len(posts_to_review)} error={exc}",
             )
             continue
         post.platform["quality_gate"]["vision"] = {
@@ -617,7 +753,7 @@ def _run_auto_quality_gate(
                 "auto",
                 "视觉复核修复",
                 "success" if _vision_review_passes(result) else "failed",
-                f"index={index}/{len(posts)} repairs={repair_count} final_score={result.score}",
+                f"index={index}/{len(posts_to_review)} repairs={repair_count} final_score={result.score}",
             )
         if not _vision_review_passes(result):
             message = (
@@ -631,19 +767,95 @@ def _run_auto_quality_gate(
                 "auto",
                 "视觉一致性复核",
                 "failed",
-                f"index={index}/{len(posts)} score={result.score}",
+                f"index={index}/{len(posts_to_review)} score={result.score}",
             )
         else:
             _emit_progress_event(
                 "auto",
                 "视觉一致性复核",
                 "success",
-                f"index={index}/{len(posts)} score={result.score}",
+                f"index={index}/{len(posts_to_review)} score={result.score}",
             )
     if errors:
         return errors
     _emit_progress_event("auto", "批次质量检查", "success", f"posts={len(posts)}")
     return []
+
+
+def _daily_news_visual_spare_count(requested_count: int) -> int:
+    """Generate a bounded surplus so a failed image can be replaced before upload."""
+    if requested_count <= 1:
+        return 0
+    return min(3, max(1, (requested_count + 4) // 5))
+
+
+def _daily_news_post_is_china_mainland(post: Post) -> bool:
+    news = post.platform.get("news") if isinstance(post.platform, dict) else None
+    picked = news.get("picked") if isinstance(news, dict) else None
+    if not isinstance(picked, dict):
+        return False
+    country = str(picked.get("sourcecountry") or "").strip().lower()
+    if country in {"china", "cn", "chn", "ch"}:
+        return True
+    domain = str(picked.get("domain") or "").strip().lower()
+    return (
+        domain.endswith(".cn")
+        or domain.endswith(".gov.cn")
+        or domain.endswith(".edu.cn")
+        or domain == "36kr.com"
+        or domain.endswith(".36kr.com")
+    )
+
+
+def _select_visual_ready_daily_news_posts(
+    posts: list[Post], *, requested_count: int
+) -> tuple[list[Post], list[Post], list[Post]]:
+    """Return selected, failed-quality, and unused visual-spare posts."""
+    ready: list[Post] = []
+    failed_quality: list[Post] = []
+    for post in posts:
+        gate = post.platform.get("quality_gate") if isinstance(post.platform, dict) else None
+        vision = gate.get("vision") if isinstance(gate, dict) else None
+        deterministic_ok = bool(gate.get("deterministic_ok")) if isinstance(gate, dict) else False
+        if deterministic_ok and isinstance(vision, dict):
+            result = VisionReviewResult(
+                ok=bool(vision.get("ok")),
+                score=int(vision.get("score") or 0),
+                issues=tuple(str(item) for item in (vision.get("issues") or [])),
+                retry_prompt=str(vision.get("retry_prompt") or ""),
+                provider=str(vision.get("provider") or ""),
+                model=str(vision.get("model") or ""),
+            )
+            if _vision_review_passes(result):
+                ready.append(post)
+                continue
+        failed_quality.append(post)
+
+    selected = ready[:requested_count]
+    required_china = _required_china_count_for_daily_news(requested_count)
+    selected_china = sum(_daily_news_post_is_china_mainland(post) for post in selected)
+    if selected_china < required_china:
+        for candidate in ready[requested_count:]:
+            if not _daily_news_post_is_china_mainland(candidate):
+                continue
+            replacement_index = next(
+                (
+                    index
+                    for index in range(len(selected) - 1, -1, -1)
+                    if not _daily_news_post_is_china_mainland(selected[index])
+                ),
+                None,
+            )
+            if replacement_index is None:
+                break
+            selected[replacement_index] = candidate
+            selected_china += 1
+            if selected_china >= required_china:
+                break
+
+    selected_ids = {post.id for post in selected}
+    unused_spares = [post for post in ready if post.id not in selected_ids]
+    return selected, failed_quality, unused_spares
 
 
 def _ensure_utf8_output() -> None:
@@ -967,7 +1179,7 @@ def _record_generation_run(
             "news_materials_file": _env_first("NEWS_MATERIALS_FILE"),
             "single_news_material_file": _env_first("SINGLE_NEWS_MATERIAL_FILE"),
             "vlm_provider": _env_first("VLM_REVIEW_PROVIDER"),
-            "vlm_model": _env_first("VLM_REVIEW_MODEL"),
+            "vlm_model": configured_vision_review_model(),
         },
     )
     paths = append_run_record(record)
@@ -1172,6 +1384,7 @@ def create(
     run_errors: list[str] = []
     generation_failed_count = 0
     generation_stage = _generation_stage_for_title(title_norm)
+    daily_news_inline_quality = False
     _emit_progress_event("create", "准备生成", "in_progress", f"title={title_norm} count={requested_count}")
     _emit_progress_event("create", generation_stage, "in_progress", f"count={requested_count}")
 
@@ -1363,9 +1576,14 @@ def run(
     ),
     login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
     wait_timeout: int = typer.Option(300, help="seconds to wait for publish UI"),
+    platform: str = typer.Option(
+        "xhs",
+        "--platform",
+        help="draft destination: xhs, toutiao, or both",
+    ),
     force: bool = typer.Option(False, help="run even if not approved or validation fails"),
 ):
-    """Save a draft via Playwright."""
+    """Save a draft to Xiaohongshu, Toutiao, or both platforms."""
     _emit_progress_event("run", "读取草稿", "in_progress", f"post_id={post_id}")
     try:
         post = load_post(post_id)
@@ -1373,10 +1591,25 @@ def run(
         typer.echo("post 不存在")
         raise typer.Exit(code=1)
 
-    _emit_progress_event("run", "读取草稿", "success", f"post_id={post.id}")
-    if post.status != PostStatus.approved and not force:
-        typer.echo("post 未审批，请先运行 approve 或使用 --force")
+    try:
+        platform_norm = normalize_publish_platform(platform)
+        target_platforms = publish_targets(platform_norm)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}")
         raise typer.Exit(code=1)
+
+    _emit_progress_event("run", "读取草稿", "success", f"post_id={post.id}")
+    if not force:
+        if "xhs" in target_platforms and post.status != PostStatus.approved:
+            typer.echo("保存到小红书前 post 必须已审批；请先运行 approve 或使用 --force")
+            raise typer.Exit(code=1)
+        if target_platforms == ("toutiao",) and post.status not in {
+            PostStatus.approved,
+            PostStatus.saved_draft,
+            PostStatus.published,
+        }:
+            typer.echo("保存到今日头条前 post 必须是已审批、已保存草稿或已发布状态")
+            raise typer.Exit(code=1)
 
     _emit_progress_event("run", "校验草稿", "in_progress", f"post_id={post.id}")
     result = validate_post(post)
@@ -1392,45 +1625,78 @@ def run(
         raise typer.Exit(code=1)
 
     _warn_headless_login_hold(headless, login_hold)
-    attempt = _next_attempt(post_id)
-    exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
-    _emit_progress_event("run", "上传草稿", "in_progress", f"post_id={post.id}")
-    exec_rec = run_save_draft_sync(
-        post,
-        assets=asset_paths,
-        dry_run=dry_run,
-        login_hold=login_hold,
-        wait_timeout_ms=wait_timeout * 1000,
-        execution=exec_rec,
-        headless=_headless_option_value(headless),
-        progress_callback=_upload_progress(post.id),
+    previous_status = post.status
+    saved_targets: list[str] = []
+    failed_targets: list[str] = []
+    for target in target_platforms:
+        target_label = "小红书" if target == "xhs" else "今日头条"
+        stage = f"上传{target_label}草稿"
+        attempt = _next_attempt(post_id)
+        exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
+        _emit_progress_event("run", stage, "in_progress", f"post_id={post.id}")
+        runner = run_save_draft_sync if target == "xhs" else run_save_toutiao_draft_sync
+        exec_rec = runner(
+            post,
+            assets=asset_paths,
+            dry_run=dry_run,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout * 1000,
+            execution=exec_rec,
+            headless=_headless_option_value(headless),
+            progress_callback=_upload_progress(post.id),
+        )
+
+        typer.echo(f"platform={target} result: {exec_rec.result}")
+        for step_result in exec_rec.steps:
+            detail = f" | {step_result.detail}" if step_result.detail else ""
+            typer.echo(f"- {step_result.name}: {step_result.status}{detail}")
+        if exec_rec.error:
+            typer.echo(_format_stage_error(stage, exec_rec.error))
+
+        if exec_rec.result == "saved_draft":
+            saved_targets.append(target)
+            post.updated_at = now_iso()
+            _mark_post_uploaded(post, exec_rec.result)
+            if target == "xhs":
+                post.platform["xhs_draft"] = {
+                    "title": post.title,
+                    "saved_at": post.updated_at,
+                    "execution_id": exec_rec.id,
+                }
+            else:
+                article = adapt_post_for_toutiao(post)
+                post.platform["toutiao_draft"] = {
+                    "title": article.title,
+                    "saved_at": post.updated_at,
+                    "execution_id": exec_rec.id,
+                }
+            _emit_progress_event("run", stage, "success", f"post_id={post.id}")
+        elif dry_run and exec_rec.result == "pending" and not exec_rec.error:
+            _emit_progress_event("run", stage, "success", f"post_id={post.id} dry_run")
+        else:
+            failed_targets.append(target)
+            _emit_progress_event(
+                "run",
+                stage,
+                "failed",
+                f"post_id={post.id} error={exec_rec.error or exec_rec.result}",
+            )
+
+    has_existing_platform_draft = any(
+        isinstance(post.platform.get(key), dict)
+        and bool(str(post.platform[key].get("saved_at") or "").strip())
+        for key in ("xhs_draft", "toutiao_draft")
     )
-
-    post.status = _apply_execution_status(post.status, exec_rec.result)
-    _mark_post_uploaded(post, exec_rec.result)
+    if previous_status != PostStatus.published:
+        if saved_targets or has_existing_platform_draft:
+            post.status = PostStatus.saved_draft
+        elif failed_targets:
+            post.status = PostStatus.failed
     post.updated_at = now_iso()
-    if exec_rec.result == "saved_draft":
-        post.platform["xhs_draft"] = {
-            "title": post.title,
-            "saved_at": post.updated_at,
-            "execution_id": exec_rec.id,
-        }
     save_post(post)
-
-    typer.echo(f"result: {exec_rec.result}")
-    for s in exec_rec.steps:
-        detail = f" | {s.detail}" if s.detail else ""
-        typer.echo(f"- {s.name}: {s.status}{detail}")
-    if exec_rec.error:
-        typer.echo(_format_stage_error("上传", exec_rec.error))
-
-
-    if exec_rec.error:
-        _emit_progress_event("run", "上传草稿", "failed", f"post_id={post.id} error={exec_rec.error}")
-    elif exec_rec.result == "saved_draft" or dry_run:
-        _emit_progress_event("run", "上传草稿", "success", f"post_id={post.id} result={exec_rec.result}")
-    else:
-        _emit_progress_event("run", "上传草稿", exec_rec.result or "failed", f"post_id={post.id}")
+    if failed_targets:
+        typer.echo(f"error: failed platforms: {', '.join(failed_targets)}")
+        raise typer.Exit(code=1)
 
 
 @app.command("update-draft")
@@ -1552,6 +1818,11 @@ def auto(
     ),
     login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
     wait_timeout: int = typer.Option(300, help="seconds to wait for publish UI"),
+    platform: str = typer.Option(
+        "xhs",
+        "--platform",
+        help="draft destination: xhs, toutiao, or both",
+    ),
     allow_partial: bool = typer.Option(
         False,
         "--allow-partial",
@@ -1579,6 +1850,12 @@ def auto(
     """Generate content then save draft in one command."""
     title_norm = _repair_cli_text((title or "").strip(), field="title")
     prompt_norm = _repair_cli_text((prompt or "").strip(), field="prompt")
+    try:
+        platform_norm = normalize_publish_platform(platform)
+        target_platforms = publish_targets(platform_norm)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}")
+        raise typer.Exit(code=1)
     news_materials_file_norm = (news_materials_file or "").strip()
     single_news_material_file_norm = (single_news_material_file or "").strip()
     if news_materials_file_norm and single_news_material_file_norm:
@@ -1636,6 +1913,7 @@ def auto(
         if preflight_report.model_plan is not None:
             _apply_scoped_environment(ctx, preflight_report.model_plan.environment())
     generation_stage = _generation_stage_for_title(title_norm)
+    daily_news_inline_quality = False
     _emit_progress_event("auto", "准备生成", "in_progress", f"title={title_norm} count={requested_count}")
     _emit_progress_event("auto", generation_stage, "in_progress", f"count={requested_count}")
     if _is_daily_ai_digest_title(title_norm):
@@ -1656,6 +1934,42 @@ def auto(
             run_errors.append(str(exc))
     elif title_norm == "每日新闻":
         try:
+            daily_news_inline_quality = bool(
+                preflight
+                and not news_materials_file_norm
+                and not single_news_material_file_norm
+            )
+            post_quality_callback = None
+            if daily_news_inline_quality:
+                _emit_progress_event(
+                    "auto",
+                    "准备视觉递补",
+                    "in_progress",
+                    f"requested={count} candidate_pool=continuous",
+                )
+                typer.echo(
+                    f"视觉递补：逐条生成并审核，失败时继续使用候选池，直到保留 {count} 条。"
+                )
+
+                def post_quality_callback(candidate_post: Post) -> list[str]:
+                    candidate_errors = _run_auto_quality_gate(
+                        [candidate_post],
+                        expected_count=1,
+                        evaluation_viewpoint=evaluation_viewpoint,
+                        require_vision=True,
+                    )
+                    _emit_progress_event(
+                        "auto",
+                        "视觉递补",
+                        "warning" if candidate_errors else "success",
+                        (
+                            f"post_id={candidate_post.id} rejected=1 reason={candidate_errors[0]}"
+                            if candidate_errors
+                            else f"post_id={candidate_post.id} accepted=1"
+                        ),
+                    )
+                    return candidate_errors
+
             posts = create_daily_news_posts(
                 prompt_hint=prompt_norm,
                 asset_paths=asset_paths,
@@ -1667,6 +1981,7 @@ def auto(
                 news_materials_file=news_materials_file_norm,
                 single_news_material_file=single_news_material_file_norm,
                 progress_callback=_daily_news_generation_progress,
+                post_quality_callback=post_quality_callback,
             )
         except PartialDailyNewsError as exc:
             typer.echo(f"partial daily news: generated={len(exc.posts)}/{exc.requested_count}; {exc}")
@@ -1737,10 +2052,46 @@ def auto(
     if preflight:
         quality_errors = _run_auto_quality_gate(
             posts,
-            expected_count=len(posts) if allow_partial else requested_count,
+            expected_count=len(posts) if (allow_partial or len(posts) != requested_count) else requested_count,
             evaluation_viewpoint=evaluation_viewpoint,
             require_vision=True,
+            reuse_vision_results=daily_news_inline_quality,
         )
+        if title_norm == "每日新闻" and len(posts) > requested_count:
+            selected_posts, failed_quality_posts, unused_spares = _select_visual_ready_daily_news_posts(
+                posts,
+                requested_count=requested_count,
+            )
+            if len(selected_posts) >= requested_count:
+                for post in failed_quality_posts:
+                    post.status = PostStatus.failed
+                    post.platform["batch_selection"] = {
+                        "status": "visual_quality_failed",
+                        "reason": "visual quality review did not pass; excluded before upload",
+                    }
+                    post.updated_at = now_iso()
+                    save_post(post)
+                for post in unused_spares:
+                    post.status = PostStatus.canceled
+                    post.platform["batch_selection"] = {
+                        "status": "unused_visual_spare",
+                        "reason": "valid spare was not needed after requested count passed quality review",
+                    }
+                    post.updated_at = now_iso()
+                    save_post(post)
+                posts = selected_posts
+                quality_errors = []
+                _emit_progress_event(
+                    "auto",
+                    "视觉备选替换",
+                    "success",
+                    f"selected={len(posts)} quality_failed={len(failed_quality_posts)} unused_spares={len(unused_spares)}",
+                )
+                typer.echo(
+                    f"视觉备选替换：保留 {len(posts)} 条；"
+                    f"淘汰 {len(failed_quality_posts)} 条视觉不合格稿，"
+                    f"取消 {len(unused_spares)} 条未使用备选。"
+                )
         if quality_errors:
             run_errors.extend(quality_errors)
             _record_generation_run(
@@ -1875,57 +2226,85 @@ def auto(
         _emit_progress_event("auto", "校验草稿", "success", f"post_id={post.id}")
 
         resolved_assets = _resolve_asset_paths(post, "")
-        attempt = _next_attempt(post.id)
-        exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
-        try:
-            _emit_progress_event("auto", "上传草稿", "in_progress", f"post_id={post.id} index={idx}/{total_posts}")
-            exec_rec = run_save_draft_sync(
-                post,
-                assets=resolved_assets,
-                dry_run=dry_run,
-                login_hold=login_hold,
-                wait_timeout_ms=wait_timeout * 1000,
-                execution=exec_rec,
-                headless=_headless_option_value(headless),
-                progress_callback=_upload_progress(post.id),
-            )
-        except Exception as exc:
-            # Defensive: run_save_draft_sync catches most exceptions, but avoid aborting the batch
-            # if something leaks out.
-            post.status = PostStatus.failed
-            post.updated_at = now_iso()
-            save_post(post)
-            upload_failed += 1
-            run_errors.append(f"upload exception post_id={post.id}: {exc}")
-            _emit_progress_event("auto", "上传草稿", "failed", f"post_id={post.id} error={exc}")
-            typer.echo(_format_stage_error("上传", f"post_id={post.id} upload exception: {exc}"))
-            continue
+        saved_targets: list[str] = []
+        target_errors: list[str] = []
+        for target in target_platforms:
+            target_label = "小红书" if target == "xhs" else "今日头条"
+            stage = f"上传{target_label}草稿"
+            attempt = _next_attempt(post.id)
+            exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
+            try:
+                _emit_progress_event(
+                    "auto",
+                    stage,
+                    "in_progress",
+                    f"post_id={post.id} index={idx}/{total_posts}",
+                )
+                runner = run_save_draft_sync if target == "xhs" else run_save_toutiao_draft_sync
+                exec_rec = runner(
+                    post,
+                    assets=resolved_assets,
+                    dry_run=dry_run,
+                    login_hold=login_hold,
+                    wait_timeout_ms=wait_timeout * 1000,
+                    execution=exec_rec,
+                    headless=_headless_option_value(headless),
+                    progress_callback=_upload_progress(post.id),
+                )
+            except Exception as exc:
+                message = f"{target} upload exception post_id={post.id}: {exc}"
+                target_errors.append(message)
+                run_errors.append(message)
+                _emit_progress_event("auto", stage, "failed", f"post_id={post.id} error={exc}")
+                typer.echo(_format_stage_error(stage, message))
+                continue
 
-        post.status = _apply_execution_status(post.status, exec_rec.result)
-        _mark_post_uploaded(post, exec_rec.result)
+            typer.echo(f"post_id={post.id} platform={target} result: {exec_rec.result}")
+            for s in exec_rec.steps:
+                detail = f" | {s.detail}" if s.detail else ""
+                typer.echo(f"- {s.name}: {s.status}{detail}")
+            if exec_rec.error:
+                message = f"{target} upload failed post_id={post.id}: {exec_rec.error}"
+                target_errors.append(message)
+                run_errors.append(message)
+                typer.echo(_format_stage_error(stage, exec_rec.error))
+                _emit_progress_event("auto", stage, "failed", f"post_id={post.id} error={exec_rec.error}")
+            if exec_rec.result == "saved_draft":
+                saved_targets.append(target)
+                post.updated_at = now_iso()
+                _mark_post_uploaded(post, exec_rec.result)
+                if target == "xhs":
+                    post.platform["xhs_draft"] = {
+                        "title": post.title,
+                        "saved_at": post.updated_at,
+                        "execution_id": exec_rec.id,
+                    }
+                else:
+                    article = adapt_post_for_toutiao(post)
+                    post.platform["toutiao_draft"] = {
+                        "title": article.title,
+                        "saved_at": post.updated_at,
+                        "execution_id": exec_rec.id,
+                    }
+                _emit_progress_event("auto", stage, "success", f"post_id={post.id}")
+            elif not dry_run and not exec_rec.error:
+                message = f"{target} draft was not saved for post_id={post.id}: result={exec_rec.result}"
+                target_errors.append(message)
+                run_errors.append(message)
+                _emit_progress_event("auto", stage, exec_rec.result or "failed", f"post_id={post.id}")
+
+        if saved_targets:
+            post.status = PostStatus.saved_draft
+        elif target_errors and not dry_run:
+            post.status = PostStatus.failed
         post.updated_at = now_iso()
-        if exec_rec.result == "saved_draft":
-            post.platform["xhs_draft"] = {
-                "title": post.title,
-                "saved_at": post.updated_at,
-                "execution_id": exec_rec.id,
-            }
         save_post(post)
 
-        typer.echo(f"post_id={post.id} result: {exec_rec.result}")
-        for s in exec_rec.steps:
-            detail = f" | {s.detail}" if s.detail else ""
-            typer.echo(f"- {s.name}: {s.status}{detail}")
-        if exec_rec.error:
-            typer.echo(_format_stage_error("上传", exec_rec.error))
-            run_errors.append(f"upload failed post_id={post.id}: {exec_rec.error}")
-            _emit_progress_event("auto", "上传草稿", "failed", f"post_id={post.id} error={exec_rec.error}")
-        if exec_rec.result == "saved_draft":
-            uploaded += 1
-            _emit_progress_event("auto", "上传草稿", "success", f"post_id={post.id}")
-        elif not dry_run:
+        if dry_run or len(saved_targets) == len(target_platforms):
+            if not dry_run:
+                uploaded += 1
+        else:
             upload_failed += 1
-            _emit_progress_event("auto", "上传草稿", exec_rec.result or "failed", f"post_id={post.id}")
 
     failed_total = max(
         generation_failed_count + skipped_invalid + upload_failed,

@@ -97,6 +97,12 @@ def test_llm_model_not_found_error_is_actionable():
     assert "权限" in reason
 
 
+def test_daily_news_image_repair_hint_allows_text_free_software_visuals():
+    hint = create_post._daily_news_image_repair_hint("Show a software performance optimization event")
+
+    assert "text-free abstract performance interface is allowed" in hint
+
+
 def test_daily_news_image_repair_hint_forbids_text_bearing_artifacts():
     hint = create_post._daily_news_image_repair_hint(
         "请修正图片中的品牌名称为 X Money"

@@ -137,6 +137,67 @@ def test_generate_ai_digest_brief_retries_malformed_json(monkeypatch):
     assert brief.items[0].published_at == item.published_at
 
 
+def test_generate_ai_digest_brief_disables_volcengine_thinking_for_json(monkeypatch):
+    item = _updates(1)[0]
+    captured: dict = {}
+    monkeypatch.setenv("AI_DIGEST_LLM_TIMEOUT_S", "37")
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": (
+                        '{"title":"每日AI讯息","subtitle":"模型更新",'
+                        '"date":"2026-06-30","items":[{'
+                        '"title":"OpenAI更新工具","summary":"开发者工具有更新。",'
+                        '"url":"https://example.com/0","tags":["AI"]}],'
+                        '"source_summary":"主要来源：OpenAI。"}'
+                    )
+                },
+            )()
+
+    def fake_init(*_args, **kwargs):
+        captured.update(kwargs)
+        return FakeModel()
+
+    monkeypatch.setattr("src.ai_digest.generate.init_chat_model", fake_init)
+
+    generate_ai_digest_brief_with_llm(
+        [LLMConfig(model="doubao-seed-2-1-turbo-260628", api_key="fake-key", base_url="https://example.com", provider="volcengine")],
+        [item],
+        target_count=1,
+        date="2026-06-30",
+    )
+
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert captured["timeout"] == 37
+
+
+def test_ensure_chinese_item_uses_specific_raw_excerpt_when_source_title_is_generic():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="RunwayAI产品披露AI产品变化",
+        summary="Runway 披露AI产品变化；具体能力以来源链接为准。",
+        source_name="Runway 官网",
+        source_type="official",
+        url="https://example.com/runway",
+        published_at="2026-06-30T08:00:00Z",
+        vendor="Runway",
+        raw_excerpt=(
+            "Runway 的实时交互数字人系统 Characters 入选 SIGGRAPH 2026 的 Real-Time Live! 环节，"
+            "团队可用一张照片在数秒内生成可对话的角色。"
+        ),
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "Runway数字人系统入选SIGGRAPH"
+    assert "实时交互数字人" in result.summary
+
+
 def test_generate_ai_digest_brief_with_llm_returns_chinese_items(monkeypatch):
     item = AIUpdateItem(
         title="OpenAI launches new developer tools",
@@ -574,6 +635,82 @@ def test_build_fallback_brief_uses_specific_source_content_for_english_updates()
     assert "后台智能体" in out.summary
 
 
+@pytest.mark.parametrize(
+    ("item", "required", "forbidden"),
+    [
+        (
+            AIUpdateItem(
+                title="Cloudflare BlogAI产品发布新进展",
+                summary="Cloudflare披露企业AI平台更新。",
+                source_name="Cloudflare Blog 官网",
+                source_type="official",
+                url="https://blog.cloudflare.com/cloudflare-os",
+                published_at="2026-08-06T08:00:00+08:00",
+                vendor="Cloudflare Blog",
+                raw_excerpt="Cloudflare 开源新版 Cloudflare OS，任何组织均可部署并连接内部系统。",
+                tags=["AI动态"],
+            ),
+            ("Cloudflare OS", "开源"),
+            ("发布新进展",),
+        ),
+        (
+            AIUpdateItem(
+                title="Mistral AIAI开放权重模型发布",
+                summary="Mistral AI披露多模态模型更新。",
+                source_name="Mistral AI",
+                source_type="official",
+                url="https://mistral.ai/news/shieldstral/",
+                published_at="2026-08-04T12:00:26Z",
+                vendor="Mistral AI",
+                raw_excerpt="Shieldstral introduces a 3B open-weights multimodal safety classifier.",
+                tags=["AI动态"],
+            ),
+            ("Shieldstral", "开放权重"),
+            ("AIAI",),
+        ),
+        (
+            AIUpdateItem(
+                title="Cloudflare Blog智能体发布新进展",
+                summary="Cloudflare发布智能体访问控制论文。",
+                source_name="Cloudflare Blog 官网",
+                source_type="official",
+                url="https://blog.cloudflare.com/the-agent-access-model",
+                published_at="2026-08-06T08:00:00+08:00",
+                vendor="Cloudflare Blog",
+                raw_excerpt="Cloudflare 发布《The Agent Access Model》论文，提出面向 AI 智能体的访问控制模型。",
+                tags=["AI安全"],
+            ),
+            ("Cloudflare", "智能体访问模型", "论文"),
+            ("发布新进展",),
+        ),
+        (
+            AIUpdateItem(
+                title="XAI产品发布新进展",
+                summary="商汤发布开源多模态模型SenseNova U1。",
+                source_name="X：商汤 SenseTime (@SenseTime_AI)",
+                source_type="aggregator",
+                url="https://aihot.virxact.com/items/example",
+                published_at="2026-08-05T08:00:00+08:00",
+                vendor="X",
+                raw_excerpt="商汤发布开源模型 SenseNova U1，可在统一流程中同时进行推理与图像生成。",
+                tags=["国内大模型"],
+            ),
+            ("商汤", "SenseNova U1"),
+            ("XAI产品", "发布新进展"),
+        ),
+    ],
+)
+def test_build_fallback_brief_repairs_generic_titles_with_specific_release_subjects(
+    item,
+    required,
+    forbidden,
+):
+    out = build_fallback_brief([item], target_count=1, date="2026-08-06").items[0]
+
+    assert all(value in out.title for value in required)
+    assert all(value not in out.title for value in forbidden)
+
+
 def test_build_fallback_brief_preserves_chinese_action_after_long_english_subject():
     item = AIUpdateItem(
         title="Scientific computing in the age of agentic AI",
@@ -593,6 +730,65 @@ def test_build_fallback_brief_preserves_chinese_action_after_long_english_subjec
     assert len(out.title) <= 28
     assert "发布新进展" in out.title
     assert any("\u4e00" <= char <= "\u9fff" for char in out.title)
+
+
+def test_build_fallback_brief_replaces_untranslated_english_topic_with_chinese_subject():
+    item = AIUpdateItem(
+        title="Ten advances in mathematics",
+        summary="OpenAI highlights ten advances in mathematics enabled by AI research.",
+        source_name="OpenAI",
+        source_type="official",
+        url="https://openai.com/index/ten-advances-in-mathematics",
+        published_at="2026-08-01T01:00:00Z",
+        vendor="OpenAI",
+        raw_excerpt="Ten advances in mathematics from OpenAI AI research.",
+        tags=["AI"],
+    )
+
+    out = build_fallback_brief([item], target_count=1, date="2026-08-01").items[0]
+
+    assert "Ten advances" not in out.title
+    assert "数学" in out.title
+    assert "Ten advances" not in out.summary
+    assert "数学" in out.summary
+
+
+def test_build_fallback_brief_drops_lone_english_tail_from_model_identifier():
+    item = AIUpdateItem(
+        title="DeepSeek-V4-Flash API is now in public beta",
+        summary="DeepSeek-V4-Flash API is now in public beta.",
+        source_name="DeepSeek",
+        source_type="official",
+        url="https://api-docs.deepseek.com/updates",
+        published_at="2026-08-01T01:00:00Z",
+        vendor="DeepSeek",
+        raw_excerpt="DeepSeek-V4-Flash API is now in public beta.",
+        tags=["AI"],
+    )
+
+    out = build_fallback_brief([item], target_count=1, date="2026-08-01").items[0]
+
+    assert "API i" not in out.title
+    assert "DeepSeek-V4-Flash API" in out.title
+
+
+def test_build_fallback_brief_replaces_a_model_title_with_a_stray_english_tail():
+    item = AIUpdateItem(
+        title="DeepSeek-V4-Flash API i\u53d1\u5e03\u65b0\u8fdb\u5c55",
+        summary="DeepSeek-V4-Flash API \u662f\u73b0\u5df2\u5f00\u653e\u7684\u6a21\u578b\u7248\u672c\u3002",
+        source_name="DeepSeek",
+        source_type="official",
+        url="https://api-docs.deepseek.com/updates",
+        published_at="2026-08-01T01:00:00Z",
+        vendor="DeepSeek",
+        raw_excerpt="DeepSeek-V4-Flash API is now in public beta.",
+        tags=["AI"],
+    )
+
+    out = build_fallback_brief([item], target_count=1, date="2026-08-01").items[0]
+
+    assert "API i" not in out.title
+    assert "DeepSeek-V4-Flash API" in out.title
 
 
 def test_build_fallback_brief_translates_ntt_data_enterprise_adoption_case():

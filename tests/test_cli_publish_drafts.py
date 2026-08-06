@@ -6,6 +6,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 import apps.cli as cli
+from src.storage.models import Execution
 
 
 def _write_uploaded_post(base: Path, post_id: str, *, title: str, uploaded_at: str) -> None:
@@ -56,6 +57,160 @@ def _write_legacy_saved_draft_post(base: Path, post_id: str, *, title: str, uplo
         ),
         encoding="utf-8",
     )
+
+
+def _write_published_post(base: Path, post_id: str, *, title: str, uploaded_at: str) -> None:
+    _write_uploaded_post(base, post_id, title=title, uploaded_at=uploaded_at)
+    path = base / "data" / "posts" / post_id / "post.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["status"] = "published"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def test_run_can_copy_an_xhs_published_post_to_toutiao_without_force(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    post_id = "abababababababababababababababab"
+    _write_published_post(
+        tmp_path,
+        post_id,
+        title="已发布内容同步到头条",
+        uploaded_at="2026-08-04T01:00:00Z",
+    )
+    asset = tmp_path / "assets" / "example.png"
+    asset.parent.mkdir()
+    asset.write_bytes(b"image")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        cli,
+        "run_save_toutiao_draft_sync",
+        lambda post, **_kwargs: calls.append(post.id)
+        or Execution(post_id=post.id, result="saved_draft", id="toutiao-run"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_save_draft_sync",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("xhs uploader must not run")),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            post_id,
+            "--platform",
+            "toutiao",
+            "--assets-glob",
+            str(asset),
+            "--headless",
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [post_id]
+    stored = json.loads((tmp_path / "data" / "posts" / post_id / "post.json").read_text(encoding="utf-8"))
+    assert stored["status"] == "published"
+    assert stored["platform"]["toutiao_draft"]["execution_id"] == "toutiao-run"
+
+
+def test_run_dry_run_returns_nonzero_when_toutiao_preflight_fails(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    post_id = "acacacacacacacacacacacacacacacac"
+    _write_published_post(
+        tmp_path,
+        post_id,
+        title="头条权益预检失败",
+        uploaded_at="2026-08-04T01:00:00Z",
+    )
+    asset = tmp_path / "assets" / "example.png"
+    asset.parent.mkdir()
+    asset.write_bytes(b"image")
+
+    monkeypatch.setattr(
+        cli,
+        "run_save_toutiao_draft_sync",
+        lambda post, **_kwargs: Execution(
+            post_id=post.id,
+            result="failed",
+            error={"message": "头条号尚未开通文章发布权益"},
+        ),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            post_id,
+            "--platform",
+            "toutiao",
+            "--assets-glob",
+            str(asset),
+            "--headless",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "failed platforms: toutiao" in result.output
+
+
+def test_run_preserves_existing_xhs_saved_status_when_toutiao_retry_fails(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    post_id = "adadadadadadadadadadadadadadadad"
+    _write_uploaded_post(
+        tmp_path,
+        post_id,
+        title="小红书已保存但头条待验证",
+        uploaded_at="2026-08-05T07:00:00Z",
+    )
+    post_path = tmp_path / "data" / "posts" / post_id / "post.json"
+    payload = json.loads(post_path.read_text(encoding="utf-8"))
+    payload["platform"]["xhs_draft"] = {
+        "title": payload["title"],
+        "saved_at": "2026-08-05T07:00:00Z",
+        "execution_id": "xhs-ok",
+    }
+    post_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    asset = tmp_path / "assets" / "example.png"
+    asset.parent.mkdir()
+    asset.write_bytes(b"image")
+
+    monkeypatch.setattr(
+        cli,
+        "run_save_toutiao_draft_sync",
+        lambda post, **_kwargs: Execution(
+            post_id=post.id,
+            result="failed",
+            error={"message": "code=7050，需要短信身份校验"},
+        ),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            post_id,
+            "--platform",
+            "toutiao",
+            "--assets-glob",
+            str(asset),
+            "--headless",
+        ],
+    )
+
+    assert result.exit_code == 1
+    stored = json.loads(post_path.read_text(encoding="utf-8"))
+    assert stored["status"] == "saved_as_draft"
+    assert stored["platform"]["xhs_draft"]["execution_id"] == "xhs-ok"
 
 
 def test_publish_drafts_requires_a_selector(monkeypatch, tmp_path: Path):

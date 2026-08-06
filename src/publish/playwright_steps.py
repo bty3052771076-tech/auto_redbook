@@ -108,12 +108,50 @@ def _metrics_operation_timeout_ms(wait_timeout_ms: int) -> int:
 
 
 def _goto_xhs_page(page, url: str, *, timeout_ms: int) -> None:
-    """Commit navigation promptly; the page-state wait owns editor readiness."""
+    """Dispatch navigation promptly; the page-state wait owns editor readiness."""
+    session = None
+    try:
+        session = page.context.new_cdp_session(page)
+    except Exception:
+        session = None
+    if session is not None:
+        result = session.send("Page.navigate", {"url": url})
+        error_text = str((result or {}).get("errorText") or "").strip()
+        if error_text:
+            raise RuntimeError(f"xiaohongshu navigation failed: {error_text}")
+        return
+
     navigation_timeout_ms = min(
         XHS_NAVIGATION_TIMEOUT_MS,
         max(30000, int(timeout_ms or 0)),
     )
-    page.goto(url, wait_until="commit", timeout=navigation_timeout_ms)
+    for attempt in range(2):
+        try:
+            page.goto(url, wait_until="commit", timeout=navigation_timeout_ms)
+            return
+        except PlaywrightTimeoutError:
+            if attempt:
+                raise
+            try:
+                page.evaluate("window.stop()")
+            except Exception:
+                pass
+            time.sleep(1)
+
+
+def _page_current_url(page) -> str:
+    """Read the document URL when Playwright misses a CDP navigation event."""
+    try:
+        url = str(page.url or "").strip()
+    except Exception:
+        url = ""
+    if url and url != "about:blank":
+        return url
+    try:
+        document_url = str(page.evaluate("document.URL") or "").strip()
+    except Exception:
+        document_url = ""
+    return document_url or url
 UPLOAD_COUNT_PATTERN = re.compile(r"(\d+)\s*/\s*18")
 GENERIC_DRAFT_TITLES = {"", "\u6682\u65e0\u7b14\u8bb0\u6807\u9898", "\u65e0\u6807\u9898"}
 READY_PAGE_HINTS = [
@@ -665,12 +703,8 @@ def _classify_xhs_page_state(url: str, title: str, body_text: str) -> str:
 
 
 def _detect_xhs_page_state(page) -> tuple[str, str]:
-    url = ""
+    url = _page_current_url(page)
     title = ""
-    try:
-        url = str(page.url or "")
-    except Exception:
-        pass
     try:
         title = str(page.title() or "")
     except Exception:
@@ -1649,8 +1683,8 @@ def _click_first(locator, *, force: bool = False, timeout_ms: int | None = None)
 def _open_draft_box(page) -> bool:
     page.evaluate("window.scrollTo(0, 0)")
     candidates = [
-        page.locator(".draft-title-box"),
         page.locator(".draft-title"),
+        page.locator(".draft-title-box"),
         page.get_by_text("\u8349\u7a3f\u7bb1", exact=False),
         page.get_by_role("button", name="\u8349\u7a3f\u7bb1"),
         page.get_by_role("link", name="\u8349\u7a3f\u7bb1"),
@@ -1676,7 +1710,37 @@ def _open_draft_box(page) -> bool:
     return False
 
 
+def _open_drawer_draft_tab(page, texts: list[str]) -> Optional[bool]:
+    """Select a draft category inside the current creator-console drawer only."""
+    try:
+        state = page.evaluate(
+            """
+            ({texts}) => {
+              const drawer = document.querySelector('.draft-drawer');
+              if (!drawer) return {drawer: false, clicked: false};
+              const tabs = Array.from(drawer.querySelectorAll('.draft-tabs .tab-item'));
+              const target = tabs.find(tab => {
+                const label = (tab.textContent || '').trim();
+                return (texts || []).some(text => text && label.includes(text));
+              });
+              if (!target) return {drawer: true, clicked: false};
+              target.click();
+              return {drawer: true, clicked: true};
+            }
+            """,
+            {"texts": list(texts)},
+        )
+    except Exception:
+        return None
+    if not isinstance(state, dict) or not bool(state.get("drawer")):
+        return None
+    return bool(state.get("clicked"))
+
+
 def _open_image_draft_tab(page) -> bool:
+    drawer_result = _open_drawer_draft_tab(page, DRAFT_TAB_TEXTS_IMAGE)
+    if drawer_result is not None:
+        return drawer_result
     for text in DRAFT_TAB_TEXTS:
         loc = page.get_by_text(text, exact=False)
         if _click_first(loc, force=True):
@@ -1709,6 +1773,9 @@ def _open_draft_tab(page, draft_type: str) -> bool:
         texts = DRAFT_TAB_TEXTS_VIDEO
     elif draft_type in ("article", "long"):
         texts = DRAFT_TAB_TEXTS_ARTICLE
+    drawer_result = _open_drawer_draft_tab(page, texts)
+    if drawer_result is not None:
+        return drawer_result
     for text in texts:
         loc = page.get_by_text(text, exact=False)
         if _click_first(loc, force=True):
@@ -2666,6 +2733,32 @@ def _open_draft_editor_for_post(page, post: Post) -> dict[str, str]:
     return item_data
 
 
+def _open_draft_editor_for_titles(
+    page,
+    post: Post,
+    *,
+    titles: Iterable[str],
+) -> tuple[dict[str, str], str]:
+    """Open a draft by any known platform title, in the supplied order."""
+    seen: set[str] = set()
+    last_error: RuntimeError | None = None
+    for raw_title in titles:
+        title = (raw_title or "").strip()
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        candidate = post if title == post.title else post.model_copy(update={"title": title})
+        try:
+            return _open_draft_editor_for_post(page, candidate), title
+        except RuntimeError as exc:
+            if not str(exc).startswith("draft not found"):
+                raise
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"draft title is empty for post_id={post.id}")
+
+
 def _click_publish_button(page) -> str:
     detail = page.evaluate(
         """
@@ -3350,9 +3443,12 @@ def run_update_draft_sync(
             steps[-1].status = "success"
 
             lookup_title = (existing_title or post.title).strip()
-            lookup_post = post.model_copy(update={"title": lookup_title})
             _step("open_existing_draft", "in_progress", f"post_id={post.id} title={lookup_title}")
-            _open_draft_editor_for_post(page, lookup_post)
+            _open_draft_editor_for_titles(
+                page,
+                post,
+                titles=(lookup_title, post.title),
+            )
             _wait_for_any_locator(
                 page,
                 ["input[placeholder*='标题']", "textarea", "[contenteditable='true']"],
@@ -3404,28 +3500,40 @@ def run_update_draft_sync(
             steps[-1].status = "success"
 
             _step("verify_updated_draft", "in_progress", "")
-            _open_platform_draft_list(
-                page,
-                draft_type=draft_type,
-                login_hold=0,
-                wait_timeout_ms=wait_timeout_ms,
-                headless=headless_value,
-                progress_callback=progress_callback,
-            )
-            _open_draft_editor_for_post(page, post)
-            _wait_for_any_locator(
-                page,
-                ["input[placeholder*='标题']", "textarea", "[contenteditable='true']"],
-                60000,
-            )
-            snapshot = _read_editor_draft_snapshot(page)
-            actual_title = snapshot.get("actual_title", "")
-            actual_body = snapshot.get("actual_body", "")
-            verified_title = _draft_title_matches_expected(actual_title, post.title)
-            verified_body = _matches_body_value(actual_body, post.body)
+            verified_title = False
+            verified_body = False
+            verify_error: RuntimeError | None = None
+            for verify_attempt in range(3):
+                _open_platform_draft_list(
+                    page,
+                    draft_type=draft_type,
+                    login_hold=0,
+                    wait_timeout_ms=wait_timeout_ms,
+                    headless=headless_value,
+                    progress_callback=progress_callback,
+                )
+                try:
+                    _open_draft_editor_for_titles(page, post, titles=(post.title,))
+                    _wait_for_any_locator(
+                        page,
+                        ["input[placeholder*='标题']", "textarea", "[contenteditable='true']"],
+                        60000,
+                    )
+                    snapshot = _read_editor_draft_snapshot(page)
+                    actual_title = snapshot.get("actual_title", "")
+                    actual_body = snapshot.get("actual_body", "")
+                    verified_title = _draft_title_matches_expected(actual_title, post.title)
+                    verified_body = _matches_body_value(actual_body, post.body)
+                    if verified_title and verified_body:
+                        break
+                    verify_error = RuntimeError("updated draft verification failed")
+                except RuntimeError as exc:
+                    verify_error = exc
+                if verify_attempt < 2:
+                    time.sleep(2)
             steps[-1].detail = f"title={verified_title} body={verified_body}"
             if not (verified_title and verified_body):
-                raise RuntimeError("updated draft verification failed")
+                raise verify_error or RuntimeError("updated draft verification failed")
             steps[-1].status = "success"
             exec_rec.result = "saved_draft"
             _emit_progress(progress_callback, "update_draft_chain", "success", post.id)

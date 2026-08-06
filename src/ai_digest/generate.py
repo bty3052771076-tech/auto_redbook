@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import Counter
 from datetime import datetime, timezone
@@ -15,7 +16,11 @@ from src.config import LLMConfig
 from .models import AIDigestBrief, AIUpdateItem
 
 
-AI_DIGEST_LLM_MAX_TOKENS = 6000
+# Keep this aligned with the workflow-wide LLM ceiling.  In particular, some
+# Ark reasoning models can consume a substantial output budget before emitting
+# their final answer, so a small ceiling may surface as an empty response.
+AI_DIGEST_LLM_MAX_TOKENS = 60000
+AI_DIGEST_LLM_TIMEOUT_SECONDS = 240
 AI_DIGEST_BODY_LIMIT = 1000
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _GENERIC_AI_DIGEST_MARKERS = (
@@ -24,6 +29,14 @@ _GENERIC_AI_DIGEST_MARKERS = (
     "公开了与相关AI产品有关的AI动态",
     "具体链接已保存在本地元数据",
     "当前摘要仅基于原始标题和摘录整理",
+    "披露AI产品变化",
+    "当前可核实信息以原始标题",
+)
+_LOW_INFORMATION_TITLE_MARKERS = (
+    "发布新进展",
+    "AI产品发布新进展",
+    "披露AI产品变化",
+    "AI产品披露AI产品变化",
 )
 _AI_CLAIM_NAMES = (
     "openai",
@@ -58,7 +71,7 @@ _AI_CLAIM_NAMES = (
 )
 _AI_MODEL_VERSION_RE = re.compile(
     r"(?<![a-z0-9])(?:gpt|claude|qwen|deepseek|glm|doubao|seedream|kimi|gemini|gemma|"
-    r"llama|mistral|minimax|ernie)[-_. ]?\d+(?:\.\d+)*(?:[-_. ]?[a-z0-9]+)?(?![a-z0-9])",
+    r"llama|mistral|minimax|ernie)[-_. ]?(?:v)?\d+(?:\.\d+)*(?:[-_. ]?[a-z0-9]+)?(?:\s+api)?(?![a-z0-9])",
     flags=re.IGNORECASE,
 )
 _AI_CLAIM_NUMBER_RE = re.compile(r"(?<![a-z0-9])\d+(?:\.\d+)?(?:[tkmb]|%|％)?(?![a-z0-9])", re.IGNORECASE)
@@ -102,6 +115,13 @@ def _has_cjk(text: str) -> bool:
 def _looks_generic_ai_digest_text(text: str) -> bool:
     compact = re.sub(r"\s+", "", text or "")
     return any(marker.replace(" ", "") in compact for marker in _GENERIC_AI_DIGEST_MARKERS)
+
+
+def _is_low_information_ai_digest_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return bool(re.search(r"(?i)AI\s*AI", text or "")) or _looks_generic_ai_digest_text(text) or any(
+        marker.replace(" ", "") in compact for marker in _LOW_INFORMATION_TITLE_MARKERS
+    )
 
 
 def _source_text(item: AIUpdateItem) -> str:
@@ -154,6 +174,7 @@ def _format_slug_word(word: str) -> str:
         "gpt": "GPT",
         "glm": "GLM",
         "llm": "LLM",
+        "os": "OS",
         "chatgpt": "ChatGPT",
         "genebench": "GeneBench",
         "discoformer": "DiScoFormer",
@@ -188,26 +209,29 @@ def _subject_is_only_source(subject: str, item: AIUpdateItem) -> bool:
 
 
 def _english_subject(item: AIUpdateItem) -> str:
-    raw = _source_text(item)
     product = _clean_subject(item.product)
     if product and not _subject_is_only_source(product, item):
         return product
     patterns = (
-        r"\b(?:GPT|GLM|Qwen|Claude|Codex|Gemini|Kimi|Doubao|Seedream|ERNIE|Llama|Mistral|DeepSeek|MiniMax)[A-Za-z0-9.\- ]{0,64}",
-        r"\b[A-Z][A-Za-z0-9.\-]+(?:\s+[A-Z][A-Za-z0-9.\-]+){0,4}\b",
+        (
+            r"\b(?:GPT|GLM|Qwen|Claude|Codex|Gemini|Kimi|Doubao|Seedream|ERNIE|Llama|Mistral|DeepSeek|MiniMax)[A-Za-z0-9.\- ]{0,64}",
+            re.IGNORECASE,
+        ),
+        (r"\b[A-Z][A-Za-z0-9.\-]+(?:\s+[A-Z][A-Za-z0-9.\-]+){0,4}\b", 0),
     )
-    for pattern in patterns:
-        match = re.search(pattern, raw, flags=re.IGNORECASE)
-        if not match:
-            continue
-        subject = _clean_subject(match.group(0))
-        if (
-            len(subject) >= 3
-            and subject.lower() not in {"the", "this", "openai", "anthropic", "microsoft"}
-            and not re.fullmatch(r"[A-Za-z0-9_-]{28,}", subject)
-            and not _subject_is_only_source(subject, item)
-        ):
-            return subject
+    for raw in (item.raw_excerpt or "", _source_text(item)):
+        for pattern, flags in patterns:
+            match = re.search(pattern, raw, flags=flags)
+            if not match:
+                continue
+            subject = _clean_subject(match.group(0))
+            if (
+                len(subject) >= 3
+                and subject.lower() not in {"the", "this", "openai", "anthropic", "microsoft"}
+                and not re.fullmatch(r"[A-Za-z0-9_-]{28,}", subject)
+                and not _subject_is_only_source(subject, item)
+            ):
+                return subject
     slug_subject = _slug_subject_from_url(item)
     if slug_subject:
         return slug_subject
@@ -227,6 +251,119 @@ def _detail_terms_from_item(item: AIUpdateItem) -> list[str]:
     return details[:4]
 
 
+_AI_PROPER_ENGLISH_WORDS = {
+    "ai",
+    "api",
+    "chatgpt",
+    "claude",
+    "codex",
+    "deepseek",
+    "doubao",
+    "gemini",
+    "glm",
+    "gpt",
+    "kimi",
+    "llm",
+    "luma",
+    "minimax",
+    "openai",
+    "qwen",
+    "runway",
+    "seedream",
+}
+_GENERIC_FALLBACK_PRODUCTS = {"", "ai", "api", "model", "models", "tool", "tools", "update", "updates"}
+
+
+def _has_untranslated_english_phrase(text: str) -> bool:
+    value = text or ""
+    if re.search(r"\b(?:AI|API|LLM)\s+[a-z](?=[\u4e00-\u9fff]|$)", value):
+        return True
+    words = [word.lower() for word in re.findall(r"[A-Za-z]{4,}", value)]
+    untranslated = [word for word in words if word not in _AI_PROPER_ENGLISH_WORDS]
+    return len(untranslated) >= 2 or any(len(word) >= 8 for word in untranslated)
+
+
+def _fallback_chinese_subject(item: AIUpdateItem) -> str:
+    raw = _source_text(item)
+    lower = raw.lower()
+    model_match = _AI_MODEL_VERSION_RE.search(raw)
+    if model_match:
+        subject = _clean_subject(model_match.group(0))
+        # The version matcher can include the first character of an English
+        # sentence tail (for example, "API i" from "API is now...").
+        subject = re.sub(r"\s+[A-Za-z]$", "", subject).strip()
+        product = _clean_subject(item.product)
+        if product:
+            missing_words = [
+                word
+                for word in product.split()
+                if word.lower() not in subject.lower().split()
+            ]
+            if missing_words:
+                subject = _clean_subject(f"{subject} {' '.join(missing_words)}")
+        return subject
+    product = _clean_subject(item.product)
+    if product and product.lower() not in _GENERIC_FALLBACK_PRODUCTS:
+        return product
+    if "mathemat" in lower:
+        return "数学AI研究"
+    english_subject = _english_subject(item)
+    if english_subject:
+        subject_lower = english_subject.lower()
+        if re.match(
+            r"^(?:gpt|glm|qwen|claude|codex|gemini|gemma|deepseek|doubao|seedream|"
+            r"kimi|minimax|ernie|llama|mistral|cerebras|suno|voice)\b",
+            subject_lower,
+        ):
+            return english_subject
+        proper_tokens = english_subject.split()
+        raw_excerpt = (item.raw_excerpt or "").strip()
+        is_named_release = bool(
+            len(proper_tokens) == 1
+            and re.match(
+                rf"^{re.escape(english_subject)}\s+(?:introduces|launches|releases|unveils)\b",
+                raw_excerpt,
+                flags=re.IGNORECASE,
+            )
+        )
+        has_product_shape = bool(
+            any(char.isdigit() for char in english_subject)
+            or re.search(r"[a-z][A-Z]", english_subject)
+            or any(token.isupper() and len(token) >= 2 for token in proper_tokens)
+        )
+        if len(proper_tokens) <= 2 and (is_named_release or has_product_shape) and re.fullmatch(
+            r"[A-Z][A-Za-z0-9.\-]*(?:\s+[A-Z0-9][A-Za-z0-9.\-]*)?",
+            english_subject,
+        ):
+            return english_subject
+    source = _clean_subject(item.vendor or item.source_name or "AI")
+    if not source or source.lower() in {"ai", "ai hot", "x"}:
+        for name in ("Suno", "Cerebras", "OpenAI", "Anthropic", "Google", "DeepSeek"):
+            if re.search(rf"\b{re.escape(name)}\b", raw, flags=re.IGNORECASE):
+                source = name
+                break
+    source = source or "AI"
+    if "mathemat" in lower:
+        topic = "数学AI研究"
+    elif "robot" in lower:
+        topic = "机器人AI"
+    elif "video" in lower or "cinematic" in lower:
+        topic = "视频生成"
+    elif "workforce" in lower or "enterprise" in lower:
+        topic = "企业AI应用"
+    elif "scientific computing" in lower or "genomics" in lower:
+        topic = "科研智能体"
+    elif "agent" in lower:
+        topic = "智能体"
+    elif "model" in lower or "release" in lower or "launch" in lower:
+        topic = "AI模型"
+    elif "api" in lower:
+        topic = "AI接口"
+    else:
+        topic = "AI产品"
+    return f"{source}{topic}"[:22]
+
+
 def _title_with_action(subject: str, action: str, *, limit: int = 28) -> str:
     clean_action = re.sub(r"\s+", " ", action or "").strip()
     clean_subject = re.sub(r"\s+", " ", subject or "").strip()
@@ -235,13 +372,70 @@ def _title_with_action(subject: str, action: str, *, limit: int = 28) -> str:
     return f"{clean_subject}{clean_action}"[:limit]
 
 
+def _specific_chinese_excerpt_title(item: AIUpdateItem, *, subject: str) -> str:
+    excerpt = re.sub(r"\s+", " ", item.raw_excerpt or "").strip()
+    if not excerpt or not _has_cjk(excerpt):
+        return ""
+    lower = excerpt.lower()
+    concise_subject = re.sub(r"AI产品$", "", subject or "").strip() or subject
+    multimodal_release = re.search(
+        r"(?P<vendor>[\u4e00-\u9fff]{2,10})发布开源(?:多模态)?模型\s*"
+        r"(?P<model>[A-Za-z][A-Za-z0-9.\-]*(?:\s+[A-Z0-9][A-Za-z0-9.\-]*){0,2})",
+        excerpt,
+    )
+    if multimodal_release:
+        return _title_with_action(
+            f"{multimodal_release.group('vendor')}{multimodal_release.group('model').strip()}",
+            "开源模型发布",
+        )
+    open_new_release = re.search(
+        r"开源新版\s*(?P<model>[A-Za-z][A-Za-z0-9.\-]*(?:\s+[A-Z0-9][A-Za-z0-9.\-]*){0,2})",
+        excerpt,
+    )
+    if open_new_release:
+        return _title_with_action(open_new_release.group("model").strip(), "正式开源")
+    paper_release = re.search(
+        r"(?P<vendor>[A-Za-z\u4e00-\u9fff][A-Za-z\u4e00-\u9fff ]{0,16})\s*发布《(?P<paper>[^》]{2,40})》论文",
+        excerpt,
+    )
+    if paper_release:
+        vendor = re.sub(r"\s+", " ", paper_release.group("vendor")).strip()
+        paper = paper_release.group("paper").strip()
+        if paper.lower() == "the agent access model":
+            paper = "智能体访问模型"
+        return _title_with_action(f"{vendor}{paper}", "论文发布")
+    if "评测服务" in excerpt and ("全面可用" in excerpt or "（ga）" in lower or "(ga)" in lower):
+        if "gemini" in lower:
+            concise_subject = "Gemini智能体"
+        return _title_with_action(concise_subject, "评测服务正式上线")
+    if "siggraph" in lower and "数字人" in excerpt:
+        return _title_with_action(concise_subject, "数字人系统入选SIGGRAPH")
+    if "代码审查" in excerpt and "评测" in excerpt:
+        return _title_with_action(concise_subject, "构建代码审查评测基准")
+    sentence = re.split(r"[。！？；]", excerpt, maxsplit=1)[0].strip()
+    vendor_prefix = re.escape(item.vendor or "")
+    if vendor_prefix:
+        without_vendor = re.sub(rf"^{vendor_prefix}[：:，,、\s]*", "", sentence).strip()
+        if without_vendor:
+            sentence = f"{concise_subject}{without_vendor}"
+    if sentence and not _has_untranslated_english_phrase(sentence):
+        return sentence[:28].rstrip("，,。；; ")
+    return ""
+
+
 def _fallback_chinese_title(item: AIUpdateItem) -> str:
     raw = _source_text(item)
-    if _has_cjk(item.title):
+    if (
+        _has_cjk(item.title)
+        and not _has_untranslated_english_phrase(item.title)
+        and not _is_low_information_ai_digest_text(item.title)
+    ):
         title = item.title or item.summary or item.raw_excerpt
         title = re.sub(r"\s+", " ", title or "").strip()
         return title[:28].rstrip("，,。；; ") or "AI产品更新"
     lower = raw.lower()
+    if "suno" in lower and "midi" in lower:
+        return "Suno推出MIDI导出等新功能"
     if "ntt data" in lower and "chatgpt enterprise" in lower and "codex" in lower:
         return "NTT DATA借助ChatGPT与Codex提效"
     legacy_names = list(
@@ -249,7 +443,10 @@ def _fallback_chinese_title(item: AIUpdateItem) -> str:
     )
     if legacy_names and ("discontinu" in lower or "deprecat" in lower):
         return f"DeepSeek将停用{'与'.join(legacy_names)}旧API名"[:28]
-    subject = _english_subject(item)
+    subject = _fallback_chinese_subject(item)
+    excerpt_title = _specific_chinese_excerpt_title(item, subject=subject)
+    if excerpt_title:
+        return excerpt_title
     if "open-weight" in lower or "open weight" in lower:
         return _title_with_action(subject, "开放权重模型发布")
     if "agentic ai" in lower and "semiconductor" in lower:
@@ -265,8 +462,13 @@ def _fallback_chinese_title(item: AIUpdateItem) -> str:
 def _fallback_chinese_summary(item: AIUpdateItem) -> str:
     source = item.source_name or item.vendor or "公开来源"
     raw = _source_text(item)
-    if _has_cjk(raw):
-        text = re.sub(r"\s+", " ", item.summary or item.raw_excerpt or item.title).strip()
+    preferred_text = item.summary or item.raw_excerpt or item.title
+    if _is_low_information_ai_digest_text(preferred_text) and item.raw_excerpt:
+        preferred_text = item.raw_excerpt
+    text = re.sub(r"\s+", " ", preferred_text).strip()
+    # Retain a source excerpt that is already written in Chinese even when it
+    # contains unavoidable product names such as SIGGRAPH or Characters.
+    if _has_cjk(raw) and _has_cjk(text):
         return text[:120].rstrip("，,。；; ") + ("…" if len(text) > 120 else "")
     lower = raw.lower()
     if "ntt data" in lower and "chatgpt enterprise" in lower and "codex" in lower:
@@ -291,7 +493,7 @@ def _fallback_chinese_summary(item: AIUpdateItem) -> str:
         )
     if ("open-weight" in lower or "open weight" in lower) and "kimi" in lower:
         return "Kimi K3以开放权重形式提供，原始资料重点提到代码与智能体能力，并给出了定价和可用性信息。"
-    subject = _english_subject(item)
+    subject = _fallback_chinese_subject(item)
     details = _detail_terms_from_item(item)
     if details:
         return f"{source}披露{subject}的新进展，原文明确涉及{'、'.join(details)}；具体能力和适用范围以来源链接为准。"
@@ -300,9 +502,17 @@ def _fallback_chinese_summary(item: AIUpdateItem) -> str:
 
 def _ensure_chinese_item(item: AIUpdateItem) -> AIUpdateItem:
     data = item.model_dump()
-    if not _has_cjk(data.get("title", "")) or _looks_generic_ai_digest_text(data.get("title", "")):
+    if (
+        not _has_cjk(data.get("title", ""))
+        or _is_low_information_ai_digest_text(data.get("title", ""))
+        or _has_untranslated_english_phrase(data.get("title", ""))
+    ):
         data["title"] = _fallback_chinese_title(item)
-    if not _has_cjk(data.get("summary", "")) or _looks_generic_ai_digest_text(data.get("summary", "")):
+    if (
+        not _has_cjk(data.get("summary", ""))
+        or _is_low_information_ai_digest_text(data.get("summary", ""))
+        or _has_untranslated_english_phrase(data.get("summary", ""))
+    ):
         data["summary"] = _fallback_chinese_summary(item)
     tags = []
     for tag in item.tags or []:
@@ -528,6 +738,13 @@ def generate_ai_digest_brief_with_llm(
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
     )
+    try:
+        request_timeout = int(
+            (os.getenv("AI_DIGEST_LLM_TIMEOUT_S") or str(AI_DIGEST_LLM_TIMEOUT_SECONDS)).strip()
+        )
+    except ValueError:
+        request_timeout = AI_DIGEST_LLM_TIMEOUT_SECONDS
+    request_timeout = max(30, min(request_timeout, 600))
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -545,15 +762,29 @@ def generate_ai_digest_brief_with_llm(
     last_exc: Exception | None = None
     for cfg in cfgs:
         try:
+            model_kwargs = {
+                "model_provider": "openai",
+                "base_url": cfg.base_url,
+                "api_key": cfg.api_key,
+                "temperature": 0.2,
+                "max_tokens": AI_DIGEST_LLM_MAX_TOKENS,
+                "timeout": request_timeout,
+            }
+            # Ark models can otherwise spend the whole output allowance on
+            # hidden reasoning and return an empty final message.  The digest
+            # is a constrained JSON transformation, so direct answering is
+            # both faster and more reliable here.
+            if (cfg.provider or "").strip().lower() == "volcengine":
+                model_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             model = init_chat_model(
                 cfg.model,
-                model_provider="openai",
-                base_url=cfg.base_url,
-                api_key=cfg.api_key,
-                temperature=0.2,
-                max_tokens=AI_DIGEST_LLM_MAX_TOKENS,
+                **model_kwargs,
             )
-            print(f"[ai-digest-llm] provider={cfg.provider} model={cfg.model} base_url={cfg.base_url}")
+            print(
+                f"[ai-digest-llm] provider={cfg.provider} model={cfg.model} "
+                f"base_url={cfg.base_url} timeout={request_timeout}s",
+                flush=True,
+            )
             for attempt in range(1, 3):
                 retry_instruction = ""
                 if attempt > 1:
@@ -566,6 +797,10 @@ def generate_ai_digest_brief_with_llm(
                     date=date or _today_date(),
                 )
                 try:
+                    print(
+                        f"[ai-digest-llm] stage=request attempt={attempt}/2 timeout={request_timeout}s",
+                        flush=True,
+                    )
                     resp = model.invoke(messages)
                     text = resp.content if hasattr(resp, "content") else str(resp)
                     brief = parse_ai_digest_brief_json(text)

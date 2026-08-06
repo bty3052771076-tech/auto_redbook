@@ -789,6 +789,45 @@ def test_focus_daily_news_item_selects_important_story_from_generic_bundle():
     assert meta["multi_story_filter"]["selected_title"] == "国务院发布超龄劳动者权益保障新规"
 
 
+def test_focus_daily_news_item_handles_ai_daily_roundup_with_inline_numbering():
+    picked = NewsItem(
+        title=(
+            "AI互联网日报：OpenAI降价对标Kimi与DeepSeek、"
+            "微软测试实时语音、微信清理号卡引流、抖音短剧上线AI预检"
+        ),
+        url="https://www.woshipm.com/ai/6439827.html",
+        source="人人都是产品经理",
+        domain="woshipm.com",
+        seendate=_recent_news_seendate(0),
+        description=(
+            "1. OpenAI宣布部分API降价 "
+            "2. 微软测试实时语音功能 "
+            "3. 微信持续清理违规号卡引流信息 "
+            "4. 抖音短剧上线AI预检"
+        ),
+        content=(
+            "1. OpenAI宣布部分API降价\n"
+            "2. 微软测试实时语音功能\n"
+            "3. 微信持续清理违规号卡引流信息\n"
+            "4. 抖音短剧上线AI预检"
+        ),
+    )
+
+    focused, meta = _focus_daily_news_item(picked)
+
+    assert focused.title == "微信持续清理违规号卡引流信息"
+    assert focused.description == "微信持续清理违规号卡引流信息"
+    assert focused.content == "微信持续清理违规号卡引流信息"
+    assert meta["multi_story_filter"]["applied"] is True
+    assert meta["multi_story_filter"]["title_before"].startswith("AI互联网日报")
+
+
+def test_daily_news_generic_multi_item_title_is_rejected_after_llm_generation():
+    assert create_post._is_generic_daily_news_title("AI互联网赛道近期多项行业动态发布") is True
+    assert create_post._is_generic_daily_news_title("近期多条科技资讯汇总") is True
+    assert create_post._is_generic_daily_news_title("微信清理违规号卡引流信息") is False
+
+
 def test_daily_news_rejects_chinese_multi_story_roundup_before_generation():
     item = NewsItem(
         title="IT早报 0726：携程公布整改措施；手机厂商抵制内存涨价；高通宣布芯片涨价",
@@ -2204,6 +2243,139 @@ def test_daily_news_image_event_includes_artwork_scene_details_from_body():
 
     assert "\u9634\u5929\u6d77\u5cb8" in event
     assert "\u9e1f\u5f62\u526a\u5f71" in event
+
+
+@pytest.mark.parametrize(
+    ("title", "body", "expected", "blocked"),
+    [
+        (
+            "2026高校健身气功锦标赛举行",
+            "内容：多所高校学生参加健身气功集体项目比赛。",
+            ("室内体育馆", "大学生", "健身气功", "裁判"),
+            ("奖牌文字",),
+        ),
+        (
+            "安踏入股后彪马半年报亏损收窄超八成",
+            "内容：运动品牌披露半年财报，亏损同比收窄。",
+            ("财经分析人员", "运动鞋服", "无文字图表"),
+            ("安踏", "彪马", "Puma"),
+        ),
+        (
+            "卫生巾疑现虫卵企业核实",
+            "内容：消费者反映卫生巾产品存在异物，企业表示正在核实。",
+            ("质检员", "卫生巾", "独立包装"),
+            ("卫生棉条", "虫卵特写"),
+        ),
+        (
+            "临商银行冠名省运田径赛为获奖健儿颁奖",
+            "内容：企业代表在田径赛颁奖现场为获奖运动员颁奖。",
+            ("赛场领奖区", "赛事工作人员", "获奖运动员", "无文字奖杯"),
+            ("临商银行", "便民服务"),
+        ),
+        (
+            "茨城县与两方签署县民健康促进合作协定",
+            "内容：地方代表、企业及足球俱乐部负责人出席合作签约仪式。",
+            ("会议室", "三方代表", "空白文件", "握手"),
+            ("茨城县", "足球俱乐部"),
+        ),
+    ],
+)
+def test_daily_news_image_event_uses_inspectable_text_free_scene(
+    title, body, expected, blocked
+):
+    picked = NewsItem(
+        title=title,
+        url="https://example.com/story",
+        source="Example",
+        domain="example.com",
+        seendate=_recent_news_seendate(0),
+        description=body,
+        content=body,
+    )
+
+    event = _normalize_daily_news_image_event(
+        title,
+        picked=picked,
+        title=title,
+        body=body,
+        prompt_norm="",
+    )
+
+    assert all(token in event for token in expected)
+    assert all(token not in event for token in blocked)
+
+
+def test_create_daily_news_posts_keeps_trying_candidates_rejected_by_post_quality_callback(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    candidates = [
+        NewsItem(
+            title=f"国内公共事件候选{i}",
+            url=f"https://example.com/story-{i}",
+            source="Example",
+            domain="example.com",
+            sourcecountry="China",
+            seendate=_recent_news_seendate(0),
+            description=f"候选{i}披露了一项可核验的公共事件进展。",
+            content=f"候选{i}披露了一项可核验的公共事件进展和处置结果。",
+        )
+        for i in range(1, 4)
+    ]
+    monkeypatch.setattr(
+        create_post,
+        "_fetch_daily_news_candidates_for_upload",
+        lambda *_args, **_kwargs: (candidates, {"provider": "test"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_focus_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    generated = iter(candidates)
+
+    def fake_generate_draft(*_args, **_kwargs):
+        item = next(generated)
+        return {
+            "title": item.title,
+            "body": _test_daily_news_body(
+                original_title=item.title,
+                content=item.content,
+                comment="该进展的实际影响仍需结合后续执行结果观察。",
+                date=_recent_news_date(),
+                source=item.source,
+            ),
+            "topics": ["每日新闻", "公共事件"],
+            "image_event": item.title,
+        }
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+    checked: list[str] = []
+
+    def post_quality_callback(post):
+        checked.append(post.title)
+        return ["图片不一致"] if len(checked) == 1 else []
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="公共事件",
+        asset_paths=[],
+        count=2,
+        auto_image=False,
+        post_quality_callback=post_quality_callback,
+    )
+
+    assert len(checked) == 3
+    assert [post.platform["news"]["source_url"] for post in posts] == [
+        candidates[1].url,
+        candidates[2].url,
+    ]
+    failed_posts = [post for post in create_post.list_posts() if post.status.value == "failed"]
+    assert [post.platform["news"]["source_url"] for post in failed_posts] == [
+        candidates[0].url
+    ]
 
 
 def test_create_daily_news_posts_replaces_cross_candidate_title_and_image_event(monkeypatch, tmp_path):
@@ -5272,6 +5444,26 @@ def test_finalize_daily_news_body_preserves_rendered_five_field_text():
     assert data["评价"] == "AI芯片竞争会继续影响算力供给和应用成本。"
     assert data["日期"] == "2026-06-19"
     assert data["来源"] == "Example News"
+
+
+def test_finalize_daily_news_body_uses_source_date_over_llm_supplied_date():
+    picked = NewsItem(
+        title="Global chip company announces new AI accelerator",
+        url="https://example.com/source",
+        source="Example News",
+        domain="example.com",
+        seendate="2026-07-31T08:00:00Z",
+    )
+    body = (
+        "\u5185\u5bb9\uff1a\n\u82af\u7247\u516c\u53f8\u62ab\u9732\u65b0\u4e00\u4ee3AI\u52a0\u901f\u4ea7\u54c1\u3002\n\n"
+        "\u8bc4\u4ef7\uff1a\n\u540e\u7eed\u5e94\u5173\u6ce8\u5b9e\u9645\u90e8\u7f72\u548c\u4f9b\u5e94\u60c5\u51b5\u3002\n\n"
+        "\u65e5\u671f\uff1a2026-08-01\n\n"
+        "\u6765\u6e90\uff1aExample News"
+    )
+
+    out = _finalize_daily_news_body(body, picked, "\u79d1\u6280\u65b0\u95fb")
+
+    assert _daily_news_body_fields(out)["\u65e5\u671f"] == "2026-07-31"
 
 
 def test_finalize_daily_news_body_strips_protocol_relative_image_urls():

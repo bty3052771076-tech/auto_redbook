@@ -53,14 +53,31 @@ def parse_vision_review(value: str | Mapping[str, Any]) -> VisionReviewResult:
     ok_value = payload.get("ok")
     if not isinstance(ok_value, bool):
         raise ValueError("视觉复核结果缺少布尔字段 ok")
-    try:
-        score = max(0, min(100, int(payload.get("score"))))
-    except (TypeError, ValueError):
-        raise ValueError("视觉复核结果缺少 0-100 的 score") from None
+    raw_score = payload.get("score")
+    if raw_score in (None, ""):
+        # Some account-provided OCR/VLM endpoints return a valid decision but
+        # omit the optional score. Keep the quality gate conservative.
+        score = 70 if ok_value else 0
+    else:
+        try:
+            score = max(0, min(100, int(raw_score)))
+        except (TypeError, ValueError):
+            raise ValueError("视觉复核结果缺少 0-100 的 score") from None
     raw_issues = payload.get("issues")
+    if raw_issues is None:
+        raw_issues = []
     if not isinstance(raw_issues, list):
         raise ValueError("视觉复核结果缺少数组字段 issues")
-    issues = tuple(str(item).strip() for item in raw_issues if str(item).strip())
+    issues_list: list[str] = []
+    for item in raw_issues:
+        if isinstance(item, Mapping):
+            item_text = item.get("message") or item.get("issue") or item.get("text") or ""
+        else:
+            item_text = item
+        text = str(item_text).strip()
+        if text:
+            issues_list.append(text)
+    issues = tuple(issues_list)
     retry_prompt = str(payload.get("retry_prompt") or "").strip()
     if not ok_value and not issues:
         raise ValueError("视觉复核未通过，但没有给出问题说明")
@@ -72,9 +89,21 @@ def parse_vision_review(value: str | Mapping[str, Any]) -> VisionReviewResult:
     )
 
 
+def configured_vision_review_model(provider: str | None = None) -> str:
+    provider_name = (provider or os.getenv("VLM_REVIEW_PROVIDER") or "").strip().lower()
+    explicit = (os.getenv("VLM_REVIEW_MODEL") or "").strip()
+    if explicit:
+        return explicit
+    if provider_name == "volcengine":
+        return (os.getenv("VOLCENGINE_VLM_MODEL") or "").strip()
+    if provider_name == "aliyun":
+        return (os.getenv("ALIYUN_VLM_MODEL") or "").strip()
+    return ""
+
+
 def load_vision_review_config() -> LLMConfig:
     provider = (os.getenv("VLM_REVIEW_PROVIDER") or "").strip().lower()
-    model = (os.getenv("VLM_REVIEW_MODEL") or "").strip()
+    model = configured_vision_review_model(provider)
     if provider not in {"aliyun", "volcengine"} or not model:
         raise RuntimeError("没有选择具备免费额度的视觉复核模型")
     if provider == "aliyun":

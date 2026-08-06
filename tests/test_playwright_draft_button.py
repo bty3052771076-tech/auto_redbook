@@ -3,6 +3,8 @@ from src.publish.playwright_steps import (
     _click_draft,
     _draft_item_matches_post,
     _draft_title_matches_expected,
+    _open_draft_editor_for_titles,
+    _open_image_draft_tab,
     _open_draft_list_and_check_saved,
     _pick_draft_click_candidate,
     _read_editor_draft_snapshot,
@@ -242,6 +244,45 @@ def test_click_draft_prefers_xhs_publish_save_component():
     assert page.mouse.clicks == []
 
 
+def test_open_image_draft_tab_scopes_selection_to_open_draft_drawer():
+    class EmptyLocator:
+        def count(self):
+            return 0
+
+    class DrawerLocator:
+        def count(self):
+            return 1
+
+        def nth(self, _index):
+            return self
+
+        def is_visible(self):
+            return True
+
+    class FakePage:
+        def __init__(self):
+            self.scripts: list[str] = []
+
+        def locator(self, selector):
+            if selector == ".draft-drawer":
+                return DrawerLocator()
+            return EmptyLocator()
+
+        def get_by_text(self, *_args, **_kwargs):
+            raise AssertionError("main-page tab lookup must not run when a draft drawer is open")
+
+        def evaluate(self, script, *_args):
+            self.scripts.append(script)
+            if ".draft-tabs .tab-item" in script:
+                return {"drawer": True, "clicked": True}
+            return False
+
+    page = FakePage()
+
+    assert _open_image_draft_tab(page) is True
+    assert any(".draft-tabs .tab-item" in script for script in page.scripts)
+
+
 def test_open_draft_list_and_check_saved_reopens_publish_page_when_inline_box_missing(monkeypatch):
     calls: list[dict] = []
     page = object()
@@ -324,6 +365,29 @@ def test_draft_item_matches_post_uses_specific_local_title():
     assert _draft_item_matches_post({"title": "AI chip factory expands"}, post) is True
     assert _draft_item_matches_post({"title": "Different daily news"}, post) is False
     assert _draft_item_matches_post({"title": ""}, post) is False
+
+
+def test_open_draft_editor_for_titles_falls_back_to_current_title(monkeypatch):
+    post = Post(id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", title="\u6bcf\u65e5AI|\u65b0\u6807\u9898")
+    seen: list[str] = []
+
+    def fake_open(_page, candidate):
+        seen.append(candidate.title)
+        if candidate.title == "\u6bcf\u65e5AI|\u65e7\u6807\u9898":
+            raise RuntimeError("draft not found")
+        return {"title": candidate.title}
+
+    monkeypatch.setattr("src.publish.playwright_steps._open_draft_editor_for_post", fake_open)
+
+    item, matched_title = _open_draft_editor_for_titles(
+        object(),
+        post,
+        titles=["\u6bcf\u65e5AI|\u65e7\u6807\u9898", post.title],
+    )
+
+    assert seen == ["\u6bcf\u65e5AI|\u65e7\u6807\u9898", post.title]
+    assert item == {"title": post.title}
+    assert matched_title == post.title
 
 
 def test_read_editor_draft_snapshot_returns_actual_title_and_body():

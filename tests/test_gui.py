@@ -17,6 +17,7 @@ from apps.gui import (
     DebouncedCallback,
     DEFAULT_LOGIN_URL,
     DEFAULT_DRAFT_URL,
+    DEFAULT_TOUTIAO_DRAFT_URL,
     DELETE_CONFIRM_AUTO,
     DELETE_CONFIRM_ASK,
     DELETE_MODE_DELETE,
@@ -33,6 +34,7 @@ from apps.gui import (
     UiLogBuffer,
     build_xhs_login_launch_args,
     build_xhs_creator_launch_args,
+    build_toutiao_creator_launch_args,
     build_cli_args,
     build_quota_dashboard_rows,
     build_source_health_dashboard_rows,
@@ -50,6 +52,8 @@ from apps.gui import (
     format_post_detail,
     format_post_time_detail,
     format_shared_draft_preview,
+    gui_hidden_autorun_enabled,
+    gui_hidden_autorun_exit_code,
     find_local_post_for_metric_row,
     list_published_metric_table_rows,
     list_publishable_drafts,
@@ -60,6 +64,7 @@ from apps.gui import (
     merge_model_option_values,
     normalize_optional_day_count,
     open_xhs_creator,
+    open_toutiao_creator,
     parse_command_progress_line,
     progress_status_from_event,
     quota_dashboard_layout,
@@ -172,6 +177,56 @@ def test_build_cli_args_check_sources():
 
     assert args[1:4] == ["-m", "apps.cli", "check-sources"]
     assert "--collection" in args and "ai_digest" in args
+
+
+def test_build_cli_args_auto_includes_publish_platform():
+    args = build_cli_args(
+        "auto",
+        params={
+            "title": "每日新闻",
+            "platform": "今日头条",
+            "assets_glob": "assets/empty/*",
+            "count": 1,
+        },
+    )
+
+    assert "--platform" in args
+    assert args[args.index("--platform") + 1] == "toutiao"
+
+
+def test_build_cli_args_auto_maps_combined_platform_to_both():
+    args = build_cli_args(
+        "auto",
+        params={
+            "title": "每日新闻",
+            "platform": "小红书 + 今日头条",
+            "assets_glob": "assets/empty/*",
+            "count": 2,
+            "headless": True,
+        },
+    )
+
+    assert args[args.index("--platform") + 1] == "both"
+    assert "--headless" in args
+
+
+def test_build_cli_args_run_includes_publish_platform():
+    args = build_cli_args(
+        "run",
+        params={
+            "post_id": "a" * 32,
+            "platform": "今日头条",
+        },
+    )
+
+    assert args[args.index("--platform") + 1] == "toutiao"
+
+
+def test_gui_exposes_publish_platform_selector():
+    source = (Path(__file__).resolve().parents[1] / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "发布平台" in source
+    assert "小红书 + 今日头条" in source
 
 
 def test_gui_exposes_llm_and_image_provider_model_options():
@@ -383,6 +438,25 @@ def test_env_autorun_helpers_parse_flags_and_ints():
     assert env_int_value("5", 1, min_value=1) == 5
     assert env_int_value("bad", 3, min_value=1) == 3
     assert env_int_value("-2", 3, min_value=1) == 1
+
+
+def test_gui_hidden_autorun_requires_both_autorun_and_hidden_flags():
+    assert gui_hidden_autorun_enabled({}) is False
+    assert gui_hidden_autorun_enabled({"AUTO_REDBOOK_GUI_AUTORUN_HIDDEN": "1"}) is False
+    assert gui_hidden_autorun_enabled({"AUTO_REDBOOK_GUI_AUTORUN": "auto"}) is False
+    assert gui_hidden_autorun_enabled(
+        {
+            "AUTO_REDBOOK_GUI_AUTORUN": "auto",
+            "AUTO_REDBOOK_GUI_AUTORUN_HIDDEN": "yes",
+        }
+    ) is True
+
+
+def test_gui_hidden_autorun_propagates_child_exit_code():
+    assert gui_hidden_autorun_exit_code(False, 7) == 0
+    assert gui_hidden_autorun_exit_code(True, None) == 0
+    assert gui_hidden_autorun_exit_code(True, 0) == 0
+    assert gui_hidden_autorun_exit_code(True, 7) == 7
 
 
 def test_prompt_entry_helpers_split_combine_and_dedupe():
@@ -974,6 +1048,56 @@ def test_xhs_creator_quick_launch_target_uses_image_publish_url():
     assert DEFAULT_LOGIN_URL == "https://creator.xiaohongshu.com"
 
 
+def test_toutiao_creator_launch_args_reuse_workspace_chrome_profile(tmp_path: Path):
+    chrome = tmp_path / "chrome.exe"
+    chrome.write_text("", encoding="utf-8")
+
+    args = build_toutiao_creator_launch_args(project_root=tmp_path, chrome_path=chrome, env={})
+
+    assert f"--user-data-dir={tmp_path / 'data' / 'browser' / 'chrome-profile'}" in args
+    assert "--profile-directory=Default" in args
+    assert "--remote-debugging-address=127.0.0.1" in args
+    assert "--remote-debugging-port=9223" in args
+    assert args[-1] == DEFAULT_TOUTIAO_DRAFT_URL
+
+
+def test_toutiao_creator_launch_detects_chrome_from_windows_environment(
+    monkeypatch,
+    tmp_path: Path,
+):
+    chrome = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
+    chrome.parent.mkdir(parents=True)
+    chrome.write_text("", encoding="utf-8")
+    missing = tmp_path / "missing"
+    monkeypatch.setenv("ProgramFiles", str(tmp_path))
+    monkeypatch.setenv("ProgramFiles(x86)", str(missing))
+    monkeypatch.setenv("LOCALAPPDATA", str(missing))
+    monkeypatch.delenv("XHS_CHROME_PATH", raising=False)
+
+    args = build_toutiao_creator_launch_args(project_root=tmp_path)
+
+    assert args[0] == str(chrome)
+    assert "--remote-debugging-port=9223" in args
+
+
+def test_open_toutiao_creator_launches_shared_profile(monkeypatch, tmp_path: Path):
+    chrome = tmp_path / "chrome.exe"
+    chrome.write_text("", encoding="utf-8")
+    launched: list[list[str]] = []
+
+    monkeypatch.setattr("apps.gui.find_chrome_executable", lambda env=None: chrome)
+    monkeypatch.setattr(
+        "apps.gui.subprocess.Popen",
+        lambda args, cwd=None: launched.append(list(args)) or object(),
+    )
+
+    monkeypatch.delenv("TOUTIAO_CDP_URL", raising=False)
+
+    assert open_toutiao_creator(project_root=tmp_path, env={}) is True
+    assert launched[0][-1] == DEFAULT_TOUTIAO_DRAFT_URL
+    assert os.environ["TOUTIAO_CDP_URL"] == "http://127.0.0.1:9223"
+
+
 def test_xhs_creator_launch_args_use_workspace_chrome_profile(tmp_path: Path):
     chrome = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
     chrome.parent.mkdir(parents=True)
@@ -1055,6 +1179,16 @@ def test_quick_launch_scripts_are_workspace_local():
     assert (root / "scripts" / "open_xhs_creator.ps1").exists()
     assert (root / "Start-GUI.cmd").exists()
     assert (root / "Open-XHS-Creator.cmd").exists()
+    assert (root / "scripts" / "open_toutiao_creator.ps1").exists()
+    assert (root / "Open-Toutiao-Creator.cmd").exists()
+
+
+def test_toutiao_quick_launch_exposes_loopback_cdp_for_workspace_automation():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "scripts" / "open_toutiao_creator.ps1").read_text(encoding="utf-8")
+
+    assert "--remote-debugging-address=127.0.0.1" in source
+    assert "--remote-debugging-port=$CdpPort" in source
 
 
 def test_gui_launcher_uses_pythonw_without_python_console_fallback():

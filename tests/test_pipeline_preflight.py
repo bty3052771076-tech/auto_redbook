@@ -251,8 +251,7 @@ def test_model_plan_prefers_explicit_free_model_then_high_remaining_image(tmp_pa
     assert plan.llm.model == "qwen3.7-max"
     assert plan.image.provider == "volcengine"
     assert plan.image.model == "doubao-seedream-3-0-t2i"
-    assert plan.vision is not None
-    assert plan.vision.model == "doubao-seed-1-6-vision"
+    assert plan.vision is None
 
 
 def test_automatic_model_plan_prefers_callable_volcengine_glm_display_name(tmp_path):
@@ -304,6 +303,113 @@ def test_automatic_model_plan_prefers_callable_volcengine_glm_display_name(tmp_p
     assert plan.llm.model == "glm-5.2"
     assert plan.vision is not None
     assert plan.vision.model == "doubao-seed-1-6-251015"
+
+
+def test_automatic_model_plan_prefers_verified_callable_vision_model_over_display_alias(tmp_path):
+    now = datetime(2026, 8, 5, 4, 0, tzinfo=timezone.utc)
+    _write_snapshot(
+        tmp_path,
+        "volcengine",
+        [
+            {
+                "model": "glm-5.2",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 20_000,
+                "total": 500_000,
+            },
+            {
+                "model": "doubao-seed-1-6-251015",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 47_000,
+                "total": 500_000,
+            },
+            {
+                "model": "doubao-seed-1-6-vision",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 500_000,
+                "total": 500_000,
+            },
+            {
+                "model": "doubao-seedream-4-0-250828",
+                "kind": "image",
+                "status": "available",
+                "remaining": 51,
+                "total": 200,
+            },
+        ],
+        captured_at=now,
+    )
+    records, rejected = load_quota_records(
+        quota_dir=tmp_path,
+        providers=("volcengine",),
+        now=now,
+        provider_keys={"volcengine": True},
+    )
+
+    plan = build_free_model_plan(records, rejected=rejected)
+
+    assert plan.vision is not None
+    assert plan.vision.model == "doubao-seed-1-6-251015"
+
+
+def test_automatic_model_plan_skips_unverified_vision_display_alias(tmp_path):
+    now = datetime(2026, 8, 6, 6, 0, tzinfo=timezone.utc)
+    _write_snapshot(
+        tmp_path,
+        "volcengine",
+        [
+            {
+                "model": "deepseek-v4-flash",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 500_000,
+                "total": 500_000,
+            },
+            {
+                "model": "doubao-seed-1-6-vision",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 500_000,
+                "total": 500_000,
+            },
+            {
+                "model": "doubao-1-5-vision-lite",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 500_000,
+                "total": 500_000,
+            },
+            {
+                "model": "qwen3.5-ocr",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 500_000,
+                "total": 500_000,
+            },
+            {
+                "model": "doubao-seedream-4-0-250828",
+                "kind": "image",
+                "status": "available",
+                "remaining": 100,
+                "total": 200,
+            },
+        ],
+        captured_at=now,
+    )
+    records, rejected = load_quota_records(
+        quota_dir=tmp_path,
+        providers=("volcengine",),
+        now=now,
+        provider_keys={"volcengine": True},
+    )
+
+    plan = build_free_model_plan(records, rejected=rejected)
+
+    assert plan.vision is not None
+    assert plan.vision.model == "qwen3.5-ocr"
 
 
 def test_model_plan_never_adds_ppinfra_without_paid_opt_in(tmp_path):

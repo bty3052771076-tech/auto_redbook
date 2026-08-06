@@ -120,7 +120,16 @@ def _split_models(value: str) -> list[str]:
 
 
 def _canonical_volcengine_model(value: str) -> str:
+    return canonical_volcengine_model(value)
+
+
+def canonical_volcengine_model(value: str) -> str:
+    """Convert Ark console display/charge names to callable endpoint IDs."""
     model = (value or "").strip()
+    # Ark quota snapshots may expose the DeepSeek V4 Flash charge-item name
+    # with a ``-ga`` suffix; the OpenAI-compatible endpoint uses the dated ID.
+    if model.lower() == "deepseek-v4-flash-ga":
+        model = "deepseek-v4-flash"
     return VOLCENGINE_LLM_ENDPOINT_ALIASES.get(model, model)
 
 

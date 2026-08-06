@@ -79,6 +79,18 @@ def test_volcengine_deepseek_v4_flash_alias_uses_live_endpoint_id(monkeypatch):
     assert cfgs[0].model == "deepseek-v4-flash-260425"
 
 
+def test_volcengine_deepseek_v4_flash_ga_quota_name_uses_live_endpoint_id(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "volcengine")
+    monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volc")
+    monkeypatch.setenv("VOLCENGINE_LLM_MODEL", "deepseek-v4-flash-ga")
+    monkeypatch.delenv("VOLCENGINE_LLM_MODELS", raising=False)
+
+    cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
+
+    assert len(cfgs) == 1
+    assert cfgs[0].model == "deepseek-v4-flash-260425"
+
+
 def test_volcengine_glm_5_2_alias_uses_live_endpoint_id(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "volcengine")
     monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volc")

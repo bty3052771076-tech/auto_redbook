@@ -54,6 +54,22 @@ def _free_records() -> list[dict]:
             "unit": "token",
         },
         {
+            "model": "doubao-1-5-vision-lite",
+            "kind": "llm",
+            "status": "available",
+            "remaining": 500_000,
+            "total": 500_000,
+            "unit": "token",
+        },
+        {
+            "model": "doubao-seed-1-6-251015",
+            "kind": "llm",
+            "status": "available",
+            "remaining": 500_000,
+            "total": 500_000,
+            "unit": "token",
+        },
+        {
             "model": "doubao-seedream-4-5-251128",
             "kind": "image",
             "status": "available",
@@ -104,6 +120,67 @@ def test_prepare_auto_pipeline_reuses_fresh_metrics_and_quota(monkeypatch, tmp_p
     assert report.model_plan.image.model == "doubao-seedream-4-5-251128"
 
 
+def test_prepare_auto_pipeline_reuses_recent_valid_quota_after_empty_snapshot(monkeypatch, tmp_path):
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+    metrics = tmp_path / "data" / "analytics" / "published_metrics_latest.csv"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_text("title,likes\n测试,1\n", encoding="utf-8")
+    os.utime(metrics, (now.timestamp(), now.timestamp()))
+    quota_dir = tmp_path / "data" / "quota"
+    valid = _write_quota(quota_dir, "volcengine", _free_records(), now - timedelta(minutes=30))
+    os.utime(valid, ((now - timedelta(minutes=30)).timestamp(),) * 2)
+    empty = quota_dir / "volcengine_quota_20260728_120001.json"
+    empty.write_text(
+        json.dumps(
+            {
+                "provider": "volcengine",
+                "captured_at": now.isoformat(),
+                "records": [],
+                "errors": ["quota page unavailable"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(empty, (now.timestamp(), now.timestamp()))
+    (quota_dir / "aliyun_quota_20260728_120001.json").write_text(
+        json.dumps(
+            {
+                "provider": "aliyun",
+                "captured_at": now.isoformat(),
+                "records": [],
+                "errors": ["login required"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    called = {"quotas": 0}
+    monkeypatch.setenv("LLM_PROVIDER", "volcengine")
+    monkeypatch.setenv("IMAGE_PROVIDER", "volcengine")
+    monkeypatch.setenv("VLM_REVIEW_PROVIDER", "volcengine")
+    monkeypatch.setattr(
+        cli,
+        "_refresh_quotas_for_preflight",
+        lambda **_kwargs: called.__setitem__("quotas", called["quotas"] + 1) or [],
+    )
+
+    report = cli._prepare_auto_pipeline(
+        headless=True,
+        login_hold=0,
+        wait_timeout=30,
+        metrics_max_age_hours=24,
+        quota_max_age_hours=2,
+        require_image=True,
+        metrics_path=metrics,
+        quota_dir=quota_dir,
+        provider_keys={"aliyun": True, "volcengine": True},
+        now=now,
+    )
+
+    assert called == {"quotas": 0}
+    assert report.quota_mode == "fresh"
+    assert report.model_plan.llm.model == "glm-5.2"
+
+
 def test_prepare_auto_pipeline_refreshes_stale_snapshots(monkeypatch, tmp_path):
     now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
     metrics = tmp_path / "data" / "analytics" / "published_metrics_latest.csv"
@@ -144,6 +221,45 @@ def test_prepare_auto_pipeline_refreshes_stale_snapshots(monkeypatch, tmp_path):
     assert called == {"metrics": 1, "quotas": 1}
     assert report.metrics_mode == "refreshed"
     assert report.quota_mode == "refreshed"
+
+
+def test_prepare_auto_pipeline_caps_headless_quota_refresh_before_using_recent_positive_snapshot(
+    monkeypatch,
+    tmp_path,
+):
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+    metrics = tmp_path / "data" / "analytics" / "published_metrics_latest.csv"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_text("title,likes\n测试,1\n", encoding="utf-8")
+    os.utime(metrics, (now.timestamp(), now.timestamp()))
+    quota_dir = tmp_path / "data" / "quota"
+    stale = _write_quota(quota_dir, "volcengine", _free_records(), now - timedelta(hours=6))
+    os.utime(stale, ((now - timedelta(hours=6)).timestamp(),) * 2)
+    captured: dict[str, int] = {}
+    monkeypatch.delenv("AUTO_QUOTA_SYNC_TIMEOUT_S", raising=False)
+
+    def refresh_quotas(**kwargs):
+        captured["wait_timeout"] = kwargs["wait_timeout"]
+        return ["quota page timeout"]
+
+    monkeypatch.setattr(cli, "_refresh_quotas_for_preflight", refresh_quotas)
+
+    report = cli._prepare_auto_pipeline(
+        headless=True,
+        login_hold=0,
+        wait_timeout=600,
+        metrics_max_age_hours=24,
+        quota_max_age_hours=2,
+        require_image=True,
+        metrics_path=metrics,
+        quota_dir=quota_dir,
+        provider_keys={"aliyun": False, "volcengine": True},
+        now=now,
+    )
+
+    assert captured["wait_timeout"] == 60
+    assert report.quota_mode == "stale_fallback"
+    assert any("24 小时容忍期" in warning for warning in report.warnings)
 
 
 def test_prepare_auto_pipeline_uses_stale_metrics_with_warning(monkeypatch, tmp_path):
@@ -249,7 +365,7 @@ def test_auto_applies_selected_models_only_for_current_invocation(monkeypatch, t
             issues=(),
             retry_prompt="",
             provider="volcengine",
-            model="doubao-seed-1-6-vision",
+            model="doubao-1-5-vision-lite",
         ),
     )
     monkeypatch.setattr(

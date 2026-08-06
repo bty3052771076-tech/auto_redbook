@@ -29,6 +29,7 @@ from src.config import (
 )
 from src.storage.files import latest_execution, published_metrics_paths
 from src.sources.health import SourceHealthSnapshot, load_source_health_snapshot
+from src.publish.targets import PUBLISH_PLATFORM_LABELS, normalize_publish_platform
 from src.workflow.create_post import DEFAULT_EVALUATION_VIEWPOINT
 
 
@@ -65,6 +66,7 @@ DEFAULT_ASSETS_GLOB = "assets/pics/*"
 AUTO_IMAGE_ASSETS_GLOB = "assets/empty/*"
 DEFAULT_LOGIN_HOLD = 600
 DEFAULT_WAIT_TIMEOUT = 600
+PUBLISH_PLATFORM_DISPLAY_OPTIONS = ["小红书", "今日头条", "小红书 + 今日头条"]
 DEFAULT_COMMAND_HEARTBEAT_S = 20.0
 COMMAND_OUTPUT_POLL_S = 0.2
 DEFAULT_PROMPT_ENTRY_COUNT = 4
@@ -120,6 +122,8 @@ DEFAULT_NEWS_CHINA_RATIO = "0.6"
 DEFAULT_NEWS_CHINA_BONUS = "0.15"
 DEFAULT_DRAFT_URL = "https://creator.xiaohongshu.com/publish/publish?target=image"
 DEFAULT_LOGIN_URL = "https://creator.xiaohongshu.com"
+DEFAULT_TOUTIAO_DRAFT_URL = "https://mp.toutiao.com/profile_v4/graphic/publish"
+DEFAULT_TOUTIAO_CDP_PORT = 9223
 DEFAULT_XHS_CHROME_PROFILE = "Default"
 DELETE_MODE_PREVIEW = "安全预览（不删除）"
 DELETE_MODE_DELETE = "正式删除（会删除小红书草稿）"
@@ -1330,6 +1334,48 @@ def build_xhs_login_launch_args(
     )
 
 
+def build_toutiao_creator_launch_args(
+    *,
+    project_root: Path = PROJECT_ROOT,
+    env: Mapping[str, str] | None = None,
+    chrome_path: str | Path | None = None,
+    url: str = DEFAULT_TOUTIAO_DRAFT_URL,
+) -> list[str]:
+    resolved_chrome = (
+        Path(chrome_path).expanduser()
+        if chrome_path
+        else find_chrome_executable(env=env)
+    )
+    if not resolved_chrome:
+        return []
+    source = dict(_env_lookup(env))
+    if str(source.get("TOUTIAO_CHROME_USER_DATA_DIR") or "").strip():
+        source["XHS_CHROME_USER_DATA_DIR"] = source["TOUTIAO_CHROME_USER_DATA_DIR"]
+    if str(source.get("TOUTIAO_CHROME_PROFILE") or "").strip():
+        source["XHS_CHROME_PROFILE"] = source["TOUTIAO_CHROME_PROFILE"]
+    raw_port = str(source.get("TOUTIAO_CDP_PORT") or DEFAULT_TOUTIAO_CDP_PORT).strip()
+    try:
+        cdp_port = int(raw_port)
+    except ValueError as exc:
+        raise ValueError("TOUTIAO_CDP_PORT 必须是 1024 到 65535 之间的整数") from exc
+    if not 1024 <= cdp_port <= 65535:
+        raise ValueError("TOUTIAO_CDP_PORT 必须是 1024 到 65535 之间的整数")
+    args = build_xhs_creator_launch_args(
+        project_root=project_root,
+        env=source,
+        chrome_path=resolved_chrome,
+        url=url,
+    )
+    if not args:
+        return []
+    return [
+        *args[:-1],
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={cdp_port}",
+        args[-1],
+    ]
+
+
 def open_xhs_creator(
     *,
     project_root: Path = PROJECT_ROOT,
@@ -1347,6 +1393,33 @@ def open_xhs_creator(
 
 def open_xhs_profile_login() -> bool:
     return open_xhs_creator(url=DEFAULT_LOGIN_URL)
+
+
+def open_toutiao_creator(
+    *,
+    project_root: Path = PROJECT_ROOT,
+    env: Mapping[str, str] | None = None,
+    url: str = DEFAULT_TOUTIAO_DRAFT_URL,
+) -> bool:
+    args = build_toutiao_creator_launch_args(
+        project_root=project_root,
+        env=env,
+        url=url,
+    )
+    if args:
+        profile_arg = next((arg for arg in args if arg.startswith("--user-data-dir=")), "")
+        if profile_arg:
+            Path(profile_arg.split("=", 1)[1]).mkdir(parents=True, exist_ok=True)
+        port_arg = next(
+            (arg for arg in args if arg.startswith("--remote-debugging-port=")),
+            "",
+        )
+        if port_arg:
+            port = port_arg.split("=", 1)[1]
+            os.environ["TOUTIAO_CDP_URL"] = f"http://127.0.0.1:{port}"
+        subprocess.Popen(args, cwd=str(project_root))
+        return True
+    return bool(webbrowser.open(url))
 
 
 def _python_for_cli() -> str:
@@ -1519,8 +1592,10 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             lookback_days = ""
             count = 1
         no_copy = bool(params.get("no_copy") or False)
+        platform = normalize_publish_platform(str(params.get("platform") or "xhs"))
 
         args.extend(["--title", title])
+        args.extend(["--platform", platform])
         if keywords:
             args.extend(["--keywords", keywords])
         args.extend(["--evaluation-viewpoint", evaluation_viewpoint])
@@ -1571,8 +1646,10 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         login_hold = int(params.get("login_hold") or 0)
         wait_timeout = int(params.get("wait_timeout") or 300)
         force = bool(params.get("force") or False)
+        platform = normalize_publish_platform(str(params.get("platform") or "xhs"))
 
         args.append(post_id)
+        args.extend(["--platform", platform])
         if assets_glob:
             args.extend(["--assets-glob", assets_glob])
         if dry_run:
@@ -1889,6 +1966,20 @@ def env_flag_enabled(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def gui_hidden_autorun_enabled(env: Mapping[str, str] | None = None) -> bool:
+    source = os.environ if env is None else env
+    return (
+        str(source.get("AUTO_REDBOOK_GUI_AUTORUN") or "").strip().lower() == "auto"
+        and env_flag_enabled(source.get("AUTO_REDBOOK_GUI_AUTORUN_HIDDEN"))
+    )
+
+
+def gui_hidden_autorun_exit_code(hidden_autorun: bool, child_exit_code: int | None) -> int:
+    if not hidden_autorun or child_exit_code is None:
+        return 0
+    return int(child_exit_code)
+
+
 def env_int_value(value: str | None, default: int, *, min_value: int | None = None) -> int:
     try:
         parsed = int((value or "").strip())
@@ -2194,6 +2285,10 @@ def main() -> None:
     from tkinter.scrolledtext import ScrolledText
 
     root = tk.Tk()
+    hidden_autorun = gui_hidden_autorun_enabled()
+    hidden_autorun_child_exit_code: int | None = None
+    if hidden_autorun:
+        root.withdraw()
     root.title("Auto Redbook - 发布控制台")
     root.geometry("1180x760")
     root.minsize(1040, 680)
@@ -2260,6 +2355,9 @@ def main() -> None:
     header.pack(fill="x", padx=18, pady=(14, 10))
     ttk.Label(header, text="Auto Redbook 发布控制台", style="Title.TLabel").pack(side="left")
     ttk.Button(header, text="打开小红书创作平台", command=open_xhs_creator).pack(side="right")
+    ttk.Button(header, text="打开头条号创作平台", command=open_toutiao_creator).pack(
+        side="right", padx=(0, 8)
+    )
     ttk.Button(header, text="登录/检查Profile", command=open_xhs_profile_login).pack(side="right", padx=(0, 8))
     ttk.Label(
         header,
@@ -2652,6 +2750,8 @@ def main() -> None:
 
     def log_line(s: str) -> None:
         log_buffer.write(s)
+        if hidden_autorun:
+            print(s, end="", flush=True)
 
     post_command_success_callbacks: dict[str, Callable[[], None]] = {}
 
@@ -2659,12 +2759,16 @@ def main() -> None:
         post_command_success_callbacks[key] = callback
 
     def log_exit(code: int) -> None:
+        nonlocal hidden_autorun_child_exit_code
+        hidden_autorun_child_exit_code = int(code)
         ui_events.put(_append_exit, code)
         callbacks = list(post_command_success_callbacks.values())
         post_command_success_callbacks.clear()
         if code == 0:
             for callback in callbacks:
                 ui_events.put(callback)
+        if hidden_autorun:
+            ui_events.put(root.destroy)
 
     def _set_status(status: str) -> None:
         status_var.set(f"状态：{status}")
@@ -2876,7 +2980,7 @@ def main() -> None:
     ttk.Label(auto_top, text="生成草稿", style="Section.TLabel").pack(anchor="w")
     ttk.Label(
         auto_top,
-        text="生成后只保存到小红书创作者中心草稿箱，不会正式发布；正式发布请进入“发布草稿”。",
+        text="生成后按所选平台保存草稿，不会正式发布；可选择小红书、今日头条或同时保存到两个平台。",
         style="Muted.TLabel",
     ).pack(anchor="w", pady=(2, 0))
 
@@ -2909,6 +3013,7 @@ def main() -> None:
     login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
     evaluation_viewpoint_var = tk.StringVar(value=DEFAULT_EVALUATION_VIEWPOINT)
+    publish_platform_var = tk.StringVar(value=PUBLISH_PLATFORM_LABELS["xhs"])
 
     _add_labeled_entry(auto_grid, 0, "标题", title_var)
     quick_titles = ttk.Frame(auto_grid)
@@ -2920,6 +3025,14 @@ def main() -> None:
     ttk.Button(quick_titles, text="每日假新闻", command=lambda: title_var.set("每日假新闻")).pack(
         side="left", padx=(8, 0)
     )
+    ttk.Label(quick_titles, text="发布平台").pack(side="left", padx=(24, 6))
+    ttk.Combobox(
+        quick_titles,
+        textvariable=publish_platform_var,
+        values=PUBLISH_PLATFORM_DISPLAY_OPTIONS,
+        state="readonly",
+        width=20,
+    ).pack(side="left")
 
     ttk.Label(auto_grid, text="关键词").grid(row=2, column=0, sticky="nw", pady=5)
     prompt_entry_vars = [tk.StringVar(value="") for _ in range(DEFAULT_PROMPT_ENTRY_COUNT)]
@@ -3256,6 +3369,7 @@ def main() -> None:
             _schedule_post_command_refresh("publish", _refresh_publish_drafts)
         params = {
             "title": title_var.get(),
+            "platform": publish_platform_var.get(),
             "keywords": combine_prompt_entries(var.get() for var in prompt_entry_vars),
             "evaluation_viewpoint": evaluation_viewpoint_var.get(),
             "assets_glob": assets_var.get(),
@@ -3285,9 +3399,12 @@ def main() -> None:
         }.get(news_material_mode_var.get().strip().lower(), "实时检索")
         count_text = "固定 1 条" if mode_label == "单条材料" else f"{max(1, count_var.get())} 条"
         save_text = "仅验证" if dry_run_var.get() else "保存草稿"
-        auto_summary_var.set(f"本次任务：{title_var.get().strip() or DEFAULT_TITLE} · {mode_label} · {count_text} · {save_text}")
+        platform_label = PUBLISH_PLATFORM_LABELS[normalize_publish_platform(publish_platform_var.get())]
+        auto_summary_var.set(
+            f"本次任务：{title_var.get().strip() or DEFAULT_TITLE} · {platform_label} · {mode_label} · {count_text} · {save_text}"
+        )
 
-    for tracked_var in (title_var, count_var, news_material_mode_var, dry_run_var):
+    for tracked_var in (title_var, publish_platform_var, count_var, news_material_mode_var, dry_run_var):
         tracked_var.trace_add("write", _refresh_auto_summary)
     _refresh_auto_summary()
 
@@ -3305,6 +3422,11 @@ def main() -> None:
             return
 
         title_var.set(os.getenv("AUTO_REDBOOK_GUI_TITLE") or DEFAULT_TITLE)
+        publish_platform_var.set(
+            PUBLISH_PLATFORM_LABELS[
+                normalize_publish_platform(os.getenv("AUTO_REDBOOK_GUI_PLATFORM") or "xhs")
+            ]
+        )
         evaluation_viewpoint_var.set(
             os.getenv("AUTO_REDBOOK_GUI_EVALUATION_VIEWPOINT") or DEFAULT_EVALUATION_VIEWPOINT
         )
@@ -3596,6 +3718,7 @@ def main() -> None:
     run_force_var = tk.BooleanVar(value=False)
     run_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     run_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
+    run_platform_var = tk.StringVar(value=PUBLISH_PLATFORM_LABELS["xhs"])
     post_lookup: dict[str, RecentPostSummary] = {}
 
     ttk.Label(run_grid, text="帖子").grid(row=0, column=0, sticky="w", pady=5)
@@ -3729,6 +3852,14 @@ def main() -> None:
     ttk.Label(run_grid, text="留空则使用 post 内素材", style="Muted.TLabel").grid(
         row=1, column=2, sticky="e", padx=(8, 0)
     )
+    ttk.Label(run_grid, text="发布平台").grid(row=2, column=0, sticky="w", pady=5)
+    ttk.Combobox(
+        run_grid,
+        textvariable=run_platform_var,
+        values=PUBLISH_PLATFORM_DISPLAY_OPTIONS,
+        state="readonly",
+        width=20,
+    ).grid(row=2, column=1, sticky="w", padx=(10, 0), pady=5)
 
     _add_execution_options(
         tab_run,
@@ -3756,6 +3887,7 @@ def main() -> None:
             "run",
             {
                 "post_id": extract_post_id_from_choice(post_id_var.get()),
+                "platform": run_platform_var.get(),
                 "assets_glob": assets_glob_var.get(),
                 "dry_run": run_dry_var.get(),
                 "headless": run_headless_var.get(),
@@ -4652,6 +4784,12 @@ def main() -> None:
     ).grid(row=12, column=0, sticky="w", pady=(10, 0))
 
     root.mainloop()
+    exit_code = gui_hidden_autorun_exit_code(
+        hidden_autorun,
+        hidden_autorun_child_exit_code,
+    )
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

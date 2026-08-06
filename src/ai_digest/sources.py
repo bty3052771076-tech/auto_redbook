@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 
@@ -37,7 +37,7 @@ class AIDigestSource:
 
 
 def default_ai_digest_sources() -> list[AIDigestSource]:
-    return [
+    sources = [
         AIDigestSource("openai", "official", "https://openai.com/news/rss.xml", "OpenAI", "rss"),
         AIDigestSource("anthropic", "official", "https://www.anthropic.com/news", "Anthropic", "html"),
         AIDigestSource("deepmind", "official", "https://deepmind.google/blog/rss.xml", "Google DeepMind", "rss"),
@@ -178,6 +178,36 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
         AIDigestSource("x-tibo-maker", "social", "https://syndication.twitter.com/srv/timeline-profile/screen-name/tibo_maker", "Tibo", "x_profile"),
         AIDigestSource("x", "social", "https://x.com/search?q=AI%20model%20release&f=live", "X", "social_html", enabled=False),
         AIDigestSource("hackernews", "social", "https://hn.algolia.com/?q=AI%20model", "Hacker News", "social_html", enabled=False),
+    ]
+    domestic_source_names = {
+        "aliyun",
+        "qwen-blog",
+        "qwen-github",
+        "zhipu-glm",
+        "zcode",
+        "deepseek",
+        "minimax",
+        "doubao",
+        "tencent-hunyuan",
+        "stepfun",
+        "bytedance-seed",
+        "baidu-qianfan",
+        "moonshot-kimi",
+        "iflytek-spark",
+        "huawei-pangu",
+        "sensetime-sensenova",
+        "01ai-yi",
+        "01ai-yi-github",
+        "baichuan-github",
+        "internlm-github",
+        "minicpm-github",
+        "minicpm-v-github",
+        "skywork",
+        "kling",
+    }
+    return [
+        replace(source, region="domestic") if source.name in domestic_source_names else source
+        for source in sources
     ]
 
 

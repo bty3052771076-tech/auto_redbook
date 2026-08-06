@@ -11,6 +11,7 @@ from src.publish.playwright_steps import (
     _goto_xhs_page,
     _locators_for_body,
     _matches_body_value,
+    _page_current_url,
     _resolve_headless,
     _resolve_profile_config,
     _wait_for_xhs_ready,
@@ -83,6 +84,81 @@ def test_goto_xhs_page_commits_without_waiting_for_domcontentloaded():
             {"wait_until": "commit", "timeout": 60000},
         )
     ]
+
+
+def test_goto_xhs_page_prefers_nonblocking_cdp_navigation():
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def send(self, method, params):
+            self.calls.append((method, params))
+            return {"frameId": "frame-1", "loaderId": "loader-1"}
+
+    class FakeContext:
+        def __init__(self):
+            self.session = FakeSession()
+
+        def new_cdp_session(self, page):
+            assert page is not None
+            return self.session
+
+    class FakePage:
+        def __init__(self):
+            self.context = FakeContext()
+            self.goto_calls = []
+
+        def goto(self, url, **kwargs):
+            self.goto_calls.append((url, kwargs))
+
+    page = FakePage()
+    url = "https://creator.xiaohongshu.com/publish/publish?target=image"
+
+    _goto_xhs_page(page, url, timeout_ms=600000)
+
+    assert page.context.session.calls == [("Page.navigate", {"url": url})]
+    assert page.goto_calls == []
+
+
+def test_page_current_url_falls_back_to_document_url_for_stale_playwright_state():
+    class FakePage:
+        url = "about:blank"
+
+        def evaluate(self, script):
+            assert script == "document.URL"
+            return "https://creator.xiaohongshu.com/login?redirectReason=401"
+
+    assert _page_current_url(FakePage()) == (
+        "https://creator.xiaohongshu.com/login?redirectReason=401"
+    )
+
+
+def test_goto_xhs_page_retries_one_transient_commit_timeout(monkeypatch):
+    class FakePage:
+        def __init__(self):
+            self.calls = []
+            self.stop_calls = 0
+
+        def goto(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if len(self.calls) == 1:
+                raise playwright_steps.PlaywrightTimeoutError("temporary timeout")
+
+        def evaluate(self, script):
+            assert "window.stop" in script
+            self.stop_calls += 1
+
+    page = FakePage()
+    monkeypatch.setattr(playwright_steps.time, "sleep", lambda _seconds: None)
+
+    _goto_xhs_page(
+        page,
+        "https://creator.xiaohongshu.com/publish/publish?target=image",
+        timeout_ms=600000,
+    )
+
+    assert len(page.calls) == 2
+    assert page.stop_calls == 1
 
 
 def test_body_locators_include_rich_text_editors():

@@ -1,6 +1,7 @@
 import os
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 from typer.main import get_command
@@ -94,6 +95,55 @@ def test_auto_passes_keywords_to_daily_news_generation(monkeypatch, tmp_path):
     assert seen["prompt_hint"] == "财经产业 公司政策"
 
 
+def test_auto_daily_ai_digest_initializes_daily_news_quality_reuse_flag(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "digest.png"
+    asset.write_bytes(b"fake digest image")
+    post = Post(
+        title="每日AI|测试简报",
+        body="每日AI讯息\n\n发布时间：2026-08-06\n来源链接：https://example.com/ai",
+        assets=[AssetInfo(path=str(asset), kind="image")],
+        platform={"ai_digest": {"mode": "daily_ai_digest"}},
+    )
+    quality_kwargs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "_prepare_auto_pipeline",
+        lambda **_kwargs: SimpleNamespace(model_plan=None, warnings=()),
+    )
+    monkeypatch.setattr(cli, "create_daily_ai_digest_posts", lambda **_kwargs: [post])
+
+    def fake_quality_gate(_posts, **kwargs):
+        quality_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli, "_run_auto_quality_gate", fake_quality_gate)
+    monkeypatch.setattr(
+        cli,
+        "run_save_draft_sync",
+        lambda post_arg, **_kwargs: Execution(post_id=post_arg.id, result="saved_draft"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "auto",
+            "--title",
+            "每日AI讯息",
+            "--assets-glob",
+            "assets/empty/*",
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert quality_kwargs["reuse_vision_results"] is False
+
+
 def test_auto_records_xhs_draft_metadata_after_successful_upload(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     asset = tmp_path / "asset.png"
@@ -138,6 +188,57 @@ def test_auto_records_xhs_draft_metadata_after_successful_upload(monkeypatch, tm
     assert final_post.platform["xhs_draft"]["title"] == post.title
     assert final_post.platform["xhs_draft"]["execution_id"] == "execution-test-id"
     assert final_post.platform["xhs_draft"]["saved_at"]
+
+
+def test_auto_platform_both_saves_each_generated_post_to_xhs_and_toutiao(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "asset.png"
+    asset.write_bytes(b"fake image")
+    post = Post(
+        title="多平台草稿测试",
+        body="内容：这是用于验证多平台草稿保存的正文。\n\n评价：需要继续观察。\n\n来源：测试源",
+        assets=[AssetInfo(path=str(asset), kind="image")],
+    )
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli, "create_daily_news_posts", lambda **_kwargs: [post])
+    monkeypatch.setattr(
+        cli,
+        "run_save_draft_sync",
+        lambda post_arg, **_kwargs: calls.append("xhs")
+        or Execution(post_id=post_arg.id, result="saved_draft", id="xhs-exec"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_save_toutiao_draft_sync",
+        lambda post_arg, **_kwargs: calls.append("toutiao")
+        or Execution(post_id=post_arg.id, result="saved_draft", id="toutiao-exec"),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "auto",
+            "--no-preflight",
+            "--platform",
+            "both",
+            "--title",
+            "每日新闻",
+            "--assets-glob",
+            str(asset),
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["xhs", "toutiao"]
+    assert post.platform["xhs_draft"]["execution_id"] == "xhs-exec"
+    assert post.platform["toutiao_draft"]["execution_id"] == "toutiao-exec"
+
 
 
 def test_auto_refuses_partial_daily_news_batch_before_upload_by_default(monkeypatch, tmp_path):
@@ -485,3 +586,92 @@ def test_auto_returns_failure_when_generated_draft_was_not_saved(monkeypatch, tm
     assert result.exit_code == 1
     assert "uploaded=0" in result.output
     assert "[auto] stage=完成 | failed" in result.output
+
+
+def test_auto_continues_candidate_pool_after_visual_quality_failure(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    asset = tmp_path / "asset.png"
+    asset.write_bytes(b"fake image")
+    body = "内容：经过来源核验的测试新闻。\n\n评价：测试评价。\n\n日期：2026-07-29\n\n来源：测试源"
+    posts = [
+        Post(title=f"测试新闻{i}", body=body, assets=[AssetInfo(path=str(asset), kind="image")])
+        for i in range(1, 4)
+    ]
+    observed: dict[str, object] = {}
+    uploaded: list[str] = []
+
+    monkeypatch.setattr(
+        cli,
+        "_prepare_auto_pipeline",
+        lambda **_kwargs: SimpleNamespace(model_plan=None),
+    )
+
+    def fake_create_daily_news_posts(**kwargs):
+        observed.update(kwargs)
+        quality_callback = kwargs["post_quality_callback"]
+        accepted = []
+        for post in posts:
+            if not quality_callback(post):
+                accepted.append(post)
+            if len(accepted) >= kwargs["count"]:
+                break
+        return accepted
+
+    quality_calls: list[tuple[list[str], bool]] = []
+
+    def fake_quality_gate(candidates, **kwargs):
+        quality_calls.append(
+            ([post.id for post in candidates], bool(kwargs.get("reuse_vision_results")))
+        )
+        for post in candidates:
+            is_bad = post is posts[0]
+            post.platform["quality_gate"] = {
+                "deterministic_ok": True,
+                "issues": [],
+                "vision": {
+                    "ok": not is_bad,
+                    "score": 100 if not is_bad else 0,
+                    "issues": [] if not is_bad else ["图片与文字不一致"],
+                },
+            }
+        if len(candidates) == 1 and candidates[0] is posts[0]:
+            return ["第 1 条图片与文字不一致（得分 0）"]
+        return []
+
+    monkeypatch.setattr(cli, "create_daily_news_posts", fake_create_daily_news_posts)
+    monkeypatch.setattr(cli, "_run_auto_quality_gate", fake_quality_gate)
+    monkeypatch.setattr(
+        cli,
+        "run_save_draft_sync",
+        lambda post_arg, **_kwargs: uploaded.append(post_arg.id)
+        or Execution(post_id=post_arg.id, result="saved_draft"),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "auto",
+            "--title",
+            "每日新闻",
+            "--count",
+            "2",
+            "--assets-glob",
+            str(asset),
+            "--login-hold",
+            "0",
+            "--wait-timeout",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert observed["count"] == 2
+    assert callable(observed["post_quality_callback"])
+    assert uploaded == [posts[1].id, posts[2].id]
+    assert quality_calls[:3] == [
+        ([posts[0].id], False),
+        ([posts[1].id], False),
+        ([posts[2].id], False),
+    ]
+    assert quality_calls[-1] == ([posts[1].id, posts[2].id], True)
+    assert "视觉递补" in result.output

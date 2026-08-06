@@ -42,9 +42,18 @@ _VISION_MODEL_PREFERENCE = (
     "doubao-seed-1-6-vision",
     "doubao-1-5-vision-pro-32k",
     "doubao-1-5-vision-lite",
+    "qwen3.5-ocr",
 )
 _VISION_MODEL_EXACT = {
     "doubao-seed-1-6-251015",
+    "qwen3.5-ocr",
+}
+# Ark may expose this legacy display label in the quota table even though the
+# OpenAI-compatible endpoint currently returns 404 for it.
+_UNCALLABLE_VISION_DISPLAY_ALIASES = {
+    "doubao-seed-1-6-vision",
+    "doubao-1-5-vision-lite",
+    "doubao-1-5-vision-pro-32k",
 }
 
 
@@ -426,7 +435,11 @@ def _choose_vision(records: Iterable[QuotaModelRecord]) -> QuotaModelRecord | No
     candidates = [
         record
         for record in records
-        if record.kind == "llm" and model_supports_vision(record.model)
+        if (
+            record.kind == "llm"
+            and model_supports_vision(record.model)
+            and record.model.strip().lower() not in _UNCALLABLE_VISION_DISPLAY_ALIASES
+        )
     ]
     if not candidates:
         return None

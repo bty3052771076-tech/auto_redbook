@@ -22,6 +22,7 @@ from src.ai_digest.generate import (
 )
 from src.ai_digest.models import AIDigestBrief, AIUpdateItem
 from src.ai_digest.rank import (
+    ai_digest_official_count,
     ai_digest_quota_counts,
     dedupe_ai_updates,
     filter_recent_ai_updates,
@@ -48,7 +49,7 @@ from src.news.daily_news import (
     rank_news_candidate_pool,
 )
 from src.storage.files import copy_assets_into_post, list_posts, post_dir, save_post, save_revision
-from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSource
+from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSource, now_iso
 from src.validation.rules import MAX_IMAGE_BODY, MAX_IMAGE_TITLE
 
 
@@ -136,6 +137,7 @@ class PartialDailyNewsError(RuntimeError):
 
 
 DailyNewsProgressCallback = Callable[[str, str, dict[str, Any]], None]
+DailyNewsPostQualityCallback = Callable[[Post], list[str]]
 
 
 def _emit_daily_news_progress(
@@ -644,6 +646,9 @@ def _enrich_daily_news_item(picked):
 def _daily_news_story_lines(value: str) -> list[str]:
     text = _strip_urls(value or "")
     text = re.sub(r"\r\n?", "\n", text)
+    numbered_markers = re.findall(r"(?:^|\s)\d{1,2}[.、]\s*", text)
+    if len(numbered_markers) >= 2:
+        text = re.sub(r"(?<!^)(?<!\n)\s+(?=\d{1,2}[.、]\s*)", "\n", text)
     text = re.sub(r"(?m)^\s*(?:[-*•·]|\d{1,2}[.、])\s*", "", text)
     lines: list[str] = []
     for raw in text.split("\n"):
@@ -702,7 +707,15 @@ def _daily_news_title_is_bundle_header(value: str) -> bool:
         "简讯",
         "要闻",
     )
-    return compact in bundle_markers or any(compact.endswith(marker) for marker in ("早报", "晚报", "快讯"))
+    if compact in bundle_markers or any(
+        compact.endswith(marker)
+        for marker in ("日报", "早报", "晚报", "简报", "快讯")
+    ):
+        return True
+    if re.search(r"(?:AI|互联网|科技|IT)?(?:日报|早报|晚报|简报|快讯)[：:]", compact, re.I):
+        story_part = re.split(r"[：:]", compact, maxsplit=1)[-1]
+        return len([part for part in re.split(r"[、；;]", story_part) if part]) >= 2
+    return False
 
 
 def _daily_news_story_importance_score(value: str) -> float:
@@ -721,6 +734,9 @@ def _daily_news_story_importance_score(value: str) -> float:
         ("监管", 2.0),
         ("调查", 2.0),
         ("处罚", 2.0),
+        ("清理", 2.1),
+        ("违规", 1.7),
+        ("治理", 1.8),
         ("事故", 2.0),
         ("死亡", 2.0),
         ("权益", 1.8),
@@ -1310,6 +1326,14 @@ def _is_generic_daily_news_title(title: str) -> bool:
     if not text:
         return True
     if text in _NEWS_GENERIC_TITLE_MARKERS:
+        return True
+    compact = re.sub(r"\s+", "", text)
+    generic_patterns = (
+        r"(?:近期|最新)?多项(?:行业)?动态(?:发布|更新|汇总|出现)?$",
+        r"(?:近期|最新)?多条.+(?:消息|资讯|新闻|动态)(?:发布|更新|汇总)?$",
+        r"(?:行业|赛道)(?:近期|最新).*(?:多项|多条).*(?:动态|消息|资讯)$",
+    )
+    if any(re.search(pattern, compact) for pattern in generic_patterns):
         return True
     rest = re.sub(r"^(?:每日新闻)(?:[｜:：—\s-]+)?", "", text).strip()
     return rest == ""
@@ -2620,11 +2644,12 @@ def _daily_news_body_to_fields(
         final_original_title = title_hint_original
     else:
         final_original_title = fallback_original_title
+    source_date = _format_news_seendate(getattr(picked, "seendate", None))
     normalized = {
         "原文标题": final_original_title,
         "内容": _limit_daily_news_content(str(content or "")),
         "评价": _clean_daily_news_comment_value(comment),
-        "日期": _clean_daily_news_json_value(date) or _format_news_seendate(getattr(picked, "seendate", None)),
+        "日期": source_date if source_date != "未知" else _clean_daily_news_json_value(date),
         "来源": _clean_daily_news_json_value(source) or _daily_news_source_name(picked),
     }
     return normalized
@@ -2736,6 +2761,38 @@ def _normalize_daily_news_image_event(
         )
         if part
     )
+    compact_context = re.sub(r"\s+", "", context)
+    if "健身气功" in compact_context and any(
+        marker in compact_context for marker in ("锦标赛", "比赛", "竞赛", "高校")
+    ):
+        return "室内体育馆内，多名大学生统一运动服进行健身气功集体展演，裁判在场边观察"
+    if "卫生巾" in compact_context and any(
+        marker in compact_context for marker in ("异物", "虫卵", "质量", "核实", "检测")
+    ):
+        return "洁净实验室内，质检员检查展开的白色卫生巾和独立包装"
+    if any(marker in compact_context for marker in ("颁奖", "获奖")) and any(
+        marker in compact_context for marker in ("田径", "赛事", "运动员", "健儿")
+    ):
+        return "赛场领奖区内，赛事工作人员为获奖运动员颁发无文字奖杯，背景无横幅标志"
+    if any(marker in compact_context for marker in ("签署", "签约", "合作协定")) and any(
+        marker in compact_context for marker in ("代表", "企业", "负责人", "三方")
+    ):
+        return "简洁会议室内，三方代表在空白文件旁握手合影，服装与背景无文字标志"
+    if any(
+        marker in compact_context
+        for marker in ("财报", "半年报", "年报", "季报", "亏损", "营收", "利润")
+    ):
+        if any(
+            marker in compact_context
+            for marker in ("运动品牌", "运动服", "运动鞋", "安踏", "彪马", "Puma")
+        ):
+            return "财经分析人员在现代办公室研究无文字图表，背景陈列无品牌标志的运动鞋服"
+        finance_subject = _normalize_image_event(value, fallback=fallback, limit=18)
+        return (
+            f"{finance_subject}，财经分析人员在现代办公室研究无文字图表和实体行业样品"
+            if finance_subject
+            else "财经分析人员在现代办公室研究无文字图表和实体行业样品"
+        )
     candidate = _normalize_image_event(value, fallback=fallback)
     artwork_scene = _daily_news_artwork_scene_details(body)
     if artwork_scene:
@@ -2946,6 +3003,7 @@ def _fetch_daily_news_related_images(
     dest_dir: Path,
     exclude_ids: Optional[set[str]] = None,
     ai_first: bool = False,
+    provider: Optional[str] = None,
 ) -> tuple[list[Path], list[dict[str, Any]], dict[str, Any] | None]:
     if not ai_first:
         paths, metas = fetch_and_download_related_images(
@@ -2958,7 +3016,18 @@ def _fetch_daily_news_related_images(
         )
         return paths, metas, None
 
-    primary_provider = _daily_news_ai_first_provider()
+    primary_provider = (provider or _daily_news_ai_first_provider()).strip().lower()
+    if primary_provider == "pexels":
+        paths, metas = fetch_and_download_related_images(
+            title=title,
+            body=body,
+            topics=topics,
+            prompt_hint=prompt_hint,
+            dest_dir=dest_dir,
+            exclude_ids=exclude_ids,
+            provider="pexels",
+        )
+        return paths, metas, None
     try:
         paths, metas = fetch_and_download_related_images(
             title=title,
@@ -3008,10 +3077,18 @@ def _daily_news_image_repair_hint(retry_prompt: str) -> str:
     return (
         f"{prefix}重新构图，只用人物、环境、实体物体和动作表达新闻事件；"
         "严禁任何品牌名、Logo、屏幕、界面、招牌、海报、文件文字、字母或数字。"
+    ) + (
+        " For software news, a text-free abstract performance interface is allowed; "
+        "any screen or interface must not contain readable text, branding, logos, letters, or numbers."
     )
 
 
-def regenerate_daily_news_post_image(post: Post, retry_prompt: str) -> bool:
+def regenerate_daily_news_post_image(
+    post: Post,
+    retry_prompt: str,
+    *,
+    provider: Optional[str] = None,
+) -> bool:
     news_meta = post.platform.get("news")
     if not isinstance(news_meta, dict):
         return False
@@ -3034,6 +3111,7 @@ def regenerate_daily_news_post_image(post: Post, retry_prompt: str) -> bool:
         dest_dir=post_dir(post.id) / "assets",
         exclude_ids=existing_ids,
         ai_first=True,
+        provider=provider,
     )
     if not image_paths:
         return False
@@ -4075,15 +4153,21 @@ def _ai_digest_selection_error(
     items,
     *,
     target_count: int,
+    min_official_count: int,
     min_domestic_model_count: int,
     min_foreign_ai_count: int,
     max_age_days: int,
 ) -> str:
     item_list = list(items or [])
     counts = ai_digest_quota_counts(item_list)
+    official_count = ai_digest_official_count(item_list)
     problems = []
     if len(item_list) < target_count:
         problems.append(f"有效资讯不足{target_count}条，当前{len(item_list)}条")
+    if official_count < min_official_count:
+        problems.append(
+            f"官方可追溯资讯不足{min_official_count}条，当前{official_count}条"
+        )
     if counts["domestic_model"] < min_domestic_model_count:
         problems.append(
             f"国内模型资讯不足{min_domestic_model_count}条，当前{counts['domestic_model']}条"
@@ -4155,6 +4239,7 @@ def _prefer_novel_ai_digest_items(
     while _ai_digest_selection_error(
         selected,
         target_count=target_count,
+        min_official_count=min_official_count,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
         max_age_days=max_age_days,
@@ -4209,10 +4294,26 @@ def _ai_digest_post_title(brief: AIDigestBrief) -> str:
     fallback = "今日AI热点速览"
     featured = featured_ai_update(list(brief.items or []))
     featured_title = str(featured.title if featured is not None else "").strip()
+    generic_title = bool(
+        re.search(r"(?:模型|产品|工具|智能体|API)?发布新进展$", re.sub(r"\s+", "", featured_title))
+    )
+    if generic_title and featured is not None:
+        raw_subject = str(featured.raw_excerpt or featured.summary or "").strip()
+        vendor = re.sub(r"(?i)\s*(?:blog|官网|official)$", "", str(featured.vendor or "").strip())
+        raw_subject = re.split(r"[，。；;｜|]", raw_subject, maxsplit=1)[0]
+        if vendor:
+            raw_subject = re.sub(rf"^{re.escape(vendor)}\s*", "", raw_subject, flags=re.IGNORECASE)
+        raw_subject = re.sub(r"^启动(?:为期)?(?:[一二三四五六七八九十\d]+(?:天|周|日))?的?", "", raw_subject)
+        raw_subject = re.sub(r"(?i)agents?\s+week", "智能体周", raw_subject)
+        raw_subject = re.sub(r"(?i)agent\s+cloud", "Agent云", raw_subject)
+        raw_subject = re.sub(r"\s+", "", raw_subject).strip("，,。；;：:、-—| ")
+        if raw_subject:
+            featured_title = raw_subject if raw_subject.lower().startswith(vendor.lower()) else f"{vendor}{raw_subject}"
     subject = re.split(r"[，。；;｜|]", featured_title, maxsplit=1)[0]
     subject_parts = re.split(r"[：:]", subject, maxsplit=1)
     if len(subject_parts) == 2 and len(subject_parts[1].strip()) >= 4:
         subject = subject_parts[1]
+    subject = subject.replace("正式开源", "开源")
     subject = re.sub(r"\s+", "", subject)
     subject = subject.replace("加密算法中的弱点", "加密弱点")
     subject = subject.replace("加密算法弱点", "加密弱点")
@@ -4256,44 +4357,87 @@ def create_daily_ai_digest_posts(
     max_age_days = lookback_windows[0]
     lookback_attempts: list[dict[str, Any]] = []
     last_pool_error = ""
+    effective_min_official_count = min_official_count
+    best_relaxed_pool: tuple[tuple[int, int, int], list[AIUpdateItem], dict[str, Any], int, int] | None = None
     progress = _ai_digest_progress_callback()
-    collection_days = max(lookback_windows)
     historical_keys = _uploaded_ai_digest_history_keys()
     if progress is not None:
-        progress("collect_pool", f"in_progress mode={lookback_meta['mode']} window={collection_days}d")
-    candidate_items, candidate_meta = collect_ai_digest_updates(
-        target_count=candidate_pool_target,
-        min_official_count=min_official_count,
-        allow_social_backfill=True,
-        max_age_days=collection_days,
-        min_domestic_model_count=min_domestic_model_count,
-        min_foreign_ai_count=min_foreign_ai_count,
-        include_pool_items=lookback_meta["mode"] == "auto_expand",
-        force_search_backfill=lookback_meta["mode"] == "auto_expand",
-        progress=progress,
-        source_health_path=Path("data") / "source_health" / "ai_digest.json",
-        persist_source_health=True,
-    )
-    candidate_meta = dict(candidate_meta or {})
-    fetched_pool_items = list(candidate_meta.pop("_fetched_items", []) or [])
-    candidate_meta.pop("_fresh_items", None)
-    candidate_meta.pop("_deduped_items", None)
-    reusable_pool_items = fetched_pool_items or list(candidate_items or [])
-    if progress is not None:
-        progress(
-            "collect_pool",
-            f"success fetched={candidate_meta.get('fetched_count')} ranked={len(candidate_items or [])}",
+        progress("collect_pool", f"in_progress mode={lookback_meta['mode']} windows={lookback_windows}")
+    auto_collection_items: list[AIUpdateItem] | None = None
+    auto_collection_meta: dict[str, Any] = {}
+    if lookback_meta["mode"] == "auto_expand":
+        collection_days = max(lookback_windows)
+        if progress is not None:
+            progress(
+                "collect_pool",
+                f"in_progress single_fetch window={collection_days}d; local_filters={lookback_windows}",
+            )
+        collected_items, collected_meta = collect_ai_digest_updates(
+            target_count=candidate_pool_target,
+            min_official_count=min_official_count,
+            allow_social_backfill=True,
+            max_age_days=collection_days,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            include_pool_items=True,
+            force_search_backfill=False,
+            progress=progress,
+            source_health_path=Path("data") / "source_health" / "ai_digest.json",
+            persist_source_health=True,
         )
+        auto_collection_meta = dict(collected_meta or {})
+        auto_collection_items = list(
+            auto_collection_meta.get("_deduped_items")
+            or auto_collection_meta.get("_fresh_items")
+            or collected_items
+            or []
+        )
+        auto_collection_meta.pop("_fetched_items", None)
+        auto_collection_meta.pop("_fresh_items", None)
+        auto_collection_meta.pop("_deduped_items", None)
+        if progress is not None:
+            progress(
+                "collect_pool",
+                f"success single_fetch window={collection_days}d "
+                f"fetched={auto_collection_meta.get('fetched_count')} pool={len(auto_collection_items)}",
+            )
     for days in lookback_windows:
-        if lookback_meta["mode"] == "auto_expand":
-            window_fresh_items = filter_recent_ai_updates(
-                reusable_pool_items,
+        if auto_collection_items is not None:
+            if progress is not None:
+                progress("filter_window", f"in_progress window={days}d cached_pool={len(auto_collection_items)}")
+            candidate_items = list(auto_collection_items)
+            candidate_meta = dict(auto_collection_meta)
+            recent_items = filter_recent_ai_updates(
+                candidate_items,
                 max_age_days=days,
                 require_url=True,
             )
-            window_deduped_items = dedupe_ai_updates(window_fresh_items)
+            candidate_meta["fresh_count"] = len(recent_items)
+            candidate_meta["deduped_count"] = len(dedupe_ai_updates(recent_items))
+            candidate_meta["collection_max_age_days"] = max(lookback_windows)
+        else:
+            if progress is not None:
+                progress("collect_pool", f"in_progress window={days}d")
+            candidate_items, candidate_meta = collect_ai_digest_updates(
+                target_count=candidate_pool_target,
+                min_official_count=min_official_count,
+                allow_social_backfill=True,
+                max_age_days=days,
+                min_domestic_model_count=min_domestic_model_count,
+                min_foreign_ai_count=min_foreign_ai_count,
+                include_pool_items=False,
+                force_search_backfill=False,
+                progress=progress,
+                source_health_path=Path("data") / "source_health" / "ai_digest.json",
+                persist_source_health=True,
+            )
+            candidate_meta = dict(candidate_meta or {})
+            candidate_meta.pop("_fetched_items", None)
+            candidate_meta.pop("_fresh_items", None)
+            candidate_meta.pop("_deduped_items", None)
+        if lookback_meta["mode"] == "auto_expand":
             window_candidate_items = rank_ai_updates(
-                reusable_pool_items,
+                list(candidate_items or []),
                 target_count=candidate_pool_target,
                 min_official_count=min_official_count,
                 allow_social_backfill=True,
@@ -4301,20 +4445,20 @@ def create_daily_ai_digest_posts(
                 min_domestic_model_count=min_domestic_model_count,
                 min_foreign_ai_count=min_foreign_ai_count,
             )
-            window_meta = {
-                **candidate_meta,
-                "max_age_days": days,
-                "fetched_count": len(reusable_pool_items),
-                "fresh_count": len(window_fresh_items),
-                "deduped_count": len(window_deduped_items),
-                "duplicate_removed_count": max(0, len(window_fresh_items) - len(window_deduped_items)),
-                "ranked_count": len(window_candidate_items),
-                "quota_counts": ai_digest_quota_counts(list(window_candidate_items or [])),
-                "collection_max_age_days": collection_days,
-            }
         else:
             window_candidate_items = list(candidate_items or [])
-            window_meta = {**candidate_meta, "collection_max_age_days": collection_days}
+        window_meta = {
+            **candidate_meta,
+            "max_age_days": days,
+            "ranked_count": len(window_candidate_items),
+            "quota_counts": ai_digest_quota_counts(list(window_candidate_items or [])),
+            "collection_max_age_days": days,
+        }
+        if progress is not None:
+            progress(
+                "collect_pool",
+                f"success window={days}d fetched={candidate_meta.get('fetched_count')} ranked={len(window_candidate_items)}",
+            )
         window_candidate_items, historical_novelty_meta = _prefer_novel_ai_digest_items(
             window_candidate_items,
             historical_keys=historical_keys,
@@ -4326,6 +4470,8 @@ def create_daily_ai_digest_posts(
         )
         window_meta["historical_novelty"] = historical_novelty_meta
         candidate_counts = ai_digest_quota_counts(list(window_candidate_items or []))
+        candidate_official_count = ai_digest_official_count(list(window_candidate_items or []))
+        window_meta["selection_official_count"] = candidate_official_count
         if not window_candidate_items:
             errors = window_meta.get("errors") if isinstance(window_meta, dict) else []
             detail = f"; errors={errors}" if errors else ""
@@ -4334,6 +4480,7 @@ def create_daily_ai_digest_posts(
             pool_error = _ai_digest_selection_error(
                 window_candidate_items,
                 target_count=target_count,
+                min_official_count=min_official_count,
                 min_domestic_model_count=min_domestic_model_count,
                 min_foreign_ai_count=min_foreign_ai_count,
                 max_age_days=days,
@@ -4347,11 +4494,35 @@ def create_daily_ai_digest_posts(
                 f"历史资讯复用{reused_selected}条，超过本批最多{max_historical_reuse}条；"
                 "继续扩大日期窗口以避免触发历史重复门槛"
             )
+        relaxed_error = _ai_digest_selection_error(
+            window_candidate_items,
+            target_count=target_count,
+            min_official_count=0,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            max_age_days=days,
+        )
+        if (
+            lookback_meta["mode"] == "auto_expand"
+            and not relaxed_error
+            and reused_selected <= max_historical_reuse
+            and candidate_official_count > 0
+        ):
+            relaxed_score = (candidate_official_count, -days, len(window_candidate_items or []))
+            if best_relaxed_pool is None or relaxed_score > best_relaxed_pool[0]:
+                best_relaxed_pool = (
+                    relaxed_score,
+                    list(window_candidate_items or []),
+                    dict(window_meta),
+                    days,
+                    candidate_official_count,
+                )
         lookback_attempts.append(
             {
                 "max_age_days": days,
                 "selection_pool_items": len(window_candidate_items or []),
                 "quota_counts": candidate_counts,
+                "official_count": candidate_official_count,
                 "error": pool_error,
                 "fetched_count": window_meta.get("fetched_count"),
                 "fresh_count": window_meta.get("fresh_count"),
@@ -4368,14 +4539,28 @@ def create_daily_ai_digest_posts(
                 "lookback_window",
                 f"{'success' if not pool_error else 'insufficient'} window={days}d "
                 f"items={len(window_candidate_items or [])} domestic={candidate_counts['domestic_model']} "
-                f"foreign={candidate_counts['foreign_ai']}",
+                f"foreign={candidate_counts['foreign_ai']} official={candidate_official_count}/{min_official_count}",
             )
         if not pool_error:
             break
+    if last_pool_error and best_relaxed_pool is not None:
+        _, items, source_meta, max_age_days, effective_min_official_count = best_relaxed_pool
+        last_pool_error = ""
+        source_meta["official_target_warning"] = (
+            f"已穷尽{lookback_windows}天窗口的官网信源；官网目标{min_official_count}条，"
+            f"实际可用{effective_min_official_count}条，其余按资讯整合站、官方社交媒体顺序补足"
+        )
+        if progress is not None:
+            progress(
+                "lookback_window",
+                f"degraded_success window={max_age_days}d items={len(items)} "
+                f"official={effective_min_official_count}/{min_official_count} reason=official_sources_exhausted",
+            )
     if last_pool_error:
         attempt_summary = "; ".join(
             f"{a['max_age_days']}d items={a['selection_pool_items']} "
-            f"domestic={a['quota_counts']['domestic_model']} foreign={a['quota_counts']['foreign_ai']}"
+            f"domestic={a['quota_counts']['domestic_model']} foreign={a['quota_counts']['foreign_ai']} "
+            f"official={a['official_count']}/{min_official_count}"
             for a in lookback_attempts
         )
         if lookback_meta["mode"] == "auto_expand":
@@ -4394,6 +4579,10 @@ def create_daily_ai_digest_posts(
     source_meta["min_domestic_model_items"] = min_domestic_model_count
     source_meta["min_foreign_ai_items"] = min_foreign_ai_count
     source_meta["selection_pool_quota_counts"] = ai_digest_quota_counts(list(items or []))
+    source_meta["selection_pool_official_count"] = ai_digest_official_count(list(items or []))
+    source_meta["official_target_items"] = min_official_count
+    source_meta["effective_min_official_items"] = effective_min_official_count
+    source_meta["official_target_met"] = source_meta["selection_pool_official_count"] >= min_official_count
     source_meta["lookback"] = {
         **lookback_meta,
         "selected_max_age_days": max_age_days,
@@ -4406,7 +4595,7 @@ def create_daily_ai_digest_posts(
     llm_items = rank_ai_updates(
         list(items or []),
         target_count=generation_target,
-        min_official_count=min_official_count,
+        min_official_count=effective_min_official_count,
         allow_social_backfill=True,
         max_age_days=max_age_days,
         min_domestic_model_count=min_domestic_model_count,
@@ -4430,7 +4619,7 @@ def create_daily_ai_digest_posts(
         brief = _build_quota_safe_ai_digest_fallback(
             items,
             target_count=generation_target,
-            min_official_count=min_official_count,
+            min_official_count=effective_min_official_count,
             max_age_days=max_age_days,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
@@ -4438,7 +4627,7 @@ def create_daily_ai_digest_posts(
     brief = _rank_brief_ai_digest_items(
         brief,
         target_count=generation_target,
-        min_official_count=min_official_count,
+        min_official_count=effective_min_official_count,
         max_age_days=max_age_days,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
@@ -4446,6 +4635,7 @@ def create_daily_ai_digest_posts(
     final_error = _ai_digest_selection_error(
         brief.items,
         target_count=generation_target,
+        min_official_count=effective_min_official_count,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
         max_age_days=max_age_days,
@@ -4456,7 +4646,7 @@ def create_daily_ai_digest_posts(
         quota_fallback = _build_quota_safe_ai_digest_fallback(
             items,
             target_count=generation_target,
-            min_official_count=min_official_count,
+            min_official_count=effective_min_official_count,
             max_age_days=max_age_days,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
@@ -4464,6 +4654,7 @@ def create_daily_ai_digest_posts(
         quota_fallback_error = _ai_digest_selection_error(
             quota_fallback.items,
             target_count=generation_target,
+            min_official_count=effective_min_official_count,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
             max_age_days=max_age_days,
@@ -4484,6 +4675,7 @@ def create_daily_ai_digest_posts(
     body_fit_error = _ai_digest_selection_error(
         brief.items,
         target_count=generation_target,
+        min_official_count=effective_min_official_count,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
         max_age_days=max_age_days,
@@ -4493,6 +4685,7 @@ def create_daily_ai_digest_posts(
     source_meta["selected_before_body_fit"] = selected_before_body_fit
     source_meta["body_fit_dropped"] = max(0, selected_before_body_fit - len(brief.items))
     source_meta["selected_quota_counts"] = ai_digest_quota_counts(list(brief.items or []))
+    source_meta["selected_official_count"] = ai_digest_official_count(list(brief.items or []))
     rendered_body = render_ai_digest_body(brief, selection_meta=source_meta)
     if len(rendered_body) > MAX_IMAGE_BODY:
         raise RuntimeError(
@@ -4515,6 +4708,9 @@ def create_daily_ai_digest_posts(
                 "candidate_pool_factor": candidate_pool_factor,
                 "selection_pool_items": len(items),
                 "min_official_items": min_official_count,
+                "official_target_items": min_official_count,
+                "effective_min_official_items": effective_min_official_count,
+                "official_target_met": source_meta["official_target_met"],
                 "min_items": target_count,
                 "min_domestic_model_items": min_domestic_model_count,
                 "min_foreign_ai_items": min_foreign_ai_count,
@@ -4946,6 +5142,7 @@ def create_daily_news_posts(
     news_materials_file: str | Path | None = None,
     single_news_material_file: str | Path | None = None,
     progress_callback: DailyNewsProgressCallback | None = None,
+    post_quality_callback: DailyNewsPostQualityCallback | None = None,
 ) -> list[Post]:
     """
     Special workflow for title="每日新闻".
@@ -5381,6 +5578,34 @@ def create_daily_news_posts(
         rev = Revision(post_id=post.id, source=RevisionSource.llm, content=draft)
         save_post(post)
         save_revision(rev)
+        if post_quality_callback is not None:
+            try:
+                post_quality_errors = list(post_quality_callback(post) or [])
+            except Exception as exc:
+                post_quality_errors = [f"上传前质量复核调用失败：{exc}"]
+            if post_quality_errors:
+                skipped_quality_count += 1
+                post.status = PostStatus.failed
+                post.platform["batch_selection"] = {
+                    "status": "visual_quality_failed",
+                    "reason": "；".join(post_quality_errors[:3]),
+                }
+                post.updated_at = now_iso()
+                save_post(post)
+                _emit_daily_news_progress(
+                    progress_callback,
+                    "视觉递补",
+                    "skipped",
+                    candidate_index=candidate_idx,
+                    completed=len(posts),
+                    target=target_count,
+                    reason=_clip_text(post_quality_errors[0], limit=160),
+                )
+                print(
+                    f"[daily_news] skip candidate={candidate_idx} reason=visual_quality_failed "
+                    f"detail={_clip_text(post_quality_errors[0], limit=160)}"
+                )
+                continue
         posts.append(post)
         if dedupe_item is not None:
             accepted_story_signatures.append(_cjk_story_event_signature(dedupe_item))

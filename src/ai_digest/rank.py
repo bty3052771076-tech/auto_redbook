@@ -481,28 +481,28 @@ def _product_topic_key(item: AIUpdateItem) -> str:
 
 
 def _model_family_topic_key(item: AIUpdateItem) -> str:
-    text = " ".join(
-        part.strip()
-        for part in (
-            item.product,
-            item.title,
-            item.summary,
-            item.raw_excerpt,
-            _url_topic_text(item.url),
-        )
-        if part and part.strip()
+    parts = (
+        item.product,
+        item.title,
+        item.summary,
+        item.raw_excerpt,
+        _url_topic_text(item.url),
     )
-    match = _MODEL_FAMILY_VERSION_RE.search(text)
-    if not match:
-        return ""
-    family = _normalize_token(match.group("family"))
-    version = _normalize_token(match.group("version"))
-    if not family or not version:
-        return ""
-    suffix_match = _MODEL_VARIANT_RE.search(text)
-    suffix = _normalize_token(suffix_match.group("suffix")) if suffix_match else ""
-    suffix_part = f"-{suffix}" if suffix and suffix not in _MODEL_FAMILY_MERGED_SUFFIXES else ""
-    return f"model:{family}-{version}{suffix_part}"
+    for text in parts:
+        if not text or not text.strip():
+            continue
+        match = _MODEL_FAMILY_VERSION_RE.search(text)
+        if not match:
+            continue
+        family = _normalize_token(match.group("family"))
+        version = _normalize_token(match.group("version"))
+        if not family or not version:
+            continue
+        suffix_match = _MODEL_VARIANT_RE.search(text)
+        suffix = _normalize_token(suffix_match.group("suffix")) if suffix_match else ""
+        suffix_part = f"-{suffix}" if suffix and suffix not in _MODEL_FAMILY_MERGED_SUFFIXES else ""
+        return f"model:{family}-{version}{suffix_part}"
+    return ""
 
 
 def _semantic_topic_key(item: AIUpdateItem) -> str:
@@ -622,6 +622,11 @@ def ai_update_is_relevant(item: AIUpdateItem) -> bool:
 
 
 def ai_update_region(item: AIUpdateItem) -> str:
+    tags = {str(tag or "").strip().lower() for tag in item.tags}
+    if "region:domestic" in tags:
+        return "domestic"
+    if "region:foreign" in tags:
+        return "foreign"
     topic = _topic_blob(item).lower()
     source = _source_blob(item).lower()
     topic_is_domestic = _contains_any_marker(topic, _DOMESTIC_AI_MARKERS)
@@ -669,6 +674,20 @@ def ai_digest_quota_counts(items: list[AIUpdateItem]) -> dict[str, int]:
         "domestic_model": sum(1 for item in items if ai_update_is_domestic_model_news(item)),
         "foreign_ai": sum(1 for item in items if ai_update_is_foreign_ai_news(item)),
     }
+
+
+def ai_digest_official_count(items: list[AIUpdateItem]) -> int:
+    """Count only direct official or official-project release URLs."""
+    count = 0
+    for item in items:
+        if item.source_type not in {"official", "github"}:
+            continue
+        host = (urlsplit(item.url or "").hostname or "").lower()
+        if host == "aihot.virxact.com" or host.endswith(".aihot.virxact.com"):
+            continue
+        if host:
+            count += 1
+    return count
 
 
 def filter_recent_ai_updates(
@@ -746,8 +765,23 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
     by_key: OrderedDict[str, AIUpdateItem] = OrderedDict()
     title_keys: dict[str, str] = {}
     topic_keys: dict[str, str] = {}
+    shared_official_urls = Counter(
+        item.normalized_url
+        for item in items
+        if item.source_type in {"official", "github"} and item.normalized_url
+    )
     for item in items:
         key = item.dedupe_key
+        if (
+            item.source_type in {"official", "github"}
+            and item.normalized_url
+            and shared_official_urls[item.normalized_url] > 1
+            and item.title_key
+        ):
+            # A release-notes page can contain several independently dated
+            # entries. Preserve distinct titles from that same official page;
+            # semantic-topic deduplication below still merges the same update.
+            key = f"{key}|title:{item.title_key}"
         title_key = item.title_key
         semantic_key = _semantic_topic_key(item)
         existing_key = title_keys.get(title_key)
@@ -867,7 +901,10 @@ def _interleave_by_vendor(items: list[AIUpdateItem], *, target_count: int) -> li
 
 
 def _selection_key(item: AIUpdateItem) -> str:
-    return _trace_url(item) or item.dedupe_key or item.title_key or f"{item.title}|{item.published_at}"
+    trace_url = _trace_url(item)
+    if item.source_type in {"official", "github"} and trace_url and item.title_key:
+        return f"{trace_url}|title:{item.title_key}"
+    return trace_url or item.dedupe_key or item.title_key or f"{item.title}|{item.published_at}"
 
 
 def _meets_ai_digest_quotas(

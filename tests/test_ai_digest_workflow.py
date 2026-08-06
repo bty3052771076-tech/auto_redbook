@@ -94,6 +94,27 @@ def test_ai_digest_post_title_uses_featured_item_and_compacts_common_wording():
     assert create_post._ai_digest_post_title(brief) == "每日AI|Claude发现加密弱点"
 
 
+def test_ai_digest_post_title_uses_excerpt_when_featured_title_is_generic():
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        date="2026-08-03",
+        items=[
+            AIUpdateItem(
+                title="Cloudflare Blog智能体发布新进展",
+                summary="Cloudflare 启动为期五天的 Agents Week，重点讨论 Agent Cloud。",
+                raw_excerpt="Cloudflare 启动为期五天的 Agents Week，核心议题是 Agent Cloud。",
+                source_name="Cloudflare Blog 官网",
+                source_type="official",
+                url="https://blog.cloudflare.com/agents-week-welcome",
+                published_at="2026-08-03T08:00:00+08:00",
+                vendor="Cloudflare Blog",
+            )
+        ],
+    )
+
+    assert create_post._ai_digest_post_title(brief) == "每日AI|Cloudflare智能体周"
+
+
 def test_ai_digest_post_title_uses_newest_featured_item_instead_of_first_source_tier():
     brief = AIDigestBrief(
         title="每日AI讯息",
@@ -119,6 +140,25 @@ def test_ai_digest_post_title_uses_newest_featured_item_instead_of_first_source_
     )
 
     assert create_post._ai_digest_post_title(brief) == "每日AI|Claude发现加密弱点"
+
+
+def test_ai_digest_post_title_keeps_open_source_action_complete_within_platform_limit():
+    item = AIUpdateItem(
+        title="Cloudflare OS正式开源",
+        summary="Cloudflare开源新版Cloudflare OS。",
+        source_name="Cloudflare",
+        source_type="official",
+        url="https://blog.cloudflare.com/cloudflare-os",
+        published_at=_fresh_published_at(),
+        vendor="Cloudflare",
+        tags=["AI动态"],
+    )
+    brief = AIDigestBrief(title="每日AI讯息", date="2026-08-06", items=[item])
+
+    title = create_post._ai_digest_post_title(brief)
+
+    assert title == "每日AI|CloudflareOS开源"
+    assert len(title) <= create_post.MAX_IMAGE_TITLE
 
 
 def test_create_daily_ai_digest_passes_workspace_source_health_path_to_collector(monkeypatch, tmp_path: Path):
@@ -199,7 +239,7 @@ def test_create_daily_ai_digest_posts_uses_llm_brief_for_chinese_items(monkeypat
     assert collect_kwargs[0]["target_count"] == 24
     assert collect_kwargs[0]["max_age_days"] == 14
     assert collect_kwargs[0]["include_pool_items"] is True
-    assert collect_kwargs[0]["force_search_backfill"] is True
+    assert collect_kwargs[0]["force_search_backfill"] is False
     assert collect_kwargs[0]["min_domestic_model_count"] == 3
     assert collect_kwargs[0]["min_foreign_ai_count"] == 3
     assert llm_kwargs[0]["target_count"] == 8
@@ -331,6 +371,7 @@ def test_create_daily_ai_digest_posts_auto_expands_to_seven_days(monkeypatch, tm
     meta = post.platform["ai_digest"]
 
     assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [14]
+    assert collect_kwargs[0]["include_pool_items"] is True
     assert meta["max_age_days"] == 7
     assert meta["actual_items"] == 8
     lookback = meta["source_meta"]["lookback"]
@@ -340,7 +381,95 @@ def test_create_daily_ai_digest_posts_auto_expands_to_seven_days(monkeypatch, tm
     assert [attempt["selection_pool_items"] for attempt in lookback["attempts"]] == [5, 8]
 
 
-def test_create_daily_ai_digest_posts_default_lookback_fetches_once_at_largest_window(monkeypatch, tmp_path: Path):
+def test_create_daily_ai_digest_posts_auto_mode_uses_best_recent_pool_after_official_sources_exhausted(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_DIGEST_MAX_AGE_DAYS", raising=False)
+    monkeypatch.delenv("AI_DIGEST_LOOKBACK_DAYS", raising=False)
+    monkeypatch.delenv("CONTENT_LOOKBACK_DAYS", raising=False)
+    monkeypatch.setenv("AI_DIGEST_TARGET_ITEMS", "8")
+    monkeypatch.setenv("AI_DIGEST_MIN_OFFICIAL_ITEMS", "6")
+    recent = datetime.now(timezone.utc).replace(microsecond=0)
+    four_days_old = recent - timedelta(days=4)
+    ten_days_old = recent - timedelta(days=10)
+    pool = _updates(12)
+    pool = [
+        item.model_copy(
+            update={
+                "source_type": "official" if index in {0, 1, 8} else "aggregator",
+                "source_name": "Official" if index in {0, 1, 8} else "Aggregator",
+                "url": f"https://source.example/{index}",
+                "vendor": "UniqueAI" if index == 8 else item.vendor,
+                "product": "UniqueAI-Release" if index == 8 else item.product,
+                "title": "UniqueAI模型版本发布" if index == 8 else item.title,
+                "summary": (
+                    "UniqueAI 发布全新模型版本与 API 更新。" if index == 8 else item.summary
+                ),
+                "raw_excerpt": (
+                    "UniqueAI new model release and API update." if index == 8 else item.raw_excerpt
+                ),
+                "published_at": (
+                    recent if index < 8 else four_days_old if index == 8 else ten_days_old
+                ).isoformat().replace("+00:00", "Z"),
+            }
+        )
+        for index, item in enumerate(pool)
+    ]
+
+    def fake_collect_ai_digest_updates(**kwargs):
+        assert kwargs["max_age_days"] == 14
+        return pool, {
+            "sources": ["fixture"],
+            "fetched_count": len(pool),
+            "fresh_count": len(pool),
+            "deduped_count": len(pool),
+            "ranked_count": len(pool),
+            "social_backfill_used": False,
+        }
+
+    monkeypatch.setattr(create_post, "collect_ai_digest_updates", fake_collect_ai_digest_updates)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: (_ for _ in ()).throw(RuntimeError("no test llm")),
+    )
+
+    post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
+    digest = post.platform["ai_digest"]
+    lookback = digest["source_meta"]["lookback"]
+
+    assert lookback["selected_max_age_days"] == 7
+    assert [attempt["official_count"] for attempt in lookback["attempts"]] == [2, 3, 3]
+    assert digest["official_target_items"] == 6
+    assert digest["effective_min_official_items"] == 3
+    assert digest["official_target_met"] is False
+    assert digest["actual_items"] == 8
+
+
+def test_create_daily_ai_digest_progress_reports_official_count(monkeypatch, tmp_path: Path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AI_DIGEST_MAX_AGE_DAYS", "3")
+    monkeypatch.setenv("AI_DIGEST_TARGET_ITEMS", "8")
+    pool = _updates(8)
+    monkeypatch.setattr(
+        create_post,
+        "collect_ai_digest_updates",
+        lambda **_kwargs: (pool, {"sources": ["fixture"], "fetched_count": 8}),
+    )
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: (_ for _ in ()).throw(RuntimeError("no test llm")),
+    )
+
+    create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)
+
+    assert "official=8/6" in capsys.readouterr().out
+
+
+def test_create_daily_ai_digest_posts_default_lookback_stops_after_three_days_when_quota_is_met(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AI_DIGEST_MAX_AGE_DAYS", raising=False)
     monkeypatch.delenv("AI_DIGEST_LOOKBACK_DAYS", raising=False)
@@ -364,6 +493,7 @@ def test_create_daily_ai_digest_posts_default_lookback_fetches_once_at_largest_w
     create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)
 
     assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [14]
+    assert collect_kwargs[0]["include_pool_items"] is True
 
 
 def test_create_daily_ai_digest_posts_fixed_lookback_days_does_not_expand(monkeypatch, tmp_path: Path):
@@ -388,6 +518,33 @@ def test_create_daily_ai_digest_posts_fixed_lookback_days_does_not_expand(monkey
         create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True, lookback_days=3)
 
     assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [3]
+
+
+def test_create_daily_ai_digest_rejects_aggregator_backfill_when_official_quota_is_unmet(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AI_DIGEST_TARGET_ITEMS", "8")
+    monkeypatch.setenv("AI_DIGEST_MIN_OFFICIAL_ITEMS", "6")
+    pool = _updates(8)
+    pool = [
+        item.model_copy(
+            update={
+                "source_type": "aggregator",
+                "source_name": "AI HOT",
+                "url": f"https://aihot.virxact.com/daily/2026-08-01?item={index}",
+            }
+        )
+        if index >= 2
+        else item
+        for index, item in enumerate(pool)
+    ]
+    monkeypatch.setattr(
+        create_post,
+        "collect_ai_digest_updates",
+        lambda **_kwargs: (pool, {"sources": ["fixture"], "social_backfill_used": False}),
+    )
+
+    with pytest.raises(RuntimeError, match="官方可追溯资讯不足6条"):
+        create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True, lookback_days=3)
 
 
 def test_create_daily_ai_digest_posts_falls_back_when_llm_breaks_quota(monkeypatch, tmp_path: Path):
