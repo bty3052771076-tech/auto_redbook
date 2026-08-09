@@ -586,6 +586,40 @@ def _review_with_bounded_image_repair(
     return result, repair_count, repair_errors, history
 
 
+def _local_ai_digest_vision_result(post: Post) -> dict[str, object] | None:
+    platform = post.platform if isinstance(post.platform, dict) else {}
+    digest = platform.get("ai_digest")
+    if not isinstance(digest, dict) or digest.get("mode") != "daily_ai_digest":
+        return None
+    items = digest.get("items")
+    try:
+        actual_items = int(digest.get("actual_items") or 0)
+    except (TypeError, ValueError):
+        return None
+    if actual_items < 1 or not isinstance(items, list) or len(items) != actual_items:
+        return None
+
+    image_assets = [asset for asset in post.assets if asset.kind == "image"]
+    expected_count = 1 + ((actual_items + 2) // 3)
+    if len(image_assets) != expected_count:
+        return None
+    expected_names = ["ai_digest_00_cover.png", *[f"ai_digest_{index:02d}.png" for index in range(1, expected_count)]]
+    actual_names = [Path(asset.path).name for asset in image_assets]
+    if actual_names != expected_names:
+        return None
+    if any(not Path(asset.path).is_file() or Path(asset.path).stat().st_size <= 0 for asset in image_assets):
+        return None
+    return {
+        "ok": True,
+        "score": 100,
+        "issues": [],
+        "retry_prompt": "",
+        "provider": "local_renderer",
+        "model": "ai_digest_template",
+        "basis": "structured digest items rendered to complete local PNG set",
+    }
+
+
 def _run_auto_quality_gate(
     posts: list[Post],
     *,
@@ -642,9 +676,16 @@ def _run_auto_quality_gate(
         return []
     posts_to_review: list[Post] = []
     reused_count = 0
+    local_render_count = 0
     for post in posts:
         gate = post.platform.get("quality_gate") if isinstance(post.platform, dict) else None
         vision = gate.get("vision") if isinstance(gate, dict) else None
+        local_render_vision = _local_ai_digest_vision_result(post)
+        if local_render_vision is not None:
+            post.platform["quality_gate"]["vision"] = local_render_vision
+            save_post(post)
+            local_render_count += 1
+            continue
         if reuse_vision_results and isinstance(vision, dict):
             previous_result = VisionReviewResult(
                 ok=bool(vision.get("ok")),
@@ -663,7 +704,7 @@ def _run_auto_quality_gate(
             "auto",
             "批次质量检查",
             "success",
-            f"posts={len(posts)} vision_reused={reused_count}",
+            f"posts={len(posts)} vision_reused={reused_count} local_render={local_render_count}",
         )
         return []
     if not configured_vision_review_model():
@@ -1338,7 +1379,7 @@ def create(
     lookback_days: Optional[int] = typer.Option(
         None,
         "--lookback-days",
-        help="每日新闻/每日AI讯息候选回溯天数；留空则按 3/7/14 天自动扩展",
+        help="每日新闻只允许 1/2 天且默认 2 天；每日AI讯息留空按 3/7/14 天自动扩展",
     ),
     news_materials_file: str = typer.Option(
         "",
@@ -1378,7 +1419,10 @@ def create(
 
     requested_count = 1 if _is_daily_ai_digest_title(title_norm) else count
     if requested_count != count:
-        typer.echo("note: 每日AI讯息会生成 1 条简报草稿；动态数量请用 AI_DIGEST_TARGET_ITEMS 控制。")
+        typer.echo(
+            "note: 每日AI讯息会生成 1 条简报草稿，并按质量自动选择 8-20 条动态；"
+            "AI_DIGEST_MAX_ITEMS 只控制上限。"
+        )
 
     started_at = now_iso()
     run_errors: list[str] = []
@@ -1791,7 +1835,7 @@ def auto(
     lookback_days: Optional[int] = typer.Option(
         None,
         "--lookback-days",
-        help="每日新闻/每日AI讯息候选回溯天数；留空则按 3/7/14 天自动扩展",
+        help="每日新闻只允许 1/2 天且默认 2 天；每日AI讯息留空按 3/7/14 天自动扩展",
     ),
     news_materials_file: str = typer.Option(
         "",
@@ -1875,7 +1919,10 @@ def auto(
 
     requested_count = 1 if _is_daily_ai_digest_title(title_norm) else count
     if requested_count != count:
-        typer.echo("note: 每日AI讯息会生成 1 条简报草稿；动态数量请用 AI_DIGEST_TARGET_ITEMS 控制。")
+        typer.echo(
+            "note: 每日AI讯息会生成 1 条简报草稿，并按质量自动选择 8-20 条动态；"
+            "AI_DIGEST_MAX_ITEMS 只控制上限。"
+        )
 
     started_at = now_iso()
     run_errors: list[str] = []

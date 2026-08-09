@@ -14,6 +14,12 @@ from src.publish.toutiao_steps import (
 from src.storage.models import AssetInfo, Execution, Post
 
 
+@pytest.fixture(autouse=True)
+def _disable_external_toutiao_cdp_auto_attach(monkeypatch):
+    """Keep fake-browser tests independent from a live local Chrome session."""
+    monkeypatch.setenv("TOUTIAO_AUTO_ATTACH_CDP", "0")
+
+
 def test_publish_target_normalization_keeps_xhs_default_and_supports_both():
     assert normalize_publish_platform("") == "xhs"
     assert normalize_publish_platform("小红书") == "xhs"
@@ -51,6 +57,36 @@ def test_toutiao_profile_accepts_platform_specific_override(monkeypatch, tmp_pat
     assert resolved_dir == profile_dir
     assert channel == "chromium"
     assert args == ["--profile-directory=Profile 2"]
+
+
+def test_toutiao_cdp_auto_detects_the_gui_browser_without_inherited_env(monkeypatch):
+    monkeypatch.delenv("TOUTIAO_CDP_URL", raising=False)
+    monkeypatch.delenv("XHS_CDP_URL", raising=False)
+    monkeypatch.setenv("TOUTIAO_AUTO_ATTACH_CDP", "1")
+    monkeypatch.setenv("TOUTIAO_CDP_PORT", "9333")
+    checked: list[str] = []
+    monkeypatch.setattr(
+        toutiao_steps,
+        "_is_toutiao_cdp_available",
+        lambda url: checked.append(url) or True,
+        raising=False,
+    )
+
+    assert toutiao_steps._resolve_toutiao_cdp_url() == "http://127.0.0.1:9333"
+    assert checked == ["http://127.0.0.1:9333"]
+
+
+def test_toutiao_cdp_sms_challenge_gets_a_default_manual_wait(monkeypatch):
+    monkeypatch.delenv("TOUTIAO_SMS_WAIT_SECONDS", raising=False)
+
+    assert (
+        toutiao_steps._resolve_toutiao_sms_wait_seconds(
+            login_hold=0,
+            cdp_url="http://127.0.0.1:9223",
+        )
+        == 600
+    )
+    assert toutiao_steps._resolve_toutiao_sms_wait_seconds(login_hold=0, cdp_url=None) == 0
 
 
 def test_daily_news_is_adapted_to_a_toutiao_article_without_inventing_facts():

@@ -230,6 +230,7 @@ def test_domestic_ai_sources_use_official_release_pages():
         "doubao": "volcengine.com",
         "bytedance-seed": "seed.bytedance.com",
         "baidu-qianfan": "cloud.baidu.com",
+        "tencent-ai-announcements": "cloud.tencent.com/announce",
     }
 
     for name, domain in expected_domains.items():

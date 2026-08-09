@@ -256,6 +256,16 @@ _MODEL_NEWS_MARKERS = (
     "上下文",
     "context",
 )
+_NON_MODEL_INFRASTRUCTURE_MARKERS = (
+    "database",
+    "mysql",
+    "tdsql",
+    "数据库",
+    "创建账号",
+    "账号接口",
+    "认证升级",
+    "certification",
+)
 _DISCUSSION_MARKERS = (
     "why",
     "opinion",
@@ -588,6 +598,41 @@ def ai_update_category_priority(item: AIUpdateItem) -> int:
     return _CATEGORY_PRIORITY.get(ai_update_category(item), 0)
 
 
+def ai_update_impact_score(item: AIUpdateItem) -> float:
+    """Score publish impact without inventing signals absent from the source item."""
+    category = ai_update_category(item)
+    category_score = {
+        "model_release": 78.0,
+        "benchmark": 74.0,
+        "technical_tool": 72.0,
+        "research": 68.0,
+        "business_case": 52.0,
+        "discussion": 35.0,
+        "other": 40.0,
+    }.get(category, 40.0)
+    reliability_bonus = min(10.0, max(0.0, ai_update_attention_score(item) * 10.0))
+    source_bonus = {"official": 2.5, "github": 2.5, "aggregator": 1.0, "search": 0.5}.get(
+        item.source_type,
+        0.0,
+    )
+    evidence_bonus = min(3.0, len(item.evidence_urls or []) * 1.0)
+    concrete_bonus = 0.0
+    product = (item.product or "").strip()
+    if product and product.lower() != "ai":
+        concrete_bonus += 3.0
+    if _MODEL_TOPIC_RE.search(_text_blob(item)):
+        concrete_bonus += 2.0
+    return round(min(100.0, category_score + reliability_bonus + source_bonus + evidence_bonus + concrete_bonus), 3)
+
+
+def ai_update_is_high_impact(item: AIUpdateItem, *, threshold: float = 75.0) -> bool:
+    category = ai_update_category(item)
+    if category not in {"model_release", "benchmark", "technical_tool", "research"}:
+        return False
+    bounded_threshold = min(100.0, max(0.0, float(threshold)))
+    return ai_update_impact_score(item) >= bounded_threshold
+
+
 def ai_update_is_relevant(item: AIUpdateItem) -> bool:
     """Reject query matches that mention AI only incidentally in article text."""
     content_parts = [
@@ -650,9 +695,19 @@ def ai_update_region(item: AIUpdateItem) -> str:
 
 
 def ai_update_is_model_news(item: AIUpdateItem) -> bool:
+    blob = _text_blob(item).lower()
+    headline_blob = " ".join(
+        part.strip()
+        for part in (item.title, item.product, _url_topic_text(item.url))
+        if part and part.strip()
+    ).lower()
+    if (
+        _contains_any_marker(headline_blob, _NON_MODEL_INFRASTRUCTURE_MARKERS)
+        and not _contains_any_marker(headline_blob, ("model", "模型", "大模型"))
+    ):
+        return False
     if ai_update_category(item) in {"model_release", "benchmark"}:
         return True
-    blob = _text_blob(item).lower()
     if any(marker in blob for marker in _FINANCIAL_MODEL_MARKERS) and not (
         _MODEL_TOPIC_RE.search(blob)
         or re.search(r"(?:^|[^a-z])ai(?:[^a-z]|$)|artificial intelligence|人工智能|大模型|智能体", blob)

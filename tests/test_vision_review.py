@@ -89,6 +89,48 @@ def test_ai_digest_quality_gate_never_replaces_rendered_cards(tmp_path, monkeypa
     assert repairs == []
 
 
+def test_ai_digest_quality_gate_accepts_complete_local_render_without_vlm(tmp_path, monkeypatch):
+    assets = []
+    for index in range(4):
+        path = tmp_path / ("ai_digest_00_cover.png" if index == 0 else f"ai_digest_{index:02d}.png")
+        Image.effect_noise((320, 420), 45 + index).convert("RGB").save(path)
+        assets.append(AssetInfo(path=str(path), kind="image"))
+    post = Post(
+        title="每日AI|模型与工具等8条更新",
+        body="每日AI讯息\n发布日期：2026-08-09\n来源链接：\nhttps://example.com/ai",
+        assets=assets,
+        platform={
+            "ai_digest": {
+                "mode": "daily_ai_digest",
+                "actual_items": 8,
+                "items": [{"title": f"AI update {index}"} for index in range(8)],
+            }
+        },
+    )
+    saved: list[Post] = []
+    monkeypatch.setattr(cli, "list_posts", lambda: [])
+    monkeypatch.setattr(cli, "save_post", lambda item: saved.append(item))
+    monkeypatch.setattr(cli, "configured_vision_review_model", lambda: "")
+    monkeypatch.setattr(
+        cli,
+        "review_post_image",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("VLM must not be called")),
+    )
+
+    errors = cli._run_auto_quality_gate(
+        [post],
+        expected_count=1,
+        evaluation_viewpoint="无视角评价",
+        require_vision=True,
+    )
+
+    assert errors == []
+    assert saved
+    assert post.platform["quality_gate"]["vision"]["ok"] is True
+    assert post.platform["quality_gate"]["vision"]["provider"] == "local_renderer"
+    assert post.platform["quality_gate"]["vision"]["model"] == "ai_digest_template"
+
+
 def test_parse_vision_review_requires_strict_fields():
     result = parse_vision_review(
         json.dumps(

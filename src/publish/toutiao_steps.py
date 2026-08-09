@@ -4,6 +4,7 @@ import os
 import re
 import time
 from urllib.parse import urlsplit
+from urllib.request import urlopen
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -170,11 +171,40 @@ def _resolve_toutiao_headless(headless: Optional[bool]) -> bool:
 
 def _resolve_toutiao_cdp_url() -> str | None:
     raw = (os.getenv("TOUTIAO_CDP_URL") or os.getenv("XHS_CDP_URL") or "").strip()
-    if not raw:
+    if raw:
+        if raw.isdigit():
+            return f"http://127.0.0.1:{raw}"
+        return raw
+    if not _env_flag("TOUTIAO_AUTO_ATTACH_CDP", True):
         return None
-    if raw.isdigit():
-        return f"http://127.0.0.1:{raw}"
-    return raw
+    raw_port = (os.getenv("TOUTIAO_CDP_PORT") or "9223").strip()
+    try:
+        port = int(raw_port)
+    except ValueError:
+        return None
+    if not 1024 <= port <= 65535:
+        return None
+    local_url = f"http://127.0.0.1:{port}"
+    return local_url if _is_toutiao_cdp_available(local_url) else None
+
+
+def _is_toutiao_cdp_available(base_url: str) -> bool:
+    try:
+        with urlopen(f"{base_url.rstrip('/')}/json/version", timeout=0.4) as response:
+            return int(getattr(response, "status", 200) or 200) == 200
+    except Exception:
+        return False
+
+
+def _resolve_toutiao_sms_wait_seconds(*, login_hold: int, cdp_url: str | None) -> int:
+    requested = max(0, int(login_hold or 0))
+    if requested > 0 or not cdp_url:
+        return requested
+    raw = (os.getenv("TOUTIAO_SMS_WAIT_SECONDS") or "600").strip()
+    try:
+        return max(0, min(3600, int(raw)))
+    except ValueError:
+        return 600
 
 
 def _emit_progress(
@@ -1448,7 +1478,11 @@ def run_save_toutiao_draft_sync(
                 except RuntimeError as first_save_error:
                     interactive_headless = headless_value and not bool(cdp_url)
                     if _toutiao_save_requires_sms(save_responses):
-                        if interactive_headless or login_hold <= 0:
+                        sms_wait_seconds = _resolve_toutiao_sms_wait_seconds(
+                            login_hold=login_hold,
+                            cdp_url=cdp_url,
+                        )
+                        if interactive_headless or sms_wait_seconds <= 0:
                             save_step.status = "failed"
                             save_step.detail = _toutiao_save_failure_message(save_responses)
                             raise RuntimeError(save_step.detail) from first_save_error
@@ -1462,7 +1496,7 @@ def run_save_toutiao_draft_sync(
                         sms_step.detail = _show_toutiao_sms_verification_overlay(page)
                         sms_step.detail = _wait_for_toutiao_sms_verification(
                             page,
-                            login_hold=login_hold,
+                            login_hold=sms_wait_seconds,
                             progress_callback=progress_callback,
                         )
                         sms_step.status = "success"

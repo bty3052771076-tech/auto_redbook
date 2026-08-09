@@ -3053,7 +3053,7 @@ def main() -> None:
         )
     ttk.Label(
         prompt_panel,
-        text="每个框填写一个检索关键词；生成每日新闻时会分别抓取候选，再按回溯天数、相关度和热度合并筛选。",
+        text="每个框填写一个检索关键词；每日新闻只筛选北京时间今天和昨天，再按相关度、热度与同事件去重合并。",
         style="Muted.TLabel",
         wraplength=760,
     ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -3074,7 +3074,7 @@ def main() -> None:
         row=6, column=2, sticky="w", padx=(10, 0)
     )
 
-    ttk.Label(auto_grid, text="回溯天数").grid(row=7, column=0, sticky="w", pady=5)
+    ttk.Label(auto_grid, text="回溯天数（新闻1-2）").grid(row=7, column=0, sticky="w", pady=5)
     ttk.Entry(auto_grid, textvariable=lookback_days_var, width=8).grid(
         row=7, column=1, sticky="w", pady=5, padx=(10, 0)
     )
@@ -3183,12 +3183,12 @@ def main() -> None:
         materials_frame.grid_remove()
         if mode == "single":
             material_file_label.configure(text="单条新闻材料文件")
-            material_hint_var.set("固定使用文件中的一条新闻生成 1 条草稿；关键词、数量与回溯天数不会参与筛选。")
+            material_hint_var.set("固定使用文件中的一条新闻生成 1 条草稿；忽略关键词和数量，但来源日期仍须在北京时间两日内。")
             single_materials_frame.grid()
             return
         if mode == "multiple":
             material_file_label.configure(text="多条新闻材料文件")
-            material_hint_var.set("从文件候选池中按关键词、数量与回溯天数继续筛选；支持标题、时间、来源、链接、内容字段。")
+            material_hint_var.set("从文件候选池中按关键词、数量和两日时效继续筛选；支持标题、时间、来源、链接、内容字段。")
             materials_frame.grid()
             return
         material_file_label.configure(text="")

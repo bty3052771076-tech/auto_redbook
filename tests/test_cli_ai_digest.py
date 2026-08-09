@@ -96,6 +96,8 @@ def test_auto_daily_ai_digest_title_uploads_one_digest_post(monkeypatch, tmp_pat
     assert uploaded == [post.id]
     assert "uploaded=1" in result.output
     assert "requested=1" in result.output
+    assert "自动选择 8-20 条" in result.output
+    assert "AI_DIGEST_MAX_ITEMS" in result.output
 
 
 def test_auto_daily_ai_digest_missing_assets_explains_local_card_rendering(monkeypatch, tmp_path: Path):

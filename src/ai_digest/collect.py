@@ -513,8 +513,13 @@ def _needs_search_backfill(
     target_count: int,
     min_domestic_model_count: int,
     min_foreign_ai_count: int,
+    require_target_count: bool = False,
 ) -> bool:
-    required_min = max(1, min(target_count, max(8, min_domestic_model_count + min_foreign_ai_count)))
+    required_min = (
+        max(1, target_count)
+        if require_target_count
+        else max(1, min(target_count, max(8, min_domestic_model_count + min_foreign_ai_count)))
+    )
     counts = ai_digest_quota_counts(ranked)
     return (
         len(ranked) < required_min
@@ -536,6 +541,7 @@ def collect_ai_digest_updates(
     min_foreign_ai_count: int = 0,
     include_pool_items: bool = False,
     force_search_backfill: bool = False,
+    force_aggregator_backfill: bool = False,
     progress: ProgressCallback | None = None,
     source_health_path: str | Path | None = None,
     source_cooldown_seconds: int | None = None,
@@ -729,6 +735,7 @@ def collect_ai_digest_updates(
         target_count=target_count,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
+        require_target_count=include_pool_items,
     )
     if official_page_backfill_used:
         _fetch_stage(official_page_sources)
@@ -759,14 +766,14 @@ def collect_ai_digest_updates(
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
     )
-    if (
-        allow_social_backfill
-        and aggregator_sources
-        and _needs_search_backfill(
+    if allow_social_backfill and aggregator_sources and (
+        force_aggregator_backfill
+        or _needs_search_backfill(
             ranked,
             target_count=target_count,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
+            require_target_count=include_pool_items,
         )
     ):
         aggregator_backfill_used = True
@@ -826,10 +833,11 @@ def collect_ai_digest_updates(
         and (
             force_search_backfill
             or _needs_search_backfill(
-            ranked,
-            target_count=target_count,
-            min_domestic_model_count=min_domestic_model_count,
-            min_foreign_ai_count=min_foreign_ai_count,
+                ranked,
+                target_count=target_count,
+                min_domestic_model_count=min_domestic_model_count,
+                min_foreign_ai_count=min_foreign_ai_count,
+                require_target_count=include_pool_items,
             )
         )
     ):
@@ -861,6 +869,7 @@ def collect_ai_digest_updates(
             target_count=target_count,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
+            require_target_count=include_pool_items,
         )
     ):
         social_backfill_used = True
@@ -906,6 +915,7 @@ def collect_ai_digest_updates(
         "social_backfill_used": social_backfill_used,
         "search_backfill_used": search_backfill_used,
         "aggregator_backfill_used": aggregator_backfill_used,
+        "aggregator_backfill_forced": bool(force_aggregator_backfill),
         "detail_source_resolution": detail_source_resolution,
         "search_backfill": search_backfill_meta,
         "quota_counts": ai_digest_quota_counts(ranked),

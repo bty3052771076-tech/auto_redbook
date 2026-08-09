@@ -2842,7 +2842,7 @@ def test_daily_news_batch_uses_successful_supervisor_order_for_drafts(monkeypatc
     ]
 
 
-def test_daily_news_upload_filters_candidates_to_beijing_three_day_window(monkeypatch):
+def test_daily_news_upload_filters_candidates_to_strict_beijing_two_day_window(monkeypatch):
     monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
@@ -2895,18 +2895,19 @@ def test_daily_news_upload_filters_candidates_to_beijing_three_day_window(monkey
     assert [item.url for item in filtered] == [
         "https://example.com/today",
         "https://example.com/yesterday",
-        "https://example.com/before-yesterday",
     ]
     pool = meta["selection_pool"]
     assert pool["requested_count"] == 2
     assert pool["target_fetch_count"] == 2
     assert pool["raw_fetch_count"] == 20
     assert pool["raw_candidate_count"] == 5
-    assert pool["recent_candidate_count"] == 3
-    assert pool["actual_candidate_count"] == 3
-    assert pool["dropped_out_of_window_count"] == 2
-    assert pool["date_window"]["max_age_days"] == 3
+    assert pool["recent_candidate_count"] == 2
+    assert pool["actual_candidate_count"] == 2
+    assert pool["dropped_out_of_window_count"] == 3
+    assert pool["date_window"]["max_age_days"] == 2
     assert pool["date_window"]["tz"] == "Asia/Shanghai"
+    assert pool["lookback"]["mode"] == "strict_freshness"
+    assert pool["lookback"]["windows"] == [2]
 
 
 def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(monkeypatch):
@@ -2960,7 +2961,7 @@ def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(
     selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
 
     assert fetch_kwargs["max_records"] == 20
-    assert fetch_kwargs["search_days"] == 14
+    assert fetch_kwargs["search_days"] == 2
     assert [item.url for item in selected] == [
         "https://example.org/world-cup-sponsors",
         "https://example.com/world-cup-rules",
@@ -2972,11 +2973,11 @@ def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(
     assert pool["recent_candidate_count"] == 3
     assert pool["prompt_relevant_candidate_count"] == 2
     assert pool["actual_candidate_count"] == 2
-    assert pool["lookback"]["mode"] == "auto_expand"
-    assert pool["lookback"]["selected_max_age_days"] == 3
+    assert pool["lookback"]["mode"] == "strict_freshness"
+    assert pool["lookback"]["selected_max_age_days"] == 2
 
 
-def test_daily_news_upload_auto_expands_to_seven_day_window(monkeypatch):
+def test_daily_news_upload_never_expands_beyond_two_day_window(monkeypatch):
     monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
@@ -3015,23 +3016,14 @@ def test_daily_news_upload_auto_expands_to_seven_day_window(monkeypatch):
 
     monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
 
-    selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
+    with pytest.raises(RuntimeError, match="strict two-day window"):
+        create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
 
     assert fetch_kwargs["max_records"] == 20
-    assert fetch_kwargs["search_days"] == 14
-    assert {item.url for item in selected} == {
-        "https://example.com/world-cup-today",
-        "https://example.org/world-cup-rights",
-    }
-    pool = meta["selection_pool"]
-    assert pool["date_window"]["max_age_days"] == 7
-    assert pool["lookback"]["mode"] == "auto_expand"
-    assert pool["lookback"]["selected_max_age_days"] == 7
-    assert [attempt["max_age_days"] for attempt in pool["lookback"]["attempts"]] == [3, 7]
-    assert [attempt["actual_candidate_count"] for attempt in pool["lookback"]["attempts"]] == [1, 2]
+    assert fetch_kwargs["search_days"] == 2
 
 
-def test_daily_news_upload_fixed_lookback_days_does_not_expand(monkeypatch):
+def test_daily_news_upload_rejects_explicit_lookback_beyond_two_days(monkeypatch):
     monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
@@ -3061,11 +3053,10 @@ def test_daily_news_upload_fixed_lookback_days_does_not_expand(monkeypatch):
 
     monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
 
-    with pytest.raises(RuntimeError, match="daily news material insufficient"):
+    with pytest.raises(RuntimeError, match="最多只能回溯 2 个北京时间自然日"):
         create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2, lookback_days=3)
 
-    assert fetch_kwargs["max_records"] == 20
-    assert fetch_kwargs["search_days"] == 3
+    assert fetch_kwargs == {}
 
 
 def test_create_daily_news_posts_replaces_generic_original_title_with_post_title(monkeypatch, tmp_path):
@@ -4789,13 +4780,13 @@ def test_daily_news_upload_passes_manual_materials_file_to_fetcher(monkeypatch, 
     assert meta["selection_pool"]["raw_candidate_count"] == 1
 
 
-def test_fetch_single_daily_news_candidate_ignores_prompt_and_lookback(monkeypatch, tmp_path):
+def test_fetch_single_daily_news_candidate_ignores_prompt_but_enforces_freshness(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     news_file = tmp_path / "single_news.md"
     news_file.write_text(
-        """
+        f"""
         title: Single material policy story
-        time: 2026-01-05
+        time: {_recent_news_date()}
         source: Example News
         url: https://example.com/single-policy-story
         content: A complete single news material that should be used directly.
@@ -4806,7 +4797,6 @@ def test_fetch_single_daily_news_candidate_ignores_prompt_and_lookback(monkeypat
     candidates, meta = create_post._fetch_daily_news_candidates_for_upload(
         "sports football prompt that does not match",
         count=8,
-        lookback_days=3,
         single_news_material_file=str(news_file),
     )
 
@@ -4814,8 +4804,31 @@ def test_fetch_single_daily_news_candidate_ignores_prompt_and_lookback(monkeypat
     assert meta["provider"] == "manual_single"
     assert meta["selection_pool"]["requested_count"] == 1
     assert meta["selection_pool"]["target_fetch_count"] == 1
-    assert meta["selection_pool"]["lookback"]["mode"] == "ignored_for_single_news_material"
+    assert meta["selection_pool"]["lookback"]["mode"] == "strict_freshness"
+    assert meta["selection_pool"]["date_window"]["max_age_days"] == 2
     assert meta["selection_pool"]["prompt_relevance"]["mode"] == "ignored_for_single_news_material"
+
+
+def test_single_news_material_rejects_an_old_or_unverifiable_source_date(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    news_file = tmp_path / "old_single_news.md"
+    news_file.write_text(
+        """
+        title: Old policy story
+        time: 2026-07-30
+        source: Example News
+        url: https://example.com/old-policy-story
+        content: This material is older than the allowed daily-news window.
+        """,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="单条新闻材料.*两日"):
+        create_post._fetch_daily_news_candidates_for_upload(
+            "",
+            count=1,
+            single_news_material_file=str(news_file),
+        )
 
 
 def test_single_news_material_prefers_ai_image_before_pexels(monkeypatch, tmp_path):
@@ -4823,9 +4836,9 @@ def test_single_news_material_prefers_ai_image_before_pexels(monkeypatch, tmp_pa
     monkeypatch.setenv("IMAGE_PROVIDER", "pexels")
     news_file = tmp_path / "single_news.md"
     news_file.write_text(
-        """
+        f"""
         标题：社交巨头拟出租算力引发市场波动
-        时间：2026-07-05
+        时间：{_recent_news_date()}
         来源：证券时报
         链接：https://example.com/meta-compute
         内容：社交巨头拟把闲置人工智能算力对外出租，市场重新评估人工智能基建公司的增长预期。
@@ -4845,7 +4858,7 @@ def test_single_news_material_prefers_ai_image_before_pexels(monkeypatch, tmp_pa
                 original_title="社交巨头拟出租算力引发市场波动",
                 content="社交巨头拟将闲置人工智能算力对外出租，引发市场对人工智能基建资产利用率的重新定价。",
                 comment="这说明人工智能基建投资开始从扩张叙事进入现金流验证阶段。",
-                date="2026-07-05",
+                date=_recent_news_date(),
                 source="证券时报",
             ),
             "topics": ["每日新闻", "人工智能"],
@@ -4881,9 +4894,9 @@ def test_single_news_material_falls_back_to_pexels_when_ai_image_fails(monkeypat
     monkeypatch.chdir(tmp_path)
     news_file = tmp_path / "single_news.md"
     news_file.write_text(
-        """
+        f"""
         标题：社交巨头拟出租算力引发市场波动
-        时间：2026-07-05
+        时间：{_recent_news_date()}
         来源：证券时报
         链接：https://example.com/meta-compute
         内容：社交巨头拟把闲置人工智能算力对外出租，市场重新评估人工智能基建公司的增长预期。
@@ -4903,7 +4916,7 @@ def test_single_news_material_falls_back_to_pexels_when_ai_image_fails(monkeypat
                 original_title="社交巨头拟出租算力引发市场波动",
                 content="社交巨头拟将闲置人工智能算力对外出租，引发市场对人工智能基建资产利用率的重新定价。",
                 comment="这说明人工智能基建投资开始从扩张叙事进入现金流验证阶段。",
-                date="2026-07-05",
+                date=_recent_news_date(),
                 source="证券时报",
             ),
             "topics": ["每日新闻", "人工智能"],

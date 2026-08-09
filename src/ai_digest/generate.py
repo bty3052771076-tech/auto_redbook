@@ -14,6 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from src.config import LLMConfig
 
 from .models import AIDigestBrief, AIUpdateItem
+from .rank import ai_update_impact_score, ai_update_is_high_impact
 
 
 # Keep this aligned with the workflow-wide LLM ceiling.  In particular, some
@@ -451,6 +452,15 @@ def _fallback_chinese_title(item: AIUpdateItem) -> str:
         return _title_with_action(subject, "开放权重模型发布")
     if "agentic ai" in lower and "semiconductor" in lower:
         return _title_with_action(subject, "推进AI智能体芯片设计")
+    if _is_low_information_ai_digest_text(item.title):
+        summary_subject = re.split(r"[，。！？；;]", item.summary or "", maxsplit=1)[0]
+        summary_subject = re.sub(r"\s+", " ", summary_subject).strip()
+        if (
+            len(summary_subject) >= 6
+            and _has_cjk(summary_subject)
+            and not _is_low_information_ai_digest_text(summary_subject)
+        ):
+            return summary_subject[:28].rstrip("，,。；; ")
     if any(marker in lower for marker in ("launch", "release", "introducing", "new ")):
         return _title_with_action(subject, "发布新进展")
     details = _detail_terms_from_item(item)
@@ -500,9 +510,26 @@ def _fallback_chinese_summary(item: AIUpdateItem) -> str:
     return f"{source}披露{subject}的AI产品变化；当前可核实信息以原始标题、摘录和来源链接为准。"
 
 
+def _repair_title_cut_inside_summary_lead(title: str, summary: str, *, limit: int = 48) -> str:
+    clean_title = re.sub(r"\s+", " ", title or "").strip()
+    clean_summary = re.sub(r"\s+", " ", summary or "").strip()
+    if len(clean_title) < 24 or not _has_cjk(clean_summary) or not clean_summary.startswith(clean_title):
+        return clean_title
+    remainder = clean_summary[len(clean_title) :]
+    if not remainder or remainder[0] in "，,。！？；;：:":
+        return clean_title
+    lead = re.split(r"[，,。！？；;]", clean_summary, maxsplit=1)[0].strip()
+    if len(clean_title) < len(lead) <= limit:
+        return lead
+    return clean_title
+
+
 def _ensure_chinese_item(item: AIUpdateItem) -> AIUpdateItem:
     data = item.model_dump()
-    if (
+    repaired_title = _repair_title_cut_inside_summary_lead(item.title, item.summary)
+    title_repaired = repaired_title != item.title
+    data["title"] = repaired_title
+    if not title_repaired and (
         not _has_cjk(data.get("title", ""))
         or _is_low_information_ai_digest_text(data.get("title", ""))
         or _has_untranslated_english_phrase(data.get("title", ""))
@@ -514,6 +541,7 @@ def _ensure_chinese_item(item: AIUpdateItem) -> AIUpdateItem:
         or _has_untranslated_english_phrase(data.get("summary", ""))
     ):
         data["summary"] = _fallback_chinese_summary(item)
+    data["title"] = _repair_title_cut_inside_summary_lead(data.get("title", ""), data.get("summary", ""))
     tags = []
     for tag in item.tags or []:
         tags.append(tag if _has_cjk(tag) else "AI动态")
@@ -707,6 +735,165 @@ def _extract_json_object(text: str) -> str:
     return raw
 
 
+def parse_ai_digest_impact_json(text: str, *, candidate_count: int) -> dict[int, dict[str, object]]:
+    data = json.loads(_extract_json_object(text))
+    raw_rows = data.get("scores") if isinstance(data, dict) else None
+    if not isinstance(raw_rows, list):
+        raise ValueError("impact supervisor response must contain a scores list")
+    expected = set(range(1, max(0, int(candidate_count)) + 1))
+    parsed: dict[int, dict[str, object]] = {}
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            raise ValueError("impact supervisor score row must be an object")
+        index = raw.get("index")
+        score = raw.get("impact_score")
+        high_impact = raw.get("high_impact")
+        if isinstance(index, bool) or not isinstance(index, int) or index not in expected:
+            raise ValueError(f"impact supervisor returned unknown candidate index: {index}")
+        if index in parsed:
+            raise ValueError(f"impact supervisor returned duplicate candidate index: {index}")
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= float(score) <= 100:
+            raise ValueError(f"impact supervisor returned invalid score for candidate {index}")
+        if not isinstance(high_impact, bool):
+            raise ValueError(f"impact supervisor returned invalid high_impact flag for candidate {index}")
+        parsed[index] = {
+            "impact_score": float(score),
+            "high_impact": high_impact,
+            "reason": str(raw.get("reason") or "").strip()[:80],
+        }
+    if set(parsed) != expected:
+        missing = sorted(expected.difference(parsed))
+        raise ValueError(f"impact supervisor omitted candidate indices: {missing}")
+    return parsed
+
+
+def _deterministic_ai_digest_impact(
+    items: list[AIUpdateItem],
+    *,
+    threshold: float,
+) -> dict[str, dict[str, object]]:
+    return {
+        item.dedupe_key: {
+            "impact_score": ai_update_impact_score(item),
+            "deterministic_score": ai_update_impact_score(item),
+            "llm_score": None,
+            "high_impact": ai_update_is_high_impact(item, threshold=threshold),
+            "reason": "deterministic_category_source_evidence_score",
+        }
+        for item in items
+    }
+
+
+def _build_ai_digest_impact_prompt(items: list[AIUpdateItem]) -> str:
+    rows = [
+        {
+            "index": index,
+            "title": item.title,
+            "summary": item.summary,
+            "source_name": item.source_name,
+            "source_type": item.source_type,
+            "published_at": item.published_at,
+            "vendor": item.vendor,
+            "product": item.product,
+            "verification_status": item.verification_status,
+            "evidence_count": len(item.evidence_urls or []),
+            "raw_excerpt": (item.raw_excerpt or "")[:400],
+        }
+        for index, item in enumerate(items, 1)
+    ]
+    return (
+        "请评估每条 AI 候选事件的公开影响力。只能依据给定事实评分，不得补充事实、改写日期或增删候选。\n"
+        "模型发布、重要版本、关键基准、具体技术突破、重大安全事件和广泛基础设施变化优先；"
+        "泛泛观点、普通企业案例和缺少具体变化的动态不得评为高影响。\n"
+        f"必须为全部 {len(rows)} 个 index 各返回一次，顺序不限。"
+        "只输出严格 JSON：{\"scores\":[{\"index\":1,\"impact_score\":0-100,"
+        "\"high_impact\":true或false,\"reason\":\"不超过30字\"}]}。\n"
+        "候选：\n"
+        + json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def evaluate_ai_digest_impact_with_llm(
+    cfgs: list[LLMConfig],
+    items: list[AIUpdateItem],
+    *,
+    threshold: float = 75.0,
+) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+    bounded_threshold = min(100.0, max(0.0, float(threshold)))
+    deterministic = _deterministic_ai_digest_impact(items, threshold=bounded_threshold)
+    if not items:
+        return deterministic, {"mode": "deterministic", "evaluated_count": 0, "error": ""}
+    if not cfgs:
+        return deterministic, {
+            "mode": "deterministic_fallback",
+            "evaluated_count": len(items),
+            "error": "LLM config missing for impact supervisor",
+        }
+
+    try:
+        request_timeout = int((os.getenv("AI_DIGEST_IMPACT_TIMEOUT_S") or "120").strip())
+    except ValueError:
+        request_timeout = 120
+    request_timeout = max(30, min(request_timeout, 600))
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "你是严谨的 AI 新闻影响力审核员。只按候选事实评分，只输出严格 JSON。",
+            ),
+            ("user", "{user_prompt}"),
+        ]
+    )
+    last_exc: Exception | None = None
+    for cfg in cfgs:
+        try:
+            model_kwargs = {
+                "model_provider": "openai",
+                "base_url": cfg.base_url,
+                "api_key": cfg.api_key,
+                "temperature": 0,
+                "max_tokens": min(AI_DIGEST_LLM_MAX_TOKENS, max(4000, len(items) * 180)),
+                "timeout": request_timeout,
+            }
+            if (cfg.provider or "").strip().lower() == "volcengine":
+                model_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            model = init_chat_model(cfg.model, **model_kwargs)
+            messages = prompt.format_messages(user_prompt=_build_ai_digest_impact_prompt(items))
+            response = model.invoke(messages)
+            content = response.content if hasattr(response, "content") else str(response)
+            llm_rows = parse_ai_digest_impact_json(content, candidate_count=len(items))
+            merged: dict[str, dict[str, object]] = {}
+            for index, item in enumerate(items, 1):
+                base = float(deterministic[item.dedupe_key]["deterministic_score"])
+                llm_score = float(llm_rows[index]["impact_score"])
+                combined = round(base * 0.4 + llm_score * 0.6, 3)
+                category_eligible = ai_update_is_high_impact(item, threshold=0)
+                merged[item.dedupe_key] = {
+                    "impact_score": combined,
+                    "deterministic_score": base,
+                    "llm_score": llm_score,
+                    "high_impact": bool(llm_rows[index]["high_impact"])
+                    and category_eligible
+                    and combined >= bounded_threshold,
+                    "reason": llm_rows[index]["reason"],
+                }
+            return merged, {
+                "mode": "llm_hybrid",
+                "evaluated_count": len(items),
+                "provider": cfg.provider,
+                "model": cfg.model,
+                "error": "",
+            }
+        except Exception as exc:
+            last_exc = exc
+            continue
+    return deterministic, {
+        "mode": "deterministic_fallback",
+        "evaluated_count": len(items),
+        "error": str(last_exc or "impact supervisor failed"),
+    }
+
+
 def parse_ai_digest_brief_json(text: str) -> AIDigestBrief:
     data = json.loads(_extract_json_object(text))
     items = [AIUpdateItem.model_validate(item) for item in data.get("items", []) if isinstance(item, dict)]
@@ -888,19 +1075,24 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
         f"资讯整合站{source_tier_counts['aggregator']}条，"
         f"社交媒体{source_tier_counts['social']}条"
     )
+    topic_lines = [
+        f"{idx}. {(item.vendor or item.source_name or f'动态{idx}').strip()[:12]}：{item.title.strip()}"
+        for idx, item in enumerate(brief.items, 1)
+    ]
     lines = [
         "每日AI讯息",
-        "",
-        f"整理了 {len(brief.items)} 条 AI 平台、模型、工具和开源动态，适合快速了解今天的 AI 变化。",
-        "",
         f"发布时间：{brief.date}",
         f"来源：{source_text}",
         source_tier_line,
+        "",
+        "今日动态：",
+        *topic_lines,
     ]
     selection_line = _selection_summary_line(selection_meta, item_count=len(brief.items))
     if selection_line:
         lines.append(selection_line)
     link_lines = []
+    link_urls = []
     for idx, item in enumerate(brief.items, 1):
         trace_urls = [
             url
@@ -912,30 +1104,31 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
             continue
         source = (item.vendor or item.source_name or f"动态{idx}").strip()
         link_lines.append(f"{idx}. {source[:12]} {url}")
+        link_urls.append(url)
     if link_lines:
         lines.extend(["", "来源链接：", *link_lines])
     body = "\n".join(lines)
     if len(body) <= AI_DIGEST_BODY_LIMIT:
         return body
 
-    compact_lines = [
-        "每日AI讯息",
-        f"发布时间：{brief.date}",
-        source_tier_line,
-    ]
-    if selection_line:
-        compact_lines.append(selection_line)
-    compact_lines.extend(["来源链接：", *link_lines])
-    body = "\n".join(compact_lines)
-    if len(body) <= AI_DIGEST_BODY_LIMIT:
-        return body
-
-    return "\n".join(
-        [
+    compact_link_lines = [f"{idx}. {url}" for idx, url in enumerate(link_urls, 1)]
+    for title_limit in (24, 18, 12, 8):
+        compact_topics = [
+            f"{idx}. {(item.vendor or item.source_name or f'动态{idx}').strip()[:8]}："
+            f"{item.title.strip()[:title_limit]}"
+            for idx, item in enumerate(brief.items, 1)
+        ]
+        compact_lines = [
             "每日AI讯息",
             f"发布时间：{brief.date}",
             source_tier_line,
+            "今日动态：",
+            *compact_topics,
             "来源链接：",
-            *(f"{idx}. {line.split(' ', 2)[-1]}" for idx, line in enumerate(link_lines, 1)),
+            *compact_link_lines,
         ]
-    )
+        body = "\n".join(compact_lines)
+        if len(body) <= AI_DIGEST_BODY_LIMIT:
+            return body
+
+    return body

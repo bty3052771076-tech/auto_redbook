@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from threading import Barrier, BrokenBarrierError
 
+import pytest
+
 from src.ai_digest import collect as collect_mod
 from src.ai_digest.collect import collect_ai_digest_updates
 from src.ai_digest.models import AIUpdateItem
@@ -15,6 +17,12 @@ from src.sources.health import (
     load_source_health_snapshot,
     save_source_health_snapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disable_external_ai_digest_search_backfill(monkeypatch):
+    """Keep collection unit tests offline unless search backfill is under test."""
+    monkeypatch.setenv("AI_DIGEST_SEARCH_BACKFILL", "0")
 
 
 def _item(title: str, source_type: str = "official") -> AIUpdateItem:
@@ -56,6 +64,36 @@ def test_collect_ai_digest_updates_skips_social_when_official_sources_are_enough
     assert meta["official_count"] == 8
     assert meta["social_backfill_used"] is False
     assert meta["aggregator_backfill_used"] is False
+
+
+def test_collect_ai_digest_updates_can_force_aggregator_backfill_for_history_deduplication():
+    calls: list[str] = []
+    sources = [
+        AIDigestSource("official", "official", "https://example.com/rss", "Fixture", "rss"),
+        AIDigestSource("aggregator", "aggregator", "https://example.com/agg", "Aggregator", "rss"),
+        AIDigestSource("x", "social", "https://x.com/search", "X", "social_html"),
+    ]
+
+    def fake_fetch(source):
+        calls.append(source.name)
+        if source.kind == "official":
+            return [_item(f"official-{i}") for i in range(8)]
+        if source.kind == "aggregator":
+            return [_item(f"aggregator-{i}", "aggregator") for i in range(2)]
+        return [_item("social-1", "social")]
+
+    _items, meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=10,
+        min_official_count=6,
+        force_aggregator_backfill=True,
+    )
+
+    assert calls == ["official", "aggregator"]
+    assert meta["aggregator_backfill_used"] is True
+    assert meta["aggregator_backfill_forced"] is True
+    assert meta["social_backfill_used"] is False
 
 
 def test_collect_ai_digest_skips_recent_timeout_and_persists_attempt_trace(tmp_path):
@@ -198,6 +236,50 @@ def test_collect_ai_digest_does_not_fetch_official_pages_when_streams_fill_the_p
     assert meta["official_page_backfill_used"] is False
 
 
+def test_collect_ai_digest_fills_requested_candidate_pool_before_stopping_sources():
+    calls: list[str] = []
+    sources = [
+        AIDigestSource(
+            "official-page",
+            "official",
+            "https://example.com/page",
+            "Page",
+            "html",
+            tier="official_page",
+        ),
+        AIDigestSource(
+            "official-stream",
+            "official",
+            "https://example.com/feed",
+            "Stream",
+            "rss",
+            tier="official_stream",
+        ),
+    ]
+
+    def fake_fetch(source):
+        calls.append(source.name)
+        if source.name == "official-stream":
+            return [_item(f"stream-{index}") for index in range(8)]
+        return [_item(f"page-{index}") for index in range(2)]
+
+    items, meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=10,
+        min_official_count=6,
+        allow_social_backfill=False,
+        max_age_days=3,
+        now=datetime(2026, 6, 30, 9, tzinfo=timezone.utc),
+        include_pool_items=True,
+    )
+
+    assert calls == ["official-stream", "official-page"]
+    assert len(items) == 10
+    assert len(meta["_deduped_items"]) == 10
+    assert meta["official_page_backfill_used"] is True
+
+
 def test_collect_ai_digest_fetches_same_stage_sources_concurrently_when_requested():
     barrier = Barrier(2)
     sources = [
@@ -316,7 +398,7 @@ def test_collect_ai_digest_updates_uses_social_backfill_when_official_sources_ar
 
 
 def test_collect_ai_digest_uses_aggregator_before_social_and_stops_when_pool_is_full(monkeypatch):
-    monkeypatch.setenv("AI_DIGEST_SEARCH_BACKFILL_ENABLED", "0")
+    monkeypatch.setenv("AI_DIGEST_SEARCH_BACKFILL", "0")
     calls: list[str] = []
     sources = [
         AIDigestSource("official", "official", "https://example.com/rss", "Official", "rss"),
@@ -427,6 +509,7 @@ def test_collect_ai_digest_updates_uses_aggregators_before_search_and_social(mon
 
 
 def test_collect_ai_digest_updates_uses_search_backfill_for_daily_digest_quotas(monkeypatch):
+    monkeypatch.setenv("AI_DIGEST_SEARCH_BACKFILL", "1")
     sources = [
         AIDigestSource("official", "official", "https://example.com/rss", "OpenAI", "rss"),
     ]

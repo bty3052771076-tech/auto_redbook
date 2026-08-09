@@ -581,6 +581,45 @@ def test_ai_update_category_keeps_opinion_discussion_as_supplement_even_with_gen
     assert rank_mod.ai_update_category(item) == "discussion"
 
 
+def test_ai_update_impact_gate_prefers_concrete_model_release_over_official_discussion():
+    release = _item(
+        "GLM-5.3 模型版本发布并开放 API",
+        source_name="智谱 GLM",
+        url="https://docs.bigmodel.cn/cn/update/glm-5-3",
+        summary="GLM-5.3 发布新版本，更新推理、代码和多模态能力并开放 API。",
+        raw_excerpt="GLM-5.3 model release with API, reasoning, coding and multimodal updates.",
+        product="GLM-5.3",
+    )
+    discussion = _item(
+        "为什么 AI 专业化是必然趋势",
+        source_name="OpenAI",
+        url="https://openai.com/index/ai-specialization-opinion",
+        summary="这是一篇观点讨论，探讨 AI 专业化的发展趋势。",
+        raw_excerpt="An opinion about why AI specialization may be inevitable.",
+        confidence_score=0.98,
+        product="",
+    )
+
+    assert rank_mod.ai_update_impact_score(release) > rank_mod.ai_update_impact_score(discussion)
+    assert rank_mod.ai_update_is_high_impact(release, threshold=75) is True
+    assert rank_mod.ai_update_is_high_impact(discussion, threshold=75) is False
+
+
+def test_ai_update_impact_gate_does_not_promote_routine_business_case_only_for_official_source():
+    item = _item(
+        "某企业采用 ChatGPT Enterprise 的案例",
+        source_name="OpenAI",
+        url="https://openai.com/index/example-enterprise-case",
+        summary="案例介绍某企业采用 ChatGPT Enterprise 改善日常办公流程。",
+        raw_excerpt="A routine case study about enterprise adoption and productivity.",
+        product="ChatGPT Enterprise",
+    )
+
+    assert rank_mod.ai_update_category(item) == "business_case"
+    assert 0 <= rank_mod.ai_update_impact_score(item) <= 100
+    assert rank_mod.ai_update_is_high_impact(item, threshold=75) is False
+
+
 def test_ai_update_category_does_not_treat_financial_valuation_model_as_ai_release():
     item = _item(
         "Motorola Solutions faces fresh valuation debate before Q2 earnings",
@@ -596,6 +635,18 @@ def test_ai_update_category_does_not_treat_financial_valuation_model_as_ai_relea
     )
 
     assert rank_mod.ai_update_category(item) == "other"
+    assert not rank_mod.ai_update_is_model_news(item)
+
+
+def test_ai_update_is_model_news_rejects_database_infrastructure_update():
+    item = _item(
+        "腾讯云 TDSQL-C 创建账号接口异步化升级",
+        source_name="Tencent Cloud AI",
+        url="https://cloud.tencent.com/announce/",
+        published_at="2026-08-06",
+        raw_excerpt="【TDSQL-C MySQL 版】创建账号接口异步化升级公告",
+    )
+
     assert not rank_mod.ai_update_is_model_news(item)
 
 

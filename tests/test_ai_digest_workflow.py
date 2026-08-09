@@ -50,6 +50,24 @@ def _updates(n: int = 10) -> list[AIUpdateItem]:
     return updates
 
 
+def _distinct_updates(n: int) -> list[AIUpdateItem]:
+    return [
+        AIUpdateItem(
+            title=f"UniqueModel{i} 模型版本发布并开放 API",
+            summary=f"UniqueModel{i} 发布独立模型版本，更新推理能力并开放 API。",
+            source_name=f"智谱 GLM {i}" if i < 3 else f"OpenAI {i}",
+            source_type="official",
+            url=f"https://v{i}.cn/r/{i}",
+            published_at=_fresh_published_at(),
+            vendor=f"智谱 GLM {i}" if i < 3 else f"OpenAI {i}",
+            product=f"UniqueModel{i}",
+            raw_excerpt=f"UniqueModel{i} independent model release and API update.",
+            tags=["AI", "region:domestic" if i < 3 else "region:foreign"],
+        )
+        for i in range(n)
+    ]
+
+
 def test_create_daily_ai_digest_posts_creates_post_with_rendered_cards(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -69,8 +87,293 @@ def test_create_daily_ai_digest_posts_creates_post_with_rendered_cards(monkeypat
     assert post.assets
     assert all(Path(asset.path).exists() for asset in post.assets)
     assert post.platform["ai_digest"]["mode"] == "daily_ai_digest"
-    assert len(post.platform["ai_digest"]["items"]) == 8
+    assert len(post.platform["ai_digest"]["items"]) == 9
+    assert post.platform["ai_digest"]["adaptive_selection"]["selection_mode"] == "adaptive_strict"
     assert post.platform["ai_digest"]["source_meta"]["sources"] == ["fixture"]
+
+
+@pytest.mark.parametrize(
+    ("strict_count", "expected_count"),
+    [(8, 8), (13, 13), (20, 20), (24, 20)],
+)
+def test_select_adaptive_ai_digest_items_uses_all_strict_candidates_up_to_twenty(
+    strict_count,
+    expected_count,
+):
+    items = _distinct_updates(strict_count)
+    scores = {
+        item.dedupe_key: {"impact_score": 90.0, "high_impact": True}
+        for item in items
+    }
+
+    selected, meta = create_post._select_adaptive_ai_digest_items(
+        items,
+        impact_scores=scores,
+        historical_keys=set(),
+        min_items=8,
+        max_items=20,
+        min_official_count=6,
+        min_domestic_model_count=3,
+        min_foreign_ai_count=3,
+    )
+
+    assert len(selected) == expected_count
+    assert meta["strict_candidate_count"] == min(strict_count, 20)
+    assert meta["fallback_selected_count"] == 0
+    assert meta["selection_mode"] == "adaptive_strict"
+
+
+def test_select_adaptive_ai_digest_items_uses_fallback_only_when_strict_pool_is_below_eight():
+    items = _distinct_updates(8)
+    scores = {
+        item.dedupe_key: {
+            "impact_score": 90.0 if index < 7 else 62.0,
+            "high_impact": index < 7,
+        }
+        for index, item in enumerate(items)
+    }
+
+    selected, meta = create_post._select_adaptive_ai_digest_items(
+        items,
+        impact_scores=scores,
+        historical_keys=set(),
+        min_items=8,
+        max_items=20,
+        min_official_count=6,
+        min_domestic_model_count=3,
+        min_foreign_ai_count=3,
+    )
+
+    assert len(selected) == 8
+    assert meta["strict_candidate_count"] == 7
+    assert meta["fallback_selected_count"] == 1
+    assert meta["selection_mode"] == "fallback_minimum"
+    assert meta["fallback_tiers"]["three_day_normal"] == 1
+
+
+def test_select_adaptive_ai_digest_items_relaxes_official_target_to_eligible_pool():
+    items = [
+        item.model_copy(
+            update={
+                "source_type": "aggregator" if index >= 4 else "official",
+                "source_name": "AI aggregator" if index >= 4 else item.source_name,
+            }
+        )
+        for index, item in enumerate(_distinct_updates(8))
+    ]
+    scores = {
+        item.dedupe_key: {
+            "impact_score": 90.0,
+            "high_impact": True,
+        }
+        for item in items
+    }
+
+    selected, meta = create_post._select_adaptive_ai_digest_items(
+        items,
+        impact_scores=scores,
+        historical_keys=set(),
+        min_items=8,
+        max_items=20,
+        min_official_count=6,
+        min_domestic_model_count=3,
+        min_foreign_ai_count=3,
+        allow_official_relaxation=True,
+    )
+
+    assert len(selected) == 8
+    assert create_post.ai_digest_official_count(selected) == 4
+    assert meta["effective_min_official_items"] == 4
+    assert meta["official_target_relaxed"] is True
+
+
+def test_select_adaptive_ai_digest_items_uses_older_normal_item_for_minimum_quota():
+    recent = datetime.now(timezone.utc).replace(microsecond=0)
+    five_days_old = recent - timedelta(days=5)
+    items = [
+        item.model_copy(
+            update={
+                "published_at": (five_days_old if index == 2 else recent)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+        )
+        for index, item in enumerate(_distinct_updates(8))
+    ]
+    high_indexes = {0, 1, 3, 4, 5, 6}
+    scores = {
+        item.dedupe_key: {
+            "impact_score": 90.0 if index in high_indexes else 60.0,
+            "high_impact": index in high_indexes,
+        }
+        for index, item in enumerate(items)
+    }
+
+    selected, meta = create_post._select_adaptive_ai_digest_items(
+        items,
+        impact_scores=scores,
+        historical_keys=set(),
+        min_items=8,
+        max_items=20,
+        min_official_count=6,
+        min_domestic_model_count=3,
+        min_foreign_ai_count=3,
+        allow_official_relaxation=True,
+    )
+
+    assert len(selected) == 8
+    assert create_post.ai_digest_quota_counts(selected)["domestic_model"] == 3
+    assert meta["fallback_tiers"]["three_day_normal"] == 1
+    assert meta["fallback_tiers"]["seven_day_normal"] == 1
+    assert meta["selection_mode"] == "fallback_minimum"
+
+
+def test_fit_ai_digest_items_to_body_capacity_keeps_largest_traceable_count():
+    items = [
+        item.model_copy(
+            update={
+                "url": f"https://example.com/releases/{'long-path-' * 5}{index}",
+            }
+        )
+        for index, item in enumerate(_distinct_updates(20))
+    ]
+
+    selected, meta = create_post._fit_ai_digest_items_to_body_capacity(
+        items,
+        min_items=8,
+        min_official_count=6,
+        max_age_days=3,
+        min_domestic_model_count=3,
+        min_foreign_ai_count=3,
+        selection_meta={"candidate_pool_target": 200},
+    )
+    body = create_post.render_ai_digest_body(
+        create_post.build_fallback_brief(selected, target_count=len(selected)),
+        selection_meta={"candidate_pool_target": 200},
+    )
+
+    assert 8 <= len(selected) < 20
+    assert meta["requested_items"] == 20
+    assert meta["selected_items"] == len(selected)
+    assert meta["dropped_items"] == 20 - len(selected)
+    assert len(body) <= create_post.MAX_IMAGE_BODY
+    assert all(item.url in body for item in selected)
+
+
+def test_create_daily_ai_digest_posts_sends_thirteen_strict_items_to_rewrite_llm(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AI_DIGEST_TARGET_ITEMS", raising=False)
+    monkeypatch.delenv("AI_DIGEST_MAX_ITEMS", raising=False)
+    pool = _distinct_updates(13)
+    captured_targets: list[int] = []
+
+    monkeypatch.setattr(
+        create_post,
+        "collect_ai_digest_updates",
+        lambda **_kwargs: (pool, {"sources": ["fixture"], "social_backfill_used": False}),
+    )
+    monkeypatch.setattr(create_post, "load_llm_configs", lambda: [object()])
+    monkeypatch.setattr(
+        create_post,
+        "evaluate_ai_digest_impact_with_llm",
+        lambda _cfgs, items, **_kwargs: (
+            {
+                item.dedupe_key: {"impact_score": 90.0, "high_impact": True}
+                for item in items
+            },
+            {"mode": "fixture", "evaluated_count": len(items), "error": ""},
+        ),
+        raising=False,
+    )
+
+    def fake_generate(_cfgs, items, **kwargs):
+        captured_targets.append(kwargs["target_count"])
+        return create_post.build_fallback_brief(items, target_count=kwargs["target_count"])
+
+    monkeypatch.setattr(create_post, "generate_ai_digest_brief_with_llm", fake_generate)
+
+    post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
+
+    assert captured_targets == [13]
+    assert post.platform["ai_digest"]["actual_items"] == 13
+    assert post.platform["ai_digest"]["min_items"] == 8
+    assert post.platform["ai_digest"]["max_items"] == 20
+    assert post.platform["ai_digest"]["adaptive_selection"]["selection_mode"] == "adaptive_strict"
+
+
+def test_create_daily_ai_digest_posts_records_fallback_when_only_seven_are_high_impact(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(tmp_path)
+    pool = _distinct_updates(8)
+    monkeypatch.setattr(
+        create_post,
+        "collect_ai_digest_updates",
+        lambda **_kwargs: (pool, {"sources": ["fixture"], "social_backfill_used": False}),
+    )
+    monkeypatch.setattr(create_post, "load_llm_configs", lambda: [object()])
+    monkeypatch.setattr(
+        create_post,
+        "evaluate_ai_digest_impact_with_llm",
+        lambda _cfgs, items, **_kwargs: (
+            {
+                item.dedupe_key: {
+                    "impact_score": 90.0 if index < 7 else 60.0,
+                    "high_impact": index < 7,
+                }
+                for index, item in enumerate(items)
+            },
+            {"mode": "fixture", "evaluated_count": len(items), "error": ""},
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        create_post,
+        "generate_ai_digest_brief_with_llm",
+        lambda _cfgs, items, **kwargs: create_post.build_fallback_brief(
+            items,
+            target_count=kwargs["target_count"],
+        ),
+    )
+
+    post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
+    adaptive = post.platform["ai_digest"]["adaptive_selection"]
+
+    assert post.platform["ai_digest"]["actual_items"] == 8
+    assert adaptive["strict_candidate_count"] == 7
+    assert adaptive["fallback_selected_count"] == 1
+    assert adaptive["selection_mode"] == "fallback_minimum"
+
+
+def test_create_daily_ai_digest_posts_can_use_legacy_exact_target_when_adaptive_is_disabled(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AI_DIGEST_ADAPTIVE_COUNT", "0")
+    monkeypatch.setenv("AI_DIGEST_TARGET_ITEMS", "10")
+    monkeypatch.setenv("AI_DIGEST_MAX_AGE_DAYS", "3")
+    pool = _distinct_updates(13)
+    captured_targets: list[int] = []
+    monkeypatch.setattr(
+        create_post,
+        "collect_ai_digest_updates",
+        lambda **_kwargs: (pool, {"sources": ["fixture"], "social_backfill_used": False}),
+    )
+    monkeypatch.setattr(create_post, "load_llm_configs", lambda: [object()])
+
+    def fake_generate(_cfgs, items, **kwargs):
+        captured_targets.append(kwargs["target_count"])
+        return create_post.build_fallback_brief(items, target_count=kwargs["target_count"])
+
+    monkeypatch.setattr(create_post, "generate_ai_digest_brief_with_llm", fake_generate)
+
+    post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
+
+    assert captured_targets == [10]
+    assert post.platform["ai_digest"]["actual_items"] == 10
+    assert post.platform["ai_digest"]["adaptive_selection"] == {}
 
 
 def test_ai_digest_post_title_uses_featured_item_and_compacts_common_wording():
@@ -92,6 +395,33 @@ def test_ai_digest_post_title_uses_featured_item_and_compacts_common_wording():
     )
 
     assert create_post._ai_digest_post_title(brief) == "每日AI|Claude发现加密弱点"
+
+
+def test_ai_digest_post_title_marks_multi_item_digest_instead_of_looking_like_single_news():
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        subtitle="AI平台、模型、工具和开源动态简报",
+        date="2026-08-07",
+        items=[
+            AIUpdateItem(
+                title="NVIDIA发布Cosmos 3开放物理AI模型",
+                summary="NVIDIA发布Cosmos 3开放物理AI模型。",
+                source_name="NVIDIA官网",
+                source_type="official",
+                url=f"https://example.com/{index}",
+                published_at="2026-08-07T08:00:00+08:00",
+                vendor="NVIDIA",
+                product="Cosmos 3" if index == 0 else f"Model-{index}",
+            )
+            for index in range(8)
+        ],
+    )
+
+    title = create_post._ai_digest_post_title(brief)
+
+    assert title.startswith("每日AI|")
+    assert title.endswith("等8条更新")
+    assert len(title) <= 20
 
 
 def test_ai_digest_post_title_uses_excerpt_when_featured_title_is_generic():
@@ -236,7 +566,7 @@ def test_create_daily_ai_digest_posts_uses_llm_brief_for_chinese_items(monkeypat
 
     assert len(calls) == 1
     assert {item.url for item in calls[0]} == {item.url for item in pool}
-    assert collect_kwargs[0]["target_count"] == 24
+    assert collect_kwargs[0]["target_count"] == 200
     assert collect_kwargs[0]["max_age_days"] == 14
     assert collect_kwargs[0]["include_pool_items"] is True
     assert collect_kwargs[0]["force_search_backfill"] is False
@@ -246,7 +576,7 @@ def test_create_daily_ai_digest_posts_uses_llm_brief_for_chinese_items(monkeypat
     assert llm_kwargs[0]["min_domestic_model_count"] == 3
     assert llm_kwargs[0]["min_foreign_ai_count"] == 3
     assert posts[0].platform["ai_digest"]["generation_mode"] == "llm"
-    assert posts[0].platform["ai_digest"]["candidate_pool_target"] == 24
+    assert posts[0].platform["ai_digest"]["candidate_pool_target"] == 200
     assert posts[0].platform["ai_digest"]["actual_items"] == 8
     titles = [item["title"] for item in posts[0].platform["ai_digest"]["items"]]
     assert "OpenAI发布开发者工具更新" in titles
@@ -279,7 +609,9 @@ def test_create_daily_ai_digest_passes_exact_quota_safe_selection_to_llm(monkeyp
     post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
 
     assert len(captured) == 1
-    assert len(captured[0]) == 8
+    assert len(captured[0]) == post.platform["ai_digest"]["actual_items"]
+    assert 8 <= len(captured[0]) <= 20
+    assert post.platform["ai_digest"]["adaptive_selection"]["body_capacity"]["requested_items"] == 13
     assert post.platform["ai_digest"]["quota_counts"]["domestic_model"] >= 3
     assert post.platform["ai_digest"]["quota_counts"]["foreign_ai"] >= 3
 
@@ -325,7 +657,7 @@ def test_create_daily_ai_digest_posts_collects_expanded_pool_and_records_counts(
     assert collect_kwargs[0]["target_count"] == 24
     assert meta["target_items"] == 8
     assert meta["candidate_pool_target"] == 24
-    assert meta["selection_pool_items"] == 24
+    assert meta["selection_pool_items"] == meta["impact_review"]["evaluated_count"]
     assert meta["actual_items"] == 8
     assert meta["quota_counts"]["domestic_model"] >= 3
     assert meta["quota_counts"]["foreign_ai"] >= 3
@@ -441,7 +773,7 @@ def test_create_daily_ai_digest_posts_auto_mode_uses_best_recent_pool_after_offi
     lookback = digest["source_meta"]["lookback"]
 
     assert lookback["selected_max_age_days"] == 7
-    assert [attempt["official_count"] for attempt in lookback["attempts"]] == [2, 3, 3]
+    assert [attempt["official_count"] for attempt in lookback["attempts"]] == [2, 3]
     assert digest["official_target_items"] == 6
     assert digest["effective_min_official_items"] == 3
     assert digest["official_target_met"] is False
@@ -520,7 +852,10 @@ def test_create_daily_ai_digest_posts_fixed_lookback_days_does_not_expand(monkey
     assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [3]
 
 
-def test_create_daily_ai_digest_rejects_aggregator_backfill_when_official_quota_is_unmet(monkeypatch, tmp_path: Path):
+def test_create_daily_ai_digest_allows_traceable_backfill_when_official_target_is_unmet(
+    monkeypatch,
+    tmp_path: Path,
+):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("AI_DIGEST_TARGET_ITEMS", "8")
     monkeypatch.setenv("AI_DIGEST_MIN_OFFICIAL_ITEMS", "6")
@@ -542,9 +877,38 @@ def test_create_daily_ai_digest_rejects_aggregator_backfill_when_official_quota_
         "collect_ai_digest_updates",
         lambda **_kwargs: (pool, {"sources": ["fixture"], "social_backfill_used": False}),
     )
+    monkeypatch.setattr(create_post, "load_llm_configs", lambda: [object()])
+    monkeypatch.setattr(
+        create_post,
+        "evaluate_ai_digest_impact_with_llm",
+        lambda _cfgs, items, **_kwargs: (
+            {
+                item.dedupe_key: {"impact_score": 90.0, "high_impact": True}
+                for item in items
+            },
+            {"mode": "fixture", "evaluated_count": len(items), "error": ""},
+        ),
+    )
+    monkeypatch.setattr(
+        create_post,
+        "generate_ai_digest_brief_with_llm",
+        lambda _cfgs, items, **kwargs: create_post.build_fallback_brief(
+            items,
+            target_count=kwargs["target_count"],
+        ),
+    )
 
-    with pytest.raises(RuntimeError, match="官方可追溯资讯不足6条"):
-        create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True, lookback_days=3)
+    post = create_post.create_daily_ai_digest_posts(
+        asset_paths=[],
+        copy_assets=True,
+        lookback_days=3,
+    )[0]
+    digest = post.platform["ai_digest"]
+
+    assert digest["actual_items"] == 8
+    assert digest["effective_min_official_items"] == 2
+    assert digest["official_target_met"] is False
+    assert digest["adaptive_selection"]["official_target_relaxed"] is True
 
 
 def test_create_daily_ai_digest_posts_falls_back_when_llm_breaks_quota(monkeypatch, tmp_path: Path):
@@ -589,7 +953,7 @@ def test_create_daily_ai_digest_posts_falls_back_when_llm_breaks_quota(monkeypat
 
     assert meta["generation_mode"] == "llm_quota_fallback"
     assert "国内模型资讯不足3条" in meta["llm_error"]
-    assert meta["actual_items"] == 8
+    assert 8 <= meta["actual_items"] <= 20
     assert meta["quota_counts"]["domestic_model"] >= 3
     assert meta["quota_counts"]["foreign_ai"] >= 3
 
@@ -662,7 +1026,8 @@ def test_create_daily_ai_digest_fallback_selects_quotas_from_full_pool(monkeypat
     post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
     meta = post.platform["ai_digest"]
 
-    assert meta["actual_items"] == 8
+    assert 8 <= meta["actual_items"] <= 20
+    assert meta["adaptive_selection"]["selection_mode"] == "adaptive_strict"
     assert meta["quota_counts"]["domestic_model"] >= 3
     assert meta["quota_counts"]["foreign_ai"] >= 3
 
@@ -766,7 +1131,8 @@ def test_create_daily_ai_digest_expands_lookback_when_history_reuse_would_hit_du
         meta["historical_novelty"]["reused_selected_count"]
         <= meta["historical_novelty"]["max_reused_before_duplicate_gate"]
     )
-    assert "历史资讯复用6条" in meta["lookback"]["attempts"][1]["error"]
+    assert [attempt["max_age_days"] for attempt in meta["lookback"]["attempts"]] == [3, 7, 14]
+    assert meta["adaptive_selection"]["fallback_tiers"]["historical_reuse"] <= 5
 
 
 def test_create_post_with_draft_routes_daily_ai_digest(monkeypatch, tmp_path: Path):

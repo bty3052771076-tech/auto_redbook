@@ -62,6 +62,25 @@ def test_readback_rejects_partial_body_or_missing_image():
     assert not result.image_ok
 
 
+def test_readback_normalizes_html_entities_in_source_urls():
+    post = Post(
+        title="AI source",
+        body="Source https://example.test/news?a=1&amp;b=2",
+        assets=[],
+    )
+
+    result = _verify_draft_readback_snapshot(
+        {
+            "actual_title": "AI source",
+            "actual_body": "Source https://example.test/news?a=1&b=2",
+        },
+        post,
+        actual_image_count=0,
+    )
+
+    assert result.ok
+
+
 def test_read_back_saved_draft_reopens_editor_and_reads_snapshot(monkeypatch):
     post = _post()
     calls: list[str] = []

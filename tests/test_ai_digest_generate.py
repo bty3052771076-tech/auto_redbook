@@ -5,7 +5,9 @@ import pytest
 from src.ai_digest.generate import (
     build_ai_digest_prompt,
     build_fallback_brief,
+    evaluate_ai_digest_impact_with_llm,
     generate_ai_digest_brief_with_llm,
+    parse_ai_digest_impact_json,
     parse_ai_digest_brief_json,
     render_ai_digest_body,
 )
@@ -83,6 +85,111 @@ def test_build_ai_digest_prompt_requires_exact_compact_rewrite():
     assert "恰好 8 条" in prompt
     assert "不得删除、增加、合并或调整顺序" in prompt
     assert "items 每项只输出" in prompt
+
+
+def test_parse_ai_digest_impact_json_requires_each_candidate_exactly_once():
+    rows = parse_ai_digest_impact_json(
+        '{"scores":['
+        '{"index":1,"impact_score":92,"high_impact":true,"reason":"重要模型版本"},'
+        '{"index":2,"impact_score":41,"high_impact":false,"reason":"一般观点"}'
+        "]}",
+        candidate_count=2,
+    )
+
+    assert rows[1]["impact_score"] == 92.0
+    assert rows[1]["high_impact"] is True
+    assert rows[2]["reason"] == "一般观点"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"scores":[{"index":1,"impact_score":90,"high_impact":true,"reason":"A"}]}' ,
+        '{"scores":['
+        '{"index":1,"impact_score":90,"high_impact":true,"reason":"A"},'
+        '{"index":1,"impact_score":80,"high_impact":true,"reason":"B"}'
+        "]}",
+        '{"scores":['
+        '{"index":1,"impact_score":90,"high_impact":true,"reason":"A"},'
+        '{"index":3,"impact_score":80,"high_impact":true,"reason":"B"}'
+        "]}",
+    ],
+)
+def test_parse_ai_digest_impact_json_rejects_missing_duplicate_or_unknown_ids(payload):
+    with pytest.raises(ValueError):
+        parse_ai_digest_impact_json(payload, candidate_count=2)
+
+
+def test_evaluate_ai_digest_impact_with_llm_blends_valid_scores(monkeypatch):
+    items = [
+        AIUpdateItem(
+            title="GLM-5.3 模型版本发布并开放 API",
+            summary="GLM-5.3 更新推理、代码和多模态能力。",
+            source_name="智谱 GLM",
+            source_type="official",
+            url="https://docs.bigmodel.cn/cn/update/glm-5-3",
+            published_at="2026-08-09T08:00:00+08:00",
+            vendor="智谱 GLM",
+            product="GLM-5.3",
+            raw_excerpt="GLM-5.3 model release.",
+        ),
+        AIUpdateItem(
+            title="为什么 AI 专业化是必然趋势",
+            summary="观点文章探讨 AI 专业化趋势。",
+            source_name="OpenAI",
+            source_type="official",
+            url="https://openai.com/index/ai-specialization-opinion",
+            published_at="2026-08-09T08:00:00+08:00",
+            vendor="OpenAI",
+            raw_excerpt="An opinion about AI specialization.",
+        ),
+    ]
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": (
+                        '{"scores":['
+                        '{"index":1,"impact_score":96,"high_impact":true,"reason":"重大版本"},'
+                        '{"index":2,"impact_score":38,"high_impact":false,"reason":"观点补充"}'
+                        "]}"
+                    )
+                },
+            )()
+
+    monkeypatch.setattr("src.ai_digest.generate.init_chat_model", lambda *_args, **_kwargs: FakeModel())
+    scores, meta = evaluate_ai_digest_impact_with_llm(
+        [LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.com", provider="test")],
+        items,
+        threshold=75,
+    )
+
+    assert meta["mode"] == "llm_hybrid"
+    assert scores[items[0].dedupe_key]["high_impact"] is True
+    assert scores[items[1].dedupe_key]["high_impact"] is False
+    assert scores[items[0].dedupe_key]["llm_score"] == 96.0
+
+
+def test_evaluate_ai_digest_impact_with_llm_falls_back_to_deterministic_scores(monkeypatch):
+    items = _updates(2)
+    monkeypatch.setattr(
+        "src.ai_digest.generate.init_chat_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("provider unavailable")),
+    )
+
+    scores, meta = evaluate_ai_digest_impact_with_llm(
+        [LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.com", provider="test")],
+        items,
+        threshold=75,
+    )
+
+    assert meta["mode"] == "deterministic_fallback"
+    assert "provider unavailable" in meta["error"]
+    assert set(scores) == {item.dedupe_key for item in items}
+    assert all(row["llm_score"] is None for row in scores.values())
 
 
 def test_generate_ai_digest_brief_retries_malformed_json(monkeypatch):
@@ -512,6 +619,70 @@ def test_generate_ai_digest_brief_rewrites_generic_llm_items_from_source_trace(m
     assert "终端权限" in out.summary
 
 
+def test_generic_ai_digest_title_uses_specific_chinese_summary_subject():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="NVIDIAAI产品发布新进展",
+        summary="NVIDIA发布Cosmos 3，整合视觉推理、世界生成与动作预测。",
+        source_name="NVIDIA官网",
+        source_type="official",
+        url="https://blogs.nvidia.com/blog/open-world-models-physical-ai",
+        published_at="2026-08-07T08:00:00+08:00",
+        vendor="NVIDIA",
+        raw_excerpt="NVIDIA发布Cosmos 3开放物理AI模型。",
+        tags=["AI动态"],
+    )
+
+    repaired = _ensure_chinese_item(item)
+
+    assert repaired.title == "NVIDIA发布Cosmos 3"
+    assert "发布新进展" not in repaired.title
+
+
+@pytest.mark.parametrize(
+    ("title", "summary", "expected"),
+    [
+        (
+            "Firebird 联合 NVIDIA 与戴尔科技在亚美尼",
+            "Firebird 联合 NVIDIA 与戴尔科技在亚美尼亚落成独联体最大 AI 算力中心。该设施面向区域企业提供算力。",
+            "Firebird 联合 NVIDIA 与戴尔科技在亚美尼亚落成独联体最大 AI 算力中心",
+        ),
+        (
+            "腾讯云 TokenHub 平台宣布下线 Kling、Vi",
+            "腾讯云 TokenHub 平台宣布下线 Kling、Vidu 及 HY 系列部分视觉模型，并同步调整计费标准。",
+            "腾讯云 TokenHub 平台宣布下线 Kling、Vidu 及 HY 系列部分视觉模型",
+        ),
+        (
+            "德国财税集团 HSP GRUPPE 全面部署 ChatG",
+            "德国财税集团 HSP GRUPPE 全面部署 ChatGPT Enterprise，显著提升内部效率与交付质量。",
+            "德国财税集团 HSP GRUPPE 全面部署 ChatGPT Enterprise",
+        ),
+        (
+            "Cloudflare 财报披露 AI 机器人流量已于今年",
+            "Cloudflare 财报披露 AI 机器人流量已于今年五月反超人类，进程较预期大幅提前。",
+            "Cloudflare 财报披露 AI 机器人流量已于今年五月反超人类",
+        ),
+    ],
+)
+def test_ensure_chinese_item_repairs_title_cut_inside_summary_lead(title, summary, expected):
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title=title,
+        summary=summary,
+        source_name="官方来源",
+        source_type="official",
+        url="https://example.com/update",
+        published_at="2026-08-09T08:00:00+08:00",
+        vendor="测试厂商",
+        raw_excerpt=summary,
+        tags=["AI动态"],
+    )
+
+    assert _ensure_chinese_item(item).title == expected
+
+
 def test_generate_ai_digest_brief_restores_source_publish_time_when_llm_changes_it(monkeypatch):
     item = AIUpdateItem(
         title="DeepSeek-V4 预览版发布",
@@ -893,6 +1064,10 @@ def test_render_ai_digest_body_includes_source_links_for_each_item():
 
     assert "每日AI讯息" in body
     assert "发布时间：2026-06-30" in body
+    assert "今日动态：" in body
+    assert "1. OpenAI：AI动态0" in body
+    assert "2. OpenAI：AI动态1" in body
+    assert body.index("1. OpenAI：AI动态0") < body.index("来源链接：")
     assert "来源链接：" in body
     assert "信源层级：官网2条，资讯整合站0条，社交媒体0条" in body
     assert "1. OpenAI https://example.com/0" in body
@@ -944,3 +1119,25 @@ def test_render_ai_digest_body_keeps_eight_links_under_platform_limit_with_long_
 
     assert len(body) <= 1000
     assert body.count("https://aihot.virxact.com/daily/2026-07-03?item=") == 8
+
+
+def test_render_ai_digest_compact_links_do_not_keep_tail_of_spaced_source_name():
+    items = [
+        AIUpdateItem(
+            title=f"Cursor Router 模型路由技术更新第{i}项详细说明",
+            summary="Cursor介绍模型路由技术更新。",
+            source_name="Cursor Blog 官网",
+            source_type="official",
+            url=f"https://cursor.com/blog/how-cursor-router-works/{'detail-' * 6}{i}",
+            published_at="2026-08-07T08:00:00+08:00",
+            vendor="Cursor Blog",
+            tags=["AI动态"],
+        )
+        for i in range(8)
+    ]
+
+    body = render_ai_digest_body(build_fallback_brief(items, target_count=8, date="2026-08-07"))
+
+    assert len(body) <= 1000
+    assert "1. https://cursor.com/" in body
+    assert "1. Blog https://cursor.com/" not in body

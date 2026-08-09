@@ -17,6 +17,7 @@ from src.config import load_llm_configs
 from src.ai_digest.collect import collect_ai_digest_updates
 from src.ai_digest.generate import (
     build_fallback_brief,
+    evaluate_ai_digest_impact_with_llm,
     generate_ai_digest_brief_with_llm,
     render_ai_digest_body,
 )
@@ -93,6 +94,7 @@ AI_DIGEST_MIN_ITEMS = 8
 AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS = 3
 AI_DIGEST_MIN_FOREIGN_AI_ITEMS = 3
 DEFAULT_CANDIDATE_LOOKBACK_WINDOWS = (3, 7, 14)
+DAILY_NEWS_MAX_LOOKBACK_DAYS = 2
 _DAILY_NEWS_TITLE_MIN_LEN = 10
 _NEWS_TITLE_PROMPT_STRONG_MARKERS = (
     "选择一条",
@@ -3141,6 +3143,29 @@ def _fetch_daily_news_candidates_for_upload(
         raise RuntimeError("single_news_material_file and news_materials_file are mutually exclusive")
     if single_material_path:
         item = load_single_news_material_file(single_material_path)
+        tz_name = os.getenv("NEWS_TZ") or "Asia/Shanghai"
+        lookback_windows, lookback_meta = _daily_news_lookback_window(
+            lookback_days,
+            env_names=("NEWS_LOOKBACK_DAYS", "CONTENT_LOOKBACK_DAYS"),
+        )
+        recent_items, date_window_meta = filter_recent_news_items(
+            [item],
+            tz_name=tz_name,
+            max_age_days=lookback_windows[0],
+        )
+        if not recent_items:
+            raise RuntimeError(
+                "单条新闻材料不符合每日新闻严格两日时效要求："
+                f"来源发布时间={item.seendate or '缺失'}，允许范围="
+                f"{date_window_meta.get('start_date')}..{date_window_meta.get('end_date')}（北京时间）。"
+            )
+        lookback_attempt = {
+            "max_age_days": lookback_windows[0],
+            "recent_candidate_count": 1,
+            "prompt_relevant_candidate_count": 1,
+            "actual_candidate_count": 1,
+            "date_window": date_window_meta,
+        }
         meta: dict[str, Any] = {
             "provider": "manual_single",
             "api_source": "manual_single",
@@ -3151,13 +3176,13 @@ def _fetch_daily_news_candidates_for_upload(
             "provider_plan": ["manual_single"],
             "provider_attempts": ["manual_single"],
             "provider_errors": [],
-            "tz": os.getenv("NEWS_TZ") or "Asia/Shanghai",
+            "tz": tz_name,
             "query": "",
             "query_variants": [],
             "query_expansion_enabled": False,
             "queries_used": [],
-            "search_days": None,
-            "used_today_range": False,
+            "search_days": lookback_windows[0],
+            "used_today_range": True,
             "manual_materials": {
                 "file_path": single_material_path,
                 "count": 1,
@@ -3177,15 +3202,14 @@ def _fetch_daily_news_candidates_for_upload(
                 "prompt_relevant_candidate_count": 1,
                 "actual_candidate_count": 1,
                 "dropped_out_of_window_count": 0,
-                "date_window": {
-                    "mode": "ignored_for_single_news_material",
-                },
+                "date_window": date_window_meta,
                 "lookback": {
-                    "mode": "ignored_for_single_news_material",
+                    **lookback_meta,
                     "input": lookback_days,
-                    "attempts": [],
+                    "selected_max_age_days": lookback_windows[0],
+                    "attempts": [lookback_attempt],
                 },
-                "selection_policy": "single_news_material_direct",
+                "selection_policy": "single_news_material_direct_after_strict_freshness",
                 "source_domain_max_ratio": None,
             },
         }
@@ -3193,7 +3217,7 @@ def _fetch_daily_news_candidates_for_upload(
 
     target_fetch_count = _daily_news_candidate_fetch_limit(count)
     raw_fetch_count = _daily_news_raw_candidate_fetch_limit(target_fetch_count)
-    lookback_windows, lookback_meta = _candidate_lookback_windows(
+    lookback_windows, lookback_meta = _daily_news_lookback_window(
         lookback_days,
         env_names=("NEWS_LOOKBACK_DAYS", "CONTENT_LOOKBACK_DAYS"),
     )
@@ -3306,17 +3330,14 @@ def _fetch_daily_news_candidates_for_upload(
             f"relevant={a['prompt_relevant_candidate_count']} selected={a['actual_candidate_count']}"
             for a in attempts
         )
-        window_label = (
-            f"已依次检查 {lookback_windows} 天窗口"
-            if lookback_meta["mode"] == "auto_expand"
-            else f"固定回溯 {lookback_windows[-1]} 天"
-        )
+        window_label = f"严格回溯 {lookback_windows[-1]} 个北京时间自然日"
         message = (
-            "daily news material insufficient | 候选池不足："
+            "daily news material insufficient in strict two-day window | 候选池不足："
             f"本次要生成 {max(1, int(count or 1))} 条，需要至少 {target_fetch_count} 条相关且有日期的候选，"
             f"当前仅得到 {len(candidates)} 条。{window_label}（北京时间 "
             f"{last_window.get('start_date')}..{last_window.get('end_date')}）。"
-            f"各窗口结果：{attempt_summary}。建议放宽关键词、增加回溯天数，或检查信源/API 状态。"
+            f"筛选结果：{attempt_summary}。为防止旧闻混入，程序不会扩大到两天之外；"
+            "请放宽关键词、补充近期信源或检查新闻 API 状态。"
         )
         _emit_daily_news_progress(
             progress_callback,
@@ -4084,10 +4105,50 @@ def _candidate_lookback_windows(
     }
 
 
+def _daily_news_lookback_window(
+    explicit_days: object = None,
+    *,
+    env_names: tuple[str, ...] = (),
+) -> tuple[list[int], dict[str, Any]]:
+    """Resolve the non-negotiable freshness window for ordinary daily news."""
+    fixed = _positive_int_or_none(explicit_days)
+    source = "argument" if fixed is not None else ""
+    if fixed is None:
+        for name in env_names:
+            fixed = _positive_int_or_none(os.getenv(name))
+            if fixed is not None:
+                source = name
+                break
+
+    days = fixed if fixed is not None else DAILY_NEWS_MAX_LOOKBACK_DAYS
+    if days > DAILY_NEWS_MAX_LOOKBACK_DAYS:
+        raise RuntimeError(
+            "每日新闻最多只能回溯 2 个北京时间自然日（发帖当天和前一天）；"
+            f"当前 {source or 'argument'}={days}，请留空或填写 1/2。"
+        )
+    return [days], {
+        "mode": "strict_freshness",
+        "source": source or "default",
+        "windows": [days],
+        "max_allowed_days": DAILY_NEWS_MAX_LOOKBACK_DAYS,
+    }
+
+
 def _ai_digest_candidate_pool_target(target_count: int) -> tuple[int, int]:
-    factor = _env_int("AI_DIGEST_CANDIDATE_POOL_FACTOR", 3, min_value=1, max_value=10)
-    pool_target = min(100, max(target_count, target_count * factor))
+    # Keep enough lower-ranked official and fallback-source items available for
+    # history-aware deduplication before the LLM sees the pool.
+    factor = _env_int("AI_DIGEST_CANDIDATE_POOL_FACTOR", 10, min_value=1, max_value=20)
+    pool_target = min(200, max(target_count, target_count * factor))
     return pool_target, factor
+
+
+def _ai_digest_adaptive_max_items() -> int:
+    raw = (os.getenv("AI_DIGEST_MAX_ITEMS") or os.getenv("AI_DIGEST_TARGET_ITEMS") or "").strip()
+    try:
+        value = int(raw) if raw else 20
+    except ValueError:
+        value = 20
+    return min(20, max(AI_DIGEST_MIN_ITEMS, value))
 
 
 def _ai_digest_progress_callback():
@@ -4202,6 +4263,197 @@ def _uploaded_ai_digest_history_keys() -> set[str]:
     return keys
 
 
+def _select_adaptive_ai_digest_items(
+    items,
+    *,
+    impact_scores: dict[str, dict[str, object]],
+    historical_keys: set[str],
+    min_items: int = AI_DIGEST_MIN_ITEMS,
+    max_items: int = 20,
+    min_official_count: int = 6,
+    min_domestic_model_count: int = AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS,
+    min_foreign_ai_count: int = AI_DIGEST_MIN_FOREIGN_AI_ITEMS,
+    allow_official_relaxation: bool = True,
+) -> tuple[list[AIUpdateItem], dict[str, Any]]:
+    minimum = max(1, int(min_items or AI_DIGEST_MIN_ITEMS))
+    maximum = max(minimum, min(20, int(max_items or 20)))
+    item_list = list(items or [])
+    ranked_all = rank_ai_updates(
+        item_list,
+        target_count=max(1, len(item_list)),
+        min_official_count=max(maximum + 1, len(item_list) + 1),
+        allow_social_backfill=True,
+        max_age_days=14,
+    )
+    recent_keys = {
+        days: {
+            item.dedupe_key
+            for item in filter_recent_ai_updates(ranked_all, max_age_days=days, require_url=True)
+        }
+        for days in (3, 7, 14)
+    }
+
+    def is_high(item: AIUpdateItem) -> bool:
+        row = impact_scores.get(item.dedupe_key) or {}
+        return bool(row.get("high_impact"))
+
+    novel = [item for item in ranked_all if item.dedupe_key not in historical_keys]
+    strict_available = [
+        item for item in novel if item.dedupe_key in recent_keys[3] and is_high(item)
+    ]
+    strict_ranked = rank_ai_updates(
+        strict_available,
+        target_count=maximum,
+        min_official_count=maximum + 1,
+        allow_social_backfill=True,
+        max_age_days=3,
+    )
+    strict_target = min(len(strict_ranked), maximum)
+    target = strict_target if strict_target >= minimum else minimum
+    max_historical_reuse = max(0, (target * 3 - 1) // 4)
+
+    strict_keys = {item.dedupe_key for item in strict_ranked}
+    tier_items = {
+        "three_day_normal": [
+            item
+            for item in novel
+            if item.dedupe_key in recent_keys[3] and item.dedupe_key not in strict_keys
+        ],
+        "seven_day_high": [
+            item
+            for item in novel
+            if item.dedupe_key in recent_keys[7]
+            and item.dedupe_key not in recent_keys[3]
+            and is_high(item)
+        ],
+        "seven_day_normal": [
+            item
+            for item in novel
+            if item.dedupe_key in recent_keys[7]
+            and item.dedupe_key not in recent_keys[3]
+            and not is_high(item)
+        ],
+        "fourteen_day_high": [
+            item
+            for item in novel
+            if item.dedupe_key in recent_keys[14]
+            and item.dedupe_key not in recent_keys[7]
+            and is_high(item)
+        ],
+        "fourteen_day_normal": [
+            item
+            for item in novel
+            if item.dedupe_key in recent_keys[14]
+            and item.dedupe_key not in recent_keys[7]
+            and not is_high(item)
+        ],
+        "historical_reuse": [
+            item for item in ranked_all if item.dedupe_key in historical_keys
+        ][:max_historical_reuse],
+    }
+    allowed = list(strict_ranked)
+    allowed_keys = {item.dedupe_key for item in allowed}
+
+    def add_tier(name: str) -> None:
+        for candidate in tier_items[name]:
+            if candidate.dedupe_key in allowed_keys:
+                continue
+            allowed.append(candidate)
+            allowed_keys.add(candidate.dedupe_key)
+
+    def select_allowed() -> list[AIUpdateItem]:
+        return rank_ai_updates(
+            allowed,
+            target_count=target,
+            min_official_count=target + 1,
+            allow_social_backfill=True,
+            max_age_days=14,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
+
+    eligible_items = list(strict_ranked)
+    eligible_keys = {item.dedupe_key for item in eligible_items}
+    for tier in tier_items.values():
+        for candidate in tier:
+            if candidate.dedupe_key in eligible_keys:
+                continue
+            eligible_items.append(candidate)
+            eligible_keys.add(candidate.dedupe_key)
+
+    requested_official_min = min(max(0, int(min_official_count or 0)), target)
+    eligible_official_count = ai_digest_official_count(eligible_items)
+    effective_official_min = (
+        min(requested_official_min, eligible_official_count)
+        if allow_official_relaxation
+        else requested_official_min
+    )
+    selected = select_allowed()
+    error = _ai_digest_selection_error(
+        selected,
+        target_count=target,
+        min_official_count=effective_official_min,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+        max_age_days=14,
+    )
+    tiers_used: list[str] = []
+    for tier_name in (
+        "three_day_normal",
+        "seven_day_high",
+        "seven_day_normal",
+        "fourteen_day_high",
+        "fourteen_day_normal",
+        "historical_reuse",
+    ):
+        if not error:
+            break
+        add_tier(tier_name)
+        tiers_used.append(tier_name)
+        selected = select_allowed()
+        error = _ai_digest_selection_error(
+            selected,
+            target_count=target,
+            min_official_count=effective_official_min,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            max_age_days=14,
+        )
+
+    selected_keys = {item.dedupe_key for item in selected}
+    reused_selected = sum(1 for item in selected if item.dedupe_key in historical_keys)
+    if reused_selected > max_historical_reuse:
+        error = (
+            f"daily ai digest historical novelty insufficient: 历史资讯复用{reused_selected}条，"
+            f"超过本批最多{max_historical_reuse}条"
+        )
+    if error:
+        raise RuntimeError(error)
+
+    selected_tier_counts = {
+        name: sum(1 for item in tier if item.dedupe_key in selected_keys)
+        for name, tier in tier_items.items()
+    }
+    fallback_selected = sum(selected_tier_counts.values())
+    return selected, {
+        "selection_mode": "adaptive_strict" if fallback_selected == 0 else "fallback_minimum",
+        "min_items": minimum,
+        "max_items": maximum,
+        "strict_candidate_count": strict_target,
+        "strict_selected_count": len(selected) - fallback_selected,
+        "fallback_selected_count": fallback_selected,
+        "fallback_tiers": selected_tier_counts,
+        "fallback_tiers_used": tiers_used,
+        "target_items": target,
+        "actual_items": len(selected),
+        "historical_reused_count": reused_selected,
+        "max_historical_reuse": max_historical_reuse,
+        "eligible_official_items": eligible_official_count,
+        "effective_min_official_items": effective_official_min,
+        "official_target_relaxed": effective_official_min < requested_official_min,
+    }
+
+
 def _prefer_novel_ai_digest_items(
     items,
     *,
@@ -4289,6 +4541,57 @@ def _fit_ai_digest_brief_to_body_limit(
     return _with_ai_digest_items(brief, items)
 
 
+def _fit_ai_digest_items_to_body_capacity(
+    items,
+    *,
+    min_items: int,
+    min_official_count: int,
+    max_age_days: int,
+    min_domestic_model_count: int,
+    min_foreign_ai_count: int,
+    selection_meta: dict | None = None,
+) -> tuple[list[AIUpdateItem], dict[str, int]]:
+    item_list = list(items or [])
+    requested = len(item_list)
+    minimum = max(1, min(int(min_items or 1), requested or 1))
+    last_length = 0
+    for target in range(requested, minimum - 1, -1):
+        selected = rank_ai_updates(
+            item_list,
+            target_count=target,
+            min_official_count=target + 1,
+            allow_social_backfill=True,
+            max_age_days=max_age_days,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
+        effective_official_min = min(max(0, int(min_official_count or 0)), target)
+        if _ai_digest_selection_error(
+            selected,
+            target_count=target,
+            min_official_count=effective_official_min,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            max_age_days=max_age_days,
+        ):
+            continue
+        preview = build_fallback_brief(selected, target_count=target)
+        last_length = len(render_ai_digest_body(preview, selection_meta=selection_meta))
+        if last_length <= MAX_IMAGE_BODY:
+            return selected, {
+                "requested_items": requested,
+                "selected_items": len(selected),
+                "dropped_items": max(0, requested - len(selected)),
+                "body_length": last_length,
+                "body_limit": MAX_IMAGE_BODY,
+            }
+    raise RuntimeError(
+        "daily ai digest body capacity insufficient: "
+        f"保留最少{minimum}条及全部来源链接后正文仍为{last_length}字，"
+        f"超过小红书上限{MAX_IMAGE_BODY}字"
+    )
+
+
 def _ai_digest_post_title(brief: AIDigestBrief) -> str:
     prefix = "每日AI|"
     fallback = "今日AI热点速览"
@@ -4318,9 +4621,21 @@ def _ai_digest_post_title(brief: AIDigestBrief) -> str:
     subject = subject.replace("加密算法中的弱点", "加密弱点")
     subject = subject.replace("加密算法弱点", "加密弱点")
     subject = subject.strip("，,。；;：:、-—| ") or fallback
-    max_subject_length = max(1, MAX_IMAGE_TITLE - len(prefix))
+    item_count = len(brief.items or [])
+    suffix = f"等{item_count}条更新" if item_count >= 3 else ""
+    if suffix:
+        product = str(featured.product if featured is not None else "").strip()
+        if product:
+            subject = re.sub(r"\s+", "", product)
+        elif featured is not None:
+            vendor = re.sub(r"(?i)\s*(?:blog|官网|official)$", "", str(featured.vendor or "").strip())
+            if vendor:
+                subject = re.sub(rf"^{re.escape(vendor)}", "", subject, flags=re.IGNORECASE)
+            subject = re.sub(r"^(?:发布|推出|上线|开源|更新|披露|宣布)", "", subject)
+            subject = subject.strip("，,。；;：:、-—| ") or fallback
+    max_subject_length = max(1, MAX_IMAGE_TITLE - len(prefix) - len(suffix))
     subject = subject[:max_subject_length].rstrip("，,。；;：:、-—| ")
-    return f"{prefix}{subject or fallback[:max_subject_length]}"
+    return f"{prefix}{subject or fallback[:max_subject_length]}{suffix}"
 
 
 def create_daily_ai_digest_posts(
@@ -4333,7 +4648,15 @@ def create_daily_ai_digest_posts(
     evaluation_viewpoint: str = DEFAULT_EVALUATION_VIEWPOINT,
     lookback_days: object = None,
 ) -> list[Post]:
-    target_count = _env_int("AI_DIGEST_TARGET_ITEMS", AI_DIGEST_MIN_ITEMS, min_value=AI_DIGEST_MIN_ITEMS, max_value=20)
+    minimum_count = AI_DIGEST_MIN_ITEMS
+    max_items = _ai_digest_adaptive_max_items()
+    legacy_target_count = _env_int(
+        "AI_DIGEST_TARGET_ITEMS",
+        minimum_count,
+        min_value=minimum_count,
+        max_value=20,
+    )
+    target_count = minimum_count
     min_official_count = _env_int("AI_DIGEST_MIN_OFFICIAL_ITEMS", 6, min_value=1, max_value=20)
     lookback_windows, lookback_meta = _candidate_lookback_windows(
         lookback_days,
@@ -4343,16 +4666,17 @@ def create_daily_ai_digest_posts(
         "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS",
         AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS,
         min_value=0,
-        max_value=target_count,
+        max_value=max_items,
     )
     min_foreign_ai_count = _env_int(
         "AI_DIGEST_MIN_FOREIGN_AI_ITEMS",
         AI_DIGEST_MIN_FOREIGN_AI_ITEMS,
         min_value=0,
-        max_value=target_count,
+        max_value=max_items,
     )
-    candidate_pool_target, candidate_pool_factor = _ai_digest_candidate_pool_target(target_count)
+    candidate_pool_target, candidate_pool_factor = _ai_digest_candidate_pool_target(max_items)
     items = []
+    selection_pool_count = 0
     source_meta: dict[str, Any] = {}
     max_age_days = lookback_windows[0]
     lookback_attempts: list[dict[str, Any]] = []
@@ -4361,6 +4685,9 @@ def create_daily_ai_digest_posts(
     best_relaxed_pool: tuple[tuple[int, int, int], list[AIUpdateItem], dict[str, Any], int, int] | None = None
     progress = _ai_digest_progress_callback()
     historical_keys = _uploaded_ai_digest_history_keys()
+    adaptive_selection_meta: dict[str, Any] = {}
+    impact_meta: dict[str, Any] = {}
+    llm_configs_cache = None
     if progress is not None:
         progress("collect_pool", f"in_progress mode={lookback_meta['mode']} windows={lookback_windows}")
     auto_collection_items: list[AIUpdateItem] | None = None
@@ -4381,6 +4708,7 @@ def create_daily_ai_digest_posts(
             min_foreign_ai_count=min_foreign_ai_count,
             include_pool_items=True,
             force_search_backfill=False,
+            force_aggregator_backfill=bool(historical_keys),
             progress=progress,
             source_health_path=Path("data") / "source_health" / "ai_digest.json",
             persist_source_health=True,
@@ -4401,7 +4729,178 @@ def create_daily_ai_digest_posts(
                 f"success single_fetch window={collection_days}d "
                 f"fetched={auto_collection_meta.get('fetched_count')} pool={len(auto_collection_items)}",
             )
-    for days in lookback_windows:
+    adaptive_mode = (os.getenv("AI_DIGEST_ADAPTIVE_COUNT") or "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if not adaptive_mode:
+        target_count = legacy_target_count
+    if adaptive_mode:
+        if auto_collection_items is None:
+            collection_days = max(lookback_windows)
+            collected_items, collected_meta = collect_ai_digest_updates(
+                target_count=candidate_pool_target,
+                min_official_count=min_official_count,
+                allow_social_backfill=True,
+                max_age_days=collection_days,
+                min_domestic_model_count=min_domestic_model_count,
+                min_foreign_ai_count=min_foreign_ai_count,
+                include_pool_items=True,
+                force_search_backfill=False,
+                force_aggregator_backfill=bool(historical_keys),
+                progress=progress,
+                source_health_path=Path("data") / "source_health" / "ai_digest.json",
+                persist_source_health=True,
+            )
+            auto_collection_meta = dict(collected_meta or {})
+            auto_collection_items = list(
+                auto_collection_meta.get("_deduped_items")
+                or auto_collection_meta.get("_fresh_items")
+                or collected_items
+                or []
+            )
+            auto_collection_meta.pop("_fetched_items", None)
+            auto_collection_meta.pop("_fresh_items", None)
+            auto_collection_meta.pop("_deduped_items", None)
+
+        supervisor_limit = _env_int(
+            "AI_DIGEST_IMPACT_SUPERVISOR_MAX_ITEMS",
+            60,
+            min_value=minimum_count,
+            max_value=100,
+        )
+        evaluation_pool = rank_ai_updates(
+            list(auto_collection_items or []),
+            target_count=supervisor_limit,
+            min_official_count=supervisor_limit + 1,
+            allow_social_backfill=True,
+            max_age_days=max(lookback_windows),
+        )
+        selection_pool_count = len(evaluation_pool)
+        try:
+            impact_threshold = float((os.getenv("AI_DIGEST_HIGH_IMPACT_SCORE") or "75").strip())
+        except ValueError:
+            impact_threshold = 75.0
+        impact_threshold = min(100.0, max(0.0, impact_threshold))
+        config_error = ""
+        try:
+            llm_configs_cache = load_llm_configs()
+        except Exception as exc:
+            llm_configs_cache = []
+            config_error = str(exc)
+        supervisor_enabled = (os.getenv("AI_DIGEST_IMPACT_SUPERVISOR") or "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        impact_scores, impact_meta = evaluate_ai_digest_impact_with_llm(
+            list(llm_configs_cache or []) if supervisor_enabled else [],
+            evaluation_pool,
+            threshold=impact_threshold,
+        )
+        if config_error and not impact_meta.get("error"):
+            impact_meta["error"] = config_error
+        impact_meta["enabled"] = supervisor_enabled
+        impact_meta["threshold"] = impact_threshold
+        impact_meta["candidate_limit"] = supervisor_limit
+        if progress is not None:
+            high_count = sum(1 for row in impact_scores.values() if row.get("high_impact"))
+            progress(
+                "impact_review",
+                f"success mode={impact_meta.get('mode')} candidates={len(evaluation_pool)} "
+                f"high_impact={high_count} threshold={impact_threshold:g}",
+            )
+
+        try:
+            items, adaptive_selection_meta = _select_adaptive_ai_digest_items(
+                evaluation_pool,
+                impact_scores=impact_scores,
+                historical_keys=historical_keys,
+                min_items=minimum_count,
+                max_items=max_items,
+                min_official_count=min_official_count,
+                min_domestic_model_count=min_domestic_model_count,
+                min_foreign_ai_count=min_foreign_ai_count,
+                allow_official_relaxation=True,
+            )
+        except RuntimeError as exc:
+            window_label = (
+                f"tried windows={lookback_windows}"
+                if lookback_meta["mode"] == "auto_expand"
+                else f"fixed {max(lookback_windows)}-day window"
+            )
+            raise RuntimeError(f"daily ai digest material insufficient: {window_label}; {exc}") from exc
+        target_count = len(items)
+        fallback_tiers = adaptive_selection_meta.get("fallback_tiers") or {}
+        if (
+            fallback_tiers.get("fourteen_day_high")
+            or fallback_tiers.get("fourteen_day_normal")
+            or fallback_tiers.get("historical_reuse")
+        ):
+            max_age_days = 14
+        elif fallback_tiers.get("seven_day_high") or fallback_tiers.get("seven_day_normal"):
+            max_age_days = 7
+        else:
+            max_age_days = min(3, max(lookback_windows))
+        effective_min_official_count = int(
+            adaptive_selection_meta.get("effective_min_official_items", min(min_official_count, target_count))
+        )
+        source_meta = dict(auto_collection_meta or {})
+        source_meta["impact_review"] = impact_meta
+        source_meta["adaptive_selection"] = adaptive_selection_meta
+        source_meta["historical_novelty"] = {
+            "historical_key_count": len(historical_keys),
+            "candidate_count_before_history_filter": len(evaluation_pool),
+            "novel_candidate_count": sum(
+                1 for item in evaluation_pool if item.dedupe_key not in historical_keys
+            ),
+            "reused_candidate_count": sum(
+                1 for item in evaluation_pool if item.dedupe_key in historical_keys
+            ),
+            "reused_selected_count": adaptive_selection_meta.get("historical_reused_count", 0),
+            "max_reused_before_duplicate_gate": adaptive_selection_meta.get("max_historical_reuse", 0),
+        }
+        source_meta["selected_impact_scores"] = [
+            {
+                "url": item.url,
+                "impact_score": (impact_scores.get(item.dedupe_key) or {}).get("impact_score"),
+                "high_impact": bool((impact_scores.get(item.dedupe_key) or {}).get("high_impact")),
+                "reason": (impact_scores.get(item.dedupe_key) or {}).get("reason", ""),
+            }
+            for item in items
+        ]
+        lookback_attempts = [
+            {
+                "max_age_days": days,
+                "selection_pool_items": len(
+                    filter_recent_ai_updates(evaluation_pool, max_age_days=days, require_url=True)
+                ),
+                "quota_counts": ai_digest_quota_counts(
+                    filter_recent_ai_updates(evaluation_pool, max_age_days=days, require_url=True)
+                ),
+                "official_count": ai_digest_official_count(
+                    filter_recent_ai_updates(evaluation_pool, max_age_days=days, require_url=True)
+                ),
+                "error": "",
+            }
+            for days in lookback_windows
+            if days <= max_age_days
+        ]
+        if progress is not None:
+            selected_official_count = ai_digest_official_count(items)
+            progress(
+                "adaptive_selection",
+                f"success strict={adaptive_selection_meta.get('strict_candidate_count')} "
+                f"fallback={adaptive_selection_meta.get('fallback_selected_count')} "
+                f"selected={target_count}/{max_items} official={selected_official_count}/{min_official_count} "
+                f"effective_official={effective_min_official_count} "
+                f"mode={adaptive_selection_meta.get('selection_mode')}",
+            )
+
+    for days in ([] if adaptive_mode else lookback_windows):
         if auto_collection_items is not None:
             if progress is not None:
                 progress("filter_window", f"in_progress window={days}d cached_pool={len(auto_collection_items)}")
@@ -4531,6 +5030,7 @@ def create_daily_ai_digest_posts(
             }
         )
         items = window_candidate_items
+        selection_pool_count = len(window_candidate_items or [])
         source_meta = window_meta
         max_age_days = days
         last_pool_error = pool_error
@@ -4574,8 +5074,9 @@ def create_daily_ai_digest_posts(
         )
     source_meta["candidate_pool_target"] = candidate_pool_target
     source_meta["candidate_pool_factor"] = candidate_pool_factor
-    source_meta["selection_pool_items"] = len(items)
-    source_meta["min_items"] = target_count
+    source_meta["selection_pool_items"] = selection_pool_count or len(items)
+    source_meta["min_items"] = minimum_count
+    source_meta["max_items"] = max_items
     source_meta["min_domestic_model_items"] = min_domestic_model_count
     source_meta["min_foreign_ai_items"] = min_foreign_ai_count
     source_meta["selection_pool_quota_counts"] = ai_digest_quota_counts(list(items or []))
@@ -4588,6 +5089,38 @@ def create_daily_ai_digest_posts(
         "selected_max_age_days": max_age_days,
         "attempts": lookback_attempts,
     }
+    if adaptive_selection_meta:
+        source_meta["adaptive_selection"] = adaptive_selection_meta
+
+    if adaptive_mode:
+        items, body_capacity_meta = _fit_ai_digest_items_to_body_capacity(
+            items,
+            min_items=minimum_count,
+            min_official_count=effective_min_official_count,
+            max_age_days=max_age_days,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            selection_meta=source_meta,
+        )
+        target_count = len(items)
+        effective_min_official_count = min(effective_min_official_count, target_count)
+        adaptive_selection_meta["body_capacity"] = body_capacity_meta
+        adaptive_selection_meta["final_target_items"] = target_count
+        source_meta["body_capacity"] = body_capacity_meta
+        source_meta["adaptive_selection"] = adaptive_selection_meta
+        selected_urls = {item.url for item in items}
+        source_meta["selected_impact_scores"] = [
+            row
+            for row in source_meta.get("selected_impact_scores", [])
+            if row.get("url") in selected_urls
+        ]
+        if progress is not None:
+            progress(
+                "body_capacity",
+                f"success selected={target_count}/{body_capacity_meta['requested_items']} "
+                f"body={body_capacity_meta['body_length']}/{body_capacity_meta['body_limit']} "
+                "links=preserved",
+            )
 
     generation_target = target_count
     generation_mode = "llm"
@@ -4604,8 +5137,9 @@ def create_daily_ai_digest_posts(
     source_meta["llm_input_items"] = len(llm_items)
     source_meta["llm_input_quota_counts"] = ai_digest_quota_counts(llm_items)
     try:
+        generation_cfgs = llm_configs_cache if llm_configs_cache is not None else load_llm_configs()
         brief = generate_ai_digest_brief_with_llm(
-            load_llm_configs(),
+            generation_cfgs,
             llm_items,
             target_count=generation_target,
             min_domestic_model_count=min_domestic_model_count,
@@ -4706,12 +5240,15 @@ def create_daily_ai_digest_posts(
                 "actual_items": len(brief.items),
                 "candidate_pool_target": candidate_pool_target,
                 "candidate_pool_factor": candidate_pool_factor,
-                "selection_pool_items": len(items),
+                "selection_pool_items": source_meta["selection_pool_items"],
                 "min_official_items": min_official_count,
                 "official_target_items": min_official_count,
                 "effective_min_official_items": effective_min_official_count,
                 "official_target_met": source_meta["official_target_met"],
-                "min_items": target_count,
+                "min_items": minimum_count,
+                "max_items": max_items,
+                "adaptive_selection": adaptive_selection_meta,
+                "impact_review": impact_meta,
                 "min_domestic_model_items": min_domestic_model_count,
                 "min_foreign_ai_items": min_foreign_ai_count,
                 "quota_counts": source_meta["selected_quota_counts"],

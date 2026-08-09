@@ -970,9 +970,8 @@ def filter_recent_news_items(
     """
     Keep only items published within the Beijing-calendar freshness window.
 
-    For daily-news draft generation the accepted dates are the posting day,
-    yesterday, and the day before yesterday. Items with missing or unparseable
-    dates are excluded because they cannot prove freshness.
+    The caller controls the number of Beijing calendar days. Items with missing
+    or unparseable dates are excluded because they cannot prove freshness.
     """
     start_day, end_day, tz = _recent_news_day_window(
         tz_name=tz_name,

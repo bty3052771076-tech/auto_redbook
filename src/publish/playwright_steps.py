@@ -2451,7 +2451,16 @@ class DraftReadbackResult:
 
 
 def _normalize_readback_text(value: str) -> str:
-    return re.sub(r"\s+", "", (value or "").strip())
+    text = (value or "").strip()
+    # Rich-text editors decode HTML entities when reopening a saved draft.
+    # Decode a couple of layers because source URLs may already contain an
+    # escaped entity before the editor serializes the content again.
+    for _ in range(2):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    return re.sub(r"\s+", "", text)
 
 
 def _verify_draft_readback_snapshot(
