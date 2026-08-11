@@ -9,7 +9,7 @@ Auto Redbook 是一个运行在本地的中文内容生产与多平台草稿分�
 - 新闻材料模式：支持单条材料直生成和多条材料候选池筛选。
 - 多平台草稿：同一条冻结内容可保存到小红书、今日头条或两边；两个创作平台共用工作区浏览器 Profile，并分别执行草稿回读验证。
 - 已发布数据：全量同步已发布笔记的浏览、点赞、评论、收藏等指标，并生成选题分析。
-- 模型额度：通过 Aliyun 百炼和 Volcengine Ark 官方控制台页面读取可见免费额度/用量，在 GUI 中搜索、排序和切换模型。
+- 模型额度：通过 Aliyun 百炼、Volcengine Ark 官方控制台页面和 SiliconFlow 模型列表 API/控制台页面读取可见免费额度/用量，在 GUI 中搜索、排序和切换模型。
 - 配图策略：普通新闻优先使用 AI 生图，生图失败时可回退 Pexels；`每日AI讯息` 使用本地简报渲染图。
 
 ## 快速开始
@@ -66,7 +66,17 @@ $env:VOLCENGINE_IMAGE_MODEL="doubao-seedream-5-0-lite-260128"
 
 Ark 控制台额度表使用用户侧名称，OpenAI 兼容接口则可能要求带日期的 API ID。程序会自动处理当前已验证映射，例如 `glm-5.2 -> glm-5-2-260617`、`deepseek-v4-flash -> deepseek-v4-flash-260425`、`deepseek-v4-pro -> deepseek-v4-pro-260425`。GUI 和 CLI 仍显示控制台名称；自动模式只选额度为正且已验证可调用的模型。
 
-还支持 `ppinfra` 和 `auto` LLM 提供商。`auto` 采用额度快照驱动的免费优先策略：只选择最新快照中 `status=available`、`remaining>0`、未过期且已配置 Key 的阿里云或火山引擎模型，不会把模型目录、默认模型或未知额度误当成免费额度，也默认不会调用 PPInfra。需要 PPInfra 时，请显式选择 `LLM_PROVIDER="ppinfra"`；只有设置 `ALLOW_PAID_LLM_FALLBACK=1`，它才具备付费兜底资格。GUI 默认使用 `auto`，图片来源也可选择 `auto`，由同一次预检选择余额充足的生图模型。模型、图片和可选新闻源凭据仅通过本地环境变量或本地未跟踪文件配置；不要把真实端点、密钥或登录态写入仓库。
+SiliconFlow（硅基流动）示例：
+
+```powershell
+$env:LLM_PROVIDER="siliconflow"
+$env:IMAGE_PROVIDER="siliconflow"
+$env:SILICONFLOW_API_KEY="YOUR_SILICONFLOW_API_KEY"
+$env:SILICONFLOW_LLM_MODEL="deepseek-ai/DeepSeek-V3"
+$env:SILICONFLOW_IMAGE_MODEL="Qwen/Qwen-Image"
+```
+
+还支持 `ppinfra` 和 `auto` LLM 提供商。`auto` 采用额度快照驱动的免费优先策略：只选择最新快照中 `status=available`、`remaining>0`、未过期且已配置 Key 的阿里云、火山引擎或硅基流动模型，不会把模型目录、默认模型或未知额度误当成免费额度，也默认不会调用 PPInfra。需要 PPInfra 时，请显式选择 `LLM_PROVIDER="ppinfra"`；只有设置 `ALLOW_PAID_LLM_FALLBACK=1`，它才具备付费兜底资格。GUI 默认使用 `auto`，图片来源也可选择 `auto`，由同一次预检选择余额充足的生图模型。模型、图片和可选新闻源凭据仅通过本地环境变量或本地未跟踪文件配置；不要把真实端点、密钥或登录态写入仓库。
 
 ### 4. 登录浏览器 Profile
 
@@ -139,7 +149,7 @@ GUI 的“自动发帖”页面按内容与来源、材料模式、本次模型�
 
 ```text
 检查/同步已发布数据
-  -> 检查/同步阿里云和火山引擎免费额度
+  -> 检查/同步阿里云、火山引擎和硅基流动免费额度
   -> 选择有正数免费额度的 LLM、生图模型和视觉模型
   -> 采集、日期过滤、相关性筛选和去重
   -> 生成文案与图片
@@ -261,9 +271,16 @@ GUI 的“自动发帖”页面按内容与来源、材料模式、本次模型�
   --login-hold 600 `
   --wait-timeout 120 `
   --save-raw
+
+.\.venv\Scripts\python.exe -m apps.cli siliconflow-quota `
+  --model deepseek-ai/DeepSeek-V3 `
+  --model Qwen/Qwen-Image `
+  --login-hold 600 `
+  --wait-timeout 120 `
+  --save-raw
 ```
 
-同步两个平台并更新 GUI 使用的快照：
+同步三个平台并更新 GUI 使用的快照：
 
 ```powershell
 .\.venv\Scripts\python.exe -m apps.cli sync-quotas `

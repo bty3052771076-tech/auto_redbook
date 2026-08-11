@@ -408,8 +408,9 @@ def test_automatic_model_plan_skips_unverified_vision_display_alias(tmp_path):
 
     plan = build_free_model_plan(records, rejected=rejected)
 
-    assert plan.vision is not None
-    assert plan.vision.model == "qwen3.5-ocr"
+    # OCR-only models cannot perform image-content consistency review, so they
+    # are excluded from vision-review selection even when free quota exists.
+    assert plan.vision is None
 
 
 def test_model_plan_never_adds_ppinfra_without_paid_opt_in(tmp_path):

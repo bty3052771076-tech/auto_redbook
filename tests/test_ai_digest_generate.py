@@ -1059,7 +1059,7 @@ def test_build_fallback_brief_describes_deepseek_api_deprecation_instead_of_the_
     assert "deepseek-reasoner" in out.summary
 
 
-def test_render_ai_digest_body_includes_source_links_for_each_item():
+def test_render_ai_digest_body_omits_source_links_for_platform_safety():
     body = render_ai_digest_body(build_fallback_brief(_updates(2), date="2026-06-30"))
 
     assert "每日AI讯息" in body
@@ -1067,14 +1067,12 @@ def test_render_ai_digest_body_includes_source_links_for_each_item():
     assert "今日动态：" in body
     assert "1. OpenAI：AI动态0" in body
     assert "2. OpenAI：AI动态1" in body
-    assert body.index("1. OpenAI：AI动态0") < body.index("来源链接：")
-    assert "来源链接：" in body
     assert "信源层级：官网2条，资讯整合站0条，社交媒体0条" in body
-    assert "1. OpenAI https://example.com/0" in body
-    assert "2. OpenAI https://example.com/1" in body
+    assert "来源链接：" not in body
+    assert "https://" not in body
 
 
-def test_render_ai_digest_body_keeps_primary_url_before_shorter_evidence_url():
+def test_render_ai_digest_body_omits_primary_and_evidence_urls():
     official_url = "https://www.anthropic.com/research/discovering-cryptographic-weaknesses-with-claude"
     aggregator_url = "https://aihot.virxact.com/daily/2026-07-29?item=1"
     item = AIUpdateItem(
@@ -1093,11 +1091,12 @@ def test_render_ai_digest_body_keeps_primary_url_before_shorter_evidence_url():
 
     body = render_ai_digest_body(build_fallback_brief([item], target_count=1, date="2026-07-29"))
 
-    assert official_url in body
+    assert official_url not in body
     assert aggregator_url not in body
+    assert "https://" not in body
 
 
-def test_render_ai_digest_body_keeps_eight_links_under_platform_limit_with_long_sources():
+def test_render_ai_digest_body_fits_eight_items_without_links_under_platform_limit():
     items = [
         AIUpdateItem(
             title=f"AI HOT 动态{i}",
@@ -1118,10 +1117,11 @@ def test_render_ai_digest_body_keeps_eight_links_under_platform_limit_with_long_
     body = render_ai_digest_body(brief, selection_meta={"fetched_count": 200, "fresh_count": 58, "deduped_count": 47})
 
     assert len(body) <= 1000
-    assert body.count("https://aihot.virxact.com/daily/2026-07-03?item=") == 8
+    assert "https://" not in body
+    assert body.count("AI HOT 动态") == 8
 
 
-def test_render_ai_digest_compact_links_do_not_keep_tail_of_spaced_source_name():
+def test_render_ai_digest_compact_body_fits_without_links():
     items = [
         AIUpdateItem(
             title=f"Cursor Router 模型路由技术更新第{i}项详细说明",
@@ -1139,5 +1139,4 @@ def test_render_ai_digest_compact_links_do_not_keep_tail_of_spaced_source_name()
     body = render_ai_digest_body(build_fallback_brief(items, target_count=8, date="2026-08-07"))
 
     assert len(body) <= 1000
-    assert "1. https://cursor.com/" in body
-    assert "1. Blog https://cursor.com/" not in body
+    assert "https://" not in body

@@ -19,6 +19,7 @@ DEFAULT_LLM_BASE_URL = "https://api.ppinfra.com/openai"
 DEFAULT_LLM_MODEL = "deepseek/deepseek-v3-0324"
 DEFAULT_ALIYUN_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_VOLCENGINE_LLM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+DEFAULT_SILICONFLOW_LLM_BASE_URL = "https://api.siliconflow.cn/v1"
 ALIYUN_FREE_LLM_MODELS = [
     "qwen3.7-plus",
     "deepseek-v4-flash",
@@ -70,6 +71,44 @@ VOLCENGINE_AVAILABLE_LLM_MODELS = [
     "qwen3-0-6b-20250429",
 ]
 DEFAULT_VOLCENGINE_LLM_MODEL = VOLCENGINE_AVAILABLE_LLM_MODELS[0]
+
+SILICONFLOW_FREE_LLM_MODELS = [
+    "deepseek-ai/DeepSeek-V3",
+    "deepseek-ai/DeepSeek-V3.1",
+    "deepseek-ai/DeepSeek-R1",
+    "Qwen/Qwen3-32B",
+    "Qwen/Qwen3-30B-A3B",
+    "Qwen/Qwen3-14B",
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-4B",
+    "Qwen/Qwen3-1.7B",
+    "Qwen/Qwen3-0.6B",
+    "Qwen/Qwen2.5-72B-Instruct",
+    "Qwen/Qwen2.5-32B-Instruct",
+    "Qwen/Qwen2.5-14B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "THUDM/GLM-4-9B-0414",
+    "THUDM/GLM-4-32B-0414",
+    "moonshotai/Kimi-K2-Instruct",
+    "moonshotai/Kimi-K2.5-Instruct",
+    "zai-org/GLM-4.5-Air",
+    "zai-org/GLM-4.5-Flash",
+    "zai-org/GLM-4.6",
+    "zai-org/GLM-4.6-Flash",
+]
+DEFAULT_SILICONFLOW_LLM_MODEL = SILICONFLOW_FREE_LLM_MODELS[0]
+
+SILICONFLOW_IMAGE_MODELS = [
+    "Kwai-Kolors/Kolors",
+    "Kwai-Kolors/Kolors-Flash",
+    "Qwen/Qwen-Image",
+    "Qwen/Qwen-Image-Edit",
+    "stabilityai/stable-diffusion-3-5-large",
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    "black-forest-labs/FLUX.1-schnell",
+    "black-forest-labs/FLUX.1-dev",
+]
 
 # Ark exposes the user-facing DeepSeek V4 Pro name in the console catalog, but
 # the OpenAI-compatible endpoint currently requires the dated deployment ID.
@@ -246,6 +285,42 @@ def _load_volcengine_llm_configs(*, include_default_model: bool = True) -> list[
     ]
 
 
+def _load_siliconflow_llm_configs(*, include_default_model: bool = True) -> list[LLMConfig]:
+    env_key = (
+        os.getenv("SILICONFLOW_LLM_API_KEY")
+        or os.getenv("SILICONFLOW_API_KEY")
+        or os.getenv("SF_API_KEY")
+    )
+    env_base = os.getenv("SILICONFLOW_LLM_BASE_URL") or os.getenv("SF_BASE_URL")
+    env_model = os.getenv("SILICONFLOW_LLM_MODEL") or os.getenv("SF_LLM_MODEL")
+    env_models = os.getenv("SILICONFLOW_LLM_MODELS") or os.getenv("SF_LLM_MODELS")
+
+    file_cfg = _parse_llm_key_file(Path("docs/siliconflow_api-key.md"))
+
+    api_key = (env_key or file_cfg.get("api_key") or "").strip()
+    if not api_key:
+        return []
+
+    base_url = (env_base or file_cfg.get("base_url") or DEFAULT_SILICONFLOW_LLM_BASE_URL).strip().rstrip("/")
+    models = _split_models(env_models or "")
+    if not models:
+        if env_model:
+            models = [(env_model or "").strip()]
+        elif include_default_model:
+            models = list(SILICONFLOW_FREE_LLM_MODELS)
+
+    return [
+        LLMConfig(
+            model=m,
+            api_key=api_key,
+            base_url=base_url,
+            provider="siliconflow",
+        )
+        for m in models
+        if (m or "").strip()
+    ]
+
+
 def _normalize_llm_provider(value: str) -> str:
     raw = (value or "").strip().lower()
     if not raw:
@@ -261,12 +336,15 @@ def _normalize_llm_provider(value: str) -> str:
         "doubao": "volcengine",
         "volcano": "volcengine",
         "volc": "volcengine",
+        "siliconflow": "siliconflow",
+        "silicon": "siliconflow",
+        "sf": "siliconflow",
         "default": "auto",
     }
     raw = aliases.get(raw, raw)
-    if raw not in {"auto", "aliyun", "volcengine", "ppinfra"}:
+    if raw not in {"auto", "aliyun", "volcengine", "siliconflow", "ppinfra"}:
         raise RuntimeError(
-            f"Unsupported LLM_PROVIDER={value!r}; supported: auto, aliyun, volcengine, ppinfra"
+            f"Unsupported LLM_PROVIDER={value!r}; supported: auto, aliyun, volcengine, siliconflow, ppinfra"
         )
     return raw
 
@@ -287,6 +365,9 @@ def load_llm_configs(
     if provider in ("auto", "volcengine"):
         configs.extend(_load_volcengine_llm_configs(include_default_model=provider != "auto"))
 
+    if provider in ("auto", "siliconflow"):
+        configs.extend(_load_siliconflow_llm_configs(include_default_model=provider != "auto"))
+
     if provider == "ppinfra" or allow_paid_fallback:
         fallback_cfg = _load_fallback_llm_config(llm_file=llm_file)
         if fallback_cfg:
@@ -302,13 +383,15 @@ def load_llm_configs(
     if not configs:
         if provider == "auto":
             raise RuntimeError(
-                "No Aliyun or Volcengine LLM configuration is available in free-first auto mode. "
-                "Configure ALIYUN_LLM_API_KEY or VOLCENGINE_API_KEY, explicitly set LLM_PROVIDER=ppinfra, "
+                "No Aliyun, Volcengine, or SiliconFlow LLM configuration is available in free-first auto mode. "
+                "Configure ALIYUN_LLM_API_KEY, VOLCENGINE_API_KEY, or SILICONFLOW_API_KEY; "
+                "explicitly set LLM_PROVIDER=ppinfra, "
                 "or set ALLOW_PAID_LLM_FALLBACK=1 to opt in to PPInfra after both platforms fail."
             )
         raise RuntimeError(
-            "LLM api_key missing: set ALIYUN_LLM_API_KEY (or ALIYUN_IMAGE_API_KEY/DASHSCOPE_API_KEY) "
-            "or VOLCENGINE_API_KEY/ARK_API_KEY, or set LLM_API_KEY / docs/llm_api-key.md "
+            "LLM api_key missing: set ALIYUN_LLM_API_KEY (or ALIYUN_IMAGE_API_KEY/DASHSCOPE_API_KEY), "
+            "VOLCENGINE_API_KEY/ARK_API_KEY, or SILICONFLOW_API_KEY; "
+            "or set LLM_API_KEY / docs/llm_api-key.md "
             "(see README.md for configuration examples)"
         )
 

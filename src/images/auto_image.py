@@ -866,6 +866,75 @@ def fetch_and_download_related_images(
             metas.append(meta)
         return paths, metas
 
+    if provider_name in ("siliconflow", "silicon", "sf"):
+        from src.images.siliconflow_images import generate_siliconflow_image
+
+        if requested_count is None and not (os.getenv("AUTO_IMAGE_COUNT") or "").strip():
+            count = 1
+
+        def _is_retryable_siliconflow_error(exc: Exception) -> bool:
+            msg = str(exc or "")
+            if not msg:
+                return False
+            msg_lower = msg.lower()
+            if "api_key missing" in msg_lower or ("invalid" in msg_lower and "key" in msg_lower):
+                return False
+            if "401" in msg_lower or "forbidden" in msg_lower:
+                return False
+            return True
+
+        siliconflow_timeout_s = float(os.getenv("SILICONFLOW_IMAGE_TIMEOUT_S") or 180.0)
+        siliconflow_download_timeout_s = float(os.getenv("SILICONFLOW_IMAGE_DOWNLOAD_TIMEOUT_S") or 60.0)
+        max_attempts = int(os.getenv("SILICONFLOW_IMAGE_MAX_ATTEMPTS") or 3)
+        retry_sleep_s = float(os.getenv("SILICONFLOW_IMAGE_RETRY_SLEEP_S") or 2.0)
+        if max_attempts <= 0:
+            max_attempts = 1
+
+        prompt = _build_aliyun_image_prompt(
+            title=title, body=body, topics=topics, prompt_hint=prompt_hint
+        )
+        post_id = dest_dir.parent.name if dest_dir.name == "assets" else dest_dir.name
+
+        paths: list[Path] = []
+        metas: list[dict[str, Any]] = []
+        for _ in range(count):
+            errors: list[str] = []
+            res = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    res = generate_siliconflow_image(
+                        post_id=post_id,
+                        prompt=prompt,
+                        dest_dir=dest_dir,
+                        timeout_s=siliconflow_timeout_s,
+                        download_timeout_s=siliconflow_download_timeout_s,
+                    )
+                    break
+                except Exception as exc:
+                    errors.append(str(exc))
+                    if attempt < max_attempts and _is_retryable_siliconflow_error(exc):
+                        time.sleep(max(0.0, retry_sleep_s))
+                        continue
+                    if attempt >= max_attempts and _is_retryable_siliconflow_error(exc):
+                        raise ImageGenerationAbandoned(
+                            provider=provider_name, attempts=attempt, errors=errors[-3:]
+                        ) from exc
+                    raise
+            if res is None:
+                raise ImageGenerationAbandoned(
+                    provider=provider_name, attempts=max_attempts, errors=errors[-3:]
+                )
+            meta = {
+                **res.meta,
+                "query_original": query_original,
+                "attempt": len(errors) + 1,
+                "attempt_max": max_attempts,
+                "attempt_errors": errors[-3:],
+            }
+            paths.append(res.path)
+            metas.append(meta)
+        return paths, metas
+
     query_used = query_original
     if provider_name == "pexels":
         hint = _pexels_query_hint(query_original)
@@ -892,7 +961,7 @@ def fetch_and_download_related_images(
                 )
             else:
                 raise RuntimeError(
-                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels, aliyun, volcengine"
+                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels, aliyun, volcengine, siliconflow"
                 )
         except Exception as exc:
             last_err = str(exc)

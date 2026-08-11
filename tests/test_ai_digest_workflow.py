@@ -228,7 +228,7 @@ def test_select_adaptive_ai_digest_items_uses_older_normal_item_for_minimum_quot
     assert meta["selection_mode"] == "fallback_minimum"
 
 
-def test_fit_ai_digest_items_to_body_capacity_keeps_largest_traceable_count():
+def test_fit_ai_digest_items_to_body_capacity_fits_all_without_links():
     items = [
         item.model_copy(
             update={
@@ -252,12 +252,12 @@ def test_fit_ai_digest_items_to_body_capacity_keeps_largest_traceable_count():
         selection_meta={"candidate_pool_target": 200},
     )
 
-    assert 8 <= len(selected) < 20
+    assert 8 <= len(selected) <= 20
     assert meta["requested_items"] == 20
     assert meta["selected_items"] == len(selected)
     assert meta["dropped_items"] == 20 - len(selected)
     assert len(body) <= create_post.MAX_IMAGE_BODY
-    assert all(item.url in body for item in selected)
+    assert "https://" not in body
 
 
 def test_create_daily_ai_digest_posts_sends_thirteen_strict_items_to_rewrite_llm(monkeypatch, tmp_path: Path):
@@ -582,7 +582,8 @@ def test_create_daily_ai_digest_posts_uses_llm_brief_for_chinese_items(monkeypat
     assert "OpenAI发布开发者工具更新" in titles
     summaries = [item["summary"] for item in posts[0].platform["ai_digest"]["items"]]
     assert any("开发者工具" in summary for summary in summaries)
-    assert "https://openai.com/news/tools" in posts[0].body
+    assert "https://openai.com/news/tools" not in posts[0].body
+    assert "https://" not in posts[0].body
 
 
 def test_create_daily_ai_digest_passes_exact_quota_safe_selection_to_llm(monkeypatch, tmp_path: Path):

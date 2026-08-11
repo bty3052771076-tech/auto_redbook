@@ -1091,27 +1091,13 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
     selection_line = _selection_summary_line(selection_meta, item_count=len(brief.items))
     if selection_line:
         lines.append(selection_line)
-    link_lines = []
-    link_urls = []
-    for idx, item in enumerate(brief.items, 1):
-        trace_urls = [
-            url
-            for url in [item.normalized_url, *(u.strip() for u in item.evidence_urls if u.strip())]
-            if url
-        ]
-        url = next(iter(dict.fromkeys(trace_urls)), "")
-        if not url:
-            continue
-        source = (item.vendor or item.source_name or f"动态{idx}").strip()
-        link_lines.append(f"{idx}. {source[:12]} {url}")
-        link_urls.append(url)
-    if link_lines:
-        lines.extend(["", "来源链接：", *link_lines])
+    # Links are intentionally not written into the draft body: external URLs in
+    # XHS posts can trigger review/removal. Source URLs remain in the local
+    # post metadata (ai_digest.items[].url / evidence_urls) for traceability.
     body = "\n".join(lines)
     if len(body) <= AI_DIGEST_BODY_LIMIT:
         return body
 
-    compact_link_lines = [f"{idx}. {url}" for idx, url in enumerate(link_urls, 1)]
     for title_limit in (24, 18, 12, 8):
         compact_topics = [
             f"{idx}. {(item.vendor or item.source_name or f'动态{idx}').strip()[:8]}："
@@ -1124,8 +1110,6 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
             source_tier_line,
             "今日动态：",
             *compact_topics,
-            "来源链接：",
-            *compact_link_lines,
         ]
         body = "\n".join(compact_lines)
         if len(body) <= AI_DIGEST_BODY_LIMIT:

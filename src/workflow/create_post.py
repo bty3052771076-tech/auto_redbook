@@ -2981,6 +2981,9 @@ _AI_IMAGE_PROVIDER_ALIASES = {
     "ark",
     "doubao",
     "seedream",
+    "siliconflow",
+    "silicon",
+    "sf",
 }
 
 
@@ -5118,8 +5121,7 @@ def create_daily_ai_digest_posts(
             progress(
                 "body_capacity",
                 f"success selected={target_count}/{body_capacity_meta['requested_items']} "
-                f"body={body_capacity_meta['body_length']}/{body_capacity_meta['body_limit']} "
-                "links=preserved",
+                f"body={body_capacity_meta['body_length']}/{body_capacity_meta['body_limit']}",
             )
 
     generation_target = target_count
@@ -5225,7 +5227,7 @@ def create_daily_ai_digest_posts(
         raise RuntimeError(
             "daily ai digest body too long: "
             f"{len(rendered_body)} > {MAX_IMAGE_BODY}; "
-            "the required traceable source URLs cannot fit within the Xiaohongshu body limit"
+            "the brief body exceeds the Xiaohongshu body limit"
         )
     post = Post(
         type="image",

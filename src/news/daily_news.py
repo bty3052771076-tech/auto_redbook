@@ -2520,26 +2520,38 @@ def _rss_fetch_articles(
     max_records: int,
     timeout_s: float,
 ) -> list[NewsItem]:
-    request = urllib.request.Request(
-        feed_url,
-        headers={"User-Agent": "Mozilla/5.0 (redbook_workflow RSS)"},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
-            payload = response.read()
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"{source_name} RSS HTTP error {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        reason = _juhe_text(getattr(exc, "reason", "") or "network error")
-        raise RuntimeError(f"{source_name} RSS request failed: {reason}") from exc
-    except TimeoutError as exc:
-        raise RuntimeError(f"{source_name} RSS request timed out") from exc
-    return _rss_items_from_xml(
-        payload,
-        source_name=source_name,
-        fallback_language=fallback_language,
-    )[: max(1, int(max_records))]
+    # Google News RSS can rate-limit consecutive keyword queries (observed as
+    # intermittent ``[Errno 2] No such file or directory`` / connection resets).
+    # Add a small delay before the first attempt plus one retry so a single
+    # rate-limited query does not silently starve the candidate pool.
+    delay_before = float(os.getenv("NEWS_RSS_REQUEST_DELAY_S") or "0.6")
+    time.sleep(max(0.0, delay_before))
+    attempts = 2
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            time.sleep(float(os.getenv("NEWS_RSS_RETRY_DELAY_S") or "3.0"))
+        request = urllib.request.Request(
+            feed_url,
+            headers={"User-Agent": "Mozilla/5.0 (redbook_workflow RSS)"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_s) as response:
+                payload = response.read()
+            return _rss_items_from_xml(
+                payload,
+                source_name=source_name,
+                fallback_language=fallback_language,
+            )[: max(1, int(max_records))]
+        except urllib.error.HTTPError as exc:
+            last_error = RuntimeError(f"{source_name} RSS HTTP error {exc.code}")
+        except urllib.error.URLError as exc:
+            reason = _juhe_text(getattr(exc, "reason", "") or "network error")
+            last_error = RuntimeError(f"{source_name} RSS request failed: {reason}")
+        except TimeoutError as exc:
+            last_error = RuntimeError(f"{source_name} RSS request timed out")
+    raise last_error if last_error is not None else RuntimeError(f"{source_name} RSS request failed")
 
 
 def _google_news_rss_base_url() -> str:

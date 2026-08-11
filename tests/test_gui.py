@@ -28,6 +28,9 @@ from apps.gui import (
     LLM_PROVIDER_OPTIONS,
     PublishedMetricTableRow,
     QuotaDashboardRow,
+    DEFAULT_SILICONFLOW_QUOTA_MODELS,
+    SILICONFLOW_IMAGE_MODEL_OPTIONS,
+    SILICONFLOW_LLM_MODEL_OPTIONS,
     RecentPostSummary,
     SourceHealthDashboardRow,
     UiEventQueue,
@@ -230,14 +233,18 @@ def test_gui_exposes_publish_platform_selector():
 
 
 def test_gui_exposes_llm_and_image_provider_model_options():
-    assert LLM_PROVIDER_OPTIONS == ["aliyun", "volcengine", "ppinfra", "auto"]
-    assert IMAGE_SOURCE_OPTIONS == ["local", "auto", "aliyun", "volcengine", "pexels"]
+    assert LLM_PROVIDER_OPTIONS == ["aliyun", "volcengine", "siliconflow", "ppinfra", "auto"]
+    assert IMAGE_SOURCE_OPTIONS == ["local", "auto", "aliyun", "volcengine", "siliconflow", "pexels"]
     assert "qwen3.7-plus" in ALIYUN_LLM_MODEL_OPTIONS
     assert "deepseek-v4-flash" in ALIYUN_LLM_MODEL_OPTIONS
     assert "doubao-seed-2-1-turbo-260628" in VOLCENGINE_LLM_MODEL_OPTIONS
     assert "glm-5.2" in VOLCENGINE_LLM_MODEL_OPTIONS
     assert "deepseek-v4-pro" in VOLCENGINE_LLM_MODEL_OPTIONS
     assert "deepseek-v4-flash" in VOLCENGINE_LLM_MODEL_OPTIONS
+    assert "deepseek-ai/DeepSeek-V3" in SILICONFLOW_LLM_MODEL_OPTIONS
+    assert "Qwen/Qwen3-32B" in SILICONFLOW_LLM_MODEL_OPTIONS
+    assert "Qwen/Qwen-Image" in SILICONFLOW_IMAGE_MODEL_OPTIONS
+    assert "Kwai-Kolors/Kolors" in SILICONFLOW_IMAGE_MODEL_OPTIONS
     assert ALIYUN_IMAGE_MODEL_OPTIONS == [
         "wan2.7-image",
         "wan2.7-image-pro",
@@ -250,6 +257,7 @@ def test_gui_exposes_llm_and_image_provider_model_options():
         "doubao-seedream-4-5-251128",
         "doubao-seedream-4-0-250828",
     ]
+    assert "deepseek-ai/DeepSeek-V3" in DEFAULT_SILICONFLOW_QUOTA_MODELS
 
 
 def test_ui_event_queue_drains_callbacks_in_order():

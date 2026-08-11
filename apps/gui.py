@@ -25,7 +25,11 @@ from src.config import (
     DEFAULT_LLM_MODEL,
     DEFAULT_VOLCENGINE_LLM_BASE_URL,
     DEFAULT_VOLCENGINE_LLM_MODEL,
+    DEFAULT_SILICONFLOW_LLM_BASE_URL,
+    DEFAULT_SILICONFLOW_LLM_MODEL,
     VOLCENGINE_AVAILABLE_LLM_MODELS,
+    SILICONFLOW_FREE_LLM_MODELS,
+    SILICONFLOW_IMAGE_MODELS,
 )
 from src.storage.files import latest_execution, published_metrics_paths
 from src.sources.health import SourceHealthSnapshot, load_source_health_snapshot
@@ -77,13 +81,14 @@ LOG_FLUSH_MAX_CHARS = 24_000
 LOG_MAX_CHARS = 220_000
 FILTER_REFRESH_DEBOUNCE_MS = 140
 
-LLM_PROVIDER_OPTIONS = ["aliyun", "volcengine", "ppinfra", "auto"]
+LLM_PROVIDER_OPTIONS = ["aliyun", "volcengine", "siliconflow", "ppinfra", "auto"]
 IMAGE_SOURCE_LOCAL = "local"
-IMAGE_PROVIDER_OPTIONS = ["auto", "aliyun", "volcengine", "pexels"]
+IMAGE_PROVIDER_OPTIONS = ["auto", "aliyun", "volcengine", "siliconflow", "pexels"]
 IMAGE_SOURCE_OPTIONS = [IMAGE_SOURCE_LOCAL] + IMAGE_PROVIDER_OPTIONS
 
 ALIYUN_LLM_MODEL_OPTIONS = list(ALIYUN_FREE_LLM_MODELS)
 VOLCENGINE_LLM_MODEL_OPTIONS = list(VOLCENGINE_AVAILABLE_LLM_MODELS)
+SILICONFLOW_LLM_MODEL_OPTIONS = list(SILICONFLOW_FREE_LLM_MODELS)
 PPINFRA_LLM_MODEL_OPTIONS = [DEFAULT_LLM_MODEL]
 AUTO_LLM_MODEL_OPTION = "自动模型列表（顺序回退）"
 
@@ -103,8 +108,10 @@ VOLCENGINE_IMAGE_MODEL_OPTIONS = [
     "doubao-seedream-4-5-251128",
     "doubao-seedream-4-0-250828",
 ]
+SILICONFLOW_IMAGE_MODEL_OPTIONS = list(SILICONFLOW_IMAGE_MODELS)
 DEFAULT_ALIYUN_IMAGE_MODELS = ALIYUN_IMAGE_MODEL_OPTIONS[0]
 DEFAULT_VOLCENGINE_IMAGE_MODELS = VOLCENGINE_IMAGE_MODEL_OPTIONS[0]
+DEFAULT_SILICONFLOW_IMAGE_MODELS = SILICONFLOW_IMAGE_MODEL_OPTIONS[0]
 DEFAULT_ALIYUN_QUOTA_MODELS = ["glm-5.2", "qwen-image-2.0-pro-2026-06-22"]
 DEFAULT_VOLCENGINE_QUOTA_MODELS = [
     "glm-5.2",
@@ -112,8 +119,15 @@ DEFAULT_VOLCENGINE_QUOTA_MODELS = [
     "deepseek-v4-flash",
     "doubao-seedream-5-0-lite-260128",
 ]
+DEFAULT_SILICONFLOW_QUOTA_MODELS = [
+    "deepseek-ai/DeepSeek-V3",
+    "Qwen/Qwen3-32B",
+    "Qwen/Qwen-Image",
+    "Kwai-Kolors/Kolors",
+]
 DEFAULT_ALIYUN_IMAGE_SIZE = "1104*1472"
 DEFAULT_VOLCENGINE_IMAGE_SIZE = "1440x2560"
+DEFAULT_SILICONFLOW_IMAGE_SIZE = "1140x1472"
 DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT = (
     "no text, no words, no letters, no watermark, no logo, no caption, no subtitle, no signature, no UI"
 )
@@ -216,11 +230,12 @@ _SOURCE_HEALTH_STATUS_ORDER = {
 }
 
 
-_QUOTA_PROVIDER_ORDER = {"aliyun": 0, "volcengine": 1}
+_QUOTA_PROVIDER_ORDER = {"aliyun": 0, "volcengine": 1, "siliconflow": 2}
 _QUOTA_KIND_ORDER = {"llm": 0, "image": 1, "unknown": 2}
 _QUOTA_PROVIDER_SEARCH_ALIASES = {
     "aliyun": "aliyun ali 阿里云 百炼 bailian",
     "volcengine": "volcengine volcano 火山引擎 ark",
+    "siliconflow": "siliconflow silicon sf 硅基流动",
 }
 QUOTA_DASHBOARD_SORT_OPTIONS: tuple[tuple[str, str], ...] = (
     ("default", "平台 / 类型 / 模型"),
@@ -706,6 +721,12 @@ def _quota_selectable_kind(kind: str, model: str) -> str:
         "seededit",
         "t2i",
         "i2i",
+        "kolors",
+        "flux",
+        "stable-diffusion",
+        "sdxl",
+        "sd-turbo",
+        "realvisxl",
         "wordart",
         "erase",
         "segmentation",
@@ -713,8 +734,10 @@ def _quota_selectable_kind(kind: str, model: str) -> str:
     )
     if any(marker in model_lc for marker in image_markers):
         return "image"
-    llm_prefixes = ("glm-", "deepseek-", "kimi-", "qwen", "doubao-", "moonshot-", "baichuan-")
-    if model_lc.startswith(llm_prefixes):
+    llm_prefixes = ("glm-", "deepseek-", "kimi-", "qwen", "doubao-", "moonshot-", "baichuan-", "yi-", "zai-org/")
+    if model_lc.startswith(llm_prefixes) or any(
+        marker in model_lc for marker in ("/glm-", "/deepseek-", "/kimi-", "/qwen-", "/qwen3", "/qwen2")
+    ):
         return "llm"
     return ""
 
@@ -723,7 +746,7 @@ def quota_dashboard_selection_target(row: QuotaDashboardRow) -> tuple[str, str, 
     provider = (row.provider or "").strip().lower()
     model = (row.model or "").strip()
     kind = _quota_selectable_kind(row.kind, model)
-    if provider not in {"aliyun", "volcengine"} or kind not in {"llm", "image"} or not model:
+    if provider not in {"aliyun", "volcengine", "siliconflow"} or kind not in {"llm", "image"} or not model:
         return None
     if (row.status or "").strip().lower() != "available":
         return None
@@ -959,7 +982,7 @@ def prepare_quota_dashboard_rows(
 def load_latest_quota_snapshots(
     *,
     quota_dir: Path | None = None,
-    providers: Iterable[str] = ("aliyun", "volcengine"),
+    providers: Iterable[str] = ("aliyun", "volcengine", "siliconflow"),
 ) -> dict[str, dict[str, Any]]:
     root = quota_dir or PROJECT_ROOT / "data" / "quota"
     snapshots: dict[str, dict[str, Any]] = {}
@@ -1755,7 +1778,7 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             args.extend(["--max-age-days", max_age_days])
         return args
 
-    if subcommand in ("aliyun-quota", "volcengine-quota"):
+    if subcommand in ("aliyun-quota", "volcengine-quota", "siliconflow-quota"):
         raw_models = params.get("models") or []
         if isinstance(raw_models, str):
             models = [m.strip() for m in re.split(r"[,;\s]+", raw_models) if m.strip()]
@@ -1786,6 +1809,7 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
     if subcommand == "sync-quotas":
         raw_aliyun_models = params.get("aliyun_models") or []
         raw_volcengine_models = params.get("volcengine_models") or []
+        raw_siliconflow_models = params.get("siliconflow_models") or []
         if isinstance(raw_aliyun_models, str):
             aliyun_models = [m.strip() for m in re.split(r"[,;\s]+", raw_aliyun_models) if m.strip()]
         else:
@@ -1794,6 +1818,10 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             volcengine_models = [m.strip() for m in re.split(r"[,;\s]+", raw_volcengine_models) if m.strip()]
         else:
             volcengine_models = [str(m).strip() for m in raw_volcengine_models if str(m).strip()]
+        if isinstance(raw_siliconflow_models, str):
+            siliconflow_models = [m.strip() for m in re.split(r"[,;\s]+", raw_siliconflow_models) if m.strip()]
+        else:
+            siliconflow_models = [str(m).strip() for m in raw_siliconflow_models if str(m).strip()]
         headless = bool(params.get("headless") or False)
         visible_only = bool(params.get("visible_only") or False)
         all_free = bool(params.get("all_free", True))
@@ -1808,6 +1836,8 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
                 args.extend(["--aliyun-model", model])
             for model in volcengine_models:
                 args.extend(["--volcengine-model", model])
+            for model in siliconflow_models:
+                args.extend(["--siliconflow-model", model])
         if headless:
             args.append("--headless")
         if visible_only:
@@ -1869,6 +1899,18 @@ def build_provider_env_overrides(
         env.pop("LLM_MODEL", None)
         env.pop("ALIYUN_LLM_MODEL", None)
         env.pop("ALIYUN_LLM_MODELS", None)
+        env.pop("SILICONFLOW_LLM_MODEL", None)
+        env.pop("SILICONFLOW_LLM_MODELS", None)
+    elif provider == "siliconflow":
+        selected = model if model and model != AUTO_LLM_MODEL_OPTION else DEFAULT_SILICONFLOW_LLM_MODEL
+        env["SILICONFLOW_LLM_MODEL"] = selected
+        env["SILICONFLOW_LLM_MODELS"] = selected
+        env.setdefault("SILICONFLOW_LLM_BASE_URL", DEFAULT_SILICONFLOW_LLM_BASE_URL)
+        env.pop("LLM_MODEL", None)
+        env.pop("ALIYUN_LLM_MODEL", None)
+        env.pop("ALIYUN_LLM_MODELS", None)
+        env.pop("VOLCENGINE_LLM_MODEL", None)
+        env.pop("VOLCENGINE_LLM_MODELS", None)
     else:
         if model == AUTO_LLM_MODEL_OPTION or not model:
             env.pop("ALIYUN_LLM_MODEL", None)
@@ -1876,6 +1918,8 @@ def build_provider_env_overrides(
             env.pop("VOLCENGINE_LLM_MODEL", None)
             env.pop("VOLCENGINE_LLM_MODELS", None)
             env.pop("LLM_MODEL", None)
+            env.pop("SILICONFLOW_LLM_MODEL", None)
+            env.pop("SILICONFLOW_LLM_MODELS", None)
         elif model in ALIYUN_LLM_MODEL_OPTIONS:
             env["ALIYUN_LLM_MODEL"] = model
             env["ALIYUN_LLM_MODELS"] = model
@@ -1886,6 +1930,15 @@ def build_provider_env_overrides(
             env["VOLCENGINE_LLM_MODELS"] = model
             env.pop("ALIYUN_LLM_MODEL", None)
             env.pop("ALIYUN_LLM_MODELS", None)
+            env.pop("SILICONFLOW_LLM_MODEL", None)
+            env.pop("SILICONFLOW_LLM_MODELS", None)
+        elif model in SILICONFLOW_LLM_MODEL_OPTIONS:
+            env["SILICONFLOW_LLM_MODEL"] = model
+            env["SILICONFLOW_LLM_MODELS"] = model
+            env.pop("ALIYUN_LLM_MODEL", None)
+            env.pop("ALIYUN_LLM_MODELS", None)
+            env.pop("VOLCENGINE_LLM_MODEL", None)
+            env.pop("VOLCENGINE_LLM_MODELS", None)
         elif model in PPINFRA_LLM_MODEL_OPTIONS:
             env["LLM_MODEL"] = model
 
@@ -1897,6 +1950,8 @@ def build_provider_env_overrides(
         env.pop("ALIYUN_IMAGE_MODELS", None)
         env.pop("VOLCENGINE_IMAGE_MODEL", None)
         env.pop("VOLCENGINE_IMAGE_MODELS", None)
+        env.pop("SILICONFLOW_IMAGE_MODEL", None)
+        env.pop("SILICONFLOW_IMAGE_MODELS", None)
         return env
 
     if img_provider not in IMAGE_PROVIDER_OPTIONS:
@@ -1908,6 +1963,8 @@ def build_provider_env_overrides(
         env.pop("ALIYUN_IMAGE_MODELS", None)
         env.pop("VOLCENGINE_IMAGE_MODEL", None)
         env.pop("VOLCENGINE_IMAGE_MODELS", None)
+        env.pop("SILICONFLOW_IMAGE_MODEL", None)
+        env.pop("SILICONFLOW_IMAGE_MODELS", None)
         return env
     env["IMAGE_PROVIDER"] = img_provider
 
@@ -1923,11 +1980,24 @@ def build_provider_env_overrides(
         env["VOLCENGINE_IMAGE_MODELS"] = selected_image
         env.pop("ALIYUN_IMAGE_MODEL", None)
         env.pop("ALIYUN_IMAGE_MODELS", None)
+        env.pop("SILICONFLOW_IMAGE_MODEL", None)
+        env.pop("SILICONFLOW_IMAGE_MODELS", None)
+    elif img_provider == "siliconflow":
+        selected_image = (image_model or DEFAULT_SILICONFLOW_IMAGE_MODELS).strip()
+        env["SILICONFLOW_IMAGE_MODEL"] = selected_image
+        env["SILICONFLOW_IMAGE_MODELS"] = selected_image
+        env["SILICONFLOW_IMAGE_BASE_URL"] = DEFAULT_SILICONFLOW_LLM_BASE_URL
+        env.pop("ALIYUN_IMAGE_MODEL", None)
+        env.pop("ALIYUN_IMAGE_MODELS", None)
+        env.pop("VOLCENGINE_IMAGE_MODEL", None)
+        env.pop("VOLCENGINE_IMAGE_MODELS", None)
     else:
         env.pop("ALIYUN_IMAGE_MODEL", None)
         env.pop("ALIYUN_IMAGE_MODELS", None)
         env.pop("VOLCENGINE_IMAGE_MODEL", None)
         env.pop("VOLCENGINE_IMAGE_MODELS", None)
+        env.pop("SILICONFLOW_IMAGE_MODEL", None)
+        env.pop("SILICONFLOW_IMAGE_MODELS", None)
 
     return env
 
@@ -2546,7 +2616,13 @@ def main() -> None:
 
         for idx, row in enumerate(quota_dashboard_rows):
             if row.provider != last_provider:
-                provider_label = "阿里云百炼" if row.provider == "aliyun" else "火山引擎 Ark"
+                provider_label = (
+                    "阿里云百炼"
+                    if row.provider == "aliyun"
+                    else "火山引擎 Ark"
+                    if row.provider == "volcengine"
+                    else "硅基流动"
+                )
                 quota_rows_canvas.create_text(
                     x0,
                     y,
@@ -2964,6 +3040,7 @@ def main() -> None:
             "sync-quotas",
             {
                 "all_free": True,
+                "siliconflow_models": DEFAULT_SILICONFLOW_QUOTA_MODELS,
                 "headless": quota_sync_headless_var.get(),
                 "visible_only": quota_sync_visible_only_var.get(),
                 "login_hold": DEFAULT_LOGIN_HOLD if not quota_sync_headless_var.get() else 0,
@@ -3216,6 +3293,7 @@ def main() -> None:
         else (
             _env_default("ALIYUN_LLM_MODEL")
             or _env_default("VOLCENGINE_LLM_MODEL")
+            or _env_default("SILICONFLOW_LLM_MODEL")
             or _env_default("LLM_MODEL")
             or DEFAULT_ALIYUN_LLM_MODEL
         )
@@ -3233,6 +3311,7 @@ def main() -> None:
         value=(
             _env_default("ALIYUN_IMAGE_MODEL")
             or _env_default("VOLCENGINE_IMAGE_MODEL")
+            or _env_default("SILICONFLOW_IMAGE_MODEL")
             or DEFAULT_ALIYUN_IMAGE_MODELS
         )
     )
@@ -3280,11 +3359,15 @@ def main() -> None:
         elif provider == "ppinfra":
             values = PPINFRA_LLM_MODEL_OPTIONS
             fallback = DEFAULT_LLM_MODEL
+        elif provider == "siliconflow":
+            values = SILICONFLOW_LLM_MODEL_OPTIONS
+            fallback = DEFAULT_SILICONFLOW_LLM_MODEL
         else:
             values = (
                 [AUTO_LLM_MODEL_OPTION]
                 + ALIYUN_LLM_MODEL_OPTIONS
                 + VOLCENGINE_LLM_MODEL_OPTIONS
+                + SILICONFLOW_LLM_MODEL_OPTIONS
                 + PPINFRA_LLM_MODEL_OPTIONS
             )
             fallback = AUTO_LLM_MODEL_OPTION
@@ -3305,6 +3388,11 @@ def main() -> None:
             image_model_box["values"] = VOLCENGINE_IMAGE_MODEL_OPTIONS
             if image_model_var.get() not in VOLCENGINE_IMAGE_MODEL_OPTIONS:
                 image_model_var.set(DEFAULT_VOLCENGINE_IMAGE_MODELS)
+            image_model_box.configure(state="normal")
+        elif source == "siliconflow":
+            image_model_box["values"] = SILICONFLOW_IMAGE_MODEL_OPTIONS
+            if image_model_var.get() not in SILICONFLOW_IMAGE_MODEL_OPTIONS:
+                image_model_var.set(DEFAULT_SILICONFLOW_IMAGE_MODELS)
             image_model_box.configure(state="normal")
         else:
             image_model_box.configure(state="disabled")
@@ -4601,14 +4689,17 @@ def main() -> None:
     for label, key, default, secret in [
         ("DashScope Key (DASHSCOPE_API_KEY)", "DASHSCOPE_API_KEY", "", True),
         ("Volcengine Ark Key (VOLCENGINE_API_KEY)", "VOLCENGINE_API_KEY", "", True),
+        ("SiliconFlow Key (SILICONFLOW_API_KEY)", "SILICONFLOW_API_KEY", "", True),
         ("ppinfra Key (LLM_API_KEY)", "LLM_API_KEY", "", True),
         ("NewsAPI Key (NEWS_API_KEY)", "NEWS_API_KEY", "", True),
         ("Pexels Key (PEXELS_API_KEY)", "PEXELS_API_KEY", "", True),
         ("Aliyun LLM Base URL", "ALIYUN_LLM_BASE_URL", DEFAULT_ALIYUN_LLM_BASE_URL, False),
         ("Volcengine Ark Base URL", "VOLCENGINE_LLM_BASE_URL", DEFAULT_VOLCENGINE_LLM_BASE_URL, False),
+        ("SiliconFlow Base URL", "SILICONFLOW_LLM_BASE_URL", DEFAULT_SILICONFLOW_LLM_BASE_URL, False),
         ("ppinfra Base URL", "LLM_BASE_URL", DEFAULT_LLM_BASE_URL, False),
         ("Aliyun Image Size", "ALIYUN_IMAGE_SIZE", DEFAULT_ALIYUN_IMAGE_SIZE, False),
         ("Volcengine Image Size", "VOLCENGINE_IMAGE_SIZE", DEFAULT_VOLCENGINE_IMAGE_SIZE, False),
+        ("SiliconFlow Image Size", "SILICONFLOW_IMAGE_SIZE", DEFAULT_SILICONFLOW_IMAGE_SIZE, False),
         ("Aliyun Negative Prompt", "ALIYUN_IMAGE_NEGATIVE_PROMPT", DEFAULT_ALIYUN_IMAGE_NEGATIVE_PROMPT, False),
         ("XHS Published URL", "XHS_PUBLISHED_URL", "", False),
         ("NEWS_CHINA_RATIO", "NEWS_CHINA_RATIO", DEFAULT_NEWS_CHINA_RATIO, False),
@@ -4665,6 +4756,14 @@ def main() -> None:
     volc_quota_visible_only_var = tk.BooleanVar(value=False)
     volc_quota_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     volc_quota_wait_timeout_var = tk.IntVar(value=120)
+    sf_quota_models_var = tk.StringVar(
+        value=",".join(DEFAULT_SILICONFLOW_QUOTA_MODELS)
+    )
+    sf_quota_headless_var = tk.BooleanVar(value=False)
+    sf_quota_save_raw_var = tk.BooleanVar(value=True)
+    sf_quota_visible_only_var = tk.BooleanVar(value=False)
+    sf_quota_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
+    sf_quota_wait_timeout_var = tk.IntVar(value=120)
 
     ttk.Label(quota_panel, text="Aliyun Bailian quota", style="Panel.TLabel").grid(
         row=2, column=0, sticky="w", pady=(5, 2)
@@ -4782,6 +4881,65 @@ def main() -> None:
         command=_run_volcengine_quota,
         style="Accent.TButton",
     ).grid(row=12, column=0, sticky="w", pady=(10, 0))
+
+    ttk.Separator(quota_panel).grid(row=13, column=0, columnspan=4, sticky="we", pady=(10, 10))
+    ttk.Label(quota_panel, text="SiliconFlow (硅基流动) quota", style="Panel.TLabel").grid(
+        row=14, column=0, sticky="w", pady=(5, 2)
+    )
+    ttk.Entry(quota_panel, textvariable=sf_quota_models_var, width=52).grid(
+        row=14, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=(5, 2)
+    )
+    ttk.Checkbutton(
+        quota_panel,
+        text="Headless",
+        variable=sf_quota_headless_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=15, column=0, sticky="w", pady=5)
+    ttk.Checkbutton(
+        quota_panel,
+        text="Save raw snapshot",
+        variable=sf_quota_save_raw_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=16, column=0, sticky="w", pady=5)
+    ttk.Checkbutton(
+        quota_panel,
+        text="Visible page only",
+        variable=sf_quota_visible_only_var,
+        style="Panel.TCheckbutton",
+    ).grid(row=17, column=0, sticky="w", pady=5)
+    ttk.Label(quota_panel, text="Login hold (s)", style="Panel.TLabel").grid(
+        row=15, column=1, sticky="e", padx=(10, 8), pady=5
+    )
+    ttk.Spinbox(quota_panel, from_=0, to=3600, textvariable=sf_quota_login_hold_var, width=8).grid(
+        row=15, column=2, sticky="w", pady=5
+    )
+    ttk.Label(quota_panel, text="Wait (s)", style="Panel.TLabel").grid(
+        row=16, column=1, sticky="e", padx=(10, 8), pady=5
+    )
+    ttk.Spinbox(quota_panel, from_=30, to=3600, textvariable=sf_quota_wait_timeout_var, width=8).grid(
+        row=16, column=2, sticky="w", pady=5
+    )
+
+    def _run_siliconflow_quota() -> None:
+        _run_command(
+            "siliconflow-quota",
+            {
+                "models": sf_quota_models_var.get(),
+                "headless": sf_quota_headless_var.get(),
+                "save_raw": sf_quota_save_raw_var.get(),
+                "visible_only": sf_quota_visible_only_var.get(),
+                "login_hold": sf_quota_login_hold_var.get(),
+                "wait_timeout": sf_quota_wait_timeout_var.get(),
+            },
+            _collect_env_overrides(),
+        )
+
+    ttk.Button(
+        quota_panel,
+        text="查询硅基流动额度",
+        command=_run_siliconflow_quota,
+        style="Accent.TButton",
+    ).grid(row=18, column=0, sticky="w", pady=(10, 0))
 
     root.mainloop()
     exit_code = gui_hidden_autorun_exit_code(

@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
 
-FREE_PROVIDERS = ("aliyun", "volcengine")
+FREE_PROVIDERS = ("aliyun", "volcengine", "siliconflow")
 DEFAULT_QUOTA_MAX_AGE = timedelta(hours=2)
 
-_PROVIDER_ORDER = {"volcengine": 0, "aliyun": 1}
+_PROVIDER_ORDER = {"volcengine": 0, "aliyun": 1, "siliconflow": 2}
 _TEXT_MODEL_PREFERENCE = (
     "glm-5.2",
     "deepseek-v4-flash",
@@ -134,6 +134,9 @@ class FreeModelPlan:
         elif self.llm.provider == "volcengine":
             values["VOLCENGINE_LLM_MODEL"] = self.llm.model
             values["VOLCENGINE_LLM_MODELS"] = self.llm.model
+        elif self.llm.provider == "siliconflow":
+            values["SILICONFLOW_LLM_MODEL"] = self.llm.model
+            values["SILICONFLOW_LLM_MODELS"] = self.llm.model
         if self.image is not None:
             values["IMAGE_PROVIDER"] = self.image.provider
             if self.image.provider == "aliyun":
@@ -142,6 +145,9 @@ class FreeModelPlan:
             elif self.image.provider == "volcengine":
                 values["VOLCENGINE_IMAGE_MODEL"] = self.image.model
                 values["VOLCENGINE_IMAGE_MODELS"] = self.image.model
+            elif self.image.provider == "siliconflow":
+                values["SILICONFLOW_IMAGE_MODEL"] = self.image.model
+                values["SILICONFLOW_IMAGE_MODELS"] = self.image.model
         if self.vision is not None:
             values["VLM_REVIEW_PROVIDER"] = self.vision.provider
             values["VLM_REVIEW_MODEL"] = self.vision.model
@@ -357,6 +363,10 @@ def load_quota_records(
 def model_supports_vision(model: str) -> bool:
     value = (model or "").strip().lower()
     if any(marker in value for marker in _UNSUPPORTED_LLM_MARKERS):
+        return False
+    # OCR-only models transcribe text; they cannot perform image-content
+    # consistency review and must not be selected as the vision reviewer.
+    if "-ocr" in value or "ocr" in value.split(".")[0].split("-")[-1:]:
         return False
     return value in _VISION_MODEL_EXACT or any(marker in value for marker in _VISION_MODEL_MARKERS)
 

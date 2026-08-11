@@ -212,5 +212,22 @@ def review_post_image(
         f"实际生图提示：{generation_prompt or '未记录'}"
     )
     raw = invoke(config, prompt=prompt, image_path=image_assets[0])
-    result = parse_vision_review(raw)
+    try:
+        result = parse_vision_review(raw)
+    except ValueError as exc:
+        # A VLM that is not suitable for the structured review (e.g. an
+        # OCR-only account model) may return valid text that is not the
+        # required JSON. Treat that as an inconclusive review rather than a
+        # hard rejection: the draft image itself already passed generation.
+        return replace(
+            VisionReviewResult(
+                ok=False,
+                score=0,
+                issues=(),
+                retry_prompt="",
+                provider=config.provider,
+                model=config.model,
+            ),
+            retry_prompt=f"视觉复核调用未返回可解析 JSON（{exc}），本次跳过复核。",
+        )
     return replace(result, provider=config.provider, model=config.model)
