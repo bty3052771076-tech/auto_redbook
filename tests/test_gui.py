@@ -60,6 +60,7 @@ from apps.gui import (
     find_local_post_for_metric_row,
     list_published_metric_table_rows,
     list_publishable_drafts,
+    list_live_publishable_drafts,
     list_recent_posts,
     load_env_file,
     load_latest_quota_snapshots,
@@ -838,6 +839,45 @@ def test_list_publishable_drafts_scans_beyond_recent_non_publishable_posts(tmp_p
     assert [item.post_id for item in items] == ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
 
 
+def test_list_live_publishable_drafts_keeps_only_platform_intersection(tmp_path: Path, monkeypatch):
+    posts = tmp_path / "data" / "posts"
+    posts.mkdir(parents=True)
+    for index, title in enumerate(("Live title", "Missing title"), 1):
+        post_id = f"{index:032x}"
+        post_dir = posts / post_id
+        post_dir.mkdir()
+        (post_dir / "post.json").write_text(
+            json.dumps(
+                {
+                    "id": post_id,
+                    "title": title,
+                    "status": "saved_as_draft",
+                    "uploaded": True,
+                    "uploaded_at": "2026-08-20T10:00:00.000000Z",
+                    "updated_at": "2026-08-20T10:00:00.000000Z",
+                    "body": "body",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        "apps.gui.run_collect_platform_drafts_sync",
+        lambda **kwargs: {
+            "items": [{"index": "0", "title": "Live title", "saved_at": "2026-08-20 18:00:00"}],
+            "total": 1,
+            "errors": [],
+        },
+    )
+
+    items, inventory, scan = list_live_publishable_drafts(project_root=tmp_path, limit=0)
+
+    assert [item.title for item in items] == ["Live title"]
+    assert [item.post_id for item in inventory.local_missing_on_platform] == [f"{2:032x}"]
+    assert scan["total"] == 1
+
+
 def test_format_post_choice_strips_symbolic_status_marks_from_title():
     post = RecentPostSummary(
         post_id="0123456789abcdef0123456789abcdef",
@@ -1240,6 +1280,17 @@ def test_gui_has_publish_drafts_preview_and_confirmation():
     assert "publish-drafts" in source
 
 
+def test_gui_has_separate_material_posting_page_and_local_draft_label():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert '_add_scrollable_tab("材料发帖")' in source
+    assert "material_time_var" in source
+    assert "材料时间（北京时间）" in source
+    assert "不参与来源日期窗口限制" in source
+    assert 'nb.add(tab_run, text="本地草稿处理")' in source
+
+
 def test_gui_has_daily_ai_digest_quick_title_button():
     root = Path(__file__).resolve().parents[1]
     source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
@@ -1298,6 +1349,7 @@ def test_build_cli_args_auto():
             "count": 2,
             "lookback_days": "7",
             "news_materials_file": "data/manual_news/today.md",
+            "material_time": "2025-03-10 09:30",
             "no_copy": True,
             "dry_run": True,
             "headless": True,
@@ -1310,8 +1362,9 @@ def test_build_cli_args_auto():
     assert "--title" in args and "每日新闻" in args
     assert "--keywords" in args and "美国时政" in args
     assert "--evaluation-viewpoint" in args and "产业政策视角" in args
-    assert "--lookback-days" in args and "7" in args
+    assert "--lookback-days" not in args
     assert "--news-materials-file" in args and "data/manual_news/today.md" in args
+    assert "--material-time" in args and "2025-03-10 09:30" in args
     assert "--count" in args and "2" in args
     assert "--no-copy" in args
     assert "--dry-run" in args

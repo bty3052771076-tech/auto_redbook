@@ -39,6 +39,17 @@ class AIDigestSource:
 def default_ai_digest_sources() -> list[AIDigestSource]:
     sources = [
         AIDigestSource("openai", "official", "https://openai.com/news/rss.xml", "OpenAI", "rss"),
+        AIDigestSource(
+            "github-status",
+            "official",
+            "https://www.githubstatus.com/history.rss",
+            "GitHub Status",
+            "rss",
+            tier="official_stream",
+            region="global",
+            topics=("incident", "outage", "platform", "service"),
+            priority=5,
+        ),
         AIDigestSource("anthropic", "official", "https://www.anthropic.com/news", "Anthropic", "html"),
         AIDigestSource("deepmind", "official", "https://deepmind.google/blog/rss.xml", "Google DeepMind", "rss"),
         AIDigestSource("metaai", "official", "https://ai.meta.com/blog", "Meta AI", "html"),

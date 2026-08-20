@@ -37,11 +37,18 @@ from src.analytics.published_metrics import analyze_published_metrics, render_pu
 from src.ai_digest.collect import collect_ai_digest_updates
 from src.news.daily_news import fetch_daily_news_candidates, _required_china_count_for_daily_news
 from src.publish.playwright_steps import (
+    run_collect_platform_drafts_sync,
     run_collect_published_metrics_sync,
     run_delete_drafts_sync,
     run_publish_drafts_sync,
     run_save_draft_sync,
     run_update_draft_sync,
+)
+from src.publish.draft_inventory import (
+    DraftInventoryResult,
+    local_record_from_post,
+    match_draft_inventory,
+    platform_records_from_items,
 )
 from src.publish.targets import normalize_publish_platform, publish_targets
 from src.publish.toutiao_steps import adapt_post_for_toutiao, run_save_toutiao_draft_sync
@@ -1394,6 +1401,34 @@ def _select_publishable_posts(
     return selected
 
 
+def _match_live_xhs_drafts(
+    posts: list[Post],
+    *,
+    draft_type: str,
+    login_hold: int,
+    wait_timeout_ms: int,
+    headless: bool,
+) -> tuple[list[Post], DraftInventoryResult, dict]:
+    """Return only local candidates still present in the live XHS draft box."""
+
+    scan = run_collect_platform_drafts_sync(
+        draft_type=draft_type,
+        login_hold=login_hold,
+        wait_timeout_ms=wait_timeout_ms,
+        headless=headless,
+        progress_callback=_upload_progress("platform-draft-scan"),
+    )
+    if scan.get("errors"):
+        raise RuntimeError("not_on_platform: " + "; ".join(str(item) for item in scan["errors"]))
+    inventory = match_draft_inventory(
+        [local_record_from_post(post, draft_type=draft_type) for post in posts],
+        platform_records_from_items(scan.get("items") or [], draft_type=draft_type),
+    )
+    matched_ids = set(inventory.publishable_post_ids)
+    matched_posts = [post for post in posts if post.id in matched_ids]
+    return matched_posts, inventory, scan
+
+
 def _mark_posts_published(posts: list[Post], result: dict) -> None:
     published_ids = {str(p).strip().lower() for p in result.get("published_post_ids", []) if str(p).strip()}
     if not published_ids and result.get("published", 0) == len(posts):
@@ -1463,6 +1498,12 @@ def create(
         help="每日新闻单条材料文件；提供后只生成 1 条，并忽略关键词/数量/回溯筛选",
         show_default=False,
     ),
+    material_time: str = typer.Option(
+        "",
+        "--material-time",
+        help="人工材料默认时间（北京时间 YYYY-MM-DD HH:MM）；不参与来源日期窗口限制",
+        show_default=False,
+    ),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
     count: int = typer.Option(1, help="生成草稿数量（>=1）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
@@ -1472,6 +1513,7 @@ def create(
     prompt_norm = _repair_cli_text((prompt or "").strip(), field="prompt")
     news_materials_file_norm = (news_materials_file or "").strip()
     single_news_material_file_norm = (single_news_material_file or "").strip()
+    material_time_norm = (material_time or "").strip()
     if news_materials_file_norm and single_news_material_file_norm:
         typer.echo("error: --single-news-material-file and --news-materials-file are mutually exclusive")
         raise typer.Exit(code=1)
@@ -1530,6 +1572,7 @@ def create(
                 lookback_days=lookback_days,
                 news_materials_file=news_materials_file_norm,
                 single_news_material_file=single_news_material_file_norm,
+                material_time=material_time_norm,
             )
         except PartialDailyNewsError as exc:
             typer.echo(f"partial daily news: generated={len(exc.posts)}/{exc.requested_count}; {exc}")
@@ -1557,6 +1600,7 @@ def create(
                         lookback_days=lookback_days,
                         news_materials_file=news_materials_file_norm,
                         single_news_material_file=single_news_material_file_norm,
+                        material_time=material_time_norm,
                     )
                 )
             except Exception as exc:
@@ -1919,6 +1963,12 @@ def auto(
         help="每日新闻单条材料文件；提供后只生成 1 条，并忽略关键词/数量/回溯筛选",
         show_default=False,
     ),
+    material_time: str = typer.Option(
+        "",
+        "--material-time",
+        help="人工材料默认时间（北京时间 YYYY-MM-DD HH:MM）；不参与来源日期窗口限制",
+        show_default=False,
+    ),
     assets_glob: str = typer.Option("assets/pics/*", help="素材路径（glob）"),
     count: int = typer.Option(1, help="生成草稿数量（>=1）"),
     no_copy: bool = typer.Option(False, help="不复制素材到 data/posts/<id>/assets"),
@@ -1972,6 +2022,7 @@ def auto(
         raise typer.Exit(code=1)
     news_materials_file_norm = (news_materials_file or "").strip()
     single_news_material_file_norm = (single_news_material_file or "").strip()
+    material_time_norm = (material_time or "").strip()
     if news_materials_file_norm and single_news_material_file_norm:
         typer.echo("error: --single-news-material-file and --news-materials-file are mutually exclusive")
         raise typer.Exit(code=1)
@@ -2097,6 +2148,7 @@ def auto(
                 lookback_days=lookback_days,
                 news_materials_file=news_materials_file_norm,
                 single_news_material_file=single_news_material_file_norm,
+                material_time=material_time_norm,
                 progress_callback=_daily_news_generation_progress,
                 post_quality_callback=post_quality_callback,
             )
@@ -2138,6 +2190,7 @@ def auto(
                         lookback_days=lookback_days,
                         news_materials_file=news_materials_file_norm,
                         single_news_material_file=single_news_material_file_norm,
+                        material_time=material_time_norm,
                     )
                 )
             except Exception as exc:
@@ -3045,8 +3098,39 @@ def publish_drafts(
         typer.echo("未找到匹配的本地已上传草稿")
         raise typer.Exit(code=1)
 
-    _emit_progress_event("publish-drafts", "选择草稿", "success", f"selected={len(posts)}")
-    typer.echo(f"selected local drafts={len(posts)}")
+    local_count = len(posts)
+    _emit_progress_event("publish-drafts", "扫描平台草稿", "in_progress", f"local={local_count}")
+    typer.echo(f"scanning live Xiaohongshu drafts; local candidates={local_count}")
+    try:
+        posts, inventory, scan = _match_live_xhs_drafts(
+            posts,
+            draft_type=draft_type,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout * 1000,
+            headless=_headless_option_value(headless),
+        )
+    except Exception as exc:
+        _emit_progress_event("publish-drafts", "扫描平台草稿", "failed", str(exc))
+        typer.echo(f"error: platform draft scan failed closed: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        "live draft inventory: "
+        f"local={local_count} platform={scan.get('total', 0)} "
+        f"matched={len(inventory.matched)} missing={len(inventory.local_missing_on_platform)} "
+        f"ambiguous={len(inventory.ambiguous)}"
+    )
+    for missing in inventory.local_missing_on_platform:
+        typer.echo(f"skip not_on_platform: {missing.post_id} | {missing.title}")
+    for ambiguous in inventory.ambiguous:
+        typer.echo(f"skip ambiguous_platform_draft: {ambiguous.post_id} | {ambiguous.title}")
+    if not posts:
+        _emit_progress_event("publish-drafts", "扫描平台草稿", "failed", "matched=0")
+        typer.echo("no publishable drafts remain in the live Xiaohongshu draft box")
+        raise typer.Exit(code=1)
+
+    _emit_progress_event("publish-drafts", "扫描平台草稿", "success", f"matched={len(posts)}")
+    typer.echo(f"selected live drafts={len(posts)}")
     for post in posts:
         typer.echo(f"- {post.id} | {post.title} | uploaded_at={post.uploaded_at or ''}")
 
@@ -3059,6 +3143,25 @@ def publish_drafts(
     def _progress(message: str) -> None:
         typer.echo(message)
 
+    _emit_progress_event("publish-drafts", "再次检查平台草稿", "in_progress", f"selected={len(posts)}")
+    try:
+        posts, inventory, scan = _match_live_xhs_drafts(
+            posts,
+            draft_type=draft_type,
+            login_hold=0,
+            wait_timeout_ms=wait_timeout * 1000,
+            headless=_headless_option_value(headless),
+        )
+    except Exception as exc:
+        _emit_progress_event("publish-drafts", "再次检查平台草稿", "failed", str(exc))
+        typer.echo(f"error: pre-publish platform draft scan failed closed: {exc}")
+        raise typer.Exit(code=1)
+    if not posts:
+        _emit_progress_event("publish-drafts", "再次检查平台草稿", "failed", "matched=0")
+        typer.echo("error: selected drafts are no longer present on Xiaohongshu")
+        raise typer.Exit(code=1)
+    _emit_progress_event("publish-drafts", "再次检查平台草稿", "success", f"matched={len(posts)}")
+    typer.echo(f"publishing live drafts={len(posts)}")
     _emit_progress_event("publish-drafts", "发布草稿", "in_progress", f"selected={len(posts)} dry_run={dry_run}")
     result = run_publish_drafts_sync(
         posts=posts,

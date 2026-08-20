@@ -14,7 +14,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from src.config import LLMConfig
 
 from .models import AIDigestBrief, AIUpdateItem
-from .rank import ai_update_impact_score, ai_update_is_high_impact
+from .rank import (
+    AI_DIGEST_MAX_ITEMS_PER_SOURCE,
+    ai_update_impact_score,
+    ai_update_is_high_impact,
+    ai_update_source_key,
+)
 
 
 # Keep this aligned with the workflow-wide LLM ceiling.  In particular, some
@@ -39,6 +44,27 @@ _LOW_INFORMATION_TITLE_MARKERS = (
     "披露AI产品变化",
     "AI产品披露AI产品变化",
 )
+
+
+def cap_ai_digest_items_by_source(
+    items: Iterable[AIUpdateItem],
+    *,
+    target_count: int | None = None,
+) -> list[AIUpdateItem]:
+    """Keep the first ranked items while enforcing the hard source cap."""
+
+    output: list[AIUpdateItem] = []
+    counts: Counter[str] = Counter()
+    limit = None if target_count is None else max(0, int(target_count))
+    for item in items:
+        if limit is not None and len(output) >= limit:
+            break
+        source_key = ai_update_source_key(item)
+        if counts[source_key] >= AI_DIGEST_MAX_ITEMS_PER_SOURCE:
+            continue
+        output.append(item)
+        counts[source_key] += 1
+    return output
 _AI_CLAIM_NAMES = (
     "openai",
     "anthropic",
@@ -620,19 +646,51 @@ def _best_source_match(generated: AIUpdateItem, source_items: list[AIUpdateItem]
 def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[AIUpdateItem]) -> AIDigestBrief:
     if not source_items:
         return _ensure_chinese_brief(brief)
-    restored: list[AIUpdateItem] = []
-    remaining_sources = list(source_items)
+    requested_count = len(brief.items)
+    # Deduplicate the model response before provenance restoration.  A model
+    # can paraphrase one URL more than once even when the prompt forbids it.
+    deduped_items = []
+    seen_keys = set()
+    for item in brief.items:
+        key = item.dedupe_key
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped_items.append(item)
+
+    # Keep the requested count when the candidate pool has enough unused
+    # sources.  These replacements use source text and metadata directly, so
+    # they remain traceable and can never render as "动态N".
+    for source in source_items:
+        if len(deduped_items) >= requested_count:
+            break
+        key = source.dedupe_key
+        if key in seen_keys:
+            continue
+        replacement = source.model_copy(
+            update={
+                "title": _fallback_chinese_title(source),
+                "summary": _fallback_chinese_summary(source),
+                "tags": source.tags or ["AI动态"],
+            }
+        )
+        deduped_items.append(replacement)
+        seen_keys.add(key)
+
+    brief = brief.model_copy(update={"items": deduped_items})
+    restored = []
+    # Match every retained item against the full source list.  Do not consume
+    # a shared match: the dedupe step above already prevents duplicate URLs.
     for index, item in enumerate(brief.items):
-        match = _best_source_match(item, remaining_sources, index)
+        match = _best_source_match(item, list(source_items), index)
         data = item.model_dump()
         if match is not None:
-            remaining_sources.remove(match)
             for key in ("url", "published_at", "source_name", "vendor", "product", "raw_excerpt"):
                 data[key] = getattr(match, key)
             data["source_type"] = match.source_type
             data["verification_status"] = match.verification_status
             data["confidence_score"] = match.confidence_score
-            evidence: list[str] = []
+            evidence = []
             for url in match.evidence_urls or []:
                 if url and url not in evidence and url != data.get("url"):
                     evidence.append(url)
@@ -651,8 +709,29 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
             ):
                 data["summary"] = _fallback_chinese_summary(match)
         restored.append(_ensure_chinese_item(AIUpdateItem.model_validate(data)))
+    capped = cap_ai_digest_items_by_source(restored, target_count=requested_count)
+    seen_keys = {item.dedupe_key for item in capped}
+    source_counts = Counter(ai_update_source_key(item) for item in capped)
+    for source in source_items:
+        if len(capped) >= requested_count:
+            break
+        if source.dedupe_key in seen_keys:
+            continue
+        source_key = ai_update_source_key(source)
+        if source_counts[source_key] >= AI_DIGEST_MAX_ITEMS_PER_SOURCE:
+            continue
+        replacement = source.model_copy(
+            update={
+                "title": _fallback_chinese_title(source),
+                "summary": _fallback_chinese_summary(source),
+                "tags": source.tags or ["AI"],
+            }
+        )
+        capped.append(_ensure_chinese_item(replacement))
+        seen_keys.add(source.dedupe_key)
+        source_counts[source_key] += 1
     brief_data = brief.model_dump()
-    brief_data["items"] = [item.model_dump() for item in restored]
+    brief_data["items"] = [item.model_dump() for item in capped]
     return _ensure_chinese_brief(AIDigestBrief.model_validate(brief_data))
 
 
@@ -711,12 +790,14 @@ def build_ai_digest_prompt(
         "你正在为小红书图文笔记制作《每日AI讯息》。\n"
         + f"程序已经选定恰好 {target_count} 条候选。请逐条翻译和改写，不得删除、增加、合并或调整顺序。\n"
         + quota_rule
+        + f"信源硬约束：同一规范化信源最多保留 {AI_DIGEST_MAX_ITEMS_PER_SOURCE} 条；若不足目标条数，必须从候选池中换用其他信源，不得用第三条补齐。\n"
         + "要求：官方源优先；社交源只能用于补充或验证；不得编造未提供的信息；全部输出中文。\n"
         + "发布时间硬规则：items[].published_at 必须从候选数据原样复制；不得使用简报日期、抓取日期、页面运行时 now 或自行推断日期替代；"
         + "候选缺少 published_at 时不得选入最终 items。\n"
         + "如果候选信息是英文、日文或其他语言，必须翻译并改写为自然中文；公司名、模型名、产品名可保留原文。\n"
         + "请返回严格 JSON，字段为 title, subtitle, date, items, source_summary。\n"
-        + "items 每项只输出：title, summary, url, tags。url 必须从对应候选原样复制。\n"
+        + "items 每项只输出：title, summary, url, tags。url 必须从对应候选原样复制；每个 URL 只能出现一次，不得把同一来源改写成多个条目。\n"
+        + "候选来源足够时必须优先使用不同来源补齐数量；不得使用‘动态数字’、‘动态3’或‘动态5’作为标题、来源或占位文本。\n"
         + "summary 控制在 50-90 字，说明更新内容和对用户/开发者的意义。\n"
         + "候选数据：\n"
         + json.dumps(rows, ensure_ascii=False, indent=2)
@@ -996,6 +1077,10 @@ def generate_ai_digest_brief_with_llm(
                             f"expected exactly {target_count} items, got {len(brief.items)}"
                         )
                     brief = _restore_traceable_ai_digest_items(brief, items)
+                    if len(brief.items) != target_count:
+                        raise ValueError(
+                            f"source diversity cap left {len(brief.items)} of {target_count} items"
+                        )
                     if date and not brief.date:
                         data = brief.model_dump()
                         data["date"] = date
@@ -1022,7 +1107,13 @@ def build_fallback_brief(
     target_count: int = 10,
     date: str = "",
 ) -> AIDigestBrief:
-    selected = [_ensure_chinese_item(item) for item in items[: max(1, int(target_count or 10))]]
+    selected = [
+        _ensure_chinese_item(item)
+        for item in cap_ai_digest_items_by_source(
+            items,
+            target_count=max(1, int(target_count or 10)),
+        )
+    ]
     vendors = Counter(item.vendor or item.source_name or "unknown" for item in selected)
     source_summary = "、".join(name for name, _count in vendors.most_common(6))
     if source_summary:

@@ -85,6 +85,9 @@ def test_build_ai_digest_prompt_requires_exact_compact_rewrite():
     assert "恰好 8 条" in prompt
     assert "不得删除、增加、合并或调整顺序" in prompt
     assert "items 每项只输出" in prompt
+    assert "URL 只能出现一次" in prompt
+    assert "动态3" in prompt
+    assert "动态5" in prompt
 
 
 def test_parse_ai_digest_impact_json_requires_each_candidate_exactly_once():
@@ -497,6 +500,58 @@ def test_generate_ai_digest_brief_restores_each_llm_item_to_a_distinct_source(mo
     assert {item.url for item in brief.items} == {source.url for source in sources}
 
 
+def test_generate_ai_digest_brief_dedupes_duplicate_urls_and_fills_from_unused_sources(monkeypatch):
+    sources = [
+        AIUpdateItem(
+            title=f"Model {index} release",
+            summary=f"Model {index} adds a documented AI capability.",
+            source_name=f"Official source {index}",
+            source_type="official",
+            url=f"https://official.example/items/{index}",
+            published_at="2026-08-20T08:00:00Z",
+            vendor=f"Vendor {index}",
+            product=f"Model-{index}",
+            raw_excerpt=f"Official release details for model {index}.",
+        )
+        for index in range(5)
+    ]
+
+    duplicate_urls = [sources[0].url, sources[0].url, sources[1].url, sources[1].url, sources[2].url]
+
+    class FakeModel:
+        def invoke(self, _messages):
+            items = [
+                {
+                    "title": f"Model update {index}",
+                    "summary": "官方来源披露了模型能力更新。",
+                    "url": url,
+                    "tags": ["AI"],
+                }
+                for index, url in enumerate(duplicate_urls, 1)
+            ]
+            return type("Resp", (), {"content": __import__("json").dumps({
+                "title": "每日AI讯息",
+                "subtitle": "模型更新",
+                "date": "2026-08-20",
+                "items": items,
+                "source_summary": "官方来源",
+            }, ensure_ascii=False)})()
+
+    monkeypatch.setattr("src.ai_digest.generate.init_chat_model", lambda *_args, **_kwargs: FakeModel())
+
+    brief = generate_ai_digest_brief_with_llm(
+        [LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.com", provider="test")],
+        sources,
+        target_count=5,
+        date="2026-08-20",
+    )
+
+    assert len(brief.items) == 5
+    assert len({item.normalized_url for item in brief.items}) == 5
+    assert all(item.vendor and item.source_name for item in brief.items)
+    assert all(not item.title.startswith("动态") for item in brief.items)
+
+
 @pytest.mark.parametrize(
     "unsupported_claim",
     ["仅限付费计划使用", "附带使用限制，企业需关注许可条款"],
@@ -774,12 +829,16 @@ def test_parse_ai_digest_brief_json_accepts_llm_output():
 
 
 def test_build_fallback_brief_keeps_about_ten_items_and_source_summary():
-    brief = build_fallback_brief(_updates(12), target_count=10, date="2026-06-30")
+    source_diverse = [
+        item.model_copy(update={"source_name": f"Vendor{i}", "vendor": f"Vendor{i}"})
+        for i, item in enumerate(_updates(12))
+    ]
+    brief = build_fallback_brief(source_diverse, target_count=10, date="2026-06-30")
 
     assert brief.title == "每日AI讯息"
     assert brief.date == "2026-06-30"
     assert len(brief.items) == 10
-    assert "OpenAI" in brief.source_summary
+    assert "Vendor0" in brief.source_summary
 
 
 def test_build_fallback_brief_uses_specific_source_content_for_english_updates():
@@ -1105,7 +1164,7 @@ def test_render_ai_digest_body_fits_eight_items_without_links_under_platform_lim
             source_type="search",
             url=f"https://aihot.virxact.com/daily/2026-07-03?item={i}",
             published_at="2026-07-03T08:00:00+08:00",
-            vendor="阿里/Qwen" if i < 3 else "OpenAI",
+                vendor=("阿里/Qwen", "OpenAI", "Anthropic", "Google")[i // 2],
             product="",
             raw_excerpt="raw",
             tags=["AI"],

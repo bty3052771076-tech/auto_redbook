@@ -31,9 +31,16 @@ from src.config import (
     SILICONFLOW_FREE_LLM_MODELS,
     SILICONFLOW_IMAGE_MODELS,
 )
-from src.storage.files import latest_execution, published_metrics_paths
+from src.storage.files import latest_execution, load_post, published_metrics_paths
 from src.sources.health import SourceHealthSnapshot, load_source_health_snapshot
 from src.publish.targets import PUBLISH_PLATFORM_LABELS, normalize_publish_platform
+from src.publish.draft_inventory import (
+    DraftInventoryResult,
+    local_record_from_post,
+    match_draft_inventory,
+    platform_records_from_items,
+)
+from src.publish.playwright_steps import run_collect_platform_drafts_sync
 from src.workflow.create_post import DEFAULT_EVALUATION_VIEWPOINT
 
 
@@ -442,6 +449,43 @@ def list_publishable_drafts(
         if limit and len(items) >= limit:
             break
     return items
+
+
+def list_live_publishable_drafts(
+    *,
+    project_root: Path = PROJECT_ROOT,
+    date: str = "",
+    limit: int = 200,
+    draft_type: str = "image",
+    login_hold: int = 0,
+    wait_timeout_ms: int = 300000,
+    headless: bool = False,
+) -> tuple[list[RecentPostSummary], DraftInventoryResult, dict[str, Any]]:
+    """Return local drafts intersected with the live XHS draft box."""
+
+    local_items = list_publishable_drafts(project_root=project_root, date=date, limit=limit)
+    if not local_items:
+        return [], DraftInventoryResult(), {"items": [], "total": 0, "errors": []}
+    posts = []
+    for item in local_items:
+        try:
+            posts.append(load_post(item.post_id, base=project_root / "data"))
+        except Exception:
+            continue
+    scan = run_collect_platform_drafts_sync(
+        draft_type=draft_type,
+        login_hold=login_hold,
+        wait_timeout_ms=wait_timeout_ms,
+        headless=headless,
+    )
+    if scan.get("errors"):
+        raise RuntimeError("平台草稿扫描失败：" + "; ".join(str(item) for item in scan["errors"]))
+    inventory = match_draft_inventory(
+        [local_record_from_post(post, draft_type=draft_type) for post in posts],
+        platform_records_from_items(scan.get("items") or [], draft_type=draft_type),
+    )
+    matched_ids = set(inventory.publishable_post_ids)
+    return [item for item in local_items if item.post_id in matched_ids], inventory, scan
 
 
 def _metric_int(value: object) -> int:
@@ -1608,6 +1652,7 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         news_materials_file = str(
             params.get("news_materials_file") or params.get("multi_news_materials_file") or ""
         ).strip()
+        material_time = str(params.get("material_time") or "").strip()
         if single_news_material_file and news_materials_file:
             raise ValueError("single and multi news material files are mutually exclusive")
         if single_news_material_file:
@@ -1622,12 +1667,14 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         if keywords:
             args.extend(["--keywords", keywords])
         args.extend(["--evaluation-viewpoint", evaluation_viewpoint])
-        if lookback_days:
+        if lookback_days and not (single_news_material_file or news_materials_file):
             args.extend(["--lookback-days", lookback_days])
         if single_news_material_file:
             args.extend(["--single-news-material-file", single_news_material_file])
         elif news_materials_file:
             args.extend(["--news-materials-file", news_materials_file])
+        if (single_news_material_file or news_materials_file) and material_time:
+            args.extend(["--material-time", material_time])
         if assets_glob:
             args.extend(["--assets-glob", assets_glob])
         args.extend(["--count", str(count)])
@@ -2475,7 +2522,7 @@ def main() -> None:
     ttk.Label(preview_header, text="记录详情", style="PanelSection.TLabel").pack(side="left")
     ttk.Label(
         preview_header,
-        text="选中草稿处理 / 发布草稿 / 已发布数据中的记录后在这里查看完整信息",
+        text="选中本地草稿处理 / 发布草稿 / 已发布数据中的记录后在这里查看完整信息",
         style="PanelMuted.TLabel",
     ).pack(side="left", padx=(10, 0))
 
@@ -2889,7 +2936,7 @@ def main() -> None:
         tab_hints = {
             "自动发帖": "生成草稿 · 选题、模型、运行设置与额度联动",
             "信源中心": "信源中心 · 检查候选来源的日期覆盖率和错误证据",
-            "草稿处理": "草稿处理 · 审核本地草稿并保存到创作者中心",
+            "本地草稿处理": "本地草稿处理 · 审核本地草稿并保存到创作者中心",
             "发布草稿": "发布草稿 · 从创作者中心草稿箱预览或正式发布",
             "已发布数据": "已发布数据 · 同步互动数据并生成选题方向",
             "删除草稿": "删除草稿 · 先安全预览，再明确确认正式删除",
@@ -3066,7 +3113,7 @@ def main() -> None:
     ttk.Label(auto_content_panel, text="内容与来源", style="PanelSection.TLabel").pack(anchor="w")
     ttk.Label(
         auto_content_panel,
-        text="先选择栏目和检索方向；需要使用已有材料时，再切换到对应的材料模式。",
+        text="先选择栏目和检索方向，程序会联网建立候选池，再按新鲜度、热度和来源多样性筛选。",
         style="PanelMuted.TLabel",
         wraplength=760,
     ).pack(anchor="w", pady=(2, 8))
@@ -3273,6 +3320,15 @@ def main() -> None:
 
     news_material_mode_var.trace_add("write", _sync_material_mode)
     _sync_material_mode()
+    for _legacy_material_widget in (
+        material_mode_frame,
+        material_file_label,
+        single_materials_frame,
+        materials_frame,
+    ):
+        _legacy_material_widget.grid_remove()
+    for _legacy_material_hint in auto_grid.grid_slaves(row=10):
+        _legacy_material_hint.grid_remove()
     auto_grid.pack(fill="x")
 
     model_panel = ttk.Frame(tab_auto, style="Panel.TFrame", padding=(12, 10))
@@ -3451,7 +3507,6 @@ def main() -> None:
         )
 
     def _run_auto() -> None:
-        material_mode = news_material_mode_var.get().strip().lower()
         if not runner.is_running():
             _schedule_post_command_refresh("posts", _refresh_post_ids)
             _schedule_post_command_refresh("publish", _refresh_publish_drafts)
@@ -3464,8 +3519,6 @@ def main() -> None:
             "image_source": image_provider_var.get(),
             "count": count_var.get(),
             "lookback_days": lookback_days_var.get(),
-            "single_news_material_file": single_news_material_file_var.get() if material_mode == "single" else "",
-            "news_materials_file": news_materials_file_var.get() if material_mode == "multiple" else "",
             "no_copy": no_copy_var.get(),
             "dry_run": dry_run_var.get(),
             "headless": headless_var.get(),
@@ -3480,19 +3533,15 @@ def main() -> None:
     auto_summary_var = tk.StringVar(value="")
 
     def _refresh_auto_summary(*_args) -> None:
-        mode_label = {
-            "online": "实时检索",
-            "single": "单条材料",
-            "multiple": "多条材料",
-        }.get(news_material_mode_var.get().strip().lower(), "实时检索")
-        count_text = "固定 1 条" if mode_label == "单条材料" else f"{max(1, count_var.get())} 条"
+        mode_label = "实时检索"
+        count_text = f"{max(1, count_var.get())} 条"
         save_text = "仅验证" if dry_run_var.get() else "保存草稿"
         platform_label = PUBLISH_PLATFORM_LABELS[normalize_publish_platform(publish_platform_var.get())]
         auto_summary_var.set(
             f"本次任务：{title_var.get().strip() or DEFAULT_TITLE} · {platform_label} · {mode_label} · {count_text} · {save_text}"
         )
 
-    for tracked_var in (title_var, publish_platform_var, count_var, news_material_mode_var, dry_run_var):
+    for tracked_var in (title_var, publish_platform_var, count_var, dry_run_var):
         tracked_var.trace_add("write", _refresh_auto_summary)
     _refresh_auto_summary()
 
@@ -3521,14 +3570,6 @@ def main() -> None:
         assets_var.set(os.getenv("AUTO_REDBOOK_GUI_ASSETS_GLOB") or AUTO_IMAGE_ASSETS_GLOB)
         count_var.set(env_int_value(os.getenv("AUTO_REDBOOK_GUI_COUNT"), count_var.get(), min_value=1))
         lookback_days_var.set(normalize_optional_day_count(os.getenv("AUTO_REDBOOK_GUI_LOOKBACK_DAYS")))
-        single_news_material_file_var.set(os.getenv("AUTO_REDBOOK_GUI_SINGLE_NEWS_MATERIAL_FILE") or "")
-        news_materials_file_var.set(os.getenv("AUTO_REDBOOK_GUI_NEWS_MATERIALS_FILE") or "")
-        if single_news_material_file_var.get().strip():
-            news_material_mode_var.set("single")
-        elif news_materials_file_var.get().strip():
-            news_material_mode_var.set("multiple")
-        else:
-            news_material_mode_var.set("online")
         dry_run_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_DRY_RUN")))
         headless_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_HEADLESS")))
         force_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_FORCE")))
@@ -3555,6 +3596,218 @@ def main() -> None:
         root.after(300, _run_auto)
 
     root.after(500, _maybe_autorun_from_env)
+
+    # --- Material posting tab ---
+    tab_material = _add_scrollable_tab("材料发帖")
+    material_top = ttk.Frame(tab_material)
+    material_top.pack(fill="x", padx=4, pady=(8, 10))
+    ttk.Label(material_top, text="使用已有材料生成草稿", style="Section.TLabel").pack(anchor="w")
+    ttk.Label(
+        material_top,
+        text="材料发帖不会联网检索，也不受每日新闻回溯天数限制；材料时间由你提供，仅用于稿件标记和追溯，不参与来源日期窗口限制。",
+        style="Muted.TLabel",
+        wraplength=760,
+    ).pack(anchor="w", pady=(2, 0))
+
+    material_content = ttk.Frame(tab_material, style="Panel.TFrame", padding=(12, 10))
+    material_content.pack(fill="x", padx=4, pady=(0, 10))
+    ttk.Label(material_content, text="材料与时间", style="PanelSection.TLabel").pack(anchor="w")
+    ttk.Label(
+        material_content,
+        text="支持 Markdown、TXT、JSON、JSONL；多条材料可在记录内写时间，未填写的记录使用下方默认时间。",
+        style="PanelMuted.TLabel",
+        wraplength=760,
+    ).pack(anchor="w", pady=(2, 8))
+    material_grid = ttk.Frame(material_content, style="Panel.TFrame")
+    material_grid.pack(fill="x")
+    material_grid.columnconfigure(1, weight=1)
+    material_grid.columnconfigure(3, weight=1)
+
+    material_title_var = tk.StringVar(value="每日新闻")
+    material_mode_var = tk.StringVar(value="single")
+    material_file_var = tk.StringVar(value="")
+    material_time_var = tk.StringVar(value="")
+    material_count_var = tk.IntVar(value=1)
+    material_evaluation_var = tk.StringVar(value=DEFAULT_EVALUATION_VIEWPOINT)
+    material_platform_var = tk.StringVar(value=PUBLISH_PLATFORM_LABELS["xhs"])
+    material_no_copy_var = tk.BooleanVar(value=False)
+    material_dry_run_var = tk.BooleanVar(value=False)
+    material_headless_var = tk.BooleanVar(value=False)
+    material_force_var = tk.BooleanVar(value=False)
+    material_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
+    material_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
+
+    _add_labeled_entry(material_grid, 0, "标题", material_title_var)
+    ttk.Label(material_grid, text="发布平台").grid(row=0, column=2, sticky="w", padx=(16, 0), pady=5)
+    ttk.Combobox(
+        material_grid,
+        textvariable=material_platform_var,
+        values=PUBLISH_PLATFORM_DISPLAY_OPTIONS,
+        state="readonly",
+        width=20,
+    ).grid(row=0, column=3, sticky="w", padx=(10, 0), pady=5)
+
+    ttk.Label(material_grid, text="材料类型").grid(row=1, column=0, sticky="w", pady=5)
+    material_mode_frame = ttk.Frame(material_grid)
+    material_mode_frame.grid(row=1, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=5)
+    ttk.Radiobutton(material_mode_frame, text="单条材料（生成1条）", value="single", variable=material_mode_var).pack(
+        side="left"
+    )
+    ttk.Radiobutton(material_mode_frame, text="多条材料（按数量生成）", value="multiple", variable=material_mode_var).pack(
+        side="left", padx=(18, 0)
+    )
+
+    ttk.Label(material_grid, text="材料文件").grid(row=2, column=0, sticky="w", pady=5)
+    material_file_frame = ttk.Frame(material_grid)
+    material_file_frame.grid(row=2, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=5)
+    material_file_frame.columnconfigure(0, weight=1)
+    ttk.Entry(material_file_frame, textvariable=material_file_var, font=base_font).grid(
+        row=0, column=0, sticky="we"
+    )
+
+    def _choose_material_file() -> None:
+        path = filedialog.askopenfilename(
+            title="选择人工新闻材料文件",
+            initialdir=str(PROJECT_ROOT),
+            filetypes=[
+                ("新闻材料", "*.md *.txt *.json *.jsonl"),
+                ("Markdown", "*.md"),
+                ("Text", "*.txt"),
+                ("JSON", "*.json *.jsonl"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            material_file_var.set(path)
+
+    ttk.Button(material_file_frame, text="浏览", command=_choose_material_file).grid(
+        row=0, column=1, sticky="e", padx=(8, 0)
+    )
+
+    ttk.Label(material_grid, text="材料时间（北京时间）").grid(row=3, column=0, sticky="w", pady=5)
+    material_time_frame = ttk.Frame(material_grid)
+    material_time_frame.grid(row=3, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=5)
+    material_time_frame.columnconfigure(0, weight=1)
+    ttk.Entry(material_time_frame, textvariable=material_time_var, font=base_font).grid(
+        row=0, column=0, sticky="we"
+    )
+
+    def _set_material_time_now() -> None:
+        material_time_var.set(datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M"))
+
+    ttk.Button(material_time_frame, text="填入当前北京时间", command=_set_material_time_now).grid(
+        row=0, column=1, sticky="e", padx=(8, 0)
+    )
+    ttk.Label(
+        material_grid,
+        text="必填；只验证格式，不判断材料新旧，也不会套用每日新闻的2/3/7/14天窗口。",
+        style="PanelMuted.TLabel",
+        wraplength=760,
+    ).grid(row=4, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
+
+    _add_labeled_entry(material_grid, 5, "评价视角", material_evaluation_var)
+    ttk.Label(material_grid, text="数量").grid(row=6, column=0, sticky="w", pady=5)
+    material_count_box = ttk.Spinbox(material_grid, from_=1, to=50, textvariable=material_count_var, width=8)
+    material_count_box.grid(row=6, column=1, sticky="w", padx=(10, 0), pady=5)
+    ttk.Checkbutton(
+        material_grid,
+        text="不复制素材 (--no-copy)",
+        variable=material_no_copy_var,
+    ).grid(row=6, column=2, sticky="w", padx=(10, 0))
+    material_hint_var = tk.StringVar(value="")
+    ttk.Label(
+        material_grid,
+        textvariable=material_hint_var,
+        style="PanelMuted.TLabel",
+        wraplength=760,
+    ).grid(row=7, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
+
+    def _sync_material_page_mode(*_args) -> None:
+        single = material_mode_var.get().strip().lower() == "single"
+        material_count_box.configure(state="disabled" if single else "normal")
+        if single:
+            material_count_var.set(1)
+            material_hint_var.set("单条模式只读取一条材料，忽略关键词和在线检索；材料时间仍为必填。")
+        else:
+            material_hint_var.set("多条模式按材料文件中的条目生成；记录自带时间优先，否则使用默认材料时间。")
+
+    material_mode_var.trace_add("write", _sync_material_page_mode)
+    _sync_material_page_mode()
+    material_grid.pack(fill="x")
+
+    ttk.Label(
+        material_content,
+        text="模型额度与自动发帖页共享；如需更换模型，请在自动发帖页的模型面板选择后再返回本页。",
+        style="PanelMuted.TLabel",
+        wraplength=760,
+    ).pack(anchor="w", pady=(8, 0))
+
+    _add_execution_options(
+        tab_material,
+        dry_run_var=material_dry_run_var,
+        headless_var=material_headless_var,
+        login_hold_var=material_login_hold_var,
+        wait_timeout_var=material_wait_timeout_var,
+        force_var=material_force_var,
+        dry_label="仅验证流程，不保存草稿",
+        headless_label="后台上传（无窗口）",
+    )
+
+    material_summary_var = tk.StringVar(value="")
+
+    def _run_material() -> None:
+        material_path = material_file_var.get().strip()
+        material_time = material_time_var.get().strip()
+        if not material_path:
+            messagebox.showerror("材料发帖", "请选择材料文件。")
+            return
+        if not material_time:
+            messagebox.showerror("材料发帖", "请填写材料时间（北京时间）。")
+            return
+        if not runner.is_running():
+            _schedule_post_command_refresh("posts", _refresh_post_ids)
+            _schedule_post_command_refresh("publish", _refresh_publish_drafts)
+        single = material_mode_var.get().strip().lower() == "single"
+        params = {
+            "title": material_title_var.get(),
+            "platform": material_platform_var.get(),
+            "keywords": "",
+            "evaluation_viewpoint": material_evaluation_var.get(),
+            "assets_glob": assets_var.get(),
+            "image_source": image_provider_var.get(),
+            "count": 1 if single else material_count_var.get(),
+            "lookback_days": "",
+            "material_time": material_time,
+            "single_news_material_file": material_path if single else "",
+            "news_materials_file": "" if single else material_path,
+            "no_copy": material_no_copy_var.get(),
+            "dry_run": material_dry_run_var.get(),
+            "headless": material_headless_var.get(),
+            "login_hold": material_login_hold_var.get(),
+            "wait_timeout": material_wait_timeout_var.get(),
+            "force": material_force_var.get(),
+        }
+        _run_command("auto", params, _auto_env())
+
+    def _refresh_material_summary(*_args) -> None:
+        mode = "单条材料" if material_mode_var.get().strip().lower() == "single" else "多条材料"
+        count_text = "1 条" if mode == "单条材料" else f"{max(1, material_count_var.get())} 条"
+        material_summary_var.set(
+            f"本次任务：{material_title_var.get().strip() or '每日新闻'} · {mode} · {count_text} · "
+            f"{'仅验证' if material_dry_run_var.get() else '保存草稿'}"
+        )
+
+    for tracked_var in (material_title_var, material_mode_var, material_count_var, material_dry_run_var):
+        tracked_var.trace_add("write", _refresh_material_summary)
+    _refresh_material_summary()
+    material_action_bar = ttk.Frame(tab_material, style="Panel.TFrame", padding=(12, 10))
+    material_action_bar.pack(fill="x", padx=4, pady=(0, 8))
+    ttk.Button(material_action_bar, text="使用材料生成草稿", command=_run_material, style="Accent.TButton").pack(
+        side="left"
+    )
+    ttk.Label(material_action_bar, textvariable=material_summary_var, style="PanelMuted.TLabel").pack(
+        side="left", padx=(14, 0)
+    )
 
     # --- Source health center ---
     tab_sources = _add_scrollable_tab("信源中心")
@@ -3794,7 +4047,7 @@ def main() -> None:
 
     # --- Run tab ---
     tab_run = ttk.Frame(nb)
-    nb.add(tab_run, text="草稿处理")
+    nb.add(tab_run, text="本地草稿处理")
     run_grid = ttk.Frame(tab_run)
     run_grid.pack(fill="x", padx=4, pady=12)
     run_grid.columnconfigure(1, weight=1)
@@ -4094,6 +4347,8 @@ def main() -> None:
     )
     publish_preview.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
     publish_rows: dict[str, RecentPostSummary] = {}
+    publish_scan_busy = False
+    publish_scan_failed = False
 
     def _set_publish_preview(text: str) -> None:
         publish_preview.configure(state="normal")
@@ -4115,7 +4370,16 @@ def main() -> None:
 
     publish_refresh_generation = 0
 
-    def _apply_publish_drafts(items: list[RecentPostSummary]) -> None:
+    def _apply_publish_drafts(
+        items: list[RecentPostSummary],
+        *,
+        local_count: int = 0,
+        platform_count: int = 0,
+        ambiguous_count: int = 0,
+    ) -> None:
+        nonlocal publish_scan_busy, publish_scan_failed
+        publish_scan_busy = False
+        publish_scan_failed = False
         publish_tree.delete(*publish_tree.get_children())
         publish_rows.clear()
         for idx, post in enumerate(items):
@@ -4127,37 +4391,59 @@ def main() -> None:
         if items:
             publish_status_var.set(f"已加载 {len(items)} 条可发布草稿。选中一条或多条可只发布选中项；不选中则按当前日期筛选结果发布。")
         else:
-            publish_status_var.set("未找到匹配的本地已上传草稿。请先用自动发帖/草稿处理上传到小红书草稿箱。")
+            publish_status_var.set("未找到匹配的本地已上传草稿。请先用自动发帖/本地草稿处理上传到小红书草稿箱。")
+        publish_status_var.set(
+            f"本地候选 {local_count} | 平台草稿 {platform_count} | "
+            f"可发布交集 {len(items)} | 歧义 {ambiguous_count}；列表仅显示实时仍存在的草稿。"
+        )
         _on_publish_selection_change()
 
     def _refresh_publish_drafts() -> None:
-        nonlocal publish_refresh_generation
+        nonlocal publish_refresh_generation, publish_scan_busy, publish_scan_failed
         publish_refresh_generation += 1
         generation = publish_refresh_generation
         date = publish_date_var.get().strip()
         limit = publish_limit_var.get()
-        publish_status_var.set("正在读取本地已上传草稿...")
+        publish_scan_busy = True
+        publish_scan_failed = False
+        _refresh_publish_action_label()
+        publish_status_var.set("正在扫描本地候选与创作者中心实时草稿清单…")
 
         def _load_publishable_drafts() -> None:
             try:
-                items = list_publishable_drafts(
+                items, inventory, scan = list_live_publishable_drafts(
                     project_root=PROJECT_ROOT,
                     date=date,
                     limit=limit,
+                    draft_type="image",
+                    login_hold=publish_login_hold_var.get(),
+                    wait_timeout_ms=publish_wait_timeout_var.get() * 1000,
+                    headless=publish_headless_var.get(),
                 )
             except Exception as exc:
                 message = str(exc)
 
                 def _show_error() -> None:
                     if generation == publish_refresh_generation:
-                        publish_status_var.set(f"读取本地已上传草稿失败：{message}")
+                        nonlocal publish_scan_busy, publish_scan_failed
+                        publish_scan_busy = False
+                        publish_scan_failed = True
+                        publish_tree.delete(*publish_tree.get_children())
+                        publish_rows.clear()
+                        publish_status_var.set(f"平台草稿扫描失败，已停止发布：{message}")
+                        _refresh_publish_action_label()
 
                 ui_events.put(_show_error)
                 return
 
             def _apply() -> None:
                 if generation == publish_refresh_generation:
-                    _apply_publish_drafts(items)
+                    _apply_publish_drafts(
+                        items,
+                        local_count=len(items) + len(inventory.local_missing_on_platform) + len(inventory.ambiguous),
+                        platform_count=int(scan.get("total") or 0),
+                        ambiguous_count=len(inventory.ambiguous),
+                    )
 
             ui_events.put(_apply)
 
@@ -4249,7 +4535,9 @@ def main() -> None:
         publish_action_button.configure(
             text=f"{action} {target_count} 条草稿" if target_count else f"{action}草稿"
         )
-        publish_action_button.configure(state="normal" if target_count else "disabled")
+        publish_action_button.configure(
+            state="normal" if target_count and not publish_scan_busy and not publish_scan_failed else "disabled"
+        )
 
     publish_dry_var.trace_add("write", _refresh_publish_action_label)
     _refresh_publish_action_label()

@@ -428,6 +428,8 @@ def test_auto_daily_news_passes_news_materials_file(monkeypatch, tmp_path):
             str(asset),
             "--news-materials-file",
             str(materials_file),
+            "--material-time",
+            "2025-03-10 09:30",
             "--login-hold",
             "0",
             "--wait-timeout",
@@ -437,6 +439,7 @@ def test_auto_daily_news_passes_news_materials_file(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert seen["news_materials_file"] == str(materials_file)
+    assert seen["material_time"] == "2025-03-10 09:30"
 
 
 def test_auto_daily_news_passes_single_news_material_file(monkeypatch, tmp_path):
@@ -482,6 +485,8 @@ def test_auto_daily_news_passes_single_news_material_file(monkeypatch, tmp_path)
             str(asset),
             "--single-news-material-file",
             str(single_file),
+            "--material-time",
+            "2025-03-10 09:30",
             "--login-hold",
             "0",
             "--wait-timeout",
@@ -495,6 +500,7 @@ def test_auto_daily_news_passes_single_news_material_file(monkeypatch, tmp_path)
     assert seen["count"] == 1
     assert seen["prompt_hint"] == ""
     assert seen["lookback_days"] is None
+    assert seen["material_time"] == "2025-03-10 09:30"
 
 
 def test_auto_news_material_options_do_not_leak_process_environment(monkeypatch, tmp_path):

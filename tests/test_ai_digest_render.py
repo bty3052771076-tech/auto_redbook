@@ -58,8 +58,14 @@ def test_paginate_items_keeps_two_to_three_updates_per_content_page():
 
 
 def test_render_ai_digest_cards_uses_two_to_three_updates_per_page(tmp_path: Path):
+    source_diverse = [
+        item.model_copy(update={"source_name": f"Vendor{i}", "vendor": f"Vendor{i}"})
+        for i, item in enumerate(
+            [_item(i, "这是一条简短的 AI 动态摘要，说明模型、产品或工具更新。") for i in range(10)]
+        )
+    ]
     brief = build_fallback_brief(
-        [_item(i, "这是一条简短的 AI 动态摘要，说明模型、产品或工具更新。") for i in range(10)],
+        source_diverse,
         target_count=10,
         date="2026-06-30",
     )

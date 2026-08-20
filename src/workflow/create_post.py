@@ -23,8 +23,10 @@ from src.ai_digest.generate import (
 )
 from src.ai_digest.models import AIDigestBrief, AIUpdateItem
 from src.ai_digest.rank import (
+    AI_DIGEST_MAX_ITEMS_PER_SOURCE,
     ai_digest_official_count,
     ai_digest_quota_counts,
+    ai_digest_source_counts,
     dedupe_ai_updates,
     filter_recent_ai_updates,
     featured_ai_update,
@@ -48,6 +50,7 @@ from src.news.daily_news import (
     load_single_news_material_file,
     pick_news_items,
     rank_news_candidate_pool,
+    resolve_manual_material_times,
 )
 from src.storage.files import copy_assets_into_post, list_posts, post_dir, save_post, save_revision
 from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSource, now_iso
@@ -3138,6 +3141,7 @@ def _fetch_daily_news_candidates_for_upload(
     lookback_days: object = None,
     news_materials_file: str | Path | None = None,
     single_news_material_file: str | Path | None = None,
+    material_time: str = "",
     progress_callback: DailyNewsProgressCallback | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
     multi_material_path = str(news_materials_file or "").strip()
@@ -3147,28 +3151,12 @@ def _fetch_daily_news_candidates_for_upload(
     if single_material_path:
         item = load_single_news_material_file(single_material_path)
         tz_name = os.getenv("NEWS_TZ") or "Asia/Shanghai"
-        lookback_windows, lookback_meta = _daily_news_lookback_window(
-            lookback_days,
-            env_names=("NEWS_LOOKBACK_DAYS", "CONTENT_LOOKBACK_DAYS"),
-        )
-        recent_items, date_window_meta = filter_recent_news_items(
+        resolved_items, resolved_times = resolve_manual_material_times(
             [item],
+            default_material_time=material_time,
             tz_name=tz_name,
-            max_age_days=lookback_windows[0],
         )
-        if not recent_items:
-            raise RuntimeError(
-                "单条新闻材料不符合每日新闻严格两日时效要求："
-                f"来源发布时间={item.seendate or '缺失'}，允许范围="
-                f"{date_window_meta.get('start_date')}..{date_window_meta.get('end_date')}（北京时间）。"
-            )
-        lookback_attempt = {
-            "max_age_days": lookback_windows[0],
-            "recent_candidate_count": 1,
-            "prompt_relevant_candidate_count": 1,
-            "actual_candidate_count": 1,
-            "date_window": date_window_meta,
-        }
+        item = resolved_items[0]
         meta: dict[str, Any] = {
             "provider": "manual_single",
             "api_source": "manual_single",
@@ -3184,12 +3172,15 @@ def _fetch_daily_news_candidates_for_upload(
             "query_variants": [],
             "query_expansion_enabled": False,
             "queries_used": [],
-            "search_days": lookback_windows[0],
-            "used_today_range": True,
+            "search_days": None,
+            "used_today_range": False,
             "manual_materials": {
                 "file_path": single_material_path,
                 "count": 1,
                 "mode": "single",
+                "default_material_time": material_time,
+                "resolved_item_times": resolved_times,
+                "freshness_policy": "bypassed_user_supplied_material",
             },
             "candidates": [asdict(item)],
             "selection_pool": {
@@ -3205,14 +3196,14 @@ def _fetch_daily_news_candidates_for_upload(
                 "prompt_relevant_candidate_count": 1,
                 "actual_candidate_count": 1,
                 "dropped_out_of_window_count": 0,
-                "date_window": date_window_meta,
+                "date_window": None,
                 "lookback": {
-                    **lookback_meta,
+                    "mode": "disabled_for_material",
                     "input": lookback_days,
-                    "selected_max_age_days": lookback_windows[0],
-                    "attempts": [lookback_attempt],
+                    "selected_max_age_days": None,
+                    "attempts": [],
                 },
-                "selection_policy": "single_news_material_direct_after_strict_freshness",
+                "selection_policy": "manual_material_without_source_date_limit",
                 "source_domain_max_ratio": None,
             },
         }
@@ -3275,6 +3266,54 @@ def _fetch_daily_news_candidates_for_upload(
     meta = dict(meta)
     raw_candidate_count = len(candidates)
     tz_name = str(meta.get("tz") or os.getenv("NEWS_TZ") or "Asia/Shanghai")
+    if multi_material_path:
+        material_target_count = max(1, int(count or 1))
+        resolved_candidates, resolved_times = resolve_manual_material_times(
+            list(candidates),
+            default_material_time=material_time,
+            tz_name=tz_name,
+        )
+        if not resolved_candidates:
+            raise RuntimeError("材料文件没有可用材料。")
+        selected_candidates = rank_news_candidate_pool(resolved_candidates, "")[:raw_fetch_count]
+        if len(selected_candidates) < material_target_count:
+            raise RuntimeError(
+                f"材料候选不足：需要至少 {material_target_count} 条材料，当前只有 {len(selected_candidates)} 条。"
+            )
+        meta["provider"] = "manual"
+        meta["manual_materials"] = {
+            "file_path": multi_material_path,
+            "count": len(resolved_candidates),
+            "mode": "multiple",
+            "default_material_time": material_time,
+            "resolved_item_times": resolved_times,
+            "freshness_policy": "bypassed_user_supplied_material",
+        }
+        meta["candidates"] = [asdict(item) for item in resolved_candidates]
+        meta["selection_pool"] = {
+            "requested_count": max(1, int(count or 1)),
+            "target_fetch_count": material_target_count,
+            "raw_fetch_count": raw_fetch_count,
+            "raw_candidate_count": raw_candidate_count,
+            "recent_candidate_count": len(resolved_candidates),
+            "prompt_relevance": {
+                "mode": "ignored_for_material",
+                "prompt_hint": prompt_norm,
+            },
+            "prompt_relevant_candidate_count": len(resolved_candidates),
+            "actual_candidate_count": len(selected_candidates),
+            "dropped_out_of_window_count": 0,
+            "date_window": None,
+            "lookback": {
+                "mode": "disabled_for_material",
+                "input": lookback_days,
+                "selected_max_age_days": None,
+                "attempts": [],
+            },
+            "selection_policy": "manual_material_without_source_date_limit",
+            "source_domain_max_ratio": None,
+        }
+        return selected_candidates, meta
     attempts: list[dict[str, Any]] = []
     selected_candidates: list[Any] = []
     selected_recent_candidates: list[Any] = []
@@ -4224,10 +4263,17 @@ def _ai_digest_selection_error(
 ) -> str:
     item_list = list(items or [])
     counts = ai_digest_quota_counts(item_list)
+    source_counts = ai_digest_source_counts(item_list)
+    source_capacity = sum(min(count, AI_DIGEST_MAX_ITEMS_PER_SOURCE) for count in source_counts.values())
     official_count = ai_digest_official_count(item_list)
     problems = []
     if len(item_list) < target_count:
         problems.append(f"有效资讯不足{target_count}条，当前{len(item_list)}条")
+    if source_capacity < target_count:
+        problems.append(
+            f"信源多样性不足：目标{target_count}条，同一信源最多{AI_DIGEST_MAX_ITEMS_PER_SOURCE}条，"
+            f"当前最多可生成{source_capacity}条"
+        )
     if official_count < min_official_count:
         problems.append(
             f"官方可追溯资讯不足{min_official_count}条，当前{official_count}条"
@@ -4241,6 +4287,32 @@ def _ai_digest_selection_error(
     if not problems:
         return ""
     return f"daily ai digest create failed: {'；'.join(problems)}；仅允许生成日前{max_age_days}日内可追溯资讯"
+
+
+def _ai_digest_source_cap_error(
+    items: Iterable[AIUpdateItem],
+    *,
+    target_count: int | None = None,
+) -> str:
+    item_list = list(items or [])
+    source_counts = ai_digest_source_counts(item_list)
+    over_limit = {
+        source: count
+        for source, count in source_counts.items()
+        if count > AI_DIGEST_MAX_ITEMS_PER_SOURCE
+    }
+    if over_limit:
+        source, count = max(over_limit.items(), key=lambda pair: pair[1])
+        return (
+            f"每日AI讯息信源约束失败：信源 {source} 有 {count} 条，"
+            f"上限为 {AI_DIGEST_MAX_ITEMS_PER_SOURCE} 条"
+        )
+    if target_count is not None and len(item_list) < int(target_count):
+        return (
+            f"每日AI讯息信源多样性不足：目标 {int(target_count)} 条，"
+            f"当前仅 {len(item_list)} 条"
+        )
+    return ""
 
 
 def _uploaded_ai_digest_history_keys() -> set[str]:
@@ -4287,6 +4359,7 @@ def _select_adaptive_ai_digest_items(
         min_official_count=max(maximum + 1, len(item_list) + 1),
         allow_social_backfill=True,
         max_age_days=14,
+        max_items_per_source=None,
     )
     recent_keys = {
         days: {
@@ -4780,6 +4853,7 @@ def create_daily_ai_digest_posts(
             min_official_count=supervisor_limit + 1,
             allow_social_backfill=True,
             max_age_days=max(lookback_windows),
+            max_items_per_source=None,
         )
         selection_pool_count = len(evaluation_pool)
         try:
@@ -4946,6 +5020,7 @@ def create_daily_ai_digest_posts(
                 max_age_days=days,
                 min_domestic_model_count=min_domestic_model_count,
                 min_foreign_ai_count=min_foreign_ai_count,
+                max_items_per_source=None,
             )
         else:
             window_candidate_items = list(candidate_items or [])
@@ -5095,6 +5170,8 @@ def create_daily_ai_digest_posts(
     if adaptive_selection_meta:
         source_meta["adaptive_selection"] = adaptive_selection_meta
 
+    # Save unfiltered source items for the quota-safe fallback
+    raw_items_for_fallback = list(items or [])
     if adaptive_mode:
         items, body_capacity_meta = _fit_ai_digest_items_to_body_capacity(
             items,
@@ -5176,14 +5253,24 @@ def create_daily_ai_digest_posts(
         min_foreign_ai_count=min_foreign_ai_count,
         max_age_days=max_age_days,
     )
+    source_cap_error = _ai_digest_source_cap_error(
+        brief.items,
+        target_count=generation_target,
+    )
+    if source_cap_error:
+        final_error = source_cap_error
     if final_error and generation_mode == "llm":
         if progress is not None:
             progress("llm_selection", f"insufficient error={final_error}; using quota-safe fallback")
+        # Prefer the unfiltered raw_items_for_fallback (14-day window) so the
+        # fallback can still hit target_count when LLM items were already
+        # narrowed to 3 days.
+        fallback_items = raw_items_for_fallback if raw_items_for_fallback else items
         quota_fallback = _build_quota_safe_ai_digest_fallback(
-            items,
+            fallback_items,
             target_count=generation_target,
             min_official_count=effective_min_official_count,
-            max_age_days=max_age_days,
+            max_age_days=None,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
         )
@@ -5216,11 +5303,22 @@ def create_daily_ai_digest_posts(
         min_foreign_ai_count=min_foreign_ai_count,
         max_age_days=max_age_days,
     )
+    source_cap_error = _ai_digest_source_cap_error(
+        brief.items,
+        target_count=generation_target,
+    )
+    if source_cap_error:
+        body_fit_error = source_cap_error
     if body_fit_error:
         raise RuntimeError(body_fit_error)
     source_meta["selected_before_body_fit"] = selected_before_body_fit
     source_meta["body_fit_dropped"] = max(0, selected_before_body_fit - len(brief.items))
     source_meta["selected_quota_counts"] = ai_digest_quota_counts(list(brief.items or []))
+    source_meta["source_distribution"] = ai_digest_source_counts(list(brief.items or []))
+    source_meta["source_distribution_max"] = max(
+        source_meta["source_distribution"].values(),
+        default=0,
+    )
     source_meta["selected_official_count"] = ai_digest_official_count(list(brief.items or []))
     rendered_body = render_ai_digest_body(brief, selection_meta=source_meta)
     if len(rendered_body) > MAX_IMAGE_BODY:
@@ -5254,6 +5352,9 @@ def create_daily_ai_digest_posts(
                 "min_domestic_model_items": min_domestic_model_count,
                 "min_foreign_ai_items": min_foreign_ai_count,
                 "quota_counts": source_meta["selected_quota_counts"],
+                "source_distribution": source_meta["source_distribution"],
+                "source_distribution_max": source_meta["source_distribution_max"],
+                "max_items_per_source": AI_DIGEST_MAX_ITEMS_PER_SOURCE,
                 "max_age_days": max_age_days,
                 "prompt_hint": (prompt_hint or "").strip(),
                 "generation_mode": generation_mode,
@@ -5296,6 +5397,7 @@ def create_post_with_draft(
     lookback_days: object = None,
     news_materials_file: str | Path | None = None,
     single_news_material_file: str | Path | None = None,
+    material_time: str = "",
 ) -> Post:
     """
     Generate a draft with LLM and persist post + revision.
@@ -5324,6 +5426,7 @@ def create_post_with_draft(
                 lookback_days=None if str(single_news_material_file or "").strip() else lookback_days,
                 news_materials_file=news_materials_file,
                 single_news_material_file=single_news_material_file,
+                material_time=material_time,
             )
             picks = pick_news_items(candidates, prompt_norm, count=1)
             if not picks:
@@ -5680,6 +5783,7 @@ def create_daily_news_posts(
     lookback_days: object = None,
     news_materials_file: str | Path | None = None,
     single_news_material_file: str | Path | None = None,
+    material_time: str = "",
     progress_callback: DailyNewsProgressCallback | None = None,
     post_quality_callback: DailyNewsPostQualityCallback | None = None,
 ) -> list[Post]:
@@ -5720,6 +5824,7 @@ def create_daily_news_posts(
         lookback_days=None if single_material_mode else lookback_days,
         news_materials_file=news_materials_file,
         single_news_material_file=single_news_material_file,
+        material_time=material_time,
         progress_callback=progress_callback,
     )
     target_count = count

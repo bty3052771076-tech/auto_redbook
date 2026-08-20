@@ -729,6 +729,7 @@ def collect_ai_digest_updates(
         now=now,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
+        max_items_per_source=None,
     )
     official_page_backfill_used = bool(official_page_sources) and _needs_search_backfill(
         stream_ranked,
@@ -748,6 +749,7 @@ def collect_ai_digest_updates(
         now=now,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
+        max_items_per_source=None,
     )
     official_count = len(official_ranked)
     social_backfill_used = False
@@ -765,6 +767,7 @@ def collect_ai_digest_updates(
         now=now,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
+        max_items_per_source=None,
     )
     if allow_social_backfill and aggregator_sources and (
         force_aggregator_backfill
@@ -787,6 +790,7 @@ def collect_ai_digest_updates(
             now=now,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=None,
         )
         detail_limit = _env_int("AI_DIGEST_AGGREGATOR_DETAIL_LIMIT", 24, min_value=1, max_value=80)
         detail_candidates = detail_candidates[:detail_limit]
@@ -826,6 +830,7 @@ def collect_ai_digest_updates(
             now=now,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=None,
         )
     if (
         allow_social_backfill
@@ -860,6 +865,7 @@ def collect_ai_digest_updates(
             now=now,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=None,
         )
     if (
         allow_social_backfill
@@ -883,6 +889,7 @@ def collect_ai_digest_updates(
             now=now,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=None,
         )
     fresh_items = filter_recent_ai_updates(
         fetched,

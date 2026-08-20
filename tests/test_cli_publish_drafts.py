@@ -3,10 +3,35 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 import apps.cli as cli
 from src.storage.models import Execution
+
+
+@pytest.fixture(autouse=True)
+def fake_live_xhs_draft_scan(monkeypatch):
+    """Keep CLI unit tests read-only while exercising live-intersection logic."""
+
+    def _scan(**kwargs):
+        items = []
+        for index, post in enumerate(cli.list_posts()):
+            if not post.uploaded and str(post.status) != "PostStatus.saved_draft":
+                continue
+            xhs = post.platform.get("xhs_draft") if isinstance(post.platform, dict) else {}
+            xhs = xhs if isinstance(xhs, dict) else {}
+            items.append(
+                {
+                    "index": str(index),
+                    "title": str(xhs.get("title") or post.title),
+                    "saved_at": str(xhs.get("saved_at") or post.uploaded_at or ""),
+                    "draft_type": kwargs.get("draft_type", "image"),
+                }
+            )
+        return {"items": items, "total": len(items), "errors": []}
+
+    monkeypatch.setattr(cli, "run_collect_platform_drafts_sync", _scan)
 
 
 def _write_uploaded_post(base: Path, post_id: str, *, title: str, uploaded_at: str) -> None:
@@ -481,3 +506,58 @@ def test_publish_drafts_all_with_limit_prefers_latest_uploaded_post(monkeypatch,
     assert result.exit_code == 0
     assert calls
     assert [post.id for post in calls[0]["posts"]] == [latest_id]
+
+
+def test_publish_drafts_exits_when_explicit_local_id_is_missing_on_platform(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    post_id = "11111111111111111111111111111111"
+    _write_uploaded_post(tmp_path, post_id, title="Not on platform", uploaded_at="2026-08-20T01:00:00.000000Z")
+    monkeypatch.setattr(cli, "run_collect_platform_drafts_sync", lambda **_kwargs: {"items": [], "total": 0, "errors": []})
+
+    result = CliRunner().invoke(cli.app, ["publish-drafts", "--post-id", post_id, "--yes"])
+
+    assert result.exit_code == 1
+    assert "no publishable drafts remain" in result.output
+
+
+def test_publish_drafts_fails_closed_when_platform_scan_errors(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    post_id = "22222222222222222222222222222222"
+    _write_uploaded_post(tmp_path, post_id, title="Scan error", uploaded_at="2026-08-20T01:00:00.000000Z")
+    monkeypatch.setattr(
+        cli,
+        "run_collect_platform_drafts_sync",
+        lambda **_kwargs: {"items": [], "total": 0, "errors": ["login required"]},
+    )
+
+    result = CliRunner().invoke(cli.app, ["publish-drafts", "--post-id", post_id, "--yes"])
+
+    assert result.exit_code == 1
+    assert "scan failed closed" in result.output
+
+
+def test_publish_drafts_rechecks_platform_before_runner(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    post_id = "33333333333333333333333333333333"
+    _write_uploaded_post(tmp_path, post_id, title="Removed before publish", uploaded_at="2026-08-20T01:00:00.000000Z")
+    scans = iter(
+        [
+            {"items": [{"index": "0", "title": "Removed before publish", "saved_at": "2026-08-20 09:00:00"}], "total": 1, "errors": []},
+            {"items": [], "total": 0, "errors": []},
+        ]
+    )
+    monkeypatch.setattr(cli, "run_collect_platform_drafts_sync", lambda **_kwargs: next(scans))
+    called = False
+
+    def fake_run_publish(**_kwargs):
+        nonlocal called
+        called = True
+        return {"published": 0, "items": [], "errors": []}
+
+    monkeypatch.setattr(cli, "run_publish_drafts_sync", fake_run_publish)
+
+    result = CliRunner().invoke(cli.app, ["publish-drafts", "--post-id", post_id, "--yes"])
+
+    assert result.exit_code == 1
+    assert called is False
+    assert "no longer present" in result.output

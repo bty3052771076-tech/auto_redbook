@@ -4780,13 +4780,13 @@ def test_daily_news_upload_passes_manual_materials_file_to_fetcher(monkeypatch, 
     assert meta["selection_pool"]["raw_candidate_count"] == 1
 
 
-def test_fetch_single_daily_news_candidate_ignores_prompt_but_enforces_freshness(monkeypatch, tmp_path):
+def test_fetch_single_daily_news_candidate_uses_material_time_without_freshness(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     news_file = tmp_path / "single_news.md"
     news_file.write_text(
         f"""
         title: Single material policy story
-        time: {_recent_news_date()}
+        time: 2026-06-30 00:00
         source: Example News
         url: https://example.com/single-policy-story
         content: A complete single news material that should be used directly.
@@ -4804,30 +4804,83 @@ def test_fetch_single_daily_news_candidate_ignores_prompt_but_enforces_freshness
     assert meta["provider"] == "manual_single"
     assert meta["selection_pool"]["requested_count"] == 1
     assert meta["selection_pool"]["target_fetch_count"] == 1
-    assert meta["selection_pool"]["lookback"]["mode"] == "strict_freshness"
-    assert meta["selection_pool"]["date_window"]["max_age_days"] == 2
+    assert candidates[0].seendate == "2026-06-30T00:00:00+08:00"
+    assert meta["selection_pool"]["lookback"]["mode"] == "disabled_for_material"
+    assert meta["selection_pool"]["date_window"] is None
+    assert meta["manual_materials"]["freshness_policy"] == "bypassed_user_supplied_material"
     assert meta["selection_pool"]["prompt_relevance"]["mode"] == "ignored_for_single_news_material"
 
 
-def test_single_news_material_rejects_an_old_or_unverifiable_source_date(monkeypatch, tmp_path):
+def test_single_news_material_accepts_old_user_time_without_freshness_filter(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     news_file = tmp_path / "old_single_news.md"
     news_file.write_text(
         """
         title: Old policy story
-        time: 2026-07-30
+        time: 2025-03-10 09:30
         source: Example News
         url: https://example.com/old-policy-story
-        content: This material is older than the allowed daily-news window.
+        content: This material is old but explicitly supplied by the user.
         """,
         encoding="utf-8",
     )
 
-    with pytest.raises(RuntimeError, match="单条新闻材料.*两日"):
+    candidates, meta = create_post._fetch_daily_news_candidates_for_upload(
+        "",
+        count=1,
+        single_news_material_file=str(news_file),
+    )
+
+    assert candidates[0].seendate == "2025-03-10T09:30:00+08:00"
+    assert meta["selection_pool"]["date_window"] is None
+
+
+def test_multi_news_material_uses_record_time_before_default_material_time(monkeypatch, tmp_path):
+    materials_file = tmp_path / "materials.md"
+    materials_file.write_text(
+        """
+        标题：有记录时间的材料
+        时间：2024-01-02 08:00
+        来源：材料源A
+        内容：第一条用户材料。
+        ---
+        标题：使用默认时间的材料
+        来源：材料源B
+        内容：第二条用户材料。
+        """,
+        encoding="utf-8",
+    )
+
+    candidates, meta = create_post._fetch_daily_news_candidates_for_upload(
+        "",
+        count=2,
+        news_materials_file=str(materials_file),
+        material_time="2023-05-06 07:30",
+    )
+
+    assert [item.seendate for item in candidates] == [
+        "2024-01-02T08:00:00+08:00",
+        "2023-05-06T07:30:00+08:00",
+    ]
+    assert meta["manual_materials"]["resolved_item_times"] == [
+        "2024-01-02T08:00:00+08:00",
+        "2023-05-06T07:30:00+08:00",
+    ]
+    assert meta["selection_pool"]["lookback"]["mode"] == "disabled_for_material"
+
+
+def test_manual_material_requires_record_or_default_material_time(tmp_path):
+    materials_file = tmp_path / "missing_time.md"
+    materials_file.write_text(
+        "标题：缺少时间的材料\n来源：材料源\n内容：需要明确时间。",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="材料时间缺失"):
         create_post._fetch_daily_news_candidates_for_upload(
             "",
             count=1,
-            single_news_material_file=str(news_file),
+            news_materials_file=str(materials_file),
         )
 
 

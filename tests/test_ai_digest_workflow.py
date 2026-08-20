@@ -90,6 +90,10 @@ def test_create_daily_ai_digest_posts_creates_post_with_rendered_cards(monkeypat
     assert len(post.platform["ai_digest"]["items"]) == 9
     assert post.platform["ai_digest"]["adaptive_selection"]["selection_mode"] == "adaptive_strict"
     assert post.platform["ai_digest"]["source_meta"]["sources"] == ["fixture"]
+    distribution = post.platform["ai_digest"]["source_distribution"]
+    assert distribution
+    assert max(distribution.values()) <= 2
+    assert post.platform["ai_digest"]["source_distribution_max"] <= 2
 
 
 @pytest.mark.parametrize(
@@ -953,7 +957,7 @@ def test_create_daily_ai_digest_posts_falls_back_when_llm_breaks_quota(monkeypat
     meta = post.platform["ai_digest"]
 
     assert meta["generation_mode"] == "llm_quota_fallback"
-    assert "国内模型资讯不足3条" in meta["llm_error"]
+    assert "信源多样性不足" in meta["llm_error"]
     assert 8 <= meta["actual_items"] <= 20
     assert meta["quota_counts"]["domestic_model"] >= 3
     assert meta["quota_counts"]["foreign_ai"] >= 3
@@ -985,11 +989,11 @@ def test_create_daily_ai_digest_fallback_selects_quotas_from_full_pool(monkeypat
         AIUpdateItem(
             title=f"智谱 GLM-{i} 发布模型版本",
             summary="智谱发布 GLM 模型版本与 API 更新。",
-            source_name="智谱",
+            source_name=f"智谱-{i}",
             source_type="official",
             url=f"https://bigmodel.cn/news/glm-{i}",
             published_at=published(30 + i),
-            vendor="智谱",
+            vendor=f"智谱-{i}",
             product=f"GLM-{i}",
             raw_excerpt=f"智谱 GLM-{i} 模型发布。",
             tags=["AI模型"],
@@ -1000,11 +1004,11 @@ def test_create_daily_ai_digest_fallback_selects_quotas_from_full_pool(monkeypat
         AIUpdateItem(
             title=f"OpenAI GPT-{i} 发布模型版本",
             summary="OpenAI 发布 GPT 模型版本与开发者 API 更新。",
-            source_name="OpenAI",
+            source_name=f"OpenAI-{i}",
             source_type="official",
             url=f"https://openai.com/news/gpt-{i}",
             published_at=published(40 + i),
-            vendor="OpenAI",
+            vendor=f"OpenAI-{i}",
             product=f"GPT-{i}",
             raw_excerpt=f"OpenAI GPT-{i} model release.",
             tags=["AI模型"],

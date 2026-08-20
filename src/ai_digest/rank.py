@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter, OrderedDict
 from datetime import date, datetime, timedelta, timezone
 import re
+import unicodedata
 from urllib.parse import unquote, urlsplit
 
 from .models import AIUpdateItem
@@ -73,6 +74,7 @@ _MODEL_VARIANT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _MODEL_FAMILY_MERGED_SUFFIXES = {"pro", "max", "flash", "lite", "preview", "exp", "speciale"}
+AI_DIGEST_MAX_ITEMS_PER_SOURCE = 2
 _MODEL_RELEASE_MARKERS = (
     "模型",
     "版本",
@@ -874,8 +876,35 @@ def dedupe_ai_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
     return _dedupe_updates(items)
 
 
+def _normalize_source_label(value: str) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().lower()
+    text = re.sub(r"[|｜·•:/：]+", " ", text)
+    text = re.sub(
+        r"\b(?:official|official site|official blog|blog|newsroom|release notes|news|官网|官方|博客|新闻)\b",
+        " ",
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def ai_update_source_key(item: AIUpdateItem) -> str:
+    """Return the canonical source/vendor key used by every selection stage."""
+
+    label = _normalize_source_label(item.vendor or item.source_name)
+    if label:
+        return label
+    host = (urlsplit(item.url or "").hostname or "").lower().strip().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host or "unknown"
+
+
+def ai_digest_source_counts(items: list[AIUpdateItem]) -> dict[str, int]:
+    return dict(Counter(ai_update_source_key(item) for item in items))
+
+
 def _vendor_key(item: AIUpdateItem) -> str:
-    return (item.vendor or item.source_name or item.source_type or "unknown").strip().lower()
+    return ai_update_source_key(item)
 
 
 def _published_day_key(item: AIUpdateItem) -> str:
@@ -1002,8 +1031,7 @@ def _rebalance_vendor_concentration(
         return selected
 
     def source_key(item: AIUpdateItem) -> str:
-        value = (item.vendor or item.source_name or "").strip().lower()
-        return value or _selection_key(item)
+        return ai_update_source_key(item)
 
     balanced = list(selected)
     selected_keys = {_selection_key(item) for item in balanced}
@@ -1047,10 +1075,27 @@ def _select_with_ai_digest_quotas(
     target_count: int,
     min_domestic_model_count: int = 0,
     min_foreign_ai_count: int = 0,
+    max_items_per_source: int | None = AI_DIGEST_MAX_ITEMS_PER_SOURCE,
 ) -> list[AIUpdateItem]:
     target = max(1, int(target_count or 1))
-    selected = list(ranked[:target])
+    source_limit = None if max_items_per_source is None else max(1, int(max_items_per_source))
+    selected: list[AIUpdateItem] = []
+    source_counts: Counter[str] = Counter()
+    for item in ranked:
+        if len(selected) >= target:
+            break
+        key = ai_update_source_key(item)
+        if source_limit is not None and source_counts[key] >= source_limit:
+            continue
+        selected.append(item)
+        source_counts[key] += 1
     selected_keys = {_selection_key(item) for item in selected}
+
+    def can_add(item: AIUpdateItem) -> bool:
+        return (
+            _selection_key(item) not in selected_keys
+            and (source_limit is None or source_counts[ai_update_source_key(item)] < source_limit)
+        )
 
     def ensure_quota(predicate, minimum: int) -> None:
         nonlocal selected_keys
@@ -1060,7 +1105,7 @@ def _select_with_ai_digest_quotas(
                 (
                     item
                     for item in ranked
-                    if predicate(item) and _selection_key(item) not in selected_keys
+                    if predicate(item) and can_add(item)
                 ),
                 None,
             )
@@ -1082,22 +1127,42 @@ def _select_with_ai_digest_quotas(
             )
             if replace_index is None:
                 break
-            selected_keys.discard(_selection_key(selected[replace_index]))
+            removed = selected[replace_index]
+            removed_source = ai_update_source_key(removed)
+            candidate_source = ai_update_source_key(candidate)
+            if source_limit is not None and source_counts[candidate_source] >= source_limit:
+                break
+            selected_keys.discard(_selection_key(removed))
+            source_counts[removed_source] -= 1
             selected[replace_index] = candidate
             selected_keys.add(_selection_key(candidate))
+            source_counts[candidate_source] += 1
 
     ensure_quota(ai_update_is_domestic_model_news, min_domestic_model_count)
     ensure_quota(ai_update_is_foreign_ai_news, min_foreign_ai_count)
-    selected = _rebalance_vendor_concentration(
-        ranked,
-        selected,
-        max_per_vendor=2,
-        min_domestic_model_count=min_domestic_model_count,
-        min_foreign_ai_count=min_foreign_ai_count,
-    )
+    if source_limit is not None:
+        selected = _rebalance_vendor_concentration(
+            ranked,
+            selected,
+            max_per_vendor=source_limit,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+        )
 
     selected_keys = {_selection_key(item) for item in selected}
-    return [item for item in ranked if _selection_key(item) in selected_keys][:target]
+    output: list[AIUpdateItem] = []
+    output_counts: Counter[str] = Counter()
+    for item in ranked:
+        if _selection_key(item) not in selected_keys:
+            continue
+        source_key = ai_update_source_key(item)
+        if source_limit is not None and output_counts[source_key] >= source_limit:
+            continue
+        output.append(item)
+        output_counts[source_key] += 1
+        if len(output) >= target:
+            break
+    return output
 
 
 def rank_ai_updates(
@@ -1110,6 +1175,7 @@ def rank_ai_updates(
     now: datetime | date | None = None,
     min_domestic_model_count: int = 0,
     min_foreign_ai_count: int = 0,
+    max_items_per_source: int | None = AI_DIGEST_MAX_ITEMS_PER_SOURCE,
 ) -> list[AIUpdateItem]:
     target = max(1, int(target_count or 10))
     relevant = [
@@ -1140,6 +1206,7 @@ def rank_ai_updates(
             target_count=target,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=max_items_per_source,
         )
         if _meets_ai_digest_quotas(
             selected,
@@ -1157,6 +1224,7 @@ def rank_ai_updates(
             target_count=target,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=max_items_per_source,
         )
 
     official_ranked = _interleave_by_vendor_for_same_day(official_like, target_count=len(official_like))
@@ -1168,4 +1236,5 @@ def rank_ai_updates(
         target_count=target,
         min_domestic_model_count=min_domestic_model_count,
         min_foreign_ai_count=min_foreign_ai_count,
+        max_items_per_source=max_items_per_source,
     )

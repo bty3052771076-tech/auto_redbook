@@ -1801,7 +1801,19 @@ def _collect_draft_items(page, *, limit: Optional[int] = None) -> list[dict[str,
             saved_at = (item.locator(".draft-time").first.text_content() or "").strip()
         except Exception:
             saved_at = ""
-        items.append({"index": str(i), "title": title, "saved_at": saved_at})
+        cover_ready = False
+        try:
+            cover_ready = item.locator(".draft-cover img, .draft-cover video").count() > 0
+        except Exception:
+            pass
+        items.append(
+            {
+                "index": str(i),
+                "title": title,
+                "saved_at": saved_at,
+                "cover_ready": "1" if cover_ready else "0",
+            }
+        )
     return items
 
 
@@ -2687,14 +2699,112 @@ def _open_platform_draft_list(
 
 def _find_platform_draft_index_for_post(page, post: Post) -> tuple[Optional[int], dict[str, str]]:
     items = _collect_draft_items(page, limit=None)
+    saved_title = ""
+    try:
+        saved_title = str((post.platform.get("xhs_draft") or {}).get("title") or "").strip()
+    except Exception:
+        saved_title = ""
+    expected_titles = tuple(title for title in (saved_title, post.title) if title)
     for item in items:
-        if not _draft_item_matches_post(item, post):
+        if not any(_draft_title_matches_expected(str(item.get("title") or ""), title) for title in expected_titles):
             continue
         try:
             return int(item.get("index", "0")), item
         except ValueError:
             return 0, item
     return None, {}
+
+
+def run_collect_platform_drafts_sync(
+    *,
+    draft_type: str = "image",
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Read the current XHS draft list without editing, publishing or deleting.
+
+    This is intentionally a separate operation from ``run_publish_drafts_sync``
+    so callers can fail closed before asking the user to confirm a publish.
+    """
+
+    result: dict[str, Any] = {
+        "draft_type": draft_type,
+        "items": [],
+        "total": 0,
+        "errors": [],
+        "profile_dir": "",
+    }
+    profile_dir, channel, args = _resolve_profile_config()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    result["profile_dir"] = str(profile_dir)
+    headless_value = _resolve_headless(headless)
+    context = None
+    browser = None
+    should_close_context = True
+    try:
+        _emit_progress(
+            progress_callback,
+            "collect_platform_drafts",
+            "in_progress",
+            f"type={draft_type} profile={profile_dir} headless={headless_value}",
+        )
+        with sync_playwright() as p:
+            cdp_url = _resolve_cdp_url()
+            if cdp_url:
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                should_close_context = False
+            else:
+                launch_kwargs = {"headless": headless_value}
+                if channel:
+                    launch_kwargs["channel"] = channel
+                if args:
+                    launch_kwargs["args"] = args
+                context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
+            context.set_default_timeout(_context_default_timeout_ms(wait_timeout_ms))
+            page = context.new_page() if not should_close_context else (context.pages[0] if context.pages else context.new_page())
+            _open_platform_draft_list(
+                page,
+                draft_type=draft_type,
+                login_hold=login_hold,
+                wait_timeout_ms=wait_timeout_ms,
+                headless=headless_value,
+                progress_callback=progress_callback,
+            )
+            raw_items = _collect_draft_items(page, limit=None)
+            result["items"] = [
+                {
+                    **item,
+                    "draft_type": draft_type,
+                    "cover_ready": item.get("cover_ready") == "1",
+                }
+                for item in raw_items
+            ]
+            result["total"] = len(result["items"])
+            _emit_progress(
+                progress_callback,
+                "collect_platform_drafts",
+                "success",
+                f"type={draft_type} items={result['total']}",
+            )
+            return result
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        _emit_progress(progress_callback, "collect_platform_drafts", "failed", str(exc))
+        return result
+    finally:
+        try:
+            if context is not None and should_close_context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None and not should_close_context:
+                browser.close()
+        except Exception:
+            pass
 
 
 def _open_draft_editor_for_post(page, post: Post) -> dict[str, str]:

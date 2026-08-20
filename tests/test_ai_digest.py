@@ -5,7 +5,12 @@ from datetime import datetime, timedelta, timezone
 
 from src.ai_digest.models import AIUpdateItem
 from src.ai_digest import rank as rank_mod
-from src.ai_digest.rank import ai_digest_quota_counts, rank_ai_updates
+from src.ai_digest.rank import (
+    ai_digest_quota_counts,
+    ai_digest_source_counts,
+    ai_update_source_key,
+    rank_ai_updates,
+)
 
 
 def _item(
@@ -20,6 +25,7 @@ def _item(
     product: str = "AI",
     evidence_urls: list[str] | None = None,
     confidence_score: float = 0.0,
+    vendor: str | None = None,
 ) -> AIUpdateItem:
     return AIUpdateItem(
         title=title,
@@ -28,7 +34,7 @@ def _item(
         source_type=source_type,
         url=f"https://example.com/{title}" if url is None else url,
         published_at=published_at,
-        vendor=source_name,
+        vendor=source_name if vendor is None else vendor,
         product=product,
         raw_excerpt=raw_excerpt if raw_excerpt is not None else f"{title} raw excerpt",
         confidence_score=confidence_score,
@@ -108,7 +114,7 @@ def test_rank_ai_updates_keeps_distinct_official_updates_from_one_release_page()
 
 
 def test_rank_ai_updates_backfills_with_social_when_official_sources_are_too_few():
-    official = [_item(f"官方动态{i}", source_name="OpenAI") for i in range(3)]
+    official = [_item(f"官方动态{i}", source_name=f"OfficialVendor{i}") for i in range(3)]
     social = [
         _item(f"社交动态{i}", source_type="social", source_name="X", url=f"https://x.com/a/{i}")
         for i in range(12)
@@ -121,9 +127,9 @@ def test_rank_ai_updates_backfills_with_social_when_official_sources_are_too_few
         allow_social_backfill=True,
     )
 
-    assert len(ranked) == 10
+    assert len(ranked) == 5
     assert sum(1 for item in ranked if item.source_type == "official") == 3
-    assert sum(1 for item in ranked if item.source_type == "social") == 7
+    assert sum(1 for item in ranked if item.source_type == "social") == 2
 
 
 def test_rank_ai_updates_uses_official_then_aggregator_then_social_tiers():
@@ -157,7 +163,8 @@ def test_rank_ai_updates_uses_official_then_aggregator_then_social_tiers():
 
 
 def test_rank_ai_updates_excludes_social_only_when_official_sources_are_enough():
-    official = [_item(f"官方动态{i}", source_name="OpenAI") for i in range(10)]
+    vendors = ["OpenAI", "Anthropic", "Google", "Meta", "Mistral", "Cohere", "xAI", "DeepSeek", "Qwen", "智谱"]
+    official = [_item(f"官方动态{i}", source_name=vendors[i]) for i in range(10)]
     social = [
         _item(f"社交动态{i}", source_type="social", source_name="X", url=f"https://x.com/a/{i}")
         for i in range(4)
@@ -215,6 +222,49 @@ def test_rank_ai_updates_preserves_recent_official_vendor_diversity():
     vendors = [item.vendor for item in ranked]
     assert {"智谱 GLM", "MiniMax", "阿里云百炼"}.issubset(set(vendors))
     assert vendors.count("OpenAI") < 10
+
+
+def test_rank_ai_updates_never_selects_more_than_two_per_source():
+    items = [
+        _item(f"OpenAI update {index}", source_name="OpenAI", url=f"https://openai.com/news/{index}")
+        for index in range(5)
+    ] + [
+        _item(f"Anthropic update {index}", source_name="Anthropic", url=f"https://anthropic.com/news/{index}")
+        for index in range(3)
+    ]
+
+    ranked = rank_ai_updates(items, target_count=10, min_official_count=99)
+
+    counts = ai_digest_source_counts(ranked)
+    assert len(ranked) == 4
+    assert max(counts.values()) <= 2
+
+
+def test_source_key_normalizes_display_suffixes_and_falls_back_to_url_host():
+    official = _item(
+        "OpenAI release",
+        source_name="OpenAI Blog",
+        vendor="OpenAI Official",
+        url="https://openai.com/news/release",
+    )
+    aggregator = _item(
+        "OpenAI mirror",
+        source_name="AI HOT | OpenAI",
+        vendor="OpenAI",
+        source_type="aggregator",
+        url="https://aihot.virxact.com/item",
+    )
+    host_only = AIUpdateItem(
+        title="Host source",
+        url="https://www.example.org/post",
+        source_name="",
+        vendor="",
+        published_at="2026-06-30T08:00:00Z",
+    )
+
+    assert ai_update_source_key(official) == "openai"
+    assert ai_update_source_key(aggregator) == "openai"
+    assert ai_update_source_key(host_only) == "example.org"
 
 
 def test_rank_ai_updates_prefers_newer_official_items_before_confidence_boosts():
@@ -278,7 +328,7 @@ def test_rank_ai_updates_keeps_only_recent_linked_items_and_caps_twenty():
     fillers = [
         _item(
             f"三天内补充动态{i}",
-            source_name=f"Vendor{i % 5}",
+                source_name=f"Vendor{i}",
             published_at="2026-06-30T12:00:00Z",
             confidence_score=0.6,
         )

@@ -941,6 +941,58 @@ def _parse_seendate_utc(seendate: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _normalize_manual_material_time(value: str, *, tz_name: str = DEFAULT_TZ) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    tz = _resolve_tz(tz_name)
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=tz).isoformat()
+        except ValueError:
+            continue
+    parsed = _parse_seendate_utc(raw)
+    if parsed is None:
+        return ""
+    return parsed.astimezone(tz).isoformat()
+
+
+def resolve_manual_material_times(
+    items: list[NewsItem],
+    *,
+    default_material_time: str = "",
+    tz_name: str | None = None,
+) -> tuple[list[NewsItem], list[str]]:
+    """Resolve user-supplied material times without applying a recency window."""
+    resolved_default = _normalize_manual_material_time(
+        default_material_time,
+        tz_name=tz_name or os.getenv("NEWS_TZ") or DEFAULT_TZ,
+    )
+    if str(default_material_time or "").strip() and not resolved_default:
+        raise RuntimeError(
+            f"材料时间无法解析：默认材料时间为 {str(default_material_time).strip()!r}，"
+            "支持 YYYY-MM-DD 或 YYYY-MM-DD HH:MM。"
+        )
+    resolved_items: list[NewsItem] = []
+    resolved_times: list[str] = []
+    for index, item in enumerate(items, start=1):
+        raw_time = str(item.seendate or "").strip() or str(default_material_time or "").strip()
+        if not raw_time:
+            raise RuntimeError(f"材料时间缺失：第{index}条材料没有时间，请填写记录时间或默认材料时间。")
+        normalized = _normalize_manual_material_time(
+            raw_time,
+            tz_name=tz_name or os.getenv("NEWS_TZ") or DEFAULT_TZ,
+        )
+        if not normalized:
+            raise RuntimeError(
+                f"材料时间无法解析：第{index}条材料的时间为 {raw_time!r}，"
+                "支持 YYYY-MM-DD 或 YYYY-MM-DD HH:MM。"
+            )
+        resolved_items.append(replace(item, seendate=normalized))
+        resolved_times.append(normalized)
+    return resolved_items, resolved_times
+
+
 def _recent_news_day_window(
     *,
     tz_name: Optional[str] = None,
