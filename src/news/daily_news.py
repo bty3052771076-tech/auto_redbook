@@ -3028,6 +3028,32 @@ def load_single_news_material_file(path: str | Path) -> NewsItem:
     return items[0]
 
 
+def read_manual_material_source_info(path: str | Path) -> dict[str, Any]:
+    """Read safe provenance fields from a GUI text snapshot, never its body."""
+    info: dict[str, Any] = {"input_origin": "file"}
+    file_path = Path(path)
+    if file_path.suffix.lower() != ".json":
+        return info
+    try:
+        payload = json.loads(file_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        return info
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return info
+    origin = str(payload.get("input_origin") or "").strip()
+    if origin != "gui_text":
+        return info
+    info["input_origin"] = origin
+    info["schema_version"] = 1
+    raw_char_count = payload.get("raw_char_count")
+    if isinstance(raw_char_count, int) and raw_char_count >= 0:
+        info["raw_char_count"] = raw_char_count
+    raw_sha256 = str(payload.get("raw_sha256") or "").strip()
+    if raw_sha256 and len(raw_sha256) <= 128:
+        info["raw_sha256"] = raw_sha256
+    return info
+
+
 def fetch_daily_news_candidates(
     prompt_hint: str,
     *,

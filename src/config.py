@@ -251,7 +251,11 @@ def _load_aliyun_llm_configs(*, default_to_all_free_models: bool = False) -> lis
     ]
 
 
-def _load_volcengine_llm_configs(*, include_default_model: bool = True) -> list[LLMConfig]:
+def _load_volcengine_llm_configs(
+    *,
+    include_default_model: bool = True,
+    preserve_model_id: bool = False,
+) -> list[LLMConfig]:
     env_key = (
         os.getenv("VOLCENGINE_LLM_API_KEY")
         or os.getenv("VOLCENGINE_API_KEY")
@@ -275,7 +279,7 @@ def _load_volcengine_llm_configs(*, include_default_model: bool = True) -> list[
 
     return [
         LLMConfig(
-            model=_canonical_volcengine_model(m),
+            model=m if preserve_model_id else _canonical_volcengine_model(m),
             api_key=api_key,
             base_url=base_url,
             provider="volcengine",
@@ -363,7 +367,12 @@ def load_llm_configs(
         )
 
     if provider in ("auto", "volcengine"):
-        configs.extend(_load_volcengine_llm_configs(include_default_model=provider != "auto"))
+        configs.extend(
+            _load_volcengine_llm_configs(
+                include_default_model=provider != "auto",
+                preserve_model_id=_env_enabled("VOLCENGINE_PRESERVE_MODEL_ID"),
+            )
+        )
 
     if provider in ("auto", "siliconflow"):
         configs.extend(_load_siliconflow_llm_configs(include_default_model=provider != "auto"))

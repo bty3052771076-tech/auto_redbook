@@ -60,3 +60,6 @@ dist/
 
 # Local GUI launcher binary (optional)
 AutoRedbookGUI*.exe
+
+# Local root backups
+*.bak/

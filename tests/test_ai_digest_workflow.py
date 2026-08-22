@@ -264,6 +264,51 @@ def test_fit_ai_digest_items_to_body_capacity_fits_all_without_links():
     assert "https://" not in body
 
 
+def test_ai_digest_llm_input_preserves_preselected_source_diverse_items():
+    selected = _distinct_updates(8)
+
+    llm_items = create_post._prepare_ai_digest_llm_items(
+        selected,
+        target_count=8,
+    )
+
+    assert len(llm_items) == 8
+    assert [item.url for item in llm_items] == [item.url for item in selected]
+
+
+def test_ai_digest_fallback_uses_raw_pool_when_prepared_selection_is_short():
+    prepared = _distinct_updates(5)
+    raw_pool = _distinct_updates(8)
+
+    fallback_items = create_post._select_ai_digest_fallback_pool(
+        prepared,
+        raw_pool,
+        target_count=8,
+    )
+
+    assert len(fallback_items) == 8
+    assert [item.url for item in fallback_items] == [item.url for item in raw_pool]
+
+
+def test_ai_digest_llm_result_is_not_reranked_after_provenance_restore():
+    brief = AIDigestBrief(
+        title="姣忔棩AI璁伅",
+        subtitle="妯″瀷鏇存柊",
+        date="2026-08-20",
+        items=_distinct_updates(8),
+    )
+
+    finalized = create_post._finalize_ai_digest_brief(
+        brief,
+        generation_mode="llm",
+        target_count=8,
+        min_official_count=5,
+        max_age_days=14,
+    )
+
+    assert [item.url for item in finalized.items] == [item.url for item in brief.items]
+
+
 def test_create_daily_ai_digest_posts_sends_thirteen_strict_items_to_rewrite_llm(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AI_DIGEST_TARGET_ITEMS", raising=False)
@@ -957,7 +1002,8 @@ def test_create_daily_ai_digest_posts_falls_back_when_llm_breaks_quota(monkeypat
     meta = post.platform["ai_digest"]
 
     assert meta["generation_mode"] == "llm_quota_fallback"
-    assert "信源多样性不足" in meta["llm_error"]
+    assert "信源" in meta["llm_error"]
+    assert "上限" in meta["llm_error"]
     assert 8 <= meta["actual_items"] <= 20
     assert meta["quota_counts"]["domestic_model"] >= 3
     assert meta["quota_counts"]["foreign_ai"] >= 3

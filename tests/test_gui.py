@@ -65,6 +65,9 @@ from apps.gui import (
     load_env_file,
     load_latest_quota_snapshots,
     load_latest_source_health_snapshots,
+    model_options_from_quota_rows,
+    prepare_material_quota_rows,
+    select_material_quota_rows,
     merge_model_option_values,
     normalize_optional_day_count,
     open_xhs_creator,
@@ -1291,6 +1294,151 @@ def test_gui_has_separate_material_posting_page_and_local_draft_label():
     assert 'nb.add(tab_run, text="本地草稿处理")' in source
 
 
+def test_material_page_has_independent_model_selectors_and_environment():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
+
+    assert "material_llm_provider_var" in source
+    assert "material_llm_model_var" in source
+    assert "material_image_provider_var" in source
+    assert "material_image_model_var" in source
+    assert "def _material_env()" in source
+    assert '"image_source": material_image_provider_var.get()' in source
+    assert "_run_command(\"auto\", params, _material_env())" in source
+    assert "模型额度与自动发帖页共享" not in source
+    assert "material_quota_panel" in source
+    assert "select_material_quota_rows" in source
+    assert "prepare_material_quota_rows" in source
+    assert "material_quota_provider_values" in source
+    assert "material_quota_search_var" in source
+    assert "material_quota_sort_var" in source
+    assert "同步免费额度" in source
+    assert "material_quota_refresh_callback" in source
+    assert "model_options_refresh_callback" in source
+    assert "model_options_from_quota_rows" in source
+
+
+def test_material_quota_rows_follow_material_model_selection():
+    rows = [
+        QuotaDashboardRow(
+            provider="aliyun",
+            model="qwen3.7-plus",
+            kind="llm",
+            status="available",
+            remaining=80,
+            total=100,
+            percent=0.8,
+            display_value="80 / 100 token",
+        ),
+        QuotaDashboardRow(
+            provider="volcengine",
+            model="deepseek-v4-flash",
+            kind="llm",
+            status="available",
+            remaining=900,
+            total=1000,
+            percent=0.9,
+            display_value="900 / 1000 token",
+        ),
+        QuotaDashboardRow(
+            provider="siliconflow",
+            model="Kwai-Kolors/Kolors",
+            kind="image",
+            status="available",
+            remaining=7,
+            total=10,
+            percent=0.7,
+            display_value="7 / 10 image",
+        ),
+    ]
+
+    selected = select_material_quota_rows(
+        rows,
+        llm_provider="volcengine",
+        llm_model="deepseek-v4-flash",
+        image_provider="siliconflow",
+        image_model="Kwai-Kolors/Kolors",
+    )
+
+    assert [(row.provider, row.model, row.kind) for row in selected] == [
+        ("volcengine", "deepseek-v4-flash", "llm"),
+        ("siliconflow", "Kwai-Kolors/Kolors", "image"),
+    ]
+
+    auto_rows = select_material_quota_rows(
+        rows,
+        llm_provider="auto",
+        llm_model="自动模型列表（顺序回退）",
+        image_provider="auto",
+        image_model="",
+    )
+    assert len(auto_rows) == 3
+    assert auto_rows[0].model == "deepseek-v4-flash"
+
+
+def test_material_quota_view_keeps_all_platforms_and_supports_provider_filter():
+    rows = [
+        QuotaDashboardRow(provider="aliyun", model="qwen3.7-plus", kind="llm", remaining=80),
+        QuotaDashboardRow(provider="volcengine", model="deepseek-v4-flash", kind="llm", remaining=900),
+        QuotaDashboardRow(provider="siliconflow", model="Kwai-Kolors/Kolors", kind="image", remaining=7),
+    ]
+
+    all_rows = prepare_material_quota_rows(rows)
+    assert {row.provider for row in all_rows} == {"aliyun", "volcengine", "siliconflow"}
+
+    volc_rows = prepare_material_quota_rows(rows, provider="volcengine")
+    assert [(row.provider, row.model) for row in volc_rows] == [
+        ("volcengine", "deepseek-v4-flash")
+    ]
+
+    image_rows = prepare_material_quota_rows(rows, query="Kolors")
+    assert [(row.provider, row.model) for row in image_rows] == [
+        ("siliconflow", "Kwai-Kolors/Kolors")
+    ]
+
+
+def test_model_options_from_quota_rows_replace_static_options_after_sync():
+    rows = [
+        QuotaDashboardRow(
+            provider="volcengine",
+            model="new-volc-llm",
+            kind="llm",
+            status="expired",
+        ),
+        QuotaDashboardRow(
+            provider="volcengine",
+            model="new-volc-image",
+            kind="image",
+            status="available",
+        ),
+        QuotaDashboardRow(
+            provider="volcengine",
+            model="old-audio-model",
+            kind="unknown",
+            status="available",
+        ),
+    ]
+
+    assert model_options_from_quota_rows(
+        rows,
+        provider="volcengine",
+        kind="llm",
+        fallback=("old-static-model",),
+    ) == ("new-volc-llm",)
+    assert model_options_from_quota_rows(
+        rows,
+        provider="volcengine",
+        kind="image",
+        fallback=("old-static-image",),
+    ) == ("new-volc-image",)
+    assert model_options_from_quota_rows(
+        [],
+        provider="volcengine",
+        kind="llm",
+        fallback=("old-static-model",),
+    ) == ("old-static-model",)
+
+
 def test_gui_has_daily_ai_digest_quick_title_button():
     root = Path(__file__).resolve().parents[1]
     source = (root / "apps" / "gui.py").read_text(encoding="utf-8")
@@ -1311,11 +1459,12 @@ def test_auto_tab_uses_multiple_prompt_entry_boxes():
     assert "lookback_days_var" in source
     assert "AUTO_REDBOOK_GUI_LOOKBACK_DAYS" in source
     assert "--lookback-days" in source
-    assert "single_news_material_file_var" in source
-    assert "multi_news_materials_file_var" in source
-    assert "--single-news-material-file" in source
-    assert "news_materials_file_var" in source
-    assert "--news-materials-file" in source
+    assert "single_news_material_file_var" not in source
+    assert "multi_news_materials_file_var" not in source
+    assert "news_materials_file_var" not in source
+    assert '_add_scrollable_tab("材料发帖")' in source
+    assert "material_input_mode_var" in source
+    assert "prepare_material_text_snapshot" in source
     assert 'text="关键词"' in source
     assert "--keywords" in source
 
@@ -1397,6 +1546,24 @@ def test_build_cli_args_auto_single_news_material_forces_one_without_prompt_or_l
     assert "--lookback-days" not in args
     count_idx = args.index("--count")
     assert args[count_idx + 1] == "1"
+
+
+def test_build_cli_args_material_text_uses_snapshot_path_not_raw_body():
+    body = "这是一段不应出现在命令行中的材料正文。"
+    args = build_cli_args(
+        "auto",
+        params={
+            "title": "每日新闻",
+            "single_news_material_file": "data/manual_materials/gui_text/snapshot.json",
+            "material_text": body,
+            "material_time": "2026-08-20 10:00",
+            "count": 1,
+        },
+    )
+
+    assert "data/manual_materials/gui_text/snapshot.json" in args
+    assert body not in args
+    assert "--material-text" not in args
 
 
 def test_build_cli_args_auto_rejects_both_single_and_multi_news_materials():

@@ -38,6 +38,19 @@ def test_volcengine_llm_provider_builds_multiple_configs(monkeypatch):
     assert all(c.base_url == DEFAULT_VOLCENGINE_LLM_BASE_URL for c in cfgs)
 
 
+def test_free_quota_model_id_is_preserved_for_runtime_endpoint(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "volcengine")
+    monkeypatch.setenv("VOLCENGINE_API_KEY", "dummy-volc")
+    monkeypatch.setenv("VOLCENGINE_LLM_MODEL", "deepseek-v4-flash")
+    monkeypatch.delenv("VOLCENGINE_LLM_MODELS", raising=False)
+    monkeypatch.setenv("VOLCENGINE_PRESERVE_MODEL_ID", "1")
+
+    cfgs = load_llm_configs(llm_file=Path("does_not_exist"))
+
+    assert len(cfgs) == 1
+    assert cfgs[0].model == "deepseek-v4-flash"
+
+
 def test_auto_provider_does_not_assume_a_default_volcengine_model_has_free_quota(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("LLM_PROVIDER", "auto")

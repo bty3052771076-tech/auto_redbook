@@ -50,6 +50,7 @@ from src.news.daily_news import (
     load_single_news_material_file,
     pick_news_items,
     rank_news_candidate_pool,
+    read_manual_material_source_info,
     resolve_manual_material_times,
 )
 from src.storage.files import copy_assets_into_post, list_posts, post_dir, save_post, save_revision
@@ -3150,6 +3151,7 @@ def _fetch_daily_news_candidates_for_upload(
         raise RuntimeError("single_news_material_file and news_materials_file are mutually exclusive")
     if single_material_path:
         item = load_single_news_material_file(single_material_path)
+        manual_source_info = read_manual_material_source_info(single_material_path)
         tz_name = os.getenv("NEWS_TZ") or "Asia/Shanghai"
         resolved_items, resolved_times = resolve_manual_material_times(
             [item],
@@ -3176,6 +3178,7 @@ def _fetch_daily_news_candidates_for_upload(
             "used_today_range": False,
             "manual_materials": {
                 "file_path": single_material_path,
+                **manual_source_info,
                 "count": 1,
                 "mode": "single",
                 "default_material_time": material_time,
@@ -3280,9 +3283,11 @@ def _fetch_daily_news_candidates_for_upload(
             raise RuntimeError(
                 f"材料候选不足：需要至少 {material_target_count} 条材料，当前只有 {len(selected_candidates)} 条。"
             )
+        manual_source_info = read_manual_material_source_info(multi_material_path)
         meta["provider"] = "manual"
         meta["manual_materials"] = {
             "file_path": multi_material_path,
+            **manual_source_info,
             "count": len(resolved_candidates),
             "mode": "multiple",
             "default_material_time": material_time,
@@ -4229,6 +4234,66 @@ def _rank_brief_ai_digest_items(
         min_foreign_ai_count=min_foreign_ai_count,
     )
     return _with_ai_digest_items(brief, ranked)
+
+
+def _finalize_ai_digest_brief(
+    brief: AIDigestBrief,
+    *,
+    generation_mode: str,
+    target_count: int,
+    min_official_count: int,
+    max_age_days: int,
+    min_domestic_model_count: int = 0,
+    min_foreign_ai_count: int = 0,
+) -> AIDigestBrief:
+    """Keep a validated LLM rewrite intact; only rank deterministic fallbacks."""
+    if generation_mode == "llm":
+        return brief
+    return _rank_brief_ai_digest_items(
+        brief,
+        target_count=target_count,
+        min_official_count=min_official_count,
+        max_age_days=max_age_days,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+    )
+
+
+def _prepare_ai_digest_llm_items(
+    items: Iterable[AIUpdateItem],
+    *,
+    target_count: int,
+) -> list[AIUpdateItem]:
+    """Pass the already validated selection to the rewrite model unchanged.
+
+    The adaptive selector and body-capacity pass already enforce freshness,
+    quotas, deduplication, and the per-source cap. Re-ranking here can remove
+    an item between selection and provenance restoration, leaving the LLM with
+    fewer traceable inputs than the requested output count.
+    """
+    selected = list(items or [])
+    target = max(1, int(target_count or 1))
+    if len(selected) < target:
+        raise RuntimeError(
+            "daily ai digest LLM input selection is shorter than the requested count: "
+            f"{len(selected)} < {target}"
+        )
+    return selected[:target]
+
+
+def _select_ai_digest_fallback_pool(
+    prepared_items: Iterable[AIUpdateItem],
+    raw_items: Iterable[AIUpdateItem],
+    *,
+    target_count: int,
+) -> list[AIUpdateItem]:
+    """Prefer the validated selection, but recover from the full raw pool if it was shortened."""
+    prepared = list(prepared_items or [])
+    target = max(1, int(target_count or 1))
+    if len(prepared) >= target:
+        return prepared
+    raw = list(raw_items or [])
+    return raw if len(raw) >= target else prepared
 
 
 def _build_quota_safe_ai_digest_fallback(
@@ -5204,17 +5269,15 @@ def create_daily_ai_digest_posts(
     generation_target = target_count
     generation_mode = "llm"
     llm_error = ""
-    llm_items = rank_ai_updates(
-        list(items or []),
-        target_count=generation_target,
-        min_official_count=effective_min_official_count,
-        allow_social_backfill=True,
-        max_age_days=max_age_days,
-        min_domestic_model_count=min_domestic_model_count,
-        min_foreign_ai_count=min_foreign_ai_count,
-    )
+    llm_items = _prepare_ai_digest_llm_items(items, target_count=generation_target)
     source_meta["llm_input_items"] = len(llm_items)
     source_meta["llm_input_quota_counts"] = ai_digest_quota_counts(llm_items)
+    if progress is not None:
+        progress(
+            "llm_input",
+            f"selected={len(llm_items)}/{generation_target} "
+            f"sources={len(ai_digest_source_counts(llm_items))}",
+        )
     try:
         generation_cfgs = llm_configs_cache if llm_configs_cache is not None else load_llm_configs()
         brief = generate_ai_digest_brief_with_llm(
@@ -5229,16 +5292,22 @@ def create_daily_ai_digest_posts(
         llm_error = str(exc)
         if progress is not None:
             progress("llm_selection", f"failed error={llm_error}; using quota-safe fallback")
-        brief = _build_quota_safe_ai_digest_fallback(
+        fallback_items = _select_ai_digest_fallback_pool(
             items,
+            raw_items_for_fallback,
+            target_count=generation_target,
+        )
+        brief = _build_quota_safe_ai_digest_fallback(
+            fallback_items,
             target_count=generation_target,
             min_official_count=effective_min_official_count,
             max_age_days=max_age_days,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
         )
-    brief = _rank_brief_ai_digest_items(
+    brief = _finalize_ai_digest_brief(
         brief,
+        generation_mode=generation_mode,
         target_count=generation_target,
         min_official_count=effective_min_official_count,
         max_age_days=max_age_days,

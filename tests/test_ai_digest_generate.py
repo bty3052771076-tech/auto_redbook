@@ -552,6 +552,76 @@ def test_generate_ai_digest_brief_dedupes_duplicate_urls_and_fills_from_unused_s
     assert all(not item.title.startswith("动态") for item in brief.items)
 
 
+def test_generate_ai_digest_brief_binds_url_less_items_to_distinct_sources(monkeypatch):
+    sources = [
+        AIUpdateItem(
+            title="OpenAI绉戠爺鏅鸿兘浣撴姤鍛?",
+            summary="OpenAI灞曠ず绉戠爺鏅鸿兘浣撳浣曞府鍔╃瀛﹁绠椼€?",
+            source_name="OpenAI",
+            source_type="official",
+            url="https://openai.com/news/science-agent",
+            published_at="2026-08-20T08:00:00Z",
+            vendor="OpenAI",
+            raw_excerpt="OpenAI scientific agent report.",
+        ),
+        AIUpdateItem(
+            title="DeepSeek妯″瀷API鏇存柊",
+            summary="DeepSeek API妯″瀷鏇存柊锛岄噸鐐瑰叧娉ㄦā鍨嬭姹傚拰绋冲畾鎬с€?",
+            source_name="DeepSeek",
+            source_type="official",
+            url="https://api-docs.deepseek.com/updates/model-api",
+            published_at="2026-08-20T09:00:00Z",
+            vendor="DeepSeek",
+            raw_excerpt="DeepSeek model API update.",
+        ),
+    ]
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": __import__("json").dumps(
+                        {
+                            "title": "姣忔棩AI璁伅",
+                            "subtitle": "妯″瀷鏇存柊",
+                            "date": "2026-08-20",
+                            "items": [
+                                {
+                                    "title": "OpenAI绉戠爺AI鏅鸿兘浣撴洿鏂?",
+                                    "summary": "OpenAI绉戠爺鏅鸿兘浣撴洿鏂般€?",
+                                    "url": "",
+                                    "tags": ["AI"],
+                                },
+                                {
+                                    "title": "OpenAI绉戠爺AI鏅鸿兘浣撳欢浼?",
+                                    "summary": "OpenAI绉戠爺AI鏅鸿兘浣撳欢浼般€?",
+                                    "url": "",
+                                    "tags": ["AI"],
+                                },
+                            ],
+                            "source_summary": "瀹樻柟鏉ユ簮",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            )()
+
+    monkeypatch.setattr("src.ai_digest.generate.init_chat_model", lambda *_args, **_kwargs: FakeModel())
+
+    brief = generate_ai_digest_brief_with_llm(
+        [LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.com", provider="test")],
+        sources,
+        target_count=2,
+        date="2026-08-20",
+    )
+
+    assert len(brief.items) == 2
+    assert {item.url for item in brief.items} == {source.url for source in sources}
+    assert {item.vendor for item in brief.items} == {"OpenAI", "DeepSeek"}
+
+
 @pytest.mark.parametrize(
     "unsupported_claim",
     ["仅限付费计划使用", "附带使用限制，企业需关注许可条款"],

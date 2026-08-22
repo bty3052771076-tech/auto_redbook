@@ -134,6 +134,9 @@ class FreeModelPlan:
         elif self.llm.provider == "volcengine":
             values["VOLCENGINE_LLM_MODEL"] = self.llm.model
             values["VOLCENGINE_LLM_MODELS"] = self.llm.model
+            # Quota snapshots contain the currently callable Ark model ID.
+            # Do not rewrite it through the historical display-name aliases.
+            values["VOLCENGINE_PRESERVE_MODEL_ID"] = "1"
         elif self.llm.provider == "siliconflow":
             values["SILICONFLOW_LLM_MODEL"] = self.llm.model
             values["SILICONFLOW_LLM_MODELS"] = self.llm.model

@@ -41,6 +41,8 @@ from src.publish.draft_inventory import (
     platform_records_from_items,
 )
 from src.publish.playwright_steps import run_collect_platform_drafts_sync
+from src.news.daily_news import parse_manual_news_materials
+from src.news.manual_material_input import prepare_material_text_snapshot
 from src.workflow.create_post import DEFAULT_EVALUATION_VIEWPOINT
 
 
@@ -1021,6 +1023,116 @@ def prepare_quota_dashboard_rows(
 ) -> list[QuotaDashboardRow]:
     filtered = filter_quota_dashboard_rows(rows, query)
     return sort_quota_dashboard_rows(filtered, sort_key, descending=descending)
+
+
+def select_material_quota_rows(
+    rows: Iterable[QuotaDashboardRow],
+    *,
+    llm_provider: str,
+    llm_model: str,
+    image_provider: str,
+    image_model: str,
+) -> list[QuotaDashboardRow]:
+    """Select the quota rows relevant to the material-posting model panel."""
+
+    items = list(rows)
+    selected: list[QuotaDashboardRow] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_matches(kind: str, provider: str, model: str) -> None:
+        normalized_provider = (provider or "auto").strip().lower()
+        normalized_model = (model or "").strip().lower()
+        if normalized_provider in {"local", "pexels"}:
+            return
+        for row in items:
+            row_kind = _quota_selectable_kind(row.kind, row.model)
+            if row_kind != kind:
+                continue
+            row_provider = (row.provider or "").strip().lower()
+            row_model = (row.model or "").strip().lower()
+            if normalized_provider != "auto" and row_provider != normalized_provider:
+                continue
+            if normalized_provider != "auto" and normalized_model and row_model != normalized_model:
+                continue
+            key = (row_provider, row_model, row_kind)
+            if key not in seen:
+                selected.append(row)
+                seen.add(key)
+
+    add_matches("llm", llm_provider, llm_model)
+    add_matches("image", image_provider, image_model)
+
+    def sort_key(row: QuotaDashboardRow) -> tuple[int, float, int, str, str]:
+        remaining = row.remaining
+        if remaining is None:
+            return (1, 0.0, _QUOTA_KIND_ORDER.get(row.kind, 99), row.provider, row.model)
+        return (
+            0,
+            -float(remaining),
+            _QUOTA_KIND_ORDER.get(row.kind, 99),
+            row.provider,
+            row.model,
+        )
+
+    return sorted(selected, key=sort_key)
+
+
+def prepare_material_quota_rows(
+    rows: Iterable[QuotaDashboardRow],
+    *,
+    provider: str = "all",
+    query: str = "",
+    sort_key: str = "default",
+    descending: bool = False,
+) -> list[QuotaDashboardRow]:
+    """Prepare the full provider quota view used by the material page."""
+
+    normalized_provider = (provider or "all").strip().lower()
+    items = list(rows)
+    if normalized_provider not in {"", "all"}:
+        items = [
+            row
+            for row in items
+            if (row.provider or "").strip().lower() == normalized_provider
+        ]
+    return prepare_quota_dashboard_rows(
+        items,
+        query=query,
+        sort_key=sort_key,
+        descending=descending,
+    )
+
+
+def model_options_from_quota_rows(
+    rows: Iterable[QuotaDashboardRow],
+    *,
+    provider: str,
+    kind: str,
+    fallback: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Return the current platform model IDs, falling back only without a snapshot."""
+
+    normalized_provider = (provider or "").strip().lower()
+    normalized_kind = (kind or "").strip().lower()
+    items = list(rows)
+    provider_rows = [
+        row
+        for row in items
+        if (row.provider or "").strip().lower() == normalized_provider
+    ]
+    if not provider_rows:
+        return tuple(dict.fromkeys(str(model).strip() for model in fallback if str(model).strip()))
+
+    options: list[str] = []
+    seen: set[str] = set()
+    for row in provider_rows:
+        inferred_kind = _quota_selectable_kind(row.kind, row.model)
+        model = (row.model or "").strip()
+        if inferred_kind != normalized_kind or not model or model in seen:
+            continue
+        options.append(model)
+        seen.add(model)
+    return tuple(options)
 
 
 def load_latest_quota_snapshots(
@@ -2555,6 +2667,8 @@ def main() -> None:
     quota_sort_desc_var = tk.BooleanVar(value=False)
     quota_sync_headless_var = tk.BooleanVar(value=False)
     quota_sync_visible_only_var = tk.BooleanVar(value=False)
+    model_options_refresh_callback: Callable[[], None] | None = None
+    material_quota_refresh_callback: Callable[[], None] | None = None
 
     quota_header = ttk.Frame(quota_dashboard_panel, style="Panel.TFrame")
     quota_header.pack(fill="x", padx=10, pady=(10, 6))
@@ -2792,6 +2906,10 @@ def main() -> None:
         snapshots = load_latest_quota_snapshots()
         quota_dashboard_all_rows = build_quota_dashboard_rows(snapshots)
         _apply_quota_dashboard_view()
+        if model_options_refresh_callback is not None:
+            model_options_refresh_callback()
+        if material_quota_refresh_callback is not None:
+            material_quota_refresh_callback()
 
     def _show_right_bottom_panel(mode: str) -> None:
         preview_panel.pack_forget()
@@ -3126,10 +3244,6 @@ def main() -> None:
     assets_var = tk.StringVar(value=DEFAULT_ASSETS_GLOB)
     count_var = tk.IntVar(value=1)
     lookback_days_var = tk.StringVar(value="")
-    single_news_material_file_var = tk.StringVar(value="")
-    multi_news_materials_file_var = tk.StringVar(value="")
-    news_materials_file_var = multi_news_materials_file_var
-    news_material_mode_var = tk.StringVar(value="online")
     no_copy_var = tk.BooleanVar(value=False)
     dry_run_var = tk.BooleanVar(value=False)
     headless_var = tk.BooleanVar(value=False)
@@ -3209,126 +3323,6 @@ def main() -> None:
         wraplength=620,
     ).grid(row=7, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=5)
 
-    ttk.Label(auto_grid, text="材料模式").grid(row=8, column=0, sticky="nw", pady=5)
-    material_mode_frame = ttk.Frame(auto_grid, style="Panel.TFrame")
-    material_mode_frame.grid(row=8, column=1, columnspan=3, sticky="w", pady=5, padx=(10, 0))
-    ttk.Radiobutton(
-        material_mode_frame,
-        text="实时检索",
-        value="online",
-        variable=news_material_mode_var,
-    ).pack(side="left")
-    ttk.Radiobutton(
-        material_mode_frame,
-        text="单条材料（固定生成 1 条）",
-        value="single",
-        variable=news_material_mode_var,
-    ).pack(side="left", padx=(16, 0))
-    ttk.Radiobutton(
-        material_mode_frame,
-        text="多条材料（继续筛选）",
-        value="multiple",
-        variable=news_material_mode_var,
-    ).pack(side="left", padx=(16, 0))
-
-    material_file_label = ttk.Label(auto_grid, text="")
-    material_file_label.grid(row=9, column=0, sticky="w", pady=5)
-    single_materials_frame = ttk.Frame(auto_grid)
-    single_materials_frame.grid(row=9, column=1, columnspan=3, sticky="we", pady=5, padx=(10, 0))
-    single_materials_frame.columnconfigure(0, weight=1)
-    ttk.Entry(single_materials_frame, textvariable=single_news_material_file_var, font=base_font).grid(
-        row=0,
-        column=0,
-        sticky="we",
-    )
-
-    def _choose_single_news_material_file() -> None:
-        path = filedialog.askopenfilename(
-            title="选择每日新闻单条材料文件",
-            initialdir=str(PROJECT_ROOT),
-            filetypes=[
-                ("新闻材料", "*.md *.txt *.json *.jsonl"),
-                ("Markdown", "*.md"),
-                ("Text", "*.txt"),
-                ("JSON", "*.json *.jsonl"),
-                ("All files", "*.*"),
-            ],
-        )
-        if path:
-            single_news_material_file_var.set(path)
-
-    ttk.Button(single_materials_frame, text="浏览", command=_choose_single_news_material_file).grid(
-        row=0,
-        column=1,
-        sticky="e",
-        padx=(8, 0),
-    )
-    materials_frame = ttk.Frame(auto_grid)
-    materials_frame.grid(row=9, column=1, columnspan=3, sticky="we", pady=5, padx=(10, 0))
-    materials_frame.columnconfigure(0, weight=1)
-    ttk.Entry(materials_frame, textvariable=news_materials_file_var, font=base_font).grid(
-        row=0,
-        column=0,
-        sticky="we",
-    )
-
-    def _choose_news_materials_file() -> None:
-        path = filedialog.askopenfilename(
-            title="选择每日新闻材料文件",
-            initialdir=str(PROJECT_ROOT),
-            filetypes=[
-                ("新闻材料", "*.md *.txt *.json *.jsonl"),
-                ("Markdown", "*.md"),
-                ("Text", "*.txt"),
-                ("JSON", "*.json *.jsonl"),
-                ("All files", "*.*"),
-            ],
-        )
-        if path:
-            news_materials_file_var.set(path)
-
-    ttk.Button(materials_frame, text="浏览", command=_choose_news_materials_file).grid(
-        row=0,
-        column=1,
-        sticky="e",
-        padx=(8, 0),
-    )
-    material_hint_var = tk.StringVar(value="")
-    ttk.Label(
-        auto_grid,
-        textvariable=material_hint_var,
-        style="PanelMuted.TLabel",
-        wraplength=760,
-    ).grid(row=10, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
-
-    def _sync_material_mode(*_args) -> None:
-        mode = news_material_mode_var.get().strip().lower()
-        single_materials_frame.grid_remove()
-        materials_frame.grid_remove()
-        if mode == "single":
-            material_file_label.configure(text="单条新闻材料文件")
-            material_hint_var.set("固定使用文件中的一条新闻生成 1 条草稿；忽略关键词和数量，但来源日期仍须在北京时间两日内。")
-            single_materials_frame.grid()
-            return
-        if mode == "multiple":
-            material_file_label.configure(text="多条新闻材料文件")
-            material_hint_var.set("从文件候选池中按关键词、数量和两日时效继续筛选；支持标题、时间、来源、链接、内容字段。")
-            materials_frame.grid()
-            return
-        material_file_label.configure(text="")
-        material_hint_var.set("实时检索会按每个关键词建立候选池，再结合新鲜度、热度和来源多样性筛选。")
-
-    news_material_mode_var.trace_add("write", _sync_material_mode)
-    _sync_material_mode()
-    for _legacy_material_widget in (
-        material_mode_frame,
-        material_file_label,
-        single_materials_frame,
-        materials_frame,
-    ):
-        _legacy_material_widget.grid_remove()
-    for _legacy_material_hint in auto_grid.grid_slaves(row=10):
-        _legacy_material_hint.grid_remove()
     auto_grid.pack(fill="x")
 
     model_panel = ttk.Frame(tab_auto, style="Panel.TFrame", padding=(12, 10))
@@ -3407,48 +3401,87 @@ def main() -> None:
     def _sync_llm_model_values(*_args) -> None:
         provider = llm_provider_var.get().strip().lower()
         if provider == "aliyun":
-            values = ALIYUN_LLM_MODEL_OPTIONS
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="aliyun",
+                    kind="llm",
+                    fallback=ALIYUN_LLM_MODEL_OPTIONS,
+                )
+            )
             fallback = DEFAULT_ALIYUN_LLM_MODEL
         elif provider == "volcengine":
-            values = VOLCENGINE_LLM_MODEL_OPTIONS
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="volcengine",
+                    kind="llm",
+                    fallback=VOLCENGINE_LLM_MODEL_OPTIONS,
+                )
+            )
             fallback = DEFAULT_VOLCENGINE_LLM_MODEL
         elif provider == "ppinfra":
             values = PPINFRA_LLM_MODEL_OPTIONS
             fallback = DEFAULT_LLM_MODEL
         elif provider == "siliconflow":
-            values = SILICONFLOW_LLM_MODEL_OPTIONS
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="siliconflow",
+                    kind="llm",
+                    fallback=SILICONFLOW_LLM_MODEL_OPTIONS,
+                )
+            )
             fallback = DEFAULT_SILICONFLOW_LLM_MODEL
         else:
-            values = (
-                [AUTO_LLM_MODEL_OPTION]
-                + ALIYUN_LLM_MODEL_OPTIONS
-                + VOLCENGINE_LLM_MODEL_OPTIONS
-                + SILICONFLOW_LLM_MODEL_OPTIONS
-                + PPINFRA_LLM_MODEL_OPTIONS
-            )
+            values = [AUTO_LLM_MODEL_OPTION]
             fallback = AUTO_LLM_MODEL_OPTION
         llm_model_box["values"] = values
         if llm_model_var.get() not in values:
-            llm_model_var.set(fallback)
+            llm_model_var.set(values[0] if values else fallback)
 
     def _sync_image_model_state(*_args) -> None:
         source = normalize_image_source(image_provider_var.get())
         if source == "auto":
             image_model_box.configure(state="disabled")
         elif source == "aliyun":
-            image_model_box["values"] = ALIYUN_IMAGE_MODEL_OPTIONS
-            if image_model_var.get() not in ALIYUN_IMAGE_MODEL_OPTIONS:
-                image_model_var.set(DEFAULT_ALIYUN_IMAGE_MODELS)
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="aliyun",
+                    kind="image",
+                    fallback=ALIYUN_IMAGE_MODEL_OPTIONS,
+                )
+            )
+            image_model_box["values"] = values
+            if image_model_var.get() not in values:
+                image_model_var.set(values[0] if values else DEFAULT_ALIYUN_IMAGE_MODELS)
             image_model_box.configure(state="normal")
         elif source == "volcengine":
-            image_model_box["values"] = VOLCENGINE_IMAGE_MODEL_OPTIONS
-            if image_model_var.get() not in VOLCENGINE_IMAGE_MODEL_OPTIONS:
-                image_model_var.set(DEFAULT_VOLCENGINE_IMAGE_MODELS)
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="volcengine",
+                    kind="image",
+                    fallback=VOLCENGINE_IMAGE_MODEL_OPTIONS,
+                )
+            )
+            image_model_box["values"] = values
+            if image_model_var.get() not in values:
+                image_model_var.set(values[0] if values else DEFAULT_VOLCENGINE_IMAGE_MODELS)
             image_model_box.configure(state="normal")
         elif source == "siliconflow":
-            image_model_box["values"] = SILICONFLOW_IMAGE_MODEL_OPTIONS
-            if image_model_var.get() not in SILICONFLOW_IMAGE_MODEL_OPTIONS:
-                image_model_var.set(DEFAULT_SILICONFLOW_IMAGE_MODELS)
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="siliconflow",
+                    kind="image",
+                    fallback=SILICONFLOW_IMAGE_MODEL_OPTIONS,
+                )
+            )
+            image_model_box["values"] = values
+            if image_model_var.get() not in values:
+                image_model_var.set(values[0] if values else DEFAULT_SILICONFLOW_IMAGE_MODELS)
             image_model_box.configure(state="normal")
         else:
             image_model_box.configure(state="disabled")
@@ -3625,7 +3658,11 @@ def main() -> None:
 
     material_title_var = tk.StringVar(value="每日新闻")
     material_mode_var = tk.StringVar(value="single")
+    material_input_mode_var = tk.StringVar(value="text")
     material_file_var = tk.StringVar(value="")
+    material_text_title_var = tk.StringVar(value="")
+    material_text_source_var = tk.StringVar(value="")
+    material_text_url_var = tk.StringVar(value="")
     material_time_var = tk.StringVar(value="")
     material_count_var = tk.IntVar(value=1)
     material_evaluation_var = tk.StringVar(value=DEFAULT_EVALUATION_VIEWPOINT)
@@ -3636,6 +3673,34 @@ def main() -> None:
     material_force_var = tk.BooleanVar(value=False)
     material_login_hold_var = tk.IntVar(value=DEFAULT_LOGIN_HOLD)
     material_wait_timeout_var = tk.IntVar(value=DEFAULT_WAIT_TIMEOUT)
+    material_llm_provider_value = _env_default("LLM_PROVIDER", DEFAULT_LLM_PROVIDER)
+    material_llm_provider_var = tk.StringVar(value=material_llm_provider_value)
+    if material_llm_provider_value == "auto":
+        material_llm_model_value = AUTO_LLM_MODEL_OPTION
+    elif material_llm_provider_value == "aliyun":
+        material_llm_model_value = _env_default("ALIYUN_LLM_MODEL", DEFAULT_ALIYUN_LLM_MODEL)
+    elif material_llm_provider_value == "volcengine":
+        material_llm_model_value = _env_default("VOLCENGINE_LLM_MODEL", DEFAULT_VOLCENGINE_LLM_MODEL)
+    elif material_llm_provider_value == "siliconflow":
+        material_llm_model_value = _env_default("SILICONFLOW_LLM_MODEL", DEFAULT_SILICONFLOW_LLM_MODEL)
+    else:
+        material_llm_model_value = _env_default("LLM_MODEL", DEFAULT_LLM_MODEL)
+    material_llm_model_var = tk.StringVar(value=material_llm_model_value)
+    material_image_source_value = normalize_image_source(
+        _env_default("IMAGE_SOURCE")
+        or _env_default("IMAGE_PROVIDER")
+        or DEFAULT_IMAGE_SOURCE
+    )
+    material_image_provider_var = tk.StringVar(value=material_image_source_value)
+    if material_image_source_value == "aliyun":
+        material_image_model_value = _env_default("ALIYUN_IMAGE_MODEL", DEFAULT_ALIYUN_IMAGE_MODELS)
+    elif material_image_source_value == "volcengine":
+        material_image_model_value = _env_default("VOLCENGINE_IMAGE_MODEL", DEFAULT_VOLCENGINE_IMAGE_MODELS)
+    elif material_image_source_value == "siliconflow":
+        material_image_model_value = _env_default("SILICONFLOW_IMAGE_MODEL", DEFAULT_SILICONFLOW_IMAGE_MODELS)
+    else:
+        material_image_model_value = DEFAULT_ALIYUN_IMAGE_MODELS
+    material_image_model_var = tk.StringVar(value=material_image_model_value)
 
     _add_labeled_entry(material_grid, 0, "标题", material_title_var)
     ttk.Label(material_grid, text="发布平台").grid(row=0, column=2, sticky="w", padx=(16, 0), pady=5)
@@ -3657,9 +3722,63 @@ def main() -> None:
         side="left", padx=(18, 0)
     )
 
-    ttk.Label(material_grid, text="材料文件").grid(row=2, column=0, sticky="w", pady=5)
+    ttk.Label(material_grid, text="输入方式").grid(row=2, column=0, sticky="w", pady=5)
+    material_input_mode_frame = ttk.Frame(material_grid)
+    material_input_mode_frame.grid(row=2, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=5)
+    ttk.Radiobutton(
+        material_input_mode_frame,
+        text="直接输入文字",
+        value="text",
+        variable=material_input_mode_var,
+    ).pack(side="left")
+    ttk.Radiobutton(
+        material_input_mode_frame,
+        text="选择文件",
+        value="file",
+        variable=material_input_mode_var,
+    ).pack(side="left", padx=(18, 0))
+
+    material_text_title_var.trace_add("write", lambda *_args: _refresh_material_text_status())
+    material_text_source_var.trace_add("write", lambda *_args: _refresh_material_text_status())
+    material_text_url_var.trace_add("write", lambda *_args: _refresh_material_text_status())
+
+    material_text_frame = ttk.Frame(material_grid)
+    material_text_frame.grid(row=3, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=5)
+    material_text_frame.columnconfigure(1, weight=1)
+    material_text_title_entry = _add_labeled_entry(
+        material_text_frame, 0, "材料标题（可选）", material_text_title_var
+    )
+    material_text_source_entry = _add_labeled_entry(
+        material_text_frame, 1, "来源名称（可选）", material_text_source_var
+    )
+    material_text_url_entry = _add_labeled_entry(
+        material_text_frame, 2, "来源链接（可选）", material_text_url_var
+    )
+    ttk.Label(material_text_frame, text="材料正文").grid(row=3, column=0, sticky="nw", pady=5)
+    material_text_box_frame = ttk.Frame(material_text_frame)
+    material_text_box_frame.grid(row=3, column=1, sticky="we", padx=(10, 0), pady=5)
+    material_text_box_frame.columnconfigure(0, weight=1)
+    material_text_box = tk.Text(
+        material_text_box_frame,
+        height=10,
+        wrap="word",
+        undo=True,
+        font=base_font,
+    )
+    material_text_box.grid(row=0, column=0, sticky="we")
+    material_text_scroll = ttk.Scrollbar(material_text_box_frame, orient="vertical", command=material_text_box.yview)
+    material_text_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+    material_text_box.configure(yscrollcommand=material_text_scroll.set)
+    material_text_status_var = tk.StringVar(value="请输入或粘贴材料正文。")
+    ttk.Label(
+        material_text_frame,
+        textvariable=material_text_status_var,
+        style="PanelMuted.TLabel",
+        wraplength=700,
+    ).grid(row=4, column=1, sticky="w", padx=(10, 0), pady=(0, 4))
+
     material_file_frame = ttk.Frame(material_grid)
-    material_file_frame.grid(row=2, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=5)
+    material_file_frame.grid(row=3, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=5)
     material_file_frame.columnconfigure(0, weight=1)
     ttk.Entry(material_file_frame, textvariable=material_file_var, font=base_font).grid(
         row=0, column=0, sticky="we"
@@ -3684,9 +3803,9 @@ def main() -> None:
         row=0, column=1, sticky="e", padx=(8, 0)
     )
 
-    ttk.Label(material_grid, text="材料时间（北京时间）").grid(row=3, column=0, sticky="w", pady=5)
+    ttk.Label(material_grid, text="材料时间（北京时间）").grid(row=4, column=0, sticky="w", pady=5)
     material_time_frame = ttk.Frame(material_grid)
-    material_time_frame.grid(row=3, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=5)
+    material_time_frame.grid(row=4, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=5)
     material_time_frame.columnconfigure(0, weight=1)
     ttk.Entry(material_time_frame, textvariable=material_time_var, font=base_font).grid(
         row=0, column=0, sticky="we"
@@ -3703,44 +3822,491 @@ def main() -> None:
         text="必填；只验证格式，不判断材料新旧，也不会套用每日新闻的2/3/7/14天窗口。",
         style="PanelMuted.TLabel",
         wraplength=760,
-    ).grid(row=4, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
+    ).grid(row=5, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
 
-    _add_labeled_entry(material_grid, 5, "评价视角", material_evaluation_var)
-    ttk.Label(material_grid, text="数量").grid(row=6, column=0, sticky="w", pady=5)
+    _add_labeled_entry(material_grid, 6, "评价视角", material_evaluation_var)
+    ttk.Label(material_grid, text="数量").grid(row=7, column=0, sticky="w", pady=5)
     material_count_box = ttk.Spinbox(material_grid, from_=1, to=50, textvariable=material_count_var, width=8)
-    material_count_box.grid(row=6, column=1, sticky="w", padx=(10, 0), pady=5)
+    material_count_box.grid(row=7, column=1, sticky="w", padx=(10, 0), pady=5)
     ttk.Checkbutton(
         material_grid,
         text="不复制素材 (--no-copy)",
         variable=material_no_copy_var,
-    ).grid(row=6, column=2, sticky="w", padx=(10, 0))
+    ).grid(row=7, column=2, sticky="w", padx=(10, 0))
     material_hint_var = tk.StringVar(value="")
     ttk.Label(
         material_grid,
         textvariable=material_hint_var,
         style="PanelMuted.TLabel",
         wraplength=760,
-    ).grid(row=7, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
+    ).grid(row=8, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
+
+    def _refresh_material_text_status(*_args) -> None:
+        raw_text = material_text_box.get("1.0", "end-1c")
+        if not raw_text.strip():
+            material_text_status_var.set("请输入或粘贴材料正文。")
+            return
+        try:
+            parsed_count = len(parse_manual_news_materials(raw_text))
+        except Exception:
+            parsed_count = 0
+        char_count = len(raw_text)
+        if parsed_count:
+            material_text_status_var.set(f"{char_count} 字符 · 已解析 {parsed_count} 条材料")
+        else:
+            material_text_status_var.set(f"{char_count} 字符 · 暂未解析出完整材料")
+
+    def _sync_material_input_mode(*_args) -> None:
+        is_text = material_input_mode_var.get().strip().lower() == "text"
+        if is_text:
+            material_text_frame.grid()
+            material_file_frame.grid_remove()
+        else:
+            material_text_frame.grid_remove()
+            material_file_frame.grid()
+        multiple = material_mode_var.get().strip().lower() == "multiple"
+        override_state = "disabled" if multiple else "normal"
+        for entry in (material_text_title_entry, material_text_source_entry, material_text_url_entry):
+            entry.configure(state=override_state if is_text else "disabled")
+        _refresh_material_text_status()
+
+    material_text_box.bind("<KeyRelease>", _refresh_material_text_status)
+    material_input_mode_var.trace_add("write", _sync_material_input_mode)
 
     def _sync_material_page_mode(*_args) -> None:
         single = material_mode_var.get().strip().lower() == "single"
         material_count_box.configure(state="disabled" if single else "normal")
+        _sync_material_input_mode()
         if single:
             material_count_var.set(1)
             material_hint_var.set("单条模式只读取一条材料，忽略关键词和在线检索；材料时间仍为必填。")
         else:
-            material_hint_var.set("多条模式按材料文件中的条目生成；记录自带时间优先，否则使用默认材料时间。")
+            material_hint_var.set("多条文字请用 --- 分隔，或粘贴 JSON/JSONL；记录自带时间优先，否则使用默认材料时间。")
 
     material_mode_var.trace_add("write", _sync_material_page_mode)
     _sync_material_page_mode()
     material_grid.pack(fill="x")
 
+    material_model_panel = ttk.Frame(tab_material, style="Panel.TFrame", padding=(12, 10))
+    material_model_panel.pack(fill="x", padx=4, pady=(0, 10))
+    material_model_grid = ttk.Frame(material_model_panel, style="Panel.TFrame")
+    material_model_grid.pack(fill="x")
+    material_model_grid.columnconfigure(1, weight=1)
+    material_model_grid.columnconfigure(3, weight=1)
+    ttk.Label(material_model_grid, text="本次材料发帖模型", style="PanelSection.TLabel").grid(
+        row=0, column=0, columnspan=4, sticky="w", pady=(0, 5)
+    )
+
+    ttk.Label(material_model_grid, text="LLM 供应商").grid(row=1, column=0, sticky="w", pady=5)
+    material_llm_provider_box = ttk.Combobox(
+        material_model_grid,
+        textvariable=material_llm_provider_var,
+        values=LLM_PROVIDER_OPTIONS,
+        state="readonly",
+        width=14,
+    )
+    material_llm_provider_box.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=5)
+    ttk.Label(material_model_grid, text="LLM 模型").grid(row=1, column=2, sticky="w", padx=(16, 0), pady=5)
+    material_llm_model_box = ttk.Combobox(
+        material_model_grid,
+        textvariable=material_llm_model_var,
+        values=ALIYUN_LLM_MODEL_OPTIONS,
+    )
+    material_llm_model_box.grid(row=1, column=3, sticky="we", padx=(10, 0), pady=5)
+
+    ttk.Label(material_model_grid, text="生图来源").grid(row=2, column=0, sticky="w", pady=5)
+    material_image_provider_box = ttk.Combobox(
+        material_model_grid,
+        textvariable=material_image_provider_var,
+        values=IMAGE_SOURCE_OPTIONS,
+        state="readonly",
+        width=14,
+    )
+    material_image_provider_box.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=5)
+    ttk.Label(material_model_grid, text="生图模型").grid(row=2, column=2, sticky="w", padx=(16, 0), pady=5)
+    material_image_model_box = ttk.Combobox(
+        material_model_grid,
+        textvariable=material_image_model_var,
+        values=ALIYUN_IMAGE_MODEL_OPTIONS,
+    )
+    material_image_model_box.grid(row=2, column=3, sticky="we", padx=(10, 0), pady=5)
+
+    material_model_hint_var = tk.StringVar(
+        value="选择“自动”时，运行前使用最新的免费额度快照选择可用模型；本面板只影响材料发帖。"
+    )
     ttk.Label(
-        material_content,
-        text="模型额度与自动发帖页共享；如需更换模型，请在自动发帖页的模型面板选择后再返回本页。",
+        material_model_panel,
+        textvariable=material_model_hint_var,
         style="PanelMuted.TLabel",
         wraplength=760,
-    ).pack(anchor="w", pady=(8, 0))
+    ).pack(anchor="w", pady=(4, 0))
+
+    def _sync_material_llm_model_values(*_args) -> None:
+        provider = material_llm_provider_var.get().strip().lower()
+        if provider == "aliyun":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="aliyun",
+                    kind="llm",
+                    fallback=ALIYUN_LLM_MODEL_OPTIONS,
+                )
+            )
+            fallback = DEFAULT_ALIYUN_LLM_MODEL
+        elif provider == "volcengine":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="volcengine",
+                    kind="llm",
+                    fallback=VOLCENGINE_LLM_MODEL_OPTIONS,
+                )
+            )
+            fallback = DEFAULT_VOLCENGINE_LLM_MODEL
+        elif provider == "ppinfra":
+            values = PPINFRA_LLM_MODEL_OPTIONS
+            fallback = DEFAULT_LLM_MODEL
+        elif provider == "siliconflow":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="siliconflow",
+                    kind="llm",
+                    fallback=SILICONFLOW_LLM_MODEL_OPTIONS,
+                )
+            )
+            fallback = DEFAULT_SILICONFLOW_LLM_MODEL
+        else:
+            values = [AUTO_LLM_MODEL_OPTION]
+            fallback = AUTO_LLM_MODEL_OPTION
+        material_llm_model_box["values"] = values
+        if material_llm_model_var.get() not in values:
+            material_llm_model_var.set(values[0] if values else fallback)
+
+    def _sync_material_image_model_state(*_args) -> None:
+        source = normalize_image_source(material_image_provider_var.get())
+        if source == "auto":
+            material_image_model_box.configure(state="disabled")
+            material_model_hint_var.set("自动生图：运行前按最新免费额度选择模型；本面板只影响材料发帖。")
+        elif source == "aliyun":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="aliyun",
+                    kind="image",
+                    fallback=ALIYUN_IMAGE_MODEL_OPTIONS,
+                )
+            )
+            material_image_model_box["values"] = values
+            if material_image_model_var.get() not in values:
+                material_image_model_var.set(values[0] if values else DEFAULT_ALIYUN_IMAGE_MODELS)
+            material_image_model_box.configure(state="normal")
+            material_model_hint_var.set("阿里云生图：使用下方选定的模型；请确认对应 API Key 和额度。")
+        elif source == "volcengine":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="volcengine",
+                    kind="image",
+                    fallback=VOLCENGINE_IMAGE_MODEL_OPTIONS,
+                )
+            )
+            material_image_model_box["values"] = values
+            if material_image_model_var.get() not in values:
+                material_image_model_var.set(values[0] if values else DEFAULT_VOLCENGINE_IMAGE_MODELS)
+            material_image_model_box.configure(state="normal")
+            material_model_hint_var.set("火山引擎生图：使用下方选定的模型；请确认对应 API Key 和额度。")
+        elif source == "siliconflow":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="siliconflow",
+                    kind="image",
+                    fallback=SILICONFLOW_IMAGE_MODEL_OPTIONS,
+                )
+            )
+            material_image_model_box["values"] = values
+            if material_image_model_var.get() not in values:
+                material_image_model_var.set(values[0] if values else DEFAULT_SILICONFLOW_IMAGE_MODELS)
+            material_image_model_box.configure(state="normal")
+            material_model_hint_var.set("硅基流动生图：使用下方选定的模型；请确认余额或免费额度。")
+        else:
+            material_image_model_box.configure(state="disabled")
+            material_model_hint_var.set("本地素材或 Pexels：不调用生图模型；本面板只影响材料发帖。")
+
+    def _material_env() -> dict[str, str]:
+        return build_provider_env_overrides(
+            _collect_env_overrides(),
+            llm_provider=material_llm_provider_var.get(),
+            llm_model=material_llm_model_var.get(),
+            image_provider=material_image_provider_var.get(),
+            image_model=material_image_model_var.get(),
+        )
+
+    material_llm_provider_var.trace_add("write", _sync_material_llm_model_values)
+    material_image_provider_var.trace_add("write", _sync_material_image_model_state)
+    _sync_material_llm_model_values()
+    _sync_material_image_model_state()
+
+    material_quota_panel = ttk.Frame(tab_material, style="Panel.TFrame", padding=(12, 10))
+    material_quota_panel.pack(fill="x", padx=4, pady=(0, 10))
+    material_quota_header = ttk.Frame(material_quota_panel, style="Panel.TFrame")
+    material_quota_header.pack(fill="x", pady=(0, 6))
+    ttk.Label(material_quota_header, text="本次模型额度", style="PanelSection.TLabel").pack(side="left")
+    material_quota_status_var = tk.StringVar(value="读取本地额度快照中...")
+    ttk.Label(
+        material_quota_header,
+        textvariable=material_quota_status_var,
+        style="PanelMuted.TLabel",
+    ).pack(side="left", padx=(10, 0))
+    material_quota_actions = ttk.Frame(material_quota_panel, style="Panel.TFrame")
+    material_quota_actions.pack(fill="x", pady=(0, 6))
+    ttk.Button(
+        material_quota_actions,
+        text="同步免费额度",
+        command=lambda: _run_quota_sync(),
+        style="Accent.TButton",
+    ).pack(side="left")
+    ttk.Button(
+        material_quota_actions,
+        text="刷新本地额度",
+        command=lambda: _refresh_quota_dashboard(),
+    ).pack(side="left", padx=(8, 0))
+
+    material_quota_provider_var = tk.StringVar(value="全部平台")
+    material_quota_provider_values = {
+        "全部平台": "all",
+        "阿里云百炼": "aliyun",
+        "火山引擎 Ark": "volcengine",
+        "硅基流动": "siliconflow",
+    }
+    material_quota_search_var = tk.StringVar(value="")
+    material_quota_sort_var = tk.StringVar(value=QUOTA_DASHBOARD_SORT_OPTIONS[0][1])
+    material_quota_sort_desc_var = tk.BooleanVar(value=False)
+    material_quota_filter_bar = ttk.Frame(material_quota_panel, style="Panel.TFrame")
+    material_quota_filter_bar.pack(fill="x", pady=(0, 6))
+    ttk.Label(material_quota_filter_bar, text="平台", style="PanelMuted.TLabel").pack(side="left")
+    ttk.Combobox(
+        material_quota_filter_bar,
+        textvariable=material_quota_provider_var,
+        values=list(material_quota_provider_values),
+        state="readonly",
+        width=14,
+    ).pack(side="left", padx=(8, 10))
+    ttk.Label(material_quota_filter_bar, text="搜索", style="PanelMuted.TLabel").pack(side="left")
+    ttk.Entry(
+        material_quota_filter_bar,
+        textvariable=material_quota_search_var,
+        width=20,
+    ).pack(side="left", fill="x", expand=True, padx=(8, 6))
+    ttk.Button(
+        material_quota_filter_bar,
+        text="清空",
+        command=lambda: material_quota_search_var.set(""),
+    ).pack(side="left")
+    ttk.Label(material_quota_filter_bar, text="排序", style="PanelMuted.TLabel").pack(side="left", padx=(12, 6))
+    ttk.Combobox(
+        material_quota_filter_bar,
+        textvariable=material_quota_sort_var,
+        values=[label for _key, label in QUOTA_DASHBOARD_SORT_OPTIONS],
+        state="readonly",
+        width=14,
+    ).pack(side="left")
+    ttk.Checkbutton(
+        material_quota_filter_bar,
+        text="倒序",
+        variable=material_quota_sort_desc_var,
+        style="Panel.TCheckbutton",
+    ).pack(side="left", padx=(8, 0))
+    ttk.Label(
+        material_quota_panel,
+        text="显示完整额度快照；当前材料页选中的模型只会高亮，不会隐藏其他平台。",
+        style="PanelMuted.TLabel",
+    ).pack(anchor="w", pady=(0, 6))
+
+    material_quota_canvas_frame = ttk.Frame(material_quota_panel, style="Panel.TFrame")
+    material_quota_canvas_frame.pack(fill="x")
+    material_quota_canvas = tk.Canvas(
+        material_quota_canvas_frame,
+        bg=palette["panel"],
+        highlightthickness=0,
+        height=116,
+    )
+    material_quota_canvas_scroll = ttk.Scrollbar(
+        material_quota_canvas_frame,
+        orient="vertical",
+        command=material_quota_canvas.yview,
+    )
+    material_quota_canvas.configure(yscrollcommand=material_quota_canvas_scroll.set)
+    material_quota_canvas.pack(side="left", fill="both", expand=True)
+    material_quota_canvas_scroll.pack(side="right", fill="y")
+    material_quota_rows: list[QuotaDashboardRow] = []
+
+    def _draw_material_quota_panel() -> None:
+        material_quota_canvas.delete("all")
+        width = max(int(material_quota_canvas.winfo_width() or 0), 460)
+        layout = quota_dashboard_layout(width)
+        x0 = layout["x0"]
+        bar_x = layout["bar_x"]
+        bar_w = layout["bar_width"]
+        value_x = layout["value_x"]
+        value_w = layout["value_width"]
+        y = 12
+        last_provider = ""
+        selected_keys = {
+            (provider.strip().lower(), model.strip().lower(), kind)
+            for provider, model, kind in (
+                (
+                    material_llm_provider_var.get(),
+                    material_llm_model_var.get(),
+                    "llm",
+                ),
+                (
+                    material_image_provider_var.get(),
+                    material_image_model_var.get(),
+                    "image",
+                ),
+            )
+            if provider.strip().lower() not in {"", "auto", "local", "pexels"}
+            and model.strip()
+        }
+        if not material_quota_rows:
+            material_quota_canvas.create_text(
+                x0,
+                y,
+                anchor="nw",
+                fill=palette["muted"],
+                font=("Microsoft YaHei UI", 9),
+                text="暂无与本次模型选择匹配的额度记录；请先同步免费额度。",
+                width=width - 28,
+            )
+            material_quota_canvas.configure(scrollregion=(0, 0, width, 56))
+            return
+        for idx, row in enumerate(material_quota_rows):
+            if row.provider != last_provider:
+                provider_label = {
+                    "aliyun": "阿里云百炼",
+                    "volcengine": "火山引擎 Ark",
+                    "siliconflow": "硅基流动",
+                }.get(row.provider, row.provider or "未知平台")
+                material_quota_canvas.create_text(
+                    x0,
+                    y,
+                    anchor="nw",
+                    fill=palette["ink"],
+                    font=("Microsoft YaHei UI", 9, "bold"),
+                    text=provider_label,
+                )
+                y += 22
+                last_provider = row.provider
+            name = quota_dashboard_row_title(row, layout["model_width"])
+            row_kind = _quota_selectable_kind(row.kind, row.model)
+            row_key = ((row.provider or "").strip().lower(), (row.model or "").strip().lower(), row_kind)
+            is_selected = row_key in selected_keys
+            row_fill = "#E4F2EF" if is_selected else (palette["soft"] if idx % 2 == 0 else palette["panel"])
+            material_quota_canvas.create_rectangle(
+                x0 - 6,
+                y - 4,
+                width - 10,
+                y + 22,
+                fill=row_fill,
+                outline="",
+            )
+            if is_selected:
+                material_quota_canvas.create_rectangle(
+                    x0 - 6,
+                    y - 4,
+                    x0 - 2,
+                    y + 22,
+                    fill=palette["signal_warn"],
+                    outline="",
+                )
+            material_quota_canvas.create_text(
+                x0,
+                y,
+                anchor="nw",
+                fill=palette["ink"],
+                font=("Microsoft YaHei UI", 9),
+                text=name,
+            )
+            material_quota_canvas.create_rectangle(
+                bar_x,
+                y + 3,
+                bar_x + bar_w,
+                y + 15,
+                fill=palette["soft"],
+                outline="",
+            )
+            if row.percent is not None:
+                material_quota_canvas.create_rectangle(
+                    bar_x,
+                    y + 3,
+                    bar_x + max(2, int(bar_w * row.percent)),
+                    y + 15,
+                    fill=_quota_bar_color(row),
+                    outline="",
+                )
+            else:
+                material_quota_canvas.create_line(
+                    bar_x,
+                    y + 9,
+                    bar_x + bar_w,
+                    y + 9,
+                    fill=_quota_bar_color(row),
+                    dash=(3, 4),
+                )
+            material_quota_canvas.create_text(
+                value_x + value_w,
+                y,
+                anchor="ne",
+                fill=palette["muted"],
+                font=("Microsoft YaHei UI", 9),
+                text=row.display_value,
+            )
+            y += 28
+        material_quota_canvas.configure(scrollregion=(0, 0, width, y + 8))
+
+    def _refresh_material_quota_panel() -> None:
+        nonlocal material_quota_rows
+        material_quota_rows = prepare_material_quota_rows(
+            quota_dashboard_all_rows,
+            provider=material_quota_provider_values.get(material_quota_provider_var.get(), "all"),
+            query=material_quota_search_var.get(),
+            sort_key=QUOTA_DASHBOARD_SORT_KEY_BY_LABEL.get(material_quota_sort_var.get(), "default"),
+            descending=material_quota_sort_desc_var.get(),
+        )
+        if not quota_dashboard_all_rows:
+            material_quota_status_var.set("暂无本地额度快照")
+        elif material_quota_rows:
+            provider_label = material_quota_provider_var.get() or "全部平台"
+            material_quota_status_var.set(f"{provider_label} · 显示 {len(material_quota_rows)} 个模型")
+        else:
+            material_quota_status_var.set("当前平台/搜索条件未找到额度记录")
+        _draw_material_quota_panel()
+
+    material_quota_refresh_callback = _refresh_material_quota_panel
+    for material_model_var in (
+        material_llm_provider_var,
+        material_llm_model_var,
+        material_image_provider_var,
+        material_image_model_var,
+    ):
+        material_model_var.trace_add("write", lambda *_args: _refresh_material_quota_panel())
+    for material_quota_filter_var in (
+        material_quota_provider_var,
+        material_quota_search_var,
+        material_quota_sort_var,
+        material_quota_sort_desc_var,
+    ):
+        material_quota_filter_var.trace_add("write", lambda *_args: _refresh_material_quota_panel())
+    material_quota_canvas.bind("<Configure>", lambda _event: _draw_material_quota_panel())
+    _refresh_material_quota_panel()
+    model_options_refresh_callback = lambda: (
+        _sync_llm_model_values(),
+        _sync_image_model_state(),
+        _sync_material_llm_model_values(),
+        _sync_material_image_model_state(),
+    )
 
     _add_execution_options(
         tab_material,
@@ -3756,26 +4322,52 @@ def main() -> None:
     material_summary_var = tk.StringVar(value="")
 
     def _run_material() -> None:
-        material_path = material_file_var.get().strip()
         material_time = material_time_var.get().strip()
-        if not material_path:
-            messagebox.showerror("材料发帖", "请选择材料文件。")
-            return
         if not material_time:
             messagebox.showerror("材料发帖", "请填写材料时间（北京时间）。")
+            return
+        single = material_mode_var.get().strip().lower() == "single"
+        input_mode = material_input_mode_var.get().strip().lower()
+        requested_count = 1 if single else max(1, int(material_count_var.get() or 1))
+        try:
+            if input_mode == "text":
+                snapshot = prepare_material_text_snapshot(
+                    material_text_box.get("1.0", "end-1c"),
+                    mode="single" if single else "multiple",
+                    requested_count=requested_count,
+                    default_material_time=material_time,
+                    title_override=material_text_title_var.get() if single else "",
+                    source_override=material_text_source_var.get() if single else "",
+                    url_override=material_text_url_var.get() if single else "",
+                    output_dir=PROJECT_ROOT / "data" / "manual_materials" / "gui_text",
+                )
+                material_path = str(snapshot.path)
+                material_text_status_var.set(
+                    f"{snapshot.raw_char_count} 字符 · 已保存本地快照 · {snapshot.item_count} 条材料"
+                )
+            elif input_mode == "file":
+                material_file = Path(material_file_var.get().strip()).expanduser()
+                if not material_file.is_file():
+                    raise RuntimeError("材料文件不存在，请重新选择文件。")
+                if material_file.suffix.lower() not in {".md", ".txt", ".json", ".jsonl"}:
+                    raise RuntimeError("材料文件格式不受支持，请选择 .md、.txt、.json 或 .jsonl 文件。")
+                material_path = str(material_file)
+            else:
+                raise RuntimeError("请选择直接输入文字或选择文件。")
+        except (RuntimeError, OSError, ValueError) as exc:
+            messagebox.showerror("材料发帖", str(exc))
             return
         if not runner.is_running():
             _schedule_post_command_refresh("posts", _refresh_post_ids)
             _schedule_post_command_refresh("publish", _refresh_publish_drafts)
-        single = material_mode_var.get().strip().lower() == "single"
         params = {
             "title": material_title_var.get(),
             "platform": material_platform_var.get(),
             "keywords": "",
             "evaluation_viewpoint": material_evaluation_var.get(),
             "assets_glob": assets_var.get(),
-            "image_source": image_provider_var.get(),
-            "count": 1 if single else material_count_var.get(),
+            "image_source": material_image_provider_var.get(),
+            "count": requested_count,
             "lookback_days": "",
             "material_time": material_time,
             "single_news_material_file": material_path if single else "",
@@ -3787,7 +4379,7 @@ def main() -> None:
             "wait_timeout": material_wait_timeout_var.get(),
             "force": material_force_var.get(),
         }
-        _run_command("auto", params, _auto_env())
+        _run_command("auto", params, _material_env())
 
     def _refresh_material_summary(*_args) -> None:
         mode = "单条材料" if material_mode_var.get().strip().lower() == "single" else "多条材料"
