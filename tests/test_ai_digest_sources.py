@@ -295,7 +295,7 @@ def test_parse_aihot_daily_html_maps_traceable_digest_items():
     assert items[0].vendor == "美团 LongCat"
     assert items[0].source_type == "aggregator"
     assert items[0].verification_status == "aggregator_only"
-    assert items[0].published_at == "2026-07-02T08:00:00+08:00"
+    assert items[0].published_at == "2026-07-02"
     assert items[0].url == "https://aihot.virxact.com/daily/2026-07-02?item=1"
     assert items[0].evidence_urls == []
     assert items[1].vendor == "Anthropic"

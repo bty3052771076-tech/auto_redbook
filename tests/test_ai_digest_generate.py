@@ -612,6 +612,7 @@ def test_generate_ai_digest_brief_binds_url_less_items_to_distinct_sources(monke
         ),
     ]
 
+
     class FakeModel:
         def invoke(self, _messages):
             return type(
@@ -1444,3 +1445,23 @@ def test_render_ai_digest_body_item_publish_time_uses_beijing_time_and_date_only
     assert "1. OpenAI：OpenAI 发布开发者工具更新（发布时间：2026-08-25 00:30）" in body
     assert "2. DeepSeek：DeepSeek 更新模型文档（发布时间：2026-08-25）" in body
     assert "https://" not in body
+
+
+def test_render_ai_digest_body_does_not_invent_time_for_date_only_source():
+    item = AIUpdateItem(
+        title="Qwen3.8-Flash-Next release",
+        summary="The official page announces the model release and open weights.",
+        source_name="Qwen official",
+        source_type="official",
+        url="https://qwen.ai/blog?id=qwen3.8-flash-next",
+        published_at="2026-08-26",
+        vendor="Qwen",
+        product="Qwen3.8-Flash-Next",
+        raw_excerpt="The official page announces the model release and open weights.",
+    )
+    brief = AIDigestBrief(date="2026-08-27", items=[item])
+
+    body = render_ai_digest_body(brief)
+
+    assert "发布时间：2026-08-26" in body
+    assert "发布时间：2026-08-26 08:00" not in body

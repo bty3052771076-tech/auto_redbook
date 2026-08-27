@@ -814,7 +814,8 @@ def parse_aihot_daily_html(
                 ),
                 source_type="aggregator",
                 url=primary_url or entry_url,
-                published_at=f"{published_date}T08:00:00+08:00",
+                # The aggregator supplies a calendar date, not a publication time.
+                published_at=published_date,
                 vendor=item_vendor,
                 product="",
                 raw_excerpt=summary,

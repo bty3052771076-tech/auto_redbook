@@ -55,6 +55,13 @@ def test_prompt_topic_official_backfill_verifies_and_returns_all_requested_topic
     assert [item.product for item in items] == topics
     assert all(item.source_type == "official" for item in items)
     assert all(item.url and item.published_at for item in items)
+    assert [item.published_at for item in items] == [
+        "2026-08-26",
+        "2026-08-26",
+        "2026-08-03",
+        "2026-08-25",
+        "2026-08-25",
+    ]
 
 
 def test_collect_ai_digest_updates_passes_prompt_topics_to_forced_search_backfill(monkeypatch):

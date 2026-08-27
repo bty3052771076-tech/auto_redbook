@@ -459,7 +459,7 @@ _PROMPT_TOPIC_OFFICIAL_SOURCES = {
         "source_name": "Qwen 官方博客",
         "vendor": "Qwen",
         "url": "https://qwen.ai/blog?id=qwen3.8-flash-next",
-        "published_at": "2026-08-26T08:00:00+08:00",
+        "published_at": "2026-08-26",
     },
     "GLM-5.3-Flash发布": {
         "title": "GLM-5.3-Flash发布并开放模型权重",
@@ -467,7 +467,7 @@ _PROMPT_TOPIC_OFFICIAL_SOURCES = {
         "source_name": "Z.ai 官方博客",
         "vendor": "智谱 GLM",
         "url": "https://z.ai/blog/glm-5.3-flash",
-        "published_at": "2026-08-26T08:00:00+08:00",
+        "published_at": "2026-08-26",
     },
     "QwenWork International上线": {
         "title": "QwenWork International上线",
@@ -475,7 +475,7 @@ _PROMPT_TOPIC_OFFICIAL_SOURCES = {
         "source_name": "QwenWork 官方文档",
         "vendor": "QwenWork",
         "url": "https://docs.qwenwork.ai/product-introduction",
-        "published_at": "2026-08-03T08:00:00+08:00",
+        "published_at": "2026-08-03",
         "evidence_urls": ["https://ali-home.alibaba.com/document-2021039099929952256"],
     },
     "Codex plus用户回复5小时限制": {
@@ -484,7 +484,7 @@ _PROMPT_TOPIC_OFFICIAL_SOURCES = {
         "source_name": "OpenAI Codex 官方定价",
         "vendor": "OpenAI",
         "url": "https://chatgpt.com/codex/pricing/",
-        "published_at": "2026-08-25T08:00:00+08:00",
+        "published_at": "2026-08-25",
         "evidence_urls": ["https://community.openai.com/t/codex-rate-limits-discussion-thread/1378553/502"],
     },
     "Breeze TTS 2权重公开可用": {
@@ -493,7 +493,7 @@ _PROMPT_TOPIC_OFFICIAL_SOURCES = {
         "source_name": "BreezeBlue 官方 GitHub",
         "vendor": "Breeze TTS 2",
         "url": "https://github.com/breezeblue-ai/breeze-tts",
-        "published_at": "2026-08-25T08:00:00+08:00",
+        "published_at": "2026-08-25",
     },
 }
 
