@@ -4,7 +4,7 @@ import json
 import os
 import re
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 from urllib.parse import unquote, urlsplit
 
@@ -12,6 +12,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
 
 from src.config import LLMConfig
+from src.llm.generate import _temperature_kwargs
 
 from .models import AIDigestBrief, AIUpdateItem
 from .rank import (
@@ -28,6 +29,7 @@ from .rank import (
 AI_DIGEST_LLM_MAX_TOKENS = 60000
 AI_DIGEST_LLM_TIMEOUT_SECONDS = 240
 AI_DIGEST_BODY_LIMIT = 1000
+_BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _GENERIC_AI_DIGEST_MARKERS = (
     "发布AI动态",
@@ -149,6 +151,12 @@ def _is_low_information_ai_digest_text(text: str) -> bool:
     return bool(re.search(r"(?i)AI\s*AI", text or "")) or _looks_generic_ai_digest_text(text) or any(
         marker.replace(" ", "") in compact for marker in _LOW_INFORMATION_TITLE_MARKERS
     )
+
+
+def _has_chinese_title_context(text: str) -> bool:
+    # A short Chinese action phrase is enough to establish that the remaining
+    # English tokens are likely product or company names, not untranslated prose.
+    return len(_CJK_RE.findall(text or "")) >= 2
 
 
 def _source_text(item: AIUpdateItem) -> str:
@@ -536,17 +544,84 @@ def _fallback_chinese_summary(item: AIUpdateItem) -> str:
     return f"{source}披露{subject}的AI产品变化；当前可核实信息以原始标题、摘录和来源链接为准。"
 
 
-def _repair_title_cut_inside_summary_lead(title: str, summary: str, *, limit: int = 48) -> str:
+_INCOMPLETE_AI_TITLE_ENDINGS = (
+    "情况下",
+    "因为",
+    "由于",
+    "如果",
+    "虽然",
+    "其中",
+    "显示",
+    "宣布与",
+    "推出",
+    "披露",
+    "正在",
+    "将",
+    "已",
+    "在",
+    "通过",
+    "针对",
+    "与",
+    "和",
+    "或",
+    "及",
+    "的",
+)
+
+
+def _title_ends_with_incomplete_phrase(value: str) -> bool:
+    compact = re.sub(r"\s+", "", value or "")
+    return bool(compact) and compact.endswith(_INCOMPLETE_AI_TITLE_ENDINGS)
+
+
+def _complete_summary_headline(
+    summary: str,
+    *,
+    limit: int = 72,
+    include_following_clause: bool = False,
+) -> str:
+    """Extract a complete, readable headline without cutting a clause."""
+
+    clean = re.sub(r"\s+", " ", summary or "").strip()
+    if not clean:
+        return ""
+    sentence = re.split(r"[。！？；;]", clean, maxsplit=1)[0].strip()
+    clauses = [part.strip() for part in re.split(r"[，,]", sentence) if part.strip()]
+    if not include_following_clause and clauses:
+        first_clause = clauses[0]
+        if len(first_clause) <= limit and not _title_ends_with_incomplete_phrase(first_clause):
+            return first_clause
+    if len(sentence) <= limit:
+        return sentence
+    candidates: list[str] = []
+    for count in range(1, len(clauses) + 1):
+        candidate = "，".join(clauses[:count]).strip()
+        if len(candidate) <= limit and not _title_ends_with_incomplete_phrase(candidate):
+            candidates.append(candidate)
+    if candidates:
+        return max(candidates, key=len)
+    return sentence
+
+
+def _repair_title_cut_inside_summary_lead(title: str, summary: str, *, limit: int = 72) -> str:
     clean_title = re.sub(r"\s+", " ", title or "").strip()
     clean_summary = re.sub(r"\s+", " ", summary or "").strip()
-    if len(clean_title) < 24 or not _has_cjk(clean_summary) or not clean_summary.startswith(clean_title):
+    if not clean_title or not _has_cjk(clean_summary) or not clean_summary.startswith(clean_title):
         return clean_title
     remainder = clean_summary[len(clean_title) :]
-    if not remainder or remainder[0] in "，,。！？；;：:":
+    if not remainder:
         return clean_title
-    lead = re.split(r"[，,。！？；;]", clean_summary, maxsplit=1)[0].strip()
-    if len(clean_title) < len(lead) <= limit:
-        return lead
+    starts_inside_token = remainder[0].isalnum() or remainder[0] in "-_/"
+    if remainder[0] in "，,。！？；;：:" and not _title_ends_with_incomplete_phrase(clean_title):
+        return clean_title
+    if starts_inside_token or _title_ends_with_incomplete_phrase(clean_title):
+        lead = _complete_summary_headline(
+            clean_summary,
+            limit=limit,
+            include_following_clause=_title_ends_with_incomplete_phrase(clean_title),
+        )
+        if len(lead) > len(clean_title):
+            return lead
     return clean_title
 
 
@@ -558,7 +633,10 @@ def _ensure_chinese_item(item: AIUpdateItem) -> AIUpdateItem:
     if not title_repaired and (
         not _has_cjk(data.get("title", ""))
         or _is_low_information_ai_digest_text(data.get("title", ""))
-        or _has_untranslated_english_phrase(data.get("title", ""))
+        or (
+            _has_untranslated_english_phrase(data.get("title", ""))
+            and not _has_chinese_title_context(data.get("title", ""))
+        )
     ):
         data["title"] = _fallback_chinese_title(item)
     if (
@@ -932,10 +1010,10 @@ def evaluate_ai_digest_impact_with_llm(
                 "model_provider": "openai",
                 "base_url": cfg.base_url,
                 "api_key": cfg.api_key,
-                "temperature": 0,
                 "max_tokens": min(AI_DIGEST_LLM_MAX_TOKENS, max(4000, len(items) * 180)),
                 "timeout": request_timeout,
             }
+            model_kwargs.update(_temperature_kwargs(cfg.model, 0))
             if (cfg.provider or "").strip().lower() == "volcengine":
                 model_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             model = init_chat_model(cfg.model, **model_kwargs)
@@ -1034,10 +1112,10 @@ def generate_ai_digest_brief_with_llm(
                 "model_provider": "openai",
                 "base_url": cfg.base_url,
                 "api_key": cfg.api_key,
-                "temperature": 0.2,
                 "max_tokens": AI_DIGEST_LLM_MAX_TOKENS,
                 "timeout": request_timeout,
             }
+            model_kwargs.update(_temperature_kwargs(cfg.model, 0.2))
             # Ark models can otherwise spend the whole output allowance on
             # hidden reasoning and return an empty final message.  The digest
             # is a constrained JSON transformation, so direct answering is
@@ -1149,27 +1227,85 @@ def _selection_summary_line(selection_meta: dict | None, *, item_count: int) -> 
     return "候选池：" + "，".join(parts)
 
 
+def _ai_digest_body_source(item: AIUpdateItem) -> str:
+    return (item.vendor or item.source_name or "官方来源").strip() or "官方来源"
+
+
+def _shorten_ai_digest_body_title(value: str, *, max_chars: int) -> str:
+    clean = re.sub(r"\s+", " ", value or "").strip()
+    if len(clean) <= max_chars:
+        return clean
+    candidate = _complete_summary_headline(clean, limit=max_chars)
+    if candidate and len(candidate) <= max_chars:
+        return candidate
+    # Titles are normally repaired before this point. This final branch is
+    # only a body-capacity guard; keep a word/clause boundary where possible.
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9._+/-]*|[\u4e00-\u9fff]", clean)
+    compact = ""
+    for word in words:
+        if len(compact) + len(word) > max_chars:
+            break
+        compact += word
+    return compact or clean[:max_chars]
+
+
+def _format_ai_digest_body_published_at(value: str) -> str:
+    """Keep date-only values and present timestamped sources in Beijing time."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+        return match.group(0) if match else ""
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_BEIJING_TZ)
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _ai_digest_body_topic_lines(
+    items: list[AIUpdateItem],
+    *,
+    include_source: bool,
+    title_limit: int | None = None,
+) -> list[str]:
+    lines = []
+    for idx, item in enumerate(items, 1):
+        title = item.title.strip()
+        if title_limit is not None:
+            title = _shorten_ai_digest_body_title(title, max_chars=title_limit)
+        prefix = f"{idx}. {_ai_digest_body_source(item)}：" if include_source else f"{idx}. "
+        published_at = _format_ai_digest_body_published_at(item.published_at)
+        suffix = f"（发布时间：{published_at}）" if published_at else ""
+        lines.append(f"{prefix}{title}{suffix}")
+    return lines
+
+
 def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None = None) -> str:
+    # Normalize once more at the presentation boundary. This protects callers
+    # that render an older/raw brief directly and keeps the body aligned with
+    # the cards and local metadata.
+    items = [_ensure_chinese_item(item) for item in brief.items]
     sources = []
-    for item in brief.items:
-        name = item.vendor or item.source_name
+    for item in items:
+        name = _ai_digest_body_source(item)
         if name and name not in sources:
             sources.append(name)
-    source_text = " / ".join(name[:16] for name in sources[:8]) or "官方公开渠道"
+    source_text = " / ".join(sources[:8]) or "官方公开渠道"
     source_tier_counts = {
-        "official": sum(1 for item in brief.items if item.source_type in {"official", "github"}),
-        "aggregator": sum(1 for item in brief.items if item.source_type in {"aggregator", "search"}),
-        "social": sum(1 for item in brief.items if item.source_type == "social"),
+        "official": sum(1 for item in items if item.source_type in {"official", "github"}),
+        "aggregator": sum(1 for item in items if item.source_type in {"aggregator", "search"}),
+        "social": sum(1 for item in items if item.source_type == "social"),
     }
     source_tier_line = (
         f"信源层级：官网{source_tier_counts['official']}条，"
         f"资讯整合站{source_tier_counts['aggregator']}条，"
         f"社交媒体{source_tier_counts['social']}条"
     )
-    topic_lines = [
-        f"{idx}. {(item.vendor or item.source_name or f'动态{idx}').strip()[:12]}：{item.title.strip()}"
-        for idx, item in enumerate(brief.items, 1)
-    ]
+    topic_lines = _ai_digest_body_topic_lines(items, include_source=True)
     lines = [
         "每日AI讯息",
         f"发布时间：{brief.date}",
@@ -1179,7 +1315,7 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
         "今日动态：",
         *topic_lines,
     ]
-    selection_line = _selection_summary_line(selection_meta, item_count=len(brief.items))
+    selection_line = _selection_summary_line(selection_meta, item_count=len(items))
     if selection_line:
         lines.append(selection_line)
     # Links are intentionally not written into the draft body: external URLs in
@@ -1189,19 +1325,30 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
     if len(body) <= AI_DIGEST_BODY_LIMIT:
         return body
 
-    for title_limit in (24, 18, 12, 8):
-        compact_topics = [
-            f"{idx}. {(item.vendor or item.source_name or f'动态{idx}').strip()[:8]}："
-            f"{item.title.strip()[:title_limit]}"
-            for idx, item in enumerate(brief.items, 1)
-        ]
+    # Compact only when the platform body limit requires it. Never slice a
+    # source name or title at an arbitrary character boundary, and keep the
+    # complete source list in the header when per-item labels are omitted.
+    variants = (
+        (True, None, False),
+        (True, 72, False),
+        (True, 48, False),
+        (False, None, False),
+        (False, 72, False),
+        (False, 48, False),
+        (False, 36, False),
+    )
+    for include_source, title_limit, include_selection in variants:
         compact_lines = [
             "每日AI讯息",
             f"发布时间：{brief.date}",
+            f"来源：{source_text}",
             source_tier_line,
+            "",
             "今日动态：",
-            *compact_topics,
+            *(_ai_digest_body_topic_lines(items, include_source=include_source, title_limit=title_limit)),
         ]
+        if include_selection and selection_line:
+            compact_lines.append(selection_line)
         body = "\n".join(compact_lines)
         if len(body) <= AI_DIGEST_BODY_LIMIT:
             return body

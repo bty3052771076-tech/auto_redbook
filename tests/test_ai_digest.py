@@ -26,6 +26,7 @@ def _item(
     evidence_urls: list[str] | None = None,
     confidence_score: float = 0.0,
     vendor: str | None = None,
+    tags: list[str] | None = None,
 ) -> AIUpdateItem:
     return AIUpdateItem(
         title=title,
@@ -39,7 +40,7 @@ def _item(
         raw_excerpt=raw_excerpt if raw_excerpt is not None else f"{title} raw excerpt",
         confidence_score=confidence_score,
         evidence_urls=evidence_urls or [],
-        tags=["AI"],
+        tags=tags or ["AI"],
     )
 
 
@@ -179,6 +180,38 @@ def test_rank_ai_updates_excludes_social_only_when_official_sources_are_enough()
 
     assert len(ranked) == 10
     assert all(item.source_type == "official" for item in ranked)
+
+
+def test_rank_ai_updates_uses_backfill_when_official_source_cap_cannot_reach_target():
+    official = [
+        _item(
+            f"OpenAI official update {index}",
+            source_name="OpenAI",
+            vendor="OpenAI",
+            url=f"https://openai.com/news/{index}",
+        )
+        for index in range(10)
+    ]
+    aggregator = [
+        _item(
+            f"Hugging Face model update {index}",
+            source_type="aggregator",
+            source_name="Hugging Face",
+            vendor="Hugging Face",
+            url=f"https://huggingface.co/blog/{index}",
+        )
+        for index in range(2)
+    ]
+
+    ranked = rank_ai_updates(
+        [*official, *aggregator],
+        target_count=4,
+        min_official_count=6,
+        allow_social_backfill=True,
+    )
+
+    assert len(ranked) == 4
+    assert {item.source_type for item in ranked} == {"official", "aggregator"}
 
 
 def test_rank_ai_updates_preserves_recent_official_vendor_diversity():
@@ -700,6 +733,25 @@ def test_ai_update_is_model_news_rejects_database_infrastructure_update():
     assert not rank_mod.ai_update_is_model_news(item)
 
 
+def test_ai_update_is_model_news_accepts_dated_domestic_model_github_release():
+    item = _item(
+        "v2.5.0",
+        source_type="github",
+        source_name="InternLM GitHub",
+        vendor="InternLM",
+        product="GitHub Release",
+        url="https://github.com/InternLM/InternLM/releases/tag/v2.5.0",
+        published_at="2026-08-22T08:00:00Z",
+        summary="Checkpoint and runtime updates for the latest open model.",
+        raw_excerpt="Repository changes for the latest open model checkpoint.",
+        tags=["region:domestic"],
+    )
+
+    assert rank_mod.ai_update_region(item) == "domestic"
+    assert rank_mod.ai_update_is_model_news(item)
+    assert ai_digest_quota_counts([item])["domestic_model"] == 1
+
+
 def test_rank_ai_updates_rejects_search_noise_without_ai_in_the_headline():
     relevant = _item(
         "Synopsys, AMD, and Microsoft push agentic AI further",
@@ -774,6 +826,160 @@ def test_rank_ai_updates_rejects_official_item_that_only_repeats_product_name():
     )
 
     assert [item.url for item in ranked] == [substantive.url]
+
+
+def test_rank_ai_updates_keeps_official_named_model_version_card():
+    compact_release = _item(
+        "GLM-5.3",
+        source_type="official",
+        source_name="智谱 GLM",
+        url="https://docs.bigmodel.cn/cn/update/new-releases",
+        published_at="2026-08-19",
+        summary="GLM-5.3",
+        raw_excerpt="GLM-5.3",
+        product="",
+    )
+
+    ranked = rank_ai_updates(
+        [compact_release],
+        target_count=1,
+        min_official_count=1,
+        max_age_days=14,
+        now=datetime(2026, 8, 23, 16, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    assert [item.title for item in ranked] == ["GLM-5.3"]
+
+
+def test_ai_update_history_key_dedupes_same_model_without_blocking_same_page_updates():
+    same_event_a = _item(
+        "DeepSeek-V4-Flash-Vision-Exp Release",
+        url="https://api-docs.deepseek.com/updates",
+        summary="DeepSeek-V4-Flash-Vision-Exp Release",
+        raw_excerpt="DeepSeek-V4-Flash-Vision-Exp Release",
+    )
+    same_event_b = _item(
+        "DeepSeek 官方文档显示 DeepSeek-V4-Flash-Vision-Exp 已发布",
+        url="https://api-docs.deepseek.com/updates",
+        summary="DeepSeek 官方文档显示 DeepSeek-V4-Flash-Vision-Exp 已发布",
+        raw_excerpt="DeepSeek-V4-Flash-Vision-Exp Release",
+    )
+    different_event = _item(
+        "DeepSeek-V4-Pro API 更新",
+        url="https://api-docs.deepseek.com/updates",
+        summary="DeepSeek-V4-Pro API 更新",
+        raw_excerpt="DeepSeek-V4-Pro API 更新",
+    )
+
+    assert rank_mod.ai_update_history_key(same_event_a) == rank_mod.ai_update_history_key(same_event_b)
+    assert rank_mod.ai_update_history_key(same_event_a) != rank_mod.ai_update_history_key(different_event)
+    mirrored_event = same_event_b.model_copy(update={"url": "https://cloud.example.com/deepseek-v4"})
+    assert rank_mod.ai_update_history_key(same_event_a) == rank_mod.ai_update_history_key(mirrored_event)
+    harness_event = same_event_a.model_copy(
+        update={
+            "title": "DeepSeek-V4-Flash-Vision-Exp 官方 Harness",
+            "summary": "DeepSeek-V4-Flash-Vision-Exp 官方 Harness",
+            "raw_excerpt": "DeepSeek-V4-Flash-Vision-Exp 官方 Harness",
+        }
+    )
+    assert rank_mod.ai_update_history_key(same_event_a) != rank_mod.ai_update_history_key(harness_event)
+
+
+def test_ai_update_history_key_normalizes_trailing_slash_for_same_official_event():
+    without_slash = _item(
+        "Mistral Agentic Search launch",
+        url="https://mistral.ai/news/agentic-search",
+        summary="Mistral Agentic Search launch",
+        raw_excerpt="Mistral Agentic Search launch",
+    )
+    with_slash = without_slash.model_copy(
+        update={
+            "url": "https://mistral.ai/news/agentic-search/",
+            "title": "Mistral AI 推出 Agentic Search 提升检索准确性",
+            "summary": "Mistral AI 推出 Agentic Search 提升检索准确性",
+            "raw_excerpt": "Mistral AI 推出 Agentic Search 提升检索准确性",
+        }
+    )
+
+    assert rank_mod.ai_update_history_key(without_slash) == rank_mod.ai_update_history_key(with_slash)
+
+
+def test_ai_update_history_key_dedupes_same_generic_listing_item_by_raw_excerpt():
+    previous = _item(
+        "Tencent Cloud TokenHub service terms update and third-party deployment note",
+        source_name="Tencent Cloud AI",
+        url="https://cloud.tencent.com/announce/",
+        summary="TokenHub service terms update",
+        raw_excerpt="【大模型服务平台 TokenHub】服务条款更新及《第三方部署模型服务特别说明》上线通知 重要",
+    )
+    rewritten = previous.model_copy(
+        update={
+            "title": "腾讯云 TokenHub 更新服务条款",
+            "summary": "TokenHub service terms update and third-party deployment",
+        }
+    )
+    different_item = previous.model_copy(
+        update={
+            "title": "腾讯云发布另一项模型服务公告",
+            "raw_excerpt": "腾讯云另一项模型服务公告，涉及控制台权限调整",
+        }
+    )
+
+    assert rank_mod.ai_update_history_key(previous) == rank_mod.ai_update_history_key(rewritten)
+    assert rank_mod.ai_update_history_key(previous) != rank_mod.ai_update_history_key(different_item)
+
+
+def test_ai_update_history_key_preserves_decimal_model_versions():
+    dotted = _item(
+        "GLM-5.3是智谱最新旗舰模型",
+        url="https://cloud.baidu.com/doc/qianfan/s/Kmh4stnjp",
+        raw_excerpt="GLM-5.3是智谱最新旗舰模型，调用说明请查看 API 文档",
+    )
+    spaced = dotted.model_copy(
+        update={
+            "title": "GLM 5.3是智谱最新旗舰模型",
+            "raw_excerpt": "GLM 5.3是智谱最新旗舰模型，调用说明请查看 API 文档",
+        }
+    )
+    major_only = dotted.model_copy(
+        update={
+            "title": "GLM-5 API 更新",
+            "raw_excerpt": "GLM-5 是智谱旗舰模型，调用说明请查看 API 文档",
+        }
+    )
+
+    assert rank_mod.ai_update_history_key(dotted) == rank_mod.ai_update_history_key(spaced)
+    assert rank_mod.ai_update_history_key(dotted) != rank_mod.ai_update_history_key(major_only)
+
+
+def test_dedupe_ai_updates_keeps_generic_topics_from_distinct_vendors():
+    openai_item = _item(
+        "New benchmark release",
+        source_name="OpenAI",
+        vendor="OpenAI",
+        url="https://openai.com/index/benchmark-release",
+        summary="New benchmark release",
+        raw_excerpt="New benchmark release",
+    )
+    anthropic_item = openai_item.model_copy(
+        update={
+            "title": "New benchmark release details",
+            "source_name": "Anthropic",
+            "vendor": "Anthropic",
+            "url": "https://anthropic.com/news/benchmark-release",
+        }
+    )
+    second_openai_item = openai_item.model_copy(
+        update={
+            "title": "Another benchmark release",
+            "url": "https://openai.com/index/another-benchmark-release",
+        }
+    )
+
+    deduped = rank_mod.dedupe_ai_updates([openai_item, anthropic_item, second_openai_item])
+
+    assert {item.source_name for item in deduped} == {"OpenAI", "Anthropic"}
+    assert len(deduped) == 3
 
 
 def test_rank_ai_updates_rejects_search_results_about_stocks_banking_and_filings():

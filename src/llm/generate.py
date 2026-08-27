@@ -14,9 +14,23 @@ from src.text_integrity import repair_utf8_as_gbk_mojibake
 
 
 DEFAULT_LLM_MAX_TOKENS = 60000
+DEFAULT_DRAFT_EFFECTIVE_MAX_TOKENS = 12000
 DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS = 240
 DEFAULT_LLM_RATE_LIMIT_RETRY_SECONDS = 65
 DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES = 3
+
+
+def _temperature_kwargs(model: str, temperature: float) -> dict[str, float]:
+    """Return sampling kwargs supported by the target model.
+
+    Aliyun's Kimi K3 endpoint rejects the OpenAI-compatible ``temperature``
+    parameter entirely.  Omitting it lets the provider use its supported
+    default while preserving the existing setting for other models.
+    """
+    normalized = re.sub(r"[^a-z0-9]+", "-", (model or "").strip().lower()).strip("-")
+    if normalized == "kimi-k3":
+        return {}
+    return {"temperature": temperature}
 
 
 def _truncate(text: str, max_len: int) -> str:
@@ -317,10 +331,73 @@ def _rate_limit_max_retries() -> int:
         return DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES
 
 
+def _transient_retry_seconds() -> int:
+    raw = os.getenv("LLM_TRANSIENT_RETRY_SECONDS", "8")
+    try:
+        return max(0, min(120, int(raw)))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _transient_retry_max() -> int:
+    raw = os.getenv("LLM_TRANSIENT_RETRY_MAX", "1")
+    try:
+        return max(0, min(3, int(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _is_transient_request_error(exc: Exception) -> bool:
+    """Identify retryable upstream failures without retrying permanent errors."""
+    message = str(exc or "").lower()
+    permanent_markers = (
+        "400",
+        "bad request",
+        "invalid",
+        "not found",
+        "unsupported",
+        "context length",
+        "max_tokens",
+        "permission",
+        "forbidden",
+        "quota",
+        "balance",
+        "content filter",
+    )
+    if any(marker in message for marker in permanent_markers):
+        return False
+    return True
+
+
 def _ensure_cfg_list(cfg: LLMConfig | list[LLMConfig]) -> list[LLMConfig]:
     if isinstance(cfg, list):
         return cfg
     return [cfg]
+
+
+def _effective_draft_max_tokens(*, prompt_text: str, max_body: int) -> int:
+    """Keep the global token ceiling without oversizing ordinary draft calls.
+
+    A long news prompt plus ``max_tokens=60000`` can exceed a provider's
+    context-budget validation before generation starts.  Drafts are bounded
+    to ``max_body`` characters, so a smaller request budget is sufficient and
+    leaves room for the input prompt and JSON envelope.
+    """
+    raw = os.getenv("LLM_MAX_TOKENS", str(DEFAULT_LLM_MAX_TOKENS))
+    try:
+        configured = max(256, int(raw))
+    except (TypeError, ValueError):
+        configured = DEFAULT_LLM_MAX_TOKENS
+
+    body_budget = max(1024, int(max_body or 0) * 4 + 1024)
+    safe_budget = min(DEFAULT_DRAFT_EFFECTIVE_MAX_TOKENS, body_budget)
+
+    # Estimate input tokens conservatively for CJK-heavy prompts.  Keep a
+    # minimum output budget, but reserve the remainder of a common 32k context
+    # window for the prompt when a caller supplies unusually large material.
+    estimated_input_tokens = max(1, len(prompt_text or "") // 2)
+    context_budget = max(4096, 32768 - estimated_input_tokens)
+    return max(256, min(configured, safe_budget, context_budget))
 
 
 def generate_draft(
@@ -381,17 +458,26 @@ def generate_draft(
     generated_text: str | None = None
     for idx, llm_cfg in enumerate(cfg_list):
         request_attempt = 0
+        transient_attempt = 0
         max_rate_limit_retries = _rate_limit_max_retries()
         while True:
             try:
+                model_kwargs = {
+                    "model_provider": "openai",
+                    "base_url": llm_cfg.base_url,
+                    "api_key": llm_cfg.api_key,
+                    "max_tokens": _effective_draft_max_tokens(
+                        prompt_text="\n".join(
+                            str(getattr(message, "content", "")) for message in messages
+                        ),
+                        max_body=max_body,
+                    ),
+                    "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                }
+                model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.4))
                 model = init_chat_model(
                     llm_cfg.model,
-                    model_provider="openai",  # use OpenAI-compatible API
-                    base_url=llm_cfg.base_url,
-                    api_key=llm_cfg.api_key,
-                    temperature=0.4,
-                    max_tokens=DEFAULT_LLM_MAX_TOKENS,
-                    timeout=DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                    **model_kwargs,
                 )
                 print(
                     f"[llm] provider={llm_cfg.provider} model={llm_cfg.model} base_url={llm_cfg.base_url}"
@@ -410,6 +496,22 @@ def generate_draft(
                     )
                     time.sleep(wait_s)
                     continue
+                if (
+                    _is_transient_request_error(exc)
+                    and transient_attempt < _transient_retry_max()
+                ):
+                    transient_attempt += 1
+                    wait_s = _transient_retry_seconds()
+                    print(
+                        f"[llm] transient_error | provider={llm_cfg.provider} model={llm_cfg.model} "
+                        f"retry={transient_attempt}/{_transient_retry_max()} wait={wait_s}s"
+                    )
+                    time.sleep(wait_s)
+                    continue
+                print(
+                    f"[llm] request_failed | provider={llm_cfg.provider} model={llm_cfg.model} "
+                    f"error={_truncate(str(exc), 240)}"
+                )
                 break
         if generated_text is not None:
             break
@@ -494,14 +596,17 @@ def generate_json(
         max_rate_limit_retries = _rate_limit_max_retries()
         while True:
             try:
+                model_kwargs = {
+                    "model_provider": "openai",
+                    "base_url": llm_cfg.base_url,
+                    "api_key": llm_cfg.api_key,
+                    "max_tokens": max(256, int(max_tokens)),
+                    "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                }
+                model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.1))
                 model = init_chat_model(
                     llm_cfg.model,
-                    model_provider="openai",
-                    base_url=llm_cfg.base_url,
-                    api_key=llm_cfg.api_key,
-                    temperature=0.1,
-                    max_tokens=max(256, int(max_tokens)),
-                    timeout=DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                    **model_kwargs,
                 )
                 print(
                     f"[llm-json] provider={llm_cfg.provider} model={llm_cfg.model} "

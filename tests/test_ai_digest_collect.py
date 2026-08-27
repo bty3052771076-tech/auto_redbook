@@ -8,7 +8,7 @@ import pytest
 from src.ai_digest import collect as collect_mod
 from src.ai_digest.collect import collect_ai_digest_updates
 from src.ai_digest.models import AIUpdateItem
-from src.ai_digest.rank import ai_digest_quota_counts
+from src.ai_digest.rank import ai_digest_quota_counts, ai_update_history_key
 from src.ai_digest.sources import AIDigestSource
 from src.news.daily_news import NewsItem
 from src.sources.health import (
@@ -38,6 +38,51 @@ def _item(title: str, source_type: str = "official") -> AIUpdateItem:
     )
 
 
+def test_prompt_topic_official_backfill_verifies_and_returns_all_requested_topics(monkeypatch):
+    monkeypatch.setattr(collect_mod, "_http_get_text", lambda _url, timeout_s=12.0: "<html>official page</html>" * 20)
+    topics = [
+        "Qwen3.8-Flash-Next正式发布",
+        "GLM-5.3-Flash发布",
+        "QwenWork International上线",
+        "Codex plus用户回复5小时限制",
+        "Breeze TTS 2权重公开可用",
+    ]
+
+    items, meta = collect_mod.fetch_ai_digest_prompt_topic_backfill(topics=topics)
+
+    assert meta["verified"] == topics
+    assert meta["failed"] == []
+    assert [item.product for item in items] == topics
+    assert all(item.source_type == "official" for item in items)
+    assert all(item.url and item.published_at for item in items)
+
+
+def test_collect_ai_digest_updates_passes_prompt_topics_to_forced_search_backfill(monkeypatch):
+    sources = [
+        AIDigestSource("official", "official", "https://example.com/rss", "Fixture", "rss"),
+    ]
+    captured: dict[str, object] = {}
+
+    def fake_search_backfill(**kwargs):
+        captured.update(kwargs)
+        return [_item("Qwen3.8-Flash-Next正式发布", "search")], {"queries": [], "errors": []}
+
+    monkeypatch.setenv("AI_DIGEST_SEARCH_BACKFILL", "1")
+    monkeypatch.setattr(collect_mod, "fetch_ai_digest_search_backfill", fake_search_backfill)
+
+    collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=lambda _source: [_item("official-release")],
+        target_count=10,
+        min_official_count=6,
+        allow_social_backfill=True,
+        force_search_backfill=True,
+        search_backfill_queries=["Qwen3.8-Flash-Next正式发布"],
+    )
+
+    assert captured["queries"] == ["Qwen3.8-Flash-Next正式发布"]
+
+
 def test_collect_ai_digest_updates_skips_social_when_official_sources_are_enough():
     calls: list[str] = []
     sources = [
@@ -64,6 +109,31 @@ def test_collect_ai_digest_updates_skips_social_when_official_sources_are_enough
     assert meta["official_count"] == 8
     assert meta["social_backfill_used"] is False
     assert meta["aggregator_backfill_used"] is False
+
+
+def test_collect_ai_digest_updates_excludes_uploaded_history_before_ranking():
+    sources = [
+        AIDigestSource("official", "official", "https://example.com/rss", "Fixture", "rss"),
+    ]
+    repeated = _item("TokenHub service terms update")
+    fresh = _item("New model release")
+
+    def fake_fetch(_source):
+        return [repeated, fresh]
+
+    items, meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=2,
+        min_official_count=1,
+        include_pool_items=True,
+        exclude_history_keys={ai_update_history_key(repeated)},
+    )
+
+    assert [item.title for item in items] == ["New model release"]
+    assert meta["historical_excluded_count"] == 1
+    assert meta["source_history_filter"]["by_source"] == {"official": 1}
+    assert [item.title for item in meta["_fetched_items"]] == ["New model release"]
 
 
 def test_collect_ai_digest_updates_can_force_aggregator_backfill_for_history_deduplication():
@@ -157,6 +227,53 @@ def test_collect_ai_digest_skips_recent_timeout_and_persists_attempt_trace(tmp_p
     persisted_by_name = {item.source_name: item for item in persisted.attempts}
     assert persisted_by_name["timed-out"].status == "timeout"
     assert persisted_by_name["healthy"].status == "success"
+
+
+def test_collect_ai_digest_replaces_source_after_timeout_ratio_threshold(tmp_path):
+    now = datetime(2026, 8, 23, 9, tzinfo=timezone.utc)
+    health_path = tmp_path / "source_health" / "ai_digest.json"
+    save_source_health_snapshot(
+        SourceHealthSnapshot(
+            collection="ai_digest",
+            generated_at=now.isoformat(),
+            attempts=[
+                SourceAttempt(
+                    collection="ai_digest",
+                    source_name="unstable",
+                    source_url="https://example.com/unstable",
+                    tier="official_page",
+                    status="timeout",
+                    checked_at=now.isoformat(),
+                    recent_statuses=("timeout", "timeout", "success", "timeout", "success"),
+                )
+            ],
+        ),
+        health_path,
+    )
+    sources = [
+        AIDigestSource("unstable", "official", "https://example.com/unstable", "Unstable", "rss"),
+        AIDigestSource("healthy", "official", "https://example.com/healthy", "Healthy", "rss"),
+    ]
+    calls: list[str] = []
+
+    def fake_fetch(source):
+        calls.append(source.name)
+        return [_item("healthy-update")]
+
+    _items, meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=1,
+        min_official_count=1,
+        allow_social_backfill=False,
+        max_age_days=3,
+        now=now,
+        source_health_path=health_path,
+        persist_source_health=True,
+    )
+
+    assert calls == ["healthy"]
+    assert meta["source_health"]["replacement_skipped"] == ["unstable"]
 
 
 def test_collect_ai_digest_fetches_official_streams_before_pages():

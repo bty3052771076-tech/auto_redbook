@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -22,9 +22,11 @@ from .history import collect_used_news_url_keys, filter_used_news_items, news_hi
 from src.sources.health import (
     SourceAttempt,
     SourceHealthSnapshot,
+    append_source_status,
     is_source_in_cooldown,
     load_source_health_snapshot,
     save_source_health_snapshot,
+    should_replace_source,
 )
 
 DEFAULT_PROVIDER = "gnews"
@@ -50,6 +52,18 @@ DEFAULT_CHINA_BONUS = 0.15
 DEFAULT_SOURCE_DOMAIN_MAX_RATIO = 0.3
 DEFAULT_PROVIDER_CANDIDATE_MAX_RATIO = 0.35
 DEFAULT_COLLECTION_DOMAIN_MAX_RATIO = 0.2
+_INTERNATIONAL_CONFLICT_MARKERS = (
+    "conflict", "war", "ceasefire", "sanction", "airstrike", "military",
+    "attack", "clash", "dispute", "trade war", "tariff", "border crisis",
+    "冲突", "战争", "停火", "制裁", "空袭", "军事", "袭击", "交火", "争端",
+    "贸易战", "关税", "谈判破裂", "领土争端",
+)
+_INTERNATIONAL_CONTEXT_MARKERS = (
+    "international", "global", "world", "middle east", "ukraine", "russia",
+    "israel", "iran", "palestine", "nato", "united nations", "europe",
+    "us", "america", "美国", "俄罗斯", "乌克兰", "以色列", "伊朗", "巴勒斯坦",
+    "中东", "欧洲", "北约", "联合国", "国际", "海外", "全球",
+)
 # Automatic collection intentionally visits multiple sources. Keep each source
 # bounded so a slow fallback cannot make the whole candidate-pool stage look
 # stalled in the CLI or GUI.
@@ -662,6 +676,58 @@ def _required_china_count_for_daily_news(count: int) -> int:
     if count > 2:
         return 1
     return 0
+
+
+def daily_news_international_conflict_quota(count: int) -> int:
+    """Return the minimum number of international conflict stories per batch."""
+    if count >= 5:
+        return 2
+    return 0
+
+
+def is_international_conflict_news(item: NewsItem) -> bool:
+    """Classify a traceable international conflict or geopolitical story."""
+    text = " ".join(
+        str(part or "")
+        for part in (
+            item.title,
+            item.description,
+            item.source,
+            item.domain,
+            item.url,
+            # A distant mention in the body (for example, a market article
+            # saying that geopolitical tension may affect prices) must not
+            # turn an ordinary story into a conflict event. Keep the event
+            # classifier anchored to the headline/lead context.
+            (item.content or "")[:600],
+        )
+    ).lower()
+    def contains_marker(marker: str) -> bool:
+        if re.fullmatch(r"[a-z0-9 ]+", marker):
+            return re.search(
+                rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])",
+                text,
+                flags=re.IGNORECASE,
+            ) is not None
+        return marker in text
+
+    return (
+        any(contains_marker(marker) for marker in _INTERNATIONAL_CONFLICT_MARKERS)
+        and any(contains_marker(marker) for marker in _INTERNATIONAL_CONTEXT_MARKERS)
+    )
+
+
+def prioritize_international_conflict_news(
+    items: list[NewsItem],
+    *,
+    required_count: int,
+) -> list[NewsItem]:
+    """Place conflict stories first while preserving order within each lane."""
+    if required_count <= 0:
+        return list(items)
+    conflicts = [item for item in items if is_international_conflict_news(item)]
+    ordinary = [item for item in items if not is_international_conflict_news(item)]
+    return [*conflicts, *ordinary]
 
 
 def _balance_china_foreign(items: list[NewsItem], *, count: int) -> list[NewsItem]:
@@ -1600,15 +1666,29 @@ def _split_prompt_keyword_queries(value: str | None) -> list[str]:
     return queries
 
 
-def _build_prompt_news_queries(prompt_hint: str) -> list[str]:
+def _build_prompt_news_queries(
+    prompt_hint: str,
+    *,
+    additional_queries: Iterable[str] = (),
+) -> list[str]:
     hint_query = (prompt_hint or "").strip()
     if not hint_query:
-        return _default_news_queries()
-    hint_en = _maybe_translate_hint_to_en(hint_query)
-    default_queries = _split_news_queries(os.getenv("NEWS_QUERY_DEFAULT")) or [DEFAULT_QUERY]
+        query_candidates = [*additional_queries, *_default_news_queries()]
+    else:
+        hint_en = _maybe_translate_hint_to_en(hint_query)
+        default_queries = _split_news_queries(os.getenv("NEWS_QUERY_DEFAULT")) or [DEFAULT_QUERY]
+        # Required editorial lanes come before keyword fragments because
+        # exhaustive providers intentionally take only their first queries.
+        query_candidates = [
+            hint_query,
+            *additional_queries,
+            *_split_prompt_keyword_queries(hint_query),
+            hint_en,
+            *default_queries,
+        ]
     out: list[str] = []
     seen: set[str] = set()
-    for q in [hint_query, *_split_prompt_keyword_queries(hint_query), hint_en, *default_queries]:
+    for q in query_candidates:
         item = re.sub(r"\s+", " ", (q or "")).strip()
         key = item.lower()
         if not item or key in seen:
@@ -3070,6 +3150,7 @@ def fetch_daily_news_candidates(
     progress_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
     minimum_qualified_records: int | None = None,
     qualified_count_callback: Callable[[list[NewsItem]], int] | None = None,
+    additional_queries: Iterable[str] | None = None,
 ) -> tuple[list[NewsItem], dict[str, Any]]:
     """
     Fetch today's news via an external API.
@@ -3110,6 +3191,7 @@ def fetch_daily_news_candidates(
     }
     health_attempts: list[SourceAttempt] = []
     cooldown_skipped: list[str] = []
+    replacement_skipped: list[str] = []
 
     def _persist_health_snapshot() -> str:
         if health_path is None or not should_persist_health:
@@ -3207,11 +3289,27 @@ def fetch_daily_news_candidates(
         )
 
     hint_query = (prompt_hint or "").strip()
+    required_queries = [
+        re.sub(r"\s+", " ", str(query or "")).strip()
+        for query in (additional_queries or [])
+        if str(query or "").strip()
+    ]
     if hint_query:
-        queries = _build_prompt_news_queries(hint_query) if expand_query_variants else [hint_query]
+        if expand_query_variants:
+            queries = (
+                _build_prompt_news_queries(hint_query, additional_queries=required_queries)
+                if required_queries
+                else _build_prompt_news_queries(hint_query)
+            )
+        else:
+            queries = [hint_query, *required_queries]
         default_queries = _split_news_queries(os.getenv("NEWS_QUERY_DEFAULT")) or [DEFAULT_QUERY]
     else:
-        queries = _default_news_queries()
+        queries = (
+            _build_prompt_news_queries("", additional_queries=required_queries)
+            if required_queries
+            else _build_prompt_news_queries("")
+        )
         default_queries = []
     aggregate_empty_prompt = not bool(hint_query)
     history_dedupe_is_enabled = news_history_dedupe_enabled()
@@ -3252,6 +3350,25 @@ def fetch_daily_news_candidates(
         if provider not in provider_attempts:
             provider_attempts.append(provider)
         previous_attempt = persisted_health_attempts.get(provider)
+        if (
+            auto_provider_selection
+            and previous_attempt is not None
+            and previous_attempt.source_url == _news_provider_health_url(provider)
+            and should_replace_source(previous_attempt)
+        ):
+            replacement_skipped.append(provider)
+            if progress_callback is not None:
+                progress_callback(
+                    "信源采集",
+                    "skipped",
+                    {
+                        "provider": provider,
+                        "source_index": provider_index,
+                        "source_total": provider_total,
+                        "reason": "timeout_ratio_reached_replacement_threshold",
+                    },
+                )
+            continue
         if auto_provider_selection and is_source_in_cooldown(
             previous_attempt,
             cooldown_seconds=cooldown_seconds,
@@ -3618,6 +3735,7 @@ def fetch_daily_news_candidates(
                 dated_count=provider_dated_count,
                 url_count=provider_url_count,
             )
+        health_attempt = append_source_status(health_attempt, previous_attempt)
         health_attempts.append(health_attempt)
         persisted_health_attempts[provider] = health_attempt
         if progress_callback is not None:
@@ -3755,6 +3873,7 @@ def fetch_daily_news_candidates(
             "snapshot_path": health_snapshot_path,
             "cooldown_seconds": cooldown_seconds,
             "cooldown_skipped": cooldown_skipped,
+            "replacement_skipped": replacement_skipped,
             "attempts": [attempt.to_dict() for attempt in health_attempts],
         },
         "candidates": [asdict(c) for c in candidates[:10]],

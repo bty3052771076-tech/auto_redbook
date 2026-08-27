@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
@@ -493,12 +494,25 @@ def _prepare_auto_pipeline(
             record for record in stale_records if record.provider not in fresh_providers
         ]
         if stale_extra:
-            records = [*records, *stale_extra]
-            quota_mode = "stale_fallback"
-            warnings.append(
-                "部分平台额度刷新未得到新鲜正余额，使用 24 小时容忍期内的最后有效额度快照："
-                f"{', '.join(sorted({record.provider for record in stale_extra}))}。"
-            )
+            strict_confirmation = (os.getenv("REQUIRE_FRESH_QUOTA_CONFIRMATION") or "1").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            stale_providers = sorted({record.provider for record in stale_extra})
+            if strict_confirmation:
+                warnings.append(
+                    "严格额度确认已启用；以下平台本次刷新未返回新鲜正余额，已排除旧快照："
+                    f"{', '.join(stale_providers)}。"
+                )
+            else:
+                records = [*records, *stale_extra]
+                quota_mode = "stale_fallback"
+                warnings.append(
+                    "部分平台额度刷新未得到新鲜正余额，使用 24 小时容忍期内的最后有效额度快照："
+                    f"{', '.join(stale_providers)}。"
+                )
         rejected.extend(stale_rejected)
 
     requested_llm_provider = (os.getenv("LLM_PROVIDER") or "auto").strip().lower()
@@ -534,6 +548,11 @@ def _prepare_auto_pipeline(
         " ".join(
             [
                 f"LLM={model_plan.llm.provider}/{model_plan.llm.model}",
+                (
+                    f"LLM-score={model_plan.llm.selection_score:.2f} "
+                    f"(capability={model_plan.llm.capability_score:.0f} "
+                    f"quota={model_plan.llm.quota_score:.0f})"
+                ),
                 (
                     f"image={model_plan.image.provider}/{model_plan.image.model}"
                     if model_plan.image is not None
@@ -2634,8 +2653,29 @@ def aliyun_quota(
     )
 
     if open_only:
-        webbrowser.open(BAILIAN_FREE_QUOTA_URL)
-        typer.echo("opened official Bailian free-quota page")
+        project_root = Path(__file__).resolve().parents[1]
+        profile_script = project_root / "scripts" / "open_aliyun_console.ps1"
+        if not profile_script.is_file():
+            typer.echo(
+                f"error: project Aliyun profile launcher is missing: {profile_script}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(profile_script),
+            ],
+            cwd=str(project_root),
+        )
+        typer.echo(
+            "opened official Bailian free-quota page with project profile: "
+            f"{project_root / 'data' / 'browser' / 'aliyun-console-profile'}"
+        )
         return
 
     if headless and login_hold > 0:

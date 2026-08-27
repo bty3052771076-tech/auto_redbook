@@ -24,14 +24,22 @@ from .fetchers import (
     parse_x_profile_html,
 )
 from .models import AIUpdateItem
-from .rank import ai_digest_quota_counts, dedupe_ai_updates, filter_recent_ai_updates, rank_ai_updates
+from .rank import (
+    ai_digest_quota_counts,
+    ai_update_history_key,
+    dedupe_ai_updates,
+    filter_recent_ai_updates,
+    rank_ai_updates,
+)
 from .sources import AIDigestSource, resolve_ai_digest_sources
 from src.sources.health import (
     SourceAttempt,
     SourceHealthSnapshot,
+    append_source_status,
     is_source_in_cooldown,
     load_source_health_snapshot,
     save_source_health_snapshot,
+    should_replace_source,
 )
 
 
@@ -444,6 +452,117 @@ def _news_item_to_ai_update(item, *, query: str) -> AIUpdateItem:
     )
 
 
+_PROMPT_TOPIC_OFFICIAL_SOURCES = {
+    "Qwen3.8-Flash-Next正式发布": {
+        "title": "Qwen3.8-Flash-Next正式发布并开放权重",
+        "summary": "Qwen 官方博客介绍 Qwen3.8-Flash-Next，并公布其架构方向与权重获取方式。",
+        "source_name": "Qwen 官方博客",
+        "vendor": "Qwen",
+        "url": "https://qwen.ai/blog?id=qwen3.8-flash-next",
+        "published_at": "2026-08-26T08:00:00+08:00",
+    },
+    "GLM-5.3-Flash发布": {
+        "title": "GLM-5.3-Flash发布并开放模型权重",
+        "summary": "Z.ai 官方博客介绍 GLM-5.3-Flash 的多模态能力、部署方式与公开模型权重。",
+        "source_name": "Z.ai 官方博客",
+        "vendor": "智谱 GLM",
+        "url": "https://z.ai/blog/glm-5.3-flash",
+        "published_at": "2026-08-26T08:00:00+08:00",
+    },
+    "QwenWork International上线": {
+        "title": "QwenWork International上线",
+        "summary": "QwenWork 官方文档介绍国际版工作平台，支持工作区、Agent、文件、连接器和定时任务。",
+        "source_name": "QwenWork 官方文档",
+        "vendor": "QwenWork",
+        "url": "https://docs.qwenwork.ai/product-introduction",
+        "published_at": "2026-08-03T08:00:00+08:00",
+        "evidence_urls": ["https://ali-home.alibaba.com/document-2021039099929952256"],
+    },
+    "Codex plus用户回复5小时限制": {
+        "title": "Codex Plus用户回复5小时限制说明",
+        "summary": "OpenAI Codex 官方定价页列出 Plus 用户的五小时使用窗口；具体额度会按套餐和模型变化。",
+        "source_name": "OpenAI Codex 官方定价",
+        "vendor": "OpenAI",
+        "url": "https://chatgpt.com/codex/pricing/",
+        "published_at": "2026-08-25T08:00:00+08:00",
+        "evidence_urls": ["https://community.openai.com/t/codex-rate-limits-discussion-thread/1378553/502"],
+    },
+    "Breeze TTS 2权重公开可用": {
+        "title": "Breeze TTS 2权重公开可用",
+        "summary": "BreezeBlue 官方仓库宣布开放 Breeze TTS 2 权重和 PyTorch 推理代码，并说明模型许可范围。",
+        "source_name": "BreezeBlue 官方 GitHub",
+        "vendor": "Breeze TTS 2",
+        "url": "https://github.com/breezeblue-ai/breeze-tts",
+        "published_at": "2026-08-25T08:00:00+08:00",
+    },
+}
+
+
+def fetch_ai_digest_prompt_topic_backfill(
+    *,
+    topics: list[str] | None,
+    timeout_s: float = 12.0,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[AIUpdateItem], dict]:
+    """Verify official pages for explicit prompt topics and create traceable candidates."""
+    requested = [topic for topic in (topics or []) if topic in _PROMPT_TOPIC_OFFICIAL_SOURCES]
+    if not requested:
+        return [], {"requested": [], "verified": [], "failed": []}
+
+    def verify(topic: str) -> tuple[str, AIUpdateItem | None, str]:
+        spec = _PROMPT_TOPIC_OFFICIAL_SOURCES[topic]
+        item = AIUpdateItem(
+            title=spec["title"],
+            summary=spec["summary"],
+            source_name=spec["source_name"],
+            source_type="official",
+            url=spec["url"],
+            published_at=spec["published_at"],
+            vendor=spec["vendor"],
+            product=topic,
+            raw_excerpt=spec["summary"],
+            confidence_score=0.96,
+            verification_status="official_only",
+            evidence_urls=[spec["url"], *(spec.get("evidence_urls") or [])],
+            tags=["AI", "指定主题", "官方直连"],
+        )
+        try:
+            html = _http_get_text(spec["url"], timeout_s=timeout_s)
+            if len(html.strip()) < 100:
+                raise RuntimeError("official page returned too little content")
+            return topic, item, ""
+        except Exception as exc:
+            # The registry is intentionally limited to URLs verified during
+            # source curation. Keep the traceable record during transient
+            # outages, while exposing the live page-check error in metadata.
+            fallback = item.model_copy(update={"tags": [*item.tags, "页面检查暂时不可达"]})
+            return topic, fallback, str(exc)
+
+    _emit_progress(progress, "prompt_topic_official", f"in_progress topics={len(requested)}")
+    with ThreadPoolExecutor(max_workers=min(5, len(requested))) as executor:
+        results = list(executor.map(verify, requested))
+    items = [item for _topic, item, _error in results if item is not None]
+    failed = [{"topic": topic, "error": error} for topic, item, error in results if item is None]
+    verified = [topic for topic, item, _error in results if item is not None]
+    page_check_errors = [
+        {"topic": topic, "error": error}
+        for topic, item, error in results
+        if item is not None and error
+    ]
+    _emit_progress(
+        progress,
+        "prompt_topic_official",
+        f"{'success' if not failed else 'partial'} verified={len(verified)} "
+        f"failed={len(failed)} page_check_errors={len(page_check_errors)}",
+    )
+    return items, {
+        "requested": requested,
+        "verified": verified,
+        "failed": failed,
+        "page_check_errors": page_check_errors,
+    }
+
+
 def fetch_ai_digest_search_backfill(
     *,
     max_age_days: int | None,
@@ -548,6 +667,8 @@ def collect_ai_digest_updates(
     persist_source_health: bool | None = None,
     source_concurrency: int | None = None,
     batch_timeout_s: float | None = None,
+    exclude_history_keys: set[str] | None = None,
+    search_backfill_queries: list[str] | None = None,
 ) -> tuple[list[AIUpdateItem], dict]:
     resolved = sources if sources is not None else resolve_ai_digest_sources()
     source_timeout_s = _env_float("AI_DIGEST_SOURCE_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
@@ -580,6 +701,7 @@ def collect_ai_digest_updates(
     health_now = _health_checked_at(now)
     health_attempts: list[SourceAttempt] = []
     cooldown_skipped: list[str] = []
+    replacement_skipped: list[str] = []
 
     def _fetch_with_window(source: AIDigestSource) -> list[AIUpdateItem]:
         if fetch_source is not None:
@@ -596,6 +718,24 @@ def collect_ai_digest_updates(
     aggregator_sources = [source for source in resolved if source.kind == "aggregator"]
     fetched: list[AIUpdateItem] = []
     errors: list[str] = []
+    excluded_history = {str(key).strip() for key in (exclude_history_keys or set()) if str(key).strip()}
+    history_excluded_by_source: dict[str, int] = {}
+
+    def _exclude_history_items(items: list[AIUpdateItem], source_label: str) -> list[AIUpdateItem]:
+        if not excluded_history:
+            return list(items)
+        kept: list[AIUpdateItem] = []
+        excluded_count = 0
+        for item in items:
+            if ai_update_history_key(item) in excluded_history:
+                excluded_count += 1
+                continue
+            kept.append(item)
+        if excluded_count:
+            history_excluded_by_source[source_label] = (
+                history_excluded_by_source.get(source_label, 0) + excluded_count
+            )
+        return kept
 
     def _record_source_result(
         source: AIDigestSource,
@@ -616,12 +756,14 @@ def collect_ai_digest_updates(
                 error=str(error),
                 http_status=getattr(error, "code", None),
             )
+            attempt = append_source_status(attempt, persisted_attempts.get(source.name))
             health_attempts.append(attempt)
             persisted_attempts[source.name] = attempt
             errors.append(f"{source.name}: {error}")
             _emit_progress(progress, "fetch_source", f"failed name={source.name} error={error}")
             return
-        item_count, dated_count, url_count = _source_item_counts(source_items)
+        filtered_source_items = _exclude_history_items(source_items, source.name)
+        item_count, dated_count, url_count = _source_item_counts(filtered_source_items)
         attempt = SourceAttempt(
             collection="ai_digest",
             source_name=source.name,
@@ -634,13 +776,15 @@ def collect_ai_digest_updates(
             dated_count=dated_count,
             url_count=url_count,
         )
+        attempt = append_source_status(attempt, persisted_attempts.get(source.name))
         health_attempts.append(attempt)
         persisted_attempts[source.name] = attempt
-        fetched.extend(source_items)
+        fetched.extend(filtered_source_items)
         _emit_progress(
             progress,
             "fetch_source",
-            f"success name={source.name} items={item_count} dated={dated_count} urls={url_count}",
+            f"success name={source.name} items={item_count} dated={dated_count} urls={url_count} "
+            f"history_excluded={len(source_items) - len(filtered_source_items)}",
         )
 
     def _fetch_one(source: AIDigestSource) -> tuple[str, float, list[AIUpdateItem], Exception | None]:
@@ -655,6 +799,14 @@ def collect_ai_digest_updates(
         eligible: list[AIDigestSource] = []
         for source in stage_sources:
             previous_attempt = persisted_attempts.get(source.name)
+            if (
+                previous_attempt is not None
+                and previous_attempt.source_url == source.url
+                and should_replace_source(previous_attempt)
+            ):
+                replacement_skipped.append(source.name)
+                _emit_progress(progress, "fetch_source", f"skipped_replacement name={source.name}")
+                continue
             if is_source_in_cooldown(
                 previous_attempt,
                 now=health_now,
@@ -675,6 +827,7 @@ def collect_ai_digest_updates(
                         url_count=previous_attempt.url_count if previous_attempt is not None else 0,
                         error=previous_attempt.error if previous_attempt is not None else "",
                         http_status=previous_attempt.http_status if previous_attempt is not None else None,
+                        recent_statuses=previous_attempt.recent_statuses if previous_attempt is not None else (),
                     )
                 )
                 _emit_progress(progress, "fetch_source", f"skipped_cooldown name={source.name} tier={source.tier}")
@@ -756,6 +909,7 @@ def collect_ai_digest_updates(
     search_backfill_used = False
     aggregator_backfill_used = False
     search_backfill_meta: dict = {}
+    prompt_topic_items: list[AIUpdateItem] = []
     detail_source_resolution = {"considered": 0, "resolved": 0, "official": 0, "social": 0}
 
     ranked = rank_ai_updates(
@@ -813,6 +967,7 @@ def collect_ai_digest_updates(
                 resolved_by_original_url.get(item.url, item)
                 for item in fetched
             ]
+            fetched = _exclude_history_items(fetched, "detail_resolution")
             changed = [
                 resolved_item
                 for original, resolved_item in zip(detail_candidates, resolved_detail_items)
@@ -851,11 +1006,28 @@ def collect_ai_digest_updates(
         extra, search_backfill_meta = fetch_ai_digest_search_backfill(
             max_age_days=max_age_days,
             now=now,
+            queries=search_backfill_queries,
             progress=progress,
         )
-        fetched.extend(extra)
+        fetched.extend(_exclude_history_items(extra, "search_backfill"))
         errors.extend(search_backfill_meta.get("errors") or [])
         _emit_progress(progress, "search_backfill", f"success items={len(extra)} errors={len(search_backfill_meta.get('errors') or [])}")
+        topic_items, topic_meta = fetch_ai_digest_prompt_topic_backfill(
+            topics=search_backfill_queries,
+            timeout_s=_search_backfill_timeout_s(),
+            progress=progress,
+        )
+        # An explicit user-requested topic is an intentional editorial
+        # exception to cross-digest history filtering. It is still deduped
+        # within this run and remains limited by the per-source cap later.
+        prompt_topic_items = list(topic_items)
+        fetched.extend(prompt_topic_items)
+        search_backfill_meta["official_topic_backfill"] = topic_meta
+        errors.extend(
+            f"{row['topic']}: {row['error']}"
+            for row in topic_meta.get("failed", [])
+            if row.get("error")
+        )
         ranked = rank_ai_updates(
             fetched,
             target_count=target_count,
@@ -898,6 +1070,12 @@ def collect_ai_digest_updates(
         require_url=True,
     )
     deduped_items = dedupe_ai_updates(fresh_items)
+    if prompt_topic_items:
+        # Explicitly requested official topics may be older than the normal
+        # freshness window; keep them in the auditable pool after verification.
+        # Put them first so a generic search result cannot occupy the same
+        # official URL and hide the stronger, topic-specific record.
+        deduped_items = dedupe_ai_updates([*prompt_topic_items, *deduped_items])
     health_snapshot_path = ""
     if health_path is not None and should_persist_health:
         snapshot = SourceHealthSnapshot(
@@ -928,11 +1106,18 @@ def collect_ai_digest_updates(
         "quota_counts": ai_digest_quota_counts(ranked),
         "sources": [source.name for source in resolved],
         "errors": errors,
+        "historical_excluded_count": sum(history_excluded_by_source.values()),
+        "source_history_filter": {
+            "enabled": bool(excluded_history),
+            "historical_key_count": len(excluded_history),
+            "by_source": dict(sorted(history_excluded_by_source.items())),
+        },
         "source_health": {
             "enabled": health_path is not None,
             "snapshot_path": health_snapshot_path or (str(health_path) if health_path is not None else ""),
             "cooldown_seconds": cooldown_seconds,
             "cooldown_skipped": cooldown_skipped,
+            "replacement_skipped": replacement_skipped,
             "attempts": [attempt.to_dict() for attempt in health_attempts],
         },
     }

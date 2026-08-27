@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 import apps.cli as cli
@@ -107,3 +109,27 @@ def test_aliyun_quota_cli_passes_visible_only(monkeypatch):
 
     assert result.exit_code == 0
     assert captured["visible_only"] is True
+
+
+def test_aliyun_quota_open_only_uses_workspace_profile_script(monkeypatch):
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        cli.webbrowser,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("open-only must not use the default browser"),
+    )
+
+    result = CliRunner().invoke(cli.app, ["aliyun-quota", "--open-only"])
+
+    assert result.exit_code == 0
+    assert calls
+    command = [str(item) for item in calls[0][0][0]]
+    assert command[0].lower() in {"powershell.exe", "powershell"}
+    expected_script = Path(cli.__file__).resolve().parents[1] / "scripts" / "open_aliyun_console.ps1"
+    assert command[-2:] == ["-File", str(expected_script)]

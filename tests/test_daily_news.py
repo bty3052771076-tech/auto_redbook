@@ -2,6 +2,8 @@ import json
 import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -10,11 +12,14 @@ from src.images.auto_image import ImageGenerationAbandoned
 from src.news import daily_news
 from src.news.daily_news import (
     NewsItem,
+    daily_news_international_conflict_quota,
+    is_international_conflict_news,
     load_manual_news_materials_file,
     load_single_news_material_file,
     parse_manual_news_materials,
     pick_best_news,
     pick_news_items,
+    prioritize_international_conflict_news,
     _dedupe_candidates,
 )
 from src.news.history import normalize_news_url_key
@@ -71,6 +76,147 @@ def test_daily_news_query_variants_expand_space_separated_prompt_keywords(monkey
     assert queries[:4] == ["世界杯 体育 足球", "世界杯", "体育", "足球"]
     assert any("world cup" in query.lower() for query in queries)
     assert len(queries) == len(dict.fromkeys(query.lower() for query in queries))
+
+
+def test_daily_news_required_queries_are_sent_before_keyword_variants(monkeypatch):
+    monkeypatch.delenv("NEWS_QUERY_DEFAULT", raising=False)
+
+    queries = daily_news._build_prompt_news_queries(
+        "财经 科技",
+        additional_queries=["国际冲突 停火", "international conflict ceasefire"],
+    )
+
+    assert queries[:3] == ["财经 科技", "国际冲突 停火", "international conflict ceasefire"]
+
+
+def test_daily_news_international_conflict_quota_prioritizes_two_traceable_items():
+    conflict_one = NewsItem(
+        title="Ceasefire talks break down as border conflict escalates",
+        url="https://example.com/world-conflict",
+        description="The international dispute triggered new sanctions and military alerts.",
+        seendate=_recent_news_seendate(0),
+        language="en",
+    )
+    conflict_two = NewsItem(
+        title="中东冲突地区停火谈判出现新变化",
+        url="https://example.com/mideast-ceasefire",
+        description="联合国呼吁保障平民并推动停火。",
+        seendate=_recent_news_seendate(0),
+    )
+    ordinary = NewsItem(
+        title="Software company reports stronger quarterly revenue",
+        url="https://example.com/business",
+        description="The company published its quarterly financial results.",
+        seendate=_recent_news_seendate(0),
+        language="en",
+    )
+
+    assert daily_news_international_conflict_quota(5) == 2
+    assert is_international_conflict_news(conflict_one)
+    assert is_international_conflict_news(conflict_two)
+    assert not is_international_conflict_news(ordinary)
+    ordered = prioritize_international_conflict_news(
+        [ordinary, conflict_one, conflict_two],
+        required_count=2,
+    )
+    assert ordered[:2] == [conflict_one, conflict_two]
+
+
+def test_daily_news_conflict_signal_survives_source_focus_rewrite():
+    original = NewsItem(
+        title="Ceasefire talks collapse in international dispute",
+        url="https://example.com/international-conflict",
+        description="The dispute triggered new sanctions and military alerts.",
+        seendate=_recent_news_seendate(0),
+        language="en",
+    )
+    focused = NewsItem(
+        title="Talks face a new development",
+        url="https://example.com/news/123",
+        description="Officials issued a new statement.",
+        seendate=original.seendate,
+        language="en",
+    )
+
+    assert create_post._daily_news_conflict_signal(original, focused) is True
+    assert create_post._daily_news_conflict_signal(focused) is False
+
+
+def test_daily_news_candidate_result_keeps_prefetch_conflict_signal(monkeypatch, tmp_path):
+    original = NewsItem(
+        title="Ceasefire talks collapse in international dispute",
+        url="https://example.com/international-conflict",
+        description="The dispute triggered new sanctions and military alerts.",
+        seendate=_recent_news_seendate(0),
+        language="en",
+    )
+    focused = replace(
+        original,
+        title="Talks face a new development",
+        description="Officials issued a new statement.",
+        url="https://example.com/news/123",
+    )
+    monkeypatch.setattr(create_post, "post_dir", lambda _post_id: tmp_path / "post")
+    monkeypatch.setattr(create_post, "is_auto_image_enabled", lambda: False)
+    monkeypatch.setattr(create_post, "generate_draft", lambda *_args, **_kwargs: {
+        "title": "谈判出现新变化",
+        "body": "内容：公开信息显示谈判出现新变化。\n\n评价：后续仍需观察。\n\n日期：2026-08-27\n\n来源：测试来源",
+        "topics": ["每日新闻"],
+    })
+    cfg = LLMConfig(provider="fake", model="fake-model", api_key="test")
+    queues = create_post.ModelWorkQueues(llm_workers=1, image_workers=1)
+    try:
+        result = create_post._prepare_daily_news_candidate(
+            candidate_index=1,
+            picked=focused,
+            cfgs=[cfg],
+            asset_paths=[],
+            copy_assets=False,
+            auto_image_enabled=False,
+            prompt_norm="国际冲突",
+            viewpoint_norm="无视角评价",
+            target_count=5,
+            single_material_mode=False,
+            base_meta={},
+            progress_callback=None,
+            model_queues=queues,
+            post_quality_callback=None,
+            prepared=(focused, {}, {}, focused),
+            original_is_conflict=True,
+        )
+    finally:
+        queues.close()
+    assert result.picked_is_conflict is True
+
+
+def test_daily_news_all_conflict_candidates_are_processed_before_ordinary_news():
+    conflict = NewsItem(
+        title="International ceasefire dispute escalates",
+        url="https://example.com/conflict",
+        description="The dispute led to new sanctions.",
+        seendate=_recent_news_seendate(0),
+        language="en",
+    )
+    ordinary = NewsItem(
+        title="Company reports quarterly results",
+        url="https://example.com/business",
+        description="The company published quarterly results.",
+        seendate=_recent_news_seendate(0),
+        language="en",
+    )
+    late_conflict = NewsItem(
+        title="International border conflict prompts talks",
+        url="https://example.com/conflict-2",
+        description="Officials discussed sanctions and a possible ceasefire.",
+        seendate=_recent_news_seendate(0),
+        language="en",
+    )
+
+    ordered = create_post._prioritize_all_daily_news_conflicts(
+        [conflict, ordinary, late_conflict]
+    )
+
+    assert ordered[:2] == [conflict, late_conflict]
 
 
 def test_relevance_score_matches_chinese_world_cup_prompt_to_english_headline():
@@ -1409,6 +1555,27 @@ def test_daily_news_title_rejects_incomplete_action_tail_and_uses_source_summary
     assert not title.endswith("启动响")
 
 
+def test_daily_news_title_compresses_canada_us_tariff_opinion_without_cutting_tail():
+    picked = NewsItem(
+        title="加拿大对美国说“不”，卡尼的关税策略面临考验",
+        url="https://example.com/canada-us",
+        source="纽约时报中文网",
+        domain="cn.nytimes.com",
+        description="观点文章讨论卡尼暂停加美贸易谈判并拟采取等额对等反制关税。",
+        content="加拿大总理办公室确认加美贸易谈判暂停，卡尼拟实施等额对等反制关税。",
+    )
+
+    title = _normalize_daily_news_title(
+        "加拿大对美国说不卡尼的关税策略面临考",
+        picked,
+        "",
+    )
+
+    assert title == "加美谈判暂停卡尼拟反制"
+    assert len(title) <= 18
+    assert not create_post._daily_news_title_has_incomplete_tail(title)
+
+
 def test_daily_news_comment_rejects_numeric_claim_missing_from_material():
     picked = NewsItem(
         title="世界杯决赛将首次设置中场秀",
@@ -1447,6 +1614,35 @@ def test_daily_news_content_rejects_unsupported_time_and_duration_claims():
         "世界杯决赛将首次设置中场秀，节目与公益教育项目联动。",
         picked,
     )
+
+
+def test_finalize_daily_news_body_keeps_chinese_copy_when_only_numbers_need_sanitizing():
+    picked = NewsItem(
+        title="US-Canada trade war escalates as Trump threatens tariff hike on vehicles",
+        url="https://www.bbc.co.uk/news/example",
+        source="BBC Business",
+        domain="www.bbc.co.uk",
+        seendate="2026-08-25",
+        description="The United States and Canada are facing a renewed trade dispute.",
+        content="Canada is considering its response while both sides assess the economic impact.",
+    )
+    body = (
+        "内容：\n"
+        "特朗普威胁自明年1月1日起，将加拿大汽车及零部件关税从25%提高至50%。"
+        "此前美加贸易谈判破裂，双方正在评估后续影响。\n\n"
+        "评价：\n"
+        "具体执行细节仍待官方公布，后续影响需要继续观察。\n\n"
+        "日期：2026-08-25\n\n来源：BBC Business"
+    )
+
+    out = _finalize_daily_news_body(body, picked, "国际争议事件")
+    fields = _daily_news_body_fields(out)
+
+    assert "25%" not in fields["内容"]
+    assert "50%" not in fields["内容"]
+    assert "美加贸易谈判" in fields["内容"]
+    assert not re.search(r"[A-Za-z]{3,}", fields["内容"])
+    assert _daily_news_quality_issue("美威胁加征汽车关税引发美加贸易争端", out, "国际争议事件") == ""
 
 
 def test_daily_news_title_compresses_human_rights_governance_without_cutting_word():
@@ -2305,6 +2501,100 @@ def test_daily_news_image_event_uses_inspectable_text_free_scene(
     assert all(token not in event for token in blocked)
 
 
+@pytest.mark.parametrize(
+    ("title", "body", "expected"),
+    [
+        (
+            "中国宏桥半年净利增长39%",
+            "内容：中国宏桥披露半年业绩，铝业相关业务利润增长，氧化铝和铝锭生产仍是核心板块。",
+            ("铝", "冶炼", "铝锭"),
+        ),
+        (
+            "阿里巴巴折价配股引发股价波动",
+            "内容：公司通过折价配股筹集资金，市场交易时段股价出现波动。",
+            ("证券交易", "配股", "趋势线"),
+        ),
+        (
+            "融创中国收购资产管理公司全部股权",
+            "内容：融创中国通过附属公司完成收购，以加强第三方建管和资产运营能力。",
+            ("城市住宅", "项目沙盘", "资产管理"),
+        ),
+    ],
+)
+def test_daily_news_image_event_keeps_finance_industry_and_transaction_scene(
+    title, body, expected
+):
+    picked = NewsItem(
+        title=title,
+        url="https://example.com/finance-story",
+        source="Example",
+        domain="example.com",
+        seendate=_recent_news_seendate(0),
+        description=body,
+        content=body,
+    )
+
+    event = _normalize_daily_news_image_event(
+        title,
+        picked=picked,
+        title=title,
+        body=body,
+        prompt_norm="财经产业",
+    )
+
+    assert all(token in event for token in expected)
+    assert "财经分析人员" not in event
+
+
+def test_daily_news_image_event_keeps_oil_camp_safety_scene_non_militarized():
+    picked = NewsItem(
+        title="中资石油勘探企业营地遭滋扰",
+        url="https://example.com/oil-camp",
+        source="驻外使馆",
+        domain="example.com",
+        seendate=_recent_news_seendate(0),
+        description="不法人员擅闯石油勘探营地，主管部门已立案调查并保障企业员工安全。",
+        content="不法人员擅闯石油勘探营地，主管部门已立案调查并保障企业员工安全。",
+    )
+
+    event = _normalize_daily_news_image_event(
+        "中资石油勘探企业遭滋扰",
+        picked=picked,
+        title="中资石油勘探企业遭滋扰",
+        body="内容：不法人员擅闯营地，主管部门已立案调查。",
+        prompt_norm="",
+    )
+
+    assert "石油勘探营地" in event
+    assert "安保人员" in event
+    assert all(token in event for token in ("无武器", "无冲突", "无文字"))
+
+
+def test_daily_news_image_event_keeps_canada_us_trade_scene_non_disastrous():
+    picked = NewsItem(
+        title="加拿大对美国说“不”，卡尼的关税策略面临考验",
+        url="https://example.com/canada-us-trade",
+        source="加拿大总理办公室",
+        domain="www.pm.gc.ca",
+        seendate=_recent_news_seendate(0),
+        description="加美贸易谈判暂停，加拿大拟实施等额对等反制关税。",
+        content="加美贸易谈判暂停，加拿大拟实施等额对等反制关税。",
+    )
+
+    event = _normalize_daily_news_image_event(
+        "加拿大总理卡尼拒绝美方贸易方案，拟实施等额对等反制关税",
+        picked=picked,
+        title="加美谈判暂停卡尼拟反制",
+        body="内容：加拿大拟实施等额对等反制关税。",
+        prompt_norm="",
+    )
+
+    assert "集装箱码头" in event
+    assert "无人物肖像" in event
+    assert "无文字" in event
+    assert "无灾难画面" in event
+
+
 def test_create_daily_news_posts_keeps_trying_candidates_rejected_by_post_quality_callback(
     monkeypatch, tmp_path
 ):
@@ -2683,6 +2973,88 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
         assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 2
         assert post.platform["news"]["selection_pool"]["raw_fetch_count"] == 20
         assert post.platform["news"]["selection_pool"]["requested_count"] == 2
+
+
+def test_daily_news_uses_two_independent_model_queues(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DAILY_NEWS_LLM_SUPERVISOR", "0")
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    candidates = [
+        NewsItem(
+            title=f"模型公司发布第{index}项技术更新",
+            url=f"https://example.com/news/{index}",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0, hour=10 - index),
+            description=f"模型公司发布第{index}项技术更新，披露具体技术变化。",
+            content=f"模型公司发布第{index}项技术更新，披露具体技术变化。",
+            sourcecountry="cn",
+        )
+        for index in range(1, 5)
+    ]
+    monkeypatch.setattr(
+        create_post,
+        "fetch_daily_news_candidates",
+        lambda _prompt, **_kwargs: (candidates, {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(create_post, "_same_cjk_story_event", lambda *_args: False)
+
+    active = {"llm": 0, "image": 0}
+    peak = {"llm": 0, "image": 0}
+    lock = threading.Lock()
+
+    def fake_generate_draft(*_args, **kwargs):
+        with lock:
+            active["llm"] += 1
+            peak["llm"] = max(peak["llm"], active["llm"])
+        time.sleep(0.04)
+        title = kwargs["prompt_hint"].split("- 新闻标题：", 1)[1].splitlines()[0].strip()
+        with lock:
+            active["llm"] -= 1
+        return {
+            "title": title,
+            "body": _test_daily_news_body(
+                original_title=title,
+                content=f"{title}披露了具体技术变化和公开信息。",
+                comment="这条新闻的价值在于技术变化具有清晰的事实依据。",
+                date=_recent_news_date(),
+                source="Example",
+            ),
+            "topics": ["每日新闻", "模型"],
+            "image_event": title,
+        }
+
+    def fake_images(**kwargs):
+        with lock:
+            active["image"] += 1
+            peak["image"] = max(peak["image"], active["image"])
+        time.sleep(0.04)
+        path = kwargs["dest_dir"] / "cover.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fake-image")
+        with lock:
+            active["image"] -= 1
+        return [path], [{"id": kwargs["title"], "provider": "fake"}], None
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+    monkeypatch.setattr(create_post, "_fetch_daily_news_related_images", fake_images)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="模型技术更新",
+        asset_paths=[],
+        count=4,
+        auto_image=True,
+    )
+
+    assert len(posts) == 4
+    assert peak == {"llm": 2, "image": 2}
 
 
 def test_daily_news_upload_uses_ten_qualified_candidates_per_requested_draft_by_default(monkeypatch):
@@ -3226,7 +3598,7 @@ def test_create_daily_news_posts_uses_backup_candidates_after_quality_skips(monk
             "title": title,
             "body": _test_daily_news_body(
                 original_title=title,
-                content="\u9879\u76ee\u56f4\u7ed5\u6280\u672f\u843d\u5730\u548c\u4ea7\u4e1a\u534f\u540c\u5c55\u5f00\uff0c\u76ee\u524d\u5df2\u516c\u5e03\u660e\u786e\u7684\u5e94\u7528\u65b9\u5411\u548c\u53c2\u4e0e\u4e3b\u4f53\u3002",
+                content=f"{title}\u56f4\u7ed5\u6280\u672f\u843d\u5730\u548c\u4ea7\u4e1a\u534f\u540c\u5c55\u5f00\uff0c\u76ee\u524d\u5df2\u516c\u5e03\u660e\u786e\u7684\u5e94\u7528\u65b9\u5411\u548c\u53c2\u4e0e\u4e3b\u4f53\u3002",
                 comment="\u8fd9\u7c7b\u9879\u76ee\u7684\u4ef7\u503c\u8981\u770b\u540e\u7eed\u5e94\u7528\u89c4\u6a21\u3001\u6210\u672c\u6536\u76ca\u548c\u7528\u6237\u53cd\u9988\u3002",
             ),
             "topics": ["\u6bcf\u65e5\u65b0\u95fb", "\u79d1\u6280"],
@@ -3459,6 +3831,81 @@ def test_create_daily_news_posts_rejects_llm_fallback_placeholder(monkeypatch, t
         )
 
     assert not list((tmp_path / "data" / "posts").glob("*/post.json"))
+
+
+def test_create_daily_news_skips_content_policy_candidate_and_continues(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    candidates = [
+        NewsItem(
+            title="含敏感内容的国际事件",
+            url="https://example.com/blocked",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description="公开摘要",
+            content="公开正文",
+        ),
+        NewsItem(
+            title="正常的财经政策更新",
+            url="https://example.com/accepted",
+            source="Example",
+            domain="example.com",
+            seendate=_recent_news_seendate(0),
+            description="公司发布了具体的政策更新摘要。",
+            content="公司发布了具体的政策更新，材料包含主体、动作和时间。",
+        ),
+    ]
+    monkeypatch.setattr(
+        create_post,
+        "_fetch_daily_news_candidates_for_upload",
+        lambda *_args, **_kwargs: (candidates, {"provider": "fake-news"}),
+    )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_focus_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(create_post, "_daily_news_quality_issue", lambda *_args: "")
+    monkeypatch.setattr(
+        create_post,
+        "pick_news_items",
+        lambda items, _prompt, *, count=1: items[:count],
+    )
+    calls = {"count": 0}
+
+    def fake_generate_draft(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"_fallback_error": "400 data_inspection_failed: inappropriate content"}
+        return {
+            "title": "财经政策更新落地",
+            "body": _test_daily_news_body(
+                original_title="正常的财经政策更新",
+                content="公司发布了具体的政策更新，材料包含主体、动作和时间。",
+                comment="后续影响需要结合正式文件和执行情况观察。",
+                date=_recent_news_date(),
+                source="Example",
+            ),
+            "topics": ["每日新闻", "财经"],
+            "image_event": "公司发布政策更新",
+        }
+
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="财经政策",
+        asset_paths=[],
+        count=1,
+        auto_image=False,
+    )
+
+    assert len(posts) == 1
+    assert "政策" in posts[0].title
+    assert calls["count"] == 2
 
 
 def test_create_daily_news_fallback_does_not_publish_prompt_as_topic(monkeypatch, tmp_path):
@@ -5005,6 +5452,74 @@ def test_single_news_material_falls_back_to_pexels_when_ai_image_fails(monkeypat
     assert posts[0].platform["image_fallback"]["to_provider"] == "pexels"
 
 
+def test_single_news_material_repairs_generic_final_body_from_source(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    news_file = tmp_path / "single_news.md"
+    news_file.write_text(
+        f"""
+        标题：中资石油勘探企业营地遭滋扰
+        时间：{_recent_news_date()} 18:25
+        来源：驻外使馆
+        链接：https://example.com/oil-camp
+        正文：当地不法分子擅闯中资石油勘探企业营地，破坏公司财物并滋扰正常经营。主管部门已拘留滋事人员并立案调查，表示将保障企业和员工安全。
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
+    )
+    monkeypatch.setattr(
+        create_post,
+        "generate_draft",
+        lambda *_args, **_kwargs: {
+            "title": "中资石油企业营地遭滋扰",
+            "body": _test_daily_news_body(
+                original_title="中资石油勘探企业营地遭滋扰",
+                content="主管部门已就营地滋扰事件开展调查。",
+                comment="已披露的处置进展值得继续关注。",
+                date=_recent_news_date(),
+                source="驻外使馆",
+            ),
+            "topics": ["每日新闻", "中资企业"],
+            "image_event": "中资石油企业营地遭滋扰",
+        },
+    )
+
+    def fake_images(*, dest_dir, **_kwargs):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / "generated.jpg"
+        out.write_bytes(b"image")
+        return [out], [{"provider": "fake", "mode": "auto_image"}]
+
+    monkeypatch.setattr(create_post, "fetch_and_download_related_images", fake_images)
+    original_quality = create_post._daily_news_quality_issue
+    calls = 0
+
+    def force_one_generic_quality(title, body, prompt_norm=""):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "generic_body"
+        return original_quality(title, body, prompt_norm)
+
+    monkeypatch.setattr(create_post, "_daily_news_quality_issue", force_one_generic_quality)
+
+    posts = create_post.create_daily_news_posts(
+        prompt_hint="",
+        asset_paths=[],
+        count=1,
+        auto_image=True,
+        single_news_material_file=str(news_file),
+    )
+
+    assert len(posts) == 1
+    assert "不法分子擅闯中资石油勘探企业营地" in posts[0].body
+    assert "主管部门已就营地滋扰事件开展调查" not in posts[0].body
+    assert calls >= 2
+
+
 def test_online_daily_news_falls_back_to_pexels_when_ai_image_fails(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("IMAGE_PROVIDER", "volcengine")
@@ -6451,3 +6966,138 @@ def test_pick_news_items_limits_single_domain_when_alternatives_exist():
     domains = [item.domain for item in picked]
     assert domains.count("36kr.com") <= 2
     assert len(set(domains)) >= 3
+
+
+def test_focus_daily_news_item_reduces_semicolon_roundup_to_one_story():
+    picked = NewsItem(
+        title=(
+            "伊朗警告：若美发动经济战，海湾将无石油出口；"
+            "加驻美大使回应谈判破裂；三部门指导调查甲醛白菜事件；"
+            "韩红基金会救护车供应商被立案调查丨每经早参"
+        ),
+        url="https://example.com/morning-brief",
+        source="每日经济新闻",
+        domain="nbd.com.cn",
+        seendate=_recent_news_seendate(0),
+        description=(
+            "伊朗警告：若美发动经济战，海湾将无石油出口；"
+            "加驻美大使回应谈判破裂；三部门指导调查甲醛白菜事件；"
+            "韩红基金会救护车供应商被立案调查"
+        ),
+        content=(
+            "伊朗警告：若美发动经济战，海湾将无石油出口；"
+            "加驻美大使回应谈判破裂；三部门指导调查甲醛白菜事件；"
+            "韩红基金会救护车供应商被立案调查"
+        ),
+    )
+
+    focused, meta = _focus_daily_news_item(picked)
+
+    assert focused.title == "伊朗警告：若美发动经济战，海湾将无石油出口"
+    assert focused.description == "伊朗警告：若美发动经济战，海湾将无石油出口"
+    assert focused.content == "伊朗警告：若美发动经济战，海湾将无石油出口"
+    assert meta["multi_story_filter"]["applied"] is True
+    assert meta["multi_story_filter"]["selected_title"] == focused.title
+
+
+def test_daily_news_offline_body_does_not_turn_generic_ai_chip_story_into_author_story():
+    picked = NewsItem(
+        title="Broadcom AI spending raises credit risk concerns",
+        url="https://example.com/broadcom-ai-risk",
+        source="TradingView",
+        domain="tradingview.com",
+        seendate=_recent_news_seendate(0),
+        description="Broadcom's artificial intelligence spending and debt profile are drawing investor scrutiny.",
+        content="Analysts said Broadcom's artificial intelligence investment could increase credit risk.",
+    )
+
+    body = _daily_news_offline_body(picked, "财经产业")
+
+    assert "作家" not in body
+    assert "出版业" not in body
+
+
+def test_daily_news_source_grounding_replaces_unrelated_repeated_body_for_each_story():
+    chip = NewsItem(
+        title="天启芯片发布新一代AI推理芯片",
+        url="https://example.com/chip",
+        source="科技日报",
+        domain="stdaily.com",
+        seendate=_recent_news_seendate(0),
+        description="天启芯片公司发布新一代AI推理芯片，面向数据中心部署。",
+        content="天启芯片公司发布新一代AI推理芯片，面向数据中心部署。",
+    )
+    lithium = NewsItem(
+        title="青海盐湖直接提锂中试取得进展",
+        url="https://example.com/lithium",
+        source="中国新闻网",
+        domain="chinanews.com.cn",
+        seendate=_recent_news_seendate(0),
+        description="青海盐湖企业公布直接提锂中试进展，计划继续验证回收率。",
+        content="青海盐湖企业公布直接提锂中试进展，计划继续验证回收率。",
+    )
+    repeated_wrong_body = _test_daily_news_body(
+        original_title="部分作家公开承认使用AI写作",
+        content="部分作家公开承认使用AI写作，出版业围绕创意和透明度的争议升温。",
+        comment="AI 使用边界、披露义务、版权和信任仍需进一步明确。",
+        date=_recent_news_date(),
+        source="错误来源",
+    )
+
+    chip_body = _finalize_daily_news_body(repeated_wrong_body, chip, "科技新闻")
+    lithium_body = _finalize_daily_news_body(repeated_wrong_body, lithium, "科技新闻")
+    chip_fields = _daily_news_body_fields(chip_body)
+    lithium_fields = _daily_news_body_fields(lithium_body)
+
+    assert "作家" not in chip_fields["内容"]
+    assert "出版业" not in chip_fields["内容"]
+    assert "天启芯片" in chip_fields["内容"]
+    assert "青海盐湖" in lithium_fields["内容"]
+    assert chip_fields["内容"] != lithium_fields["内容"]
+
+
+def test_daily_news_quality_rejects_semicolon_roundup_body():
+    body = _test_daily_news_body(
+        original_title="伊朗警告若美发动经济战",
+        content=(
+            "伊朗警告若美国发动经济战，海湾将无石油出口；"
+            "加驻美大使回应谈判破裂；三部门指导调查甲醛白菜事件；"
+            "韩红基金会救护车供应商被立案调查。"
+        ),
+        comment="后续仍需以各方正式发布的信息为准。",
+        date=_recent_news_date(),
+        source="每日经济新闻",
+    )
+
+    assert _daily_news_quality_issue("伊朗警告经济战风险", body, "国际新闻") == "multi_story_body"
+
+
+def test_daily_news_finalizer_repairs_nested_content_label_and_dangling_amount():
+    picked = NewsItem(
+        title="融创中国：收购而今管理全部股权，转型资产管理加资产运营",
+        url="https://example.com/rongchuang",
+        source="澎湃新闻",
+        domain="thepaper.cn",
+        seendate=_recent_news_seendate(0),
+        content=(
+            "8月24日晚间，融创中国公告，通过间接全资附属公司收购而今管理全部股权。"
+            "收购目标股权的代价为人民币1.23亿元，将以发行代价股份方式支付。"
+            "公司称收购事项支持资产管理和资产运营的战略转型。"
+        ),
+    )
+    malformed = _test_daily_news_body(
+        original_title="融创中国收购而今管理全部股权",
+        content='"内容：8月24日晚间，融创中国公告，通过间接全资附属公司收购而今管理全部股权，代价1.',
+        comment="围绕融创中国收购而今管理全部股权的实际影响，仍需结合后续公开信息判断。",
+        date=_recent_news_date(),
+        source="澎湃新闻",
+    )
+
+    repaired = _finalize_daily_news_body(malformed, picked, "财经产业")
+    fields = _daily_news_body_fields(repaired)
+
+    assert not fields["内容"].startswith('"内容：')
+    assert "代价1." not in fields["内容"]
+    assert "1.23亿元" in fields["内容"]
+    assert _daily_news_quality_issue("融创中国收购而今管理全部股权", repaired, "财经产业") == ""
+    assert _daily_news_quality_issue("融创中国收购而今管理全部股权", malformed, "财经产业") == "malformed_body_content"

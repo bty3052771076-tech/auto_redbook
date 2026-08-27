@@ -5,6 +5,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from PIL import Image
 from typer.testing import CliRunner
 
@@ -233,6 +235,7 @@ def test_prepare_auto_pipeline_caps_headless_quota_refresh_before_using_recent_p
     metrics.write_text("title,likes\n测试,1\n", encoding="utf-8")
     os.utime(metrics, (now.timestamp(), now.timestamp()))
     quota_dir = tmp_path / "data" / "quota"
+    monkeypatch.setenv("REQUIRE_FRESH_QUOTA_CONFIRMATION", "0")
     stale = _write_quota(quota_dir, "volcengine", _free_records(), now - timedelta(hours=6))
     os.utime(stale, ((now - timedelta(hours=6)).timestamp(),) * 2)
     captured: dict[str, int] = {}
@@ -292,6 +295,40 @@ def test_prepare_auto_pipeline_uses_stale_metrics_with_warning(monkeypatch, tmp_
 
     assert report.metrics_mode == "stale_fallback"
     assert any("creator center timeout" in warning for warning in report.warnings)
+
+
+def test_prepare_auto_pipeline_strict_quota_confirmation_excludes_stale_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+    metrics = tmp_path / "data" / "analytics" / "published_metrics_latest.csv"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_text("title,likes\n测试,1\n", encoding="utf-8")
+    os.utime(metrics, (now.timestamp(), now.timestamp()))
+    quota_dir = tmp_path / "data" / "quota"
+    stale = _write_quota(quota_dir, "volcengine", _free_records(), now - timedelta(hours=6))
+    os.utime(stale, ((now - timedelta(hours=6)).timestamp(),) * 2)
+    monkeypatch.setenv("REQUIRE_FRESH_QUOTA_CONFIRMATION", "1")
+    monkeypatch.setattr(
+        cli,
+        "_refresh_quotas_for_preflight",
+        lambda **_kwargs: ["quota page timeout"],
+    )
+
+    with pytest.raises(FreeQuotaUnavailableError):
+        cli._prepare_auto_pipeline(
+            headless=True,
+            login_hold=0,
+            wait_timeout=30,
+            metrics_max_age_hours=24,
+            quota_max_age_hours=2,
+            require_image=True,
+            metrics_path=metrics,
+            quota_dir=quota_dir,
+            provider_keys={"aliyun": False, "volcengine": True},
+            now=now,
+        )
 
 
 def test_prepare_auto_pipeline_blocks_when_quota_refresh_has_no_free_models(

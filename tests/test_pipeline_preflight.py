@@ -298,11 +298,87 @@ def test_automatic_model_plan_prefers_callable_volcengine_glm_display_name(tmp_p
         provider_keys={"volcengine": True},
     )
 
-    plan = build_free_model_plan(records, rejected=rejected)
+    plan = build_free_model_plan(records, rejected=rejected, require_image=False)
 
     assert plan.llm.model == "glm-5.2"
     assert plan.vision is not None
     assert plan.vision.model == "doubao-seed-1-6-251015"
+
+
+def test_automatic_model_plan_combines_capability_and_free_quota(tmp_path):
+    now = datetime(2026, 8, 24, 4, 0, tzinfo=timezone.utc)
+    _write_snapshot(
+        tmp_path,
+        "aliyun",
+        [
+            {
+                "model": "qwen3.8-max",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 1_000_000,
+                "total": 1_000_000,
+            },
+            {
+                "model": "qwen3.8-27b",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 1_000_000,
+                "total": 1_000_000,
+            },
+        ],
+        captured_at=now,
+    )
+    records, rejected = load_quota_records(
+        quota_dir=tmp_path,
+        providers=("aliyun",),
+        now=now,
+        provider_keys={"aliyun": True},
+    )
+
+    plan = build_free_model_plan(records, rejected=rejected, require_image=False)
+
+    assert plan.llm.model == "qwen3.8-max"
+    assert plan.llm.capability_score > 0
+    assert plan.llm.quota_score == 100
+    assert plan.llm.selection_score > 0
+    assert "能力" in plan.llm.selection_reason
+    assert "额度" in plan.llm.selection_reason
+
+
+def test_automatic_model_plan_can_trade_capability_for_sufficient_quota_headroom(tmp_path):
+    now = datetime(2026, 8, 24, 4, 0, tzinfo=timezone.utc)
+    _write_snapshot(
+        tmp_path,
+        "aliyun",
+        [
+            {
+                "model": "qwen3.8-max",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 100_000,
+                "total": 1_000_000,
+            },
+            {
+                "model": "deepseek-v4-pro-0813",
+                "kind": "llm",
+                "status": "available",
+                "remaining": 711_426,
+                "total": 1_000_000,
+            },
+        ],
+        captured_at=now,
+    )
+    records, rejected = load_quota_records(
+        quota_dir=tmp_path,
+        providers=("aliyun",),
+        now=now,
+        provider_keys={"aliyun": True},
+    )
+
+    plan = build_free_model_plan(records, rejected=rejected, require_image=False)
+
+    assert plan.llm.model == "deepseek-v4-pro-0813"
+    assert plan.llm.selection_score > 0
 
 
 def test_automatic_model_plan_prefers_verified_callable_vision_model_over_display_alias(tmp_path):

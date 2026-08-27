@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections import Counter, OrderedDict
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import re
 import unicodedata
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .models import AIUpdateItem
 
@@ -65,7 +66,9 @@ _MODEL_TOPIC_RE = re.compile(
 )
 _MODEL_FAMILY_VERSION_RE = re.compile(
     r"\b(?P<family>deepseek|glm|qwen|gpt|claude|gemini|gemma|doubao|seedream|kimi|minimax|ernie|llama|mistral)"
-    r"[\s._-]*(?:v)?(?P<version>\d+(?:\.\d+)?)\b",
+    # Do not include ``.`` in the separator: in ``GLM-5.3是`` the greedy
+    # separator would otherwise consume the decimal point and parse only 5.
+    r"[\s_-]*(?:v)?(?P<version>\d+(?:\.\d+)?)(?=$|[^A-Za-z0-9_])",
     flags=re.IGNORECASE,
 )
 _MODEL_VARIANT_RE = re.compile(
@@ -74,6 +77,24 @@ _MODEL_VARIANT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _MODEL_FAMILY_MERGED_SUFFIXES = {"pro", "max", "flash", "lite", "preview", "exp", "speciale"}
+_MODEL_HISTORY_VARIANT_WORDS = {
+    "air",
+    "code",
+    "coder",
+    "flash",
+    "instruct",
+    "lite",
+    "max",
+    "mini",
+    "preview",
+    "pro",
+    "reasoning",
+    "speciale",
+    "thinking",
+    "turbo",
+    "vision",
+    "exp",
+}
 AI_DIGEST_MAX_ITEMS_PER_SOURCE = 2
 _MODEL_RELEASE_MARKERS = (
     "模型",
@@ -543,6 +564,112 @@ def _semantic_topic_key(item: AIUpdateItem) -> str:
     return "topic:" + "-".join([anchor, *extras])
 
 
+def _model_history_topic_key(item: AIUpdateItem) -> str:
+    """Preserve named model variants for cross-digest history checks."""
+    parts = (
+        item.product,
+        item.title,
+        item.summary,
+        item.raw_excerpt,
+        _url_topic_text(item.url),
+    )
+    for text in parts:
+        if not text or not text.strip():
+            continue
+        match = _MODEL_FAMILY_VERSION_RE.search(text)
+        if not match:
+            continue
+        family = _normalize_token(match.group("family"))
+        version = _normalize_token(match.group("version"))
+        if not family or not version:
+            continue
+        suffix_words: list[str] = []
+        suffix_text = text[match.end() : match.end() + 64]
+        for word in re.findall(r"[A-Za-z][A-Za-z0-9]*", suffix_text):
+            normalized = word.lower()
+            if normalized not in _MODEL_HISTORY_VARIANT_WORDS:
+                break
+            suffix_words.append(normalized)
+            if len(suffix_words) >= 4:
+                break
+        suffix_part = "-".join(suffix_words)
+        return f"model:{family}-{version}{('-' + suffix_part) if suffix_part else ''}"
+    return ""
+
+
+def _history_event_key(item: AIUpdateItem) -> str:
+    # ``raw_excerpt`` survives LLM rewriting and is the most stable event
+    # descriptor when comparing a saved digest with a newly fetched source.
+    blob = (item.raw_excerpt or item.title or item.summary or _text_blob(item)).lower()
+    if _contains_any_marker(blob, ("harness",)):
+        return "harness"
+    if _contains_any_marker(blob, ("billing", "pricing", "price", "计费", "收费", "价格")):
+        return "billing"
+    if _contains_any_marker(blob, ("api", "公测", "调用", "接口")):
+        return "api"
+    if _contains_any_marker(
+        blob,
+        ("release", "released", "launch", "launched", "introducing", "发布", "上线", "推出"),
+    ):
+        return "release"
+    if _contains_any_marker(blob, ("update", "updated", "更新", "升级", "集成", "integrat")):
+        return "update"
+    return ai_update_category(item)
+
+
+def ai_update_history_key(item: AIUpdateItem) -> str:
+    """Return a stable event key for cross-digest history deduplication.
+
+    A whole official release-notes page is not one event: several model
+    updates may share its URL. Combine the trace URL with the model/topic key
+    so the same release is blocked without suppressing a different update on
+    that page.
+    """
+    topic = _model_history_topic_key(item) or _semantic_topic_key(item) or f"title:{item.title_key}"
+    # A named model version identifies the release event across official
+    # vendor pages, cloud catalogs, and mirrored documentation URLs.
+    if topic.startswith("model:"):
+        return f"{topic}|event:{_history_event_key(item)}"
+    raw_url = item.normalized_url or ""
+    if raw_url:
+        parsed = urlsplit(raw_url)
+        path = unquote(parsed.path or "/").rstrip("/") or "/"
+        base = urlunsplit(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                path,
+                parsed.query,
+                "",
+            )
+        )
+        path_parts = [part for part in path.split("/") if part]
+        generic_pages = {
+            "announce",
+            "blog",
+            "changelog",
+            "news",
+            "research",
+            "updates",
+        }
+        if len(path_parts) >= 2 and path_parts[-1].lower() not in generic_pages:
+            # A specific article URL is a stronger event identity than a
+            # rewritten headline. Listing pages retain the semantic topic
+            # suffix because one page can contain several updates.
+            return f"{base}|event:url"
+        # Listing/announcement pages often expose the same update again with
+        # a different LLM-written title. The source excerpt is the stable
+        # event identity in that case; keep the URL as a namespace so two
+        # unrelated pages with similar wording do not collide.
+        raw_excerpt = re.sub(r"\s+", " ", (item.raw_excerpt or "").strip().lower())
+        if raw_excerpt:
+            excerpt_hash = hashlib.sha256(raw_excerpt.encode("utf-8")).hexdigest()[:24]
+            return f"{base}|event:text:{excerpt_hash}"
+    else:
+        base = f"title:{item.title_key}"
+    return f"{base}|{topic}"
+
+
 def _trace_url(item: AIUpdateItem) -> str:
     if item.normalized_url:
         return item.normalized_url
@@ -648,7 +775,21 @@ def ai_update_is_relevant(item: AIUpdateItem) -> bool:
         and len(set(content_parts)) == 1
         and not _contains_any_marker(content_blob, _AI_CHANGE_MARKERS)
     ):
-        return False
+        # Official release-note pages often expose a compact card whose title,
+        # summary and excerpt are intentionally identical (for example,
+        # "GLM-5.3"). Keep it when the card names a concrete model version;
+        # generic product-only cards such as "Qwen Code" remain noise.
+        headline_blob = " ".join(
+            part.strip()
+            for part in (item.title, item.product, _url_topic_text(item.url))
+            if part and part.strip()
+        )
+        has_named_model_version = bool(_MODEL_FAMILY_VERSION_RE.search(headline_blob))
+        if not (
+            item.source_type in {"official", "github"}
+            and has_named_model_version
+        ):
+            return False
     if item.source_type != "search":
         return True
     if not (item.summary.strip() or item.raw_excerpt.strip()):
@@ -841,9 +982,25 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
             key = f"{key}|title:{item.title_key}"
         title_key = item.title_key
         semantic_key = _semantic_topic_key(item)
+        # Generic categories such as ``topic:benchmark`` are not event
+        # identities. Do not merge them at all; URL/title keys still remove
+        # exact duplicates, while explicit model/product keys can continue to
+        # merge mirrored announcements across vendors.
+        generic_topic_keys = {
+            "topic:benchmark",
+            "topic:bench",
+            "topic:eval",
+            "topic:model",
+            "topic:models",
+            "topic:tool",
+            "topic:tools",
+            "topic:update",
+            "topic:updates",
+        }
+        semantic_lookup_key = "" if semantic_key in generic_topic_keys else semantic_key
         existing_key = title_keys.get(title_key)
-        if not existing_key and semantic_key:
-            existing_key = topic_keys.get(semantic_key)
+        if not existing_key and semantic_lookup_key:
+            existing_key = topic_keys.get(semantic_lookup_key)
         if existing_key and existing_key in by_key:
             merged = by_key[existing_key]
             if key in by_key and key != existing_key:
@@ -856,8 +1013,8 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
             by_key[existing_key] = _merge_items(winner, loser)
             if title_key:
                 title_keys[title_key] = existing_key
-            if semantic_key:
-                topic_keys[semantic_key] = existing_key
+            if semantic_lookup_key:
+                topic_keys[semantic_lookup_key] = existing_key
             continue
         if key in by_key:
             winner = _prefer_item(by_key[key], item)
@@ -867,8 +1024,8 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
         by_key[key] = item
         if title_key:
             title_keys[title_key] = key
-        if semantic_key:
-            topic_keys[semantic_key] = key
+        if semantic_lookup_key:
+            topic_keys[semantic_lookup_key] = key
     return list(by_key.values())
 
 
@@ -1208,7 +1365,7 @@ def rank_ai_updates(
             min_foreign_ai_count=min_foreign_ai_count,
             max_items_per_source=max_items_per_source,
         )
-        if _meets_ai_digest_quotas(
+        if len(selected) >= target and _meets_ai_digest_quotas(
             selected,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,

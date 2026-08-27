@@ -23,6 +23,24 @@ _TEXT_MODEL_PREFERENCE = (
     "qwen3.7-max",
     "qwen3.7-plus",
 )
+# This is a task-fit scale for news writing and structured JSON generation,
+# not a vendor benchmark.  The score is deliberately local and reviewable so
+# quota selection never turns into an opaque provider-specific preference.
+_LLM_CAPABILITY_PROFILES = (
+    ("deepseek-v4-pro", 100.0),
+    ("qwen3.8-max", 99.0),
+    ("kimi-k3", 97.0),
+    ("qwen3.7-max", 96.0),
+    ("glm-5.2", 94.0),
+    ("qwen3.8-2.4t-a95b", 93.0),
+    ("doubao-seed-2-1-pro", 86.0),
+    ("qwen3.8-27b", 88.0),
+    ("qwen3.7-plus", 88.0),
+    ("deepseek-v4-flash", 84.0),
+    ("qwen3.7-flash", 82.0),
+    ("doubao-seed-2-1-turbo", 80.0),
+    ("kimi-k2.7-code", 78.0),
+)
 _UNSUPPORTED_LLM_MARKERS = (
     "embedding",
     "rerank",
@@ -101,9 +119,21 @@ class ModelChoice:
     unit: str
     snapshot_path: Path
     captured_at: datetime
+    capability_score: float = 0.0
+    quota_score: float = 0.0
+    selection_score: float = 0.0
+    selection_reason: str = ""
 
     @classmethod
-    def from_record(cls, record: QuotaModelRecord) -> "ModelChoice":
+    def from_record(
+        cls,
+        record: QuotaModelRecord,
+        *,
+        capability_score: float = 0.0,
+        quota_score: float = 0.0,
+        selection_score: float = 0.0,
+        selection_reason: str = "",
+    ) -> "ModelChoice":
         return cls(
             provider=record.provider,
             model=record.model,
@@ -113,6 +143,10 @@ class ModelChoice:
             unit=record.unit,
             snapshot_path=record.snapshot_path,
             captured_at=record.captured_at,
+            capability_score=capability_score,
+            quota_score=quota_score,
+            selection_score=selection_score,
+            selection_reason=selection_reason,
         )
 
 
@@ -395,6 +429,37 @@ def _vision_preference_rank(model: str) -> int:
     return len(_VISION_MODEL_PREFERENCE)
 
 
+def llm_capability_score(model: str) -> float:
+    """Return a transparent task-fit score for news/AI-digest generation."""
+    value = (model or "").strip().lower()
+    for prefix, score in _LLM_CAPABILITY_PROFILES:
+        if value == prefix or value.startswith(f"{prefix}-"):
+            return score
+    return 60.0
+
+
+def _quota_headroom_score(record: QuotaModelRecord) -> float:
+    if record.total is not None and record.total > 0:
+        return round(max(0.0, min(100.0, record.remaining_ratio * 100.0)), 2)
+    # A provider may expose remaining tokens without a total. Keep the model
+    # eligible, but make the uncertainty visible in the score.
+    return round(max(0.0, min(100.0, record.remaining / 1_000_000.0 * 100.0)), 2)
+
+
+def llm_selection_score(record: QuotaModelRecord) -> float:
+    """Combine capability (70%) and current free-quota headroom (30%)."""
+    capability = llm_capability_score(record.model)
+    quota = _quota_headroom_score(record)
+    return round(capability * 0.70 + quota * 0.30, 2)
+
+
+def _llm_selection_reason(record: QuotaModelRecord) -> str:
+    capability = llm_capability_score(record.model)
+    quota = _quota_headroom_score(record)
+    score = llm_selection_score(record)
+    return f"能力{capability:.0f}/100 + 免费额度{quota:.0f}/100 = 综合{score:.2f}"
+
+
 def _choose_llm(
     records: Iterable[QuotaModelRecord],
     *,
@@ -411,6 +476,7 @@ def _choose_llm(
         candidates,
         key=lambda record: (
             _explicit_rank(record.model, explicit_model),
+            -llm_selection_score(record),
             _preference_rank(record.model),
             -record.remaining_ratio,
             -record.remaining,
@@ -513,7 +579,13 @@ def build_free_model_plan(
         )
     vision = _choose_vision(items)
     return FreeModelPlan(
-        llm=ModelChoice.from_record(llm),
+        llm=ModelChoice.from_record(
+            llm,
+            capability_score=llm_capability_score(llm.model),
+            quota_score=_quota_headroom_score(llm),
+            selection_score=llm_selection_score(llm),
+            selection_reason=_llm_selection_reason(llm),
+        ),
         image=ModelChoice.from_record(image) if image is not None else None,
         vision=ModelChoice.from_record(vision) if vision is not None else None,
         rejected=rejected_items,

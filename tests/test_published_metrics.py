@@ -170,6 +170,22 @@ def test_published_metrics_collect_cap_is_configurable(monkeypatch):
     assert _published_metrics_collect_cap() == 25
 
 
+def test_published_metrics_collection_prioritizes_real_note_cards_before_nested_nodes(
+    monkeypatch,
+):
+    monkeypatch.delenv("XHS_METRICS_MAX_ITEMS", raising=False)
+    assert _published_metrics_collect_cap() >= 2000
+
+
+def test_published_metric_card_selector_keeps_note_card_selector_first():
+    import inspect
+
+    source = inspect.getsource(playwright_steps._collect_published_metric_cards)
+    assert "priorityNodes" in source
+    assert "fallbackNodes" in source
+    assert "priorityNodes, ...fallbackNodes" in source
+
+
 def test_published_metrics_default_scroll_budget_supports_large_creator_accounts(monkeypatch):
     monkeypatch.delenv("XHS_METRICS_MAX_SCROLLS", raising=False)
     assert _published_metrics_max_scrolls() == 1000

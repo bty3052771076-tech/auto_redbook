@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -43,6 +43,7 @@ class SourceAttempt:
     url_count: int = 0
     error: str = ""
     http_status: int | None = None
+    recent_statuses: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +59,7 @@ class SourceAttempt:
             "url_count": self.url_count,
             "error": self.error,
             "http_status": self.http_status,
+            "recent_statuses": list(self.recent_statuses),
         }
 
     @classmethod
@@ -75,6 +77,11 @@ class SourceAttempt:
             url_count=int(value.get("url_count") or 0),
             error=str(value.get("error") or ""),
             http_status=(int(value["http_status"]) if value.get("http_status") is not None else None),
+            recent_statuses=tuple(
+                str(item)
+                for item in (value.get("recent_statuses") or [])
+                if str(item).strip()
+            ),
         )
 
 
@@ -124,6 +131,40 @@ def is_source_in_cooldown(
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=timezone.utc)
     return reference.astimezone(timezone.utc) < checked_at + timedelta(seconds=max(0, int(cooldown_seconds)))
+
+
+def append_source_status(
+    attempt: SourceAttempt,
+    previous: SourceAttempt | None = None,
+    *,
+    window: int = 10,
+) -> SourceAttempt:
+    """Attach a bounded status history to the latest source attempt.
+
+    A changed endpoint starts a fresh history. This prevents a repaired source
+    URL from inheriting the failure streak of the retired endpoint.
+    """
+    old_statuses = ()
+    if previous is not None and previous.source_url == attempt.source_url:
+        old_statuses = previous.recent_statuses or ((previous.status,) if previous.status else ())
+    statuses = (*old_statuses, attempt.status)
+    return replace(attempt, recent_statuses=tuple(statuses[-max(1, int(window)):]))
+
+
+def should_replace_source(
+    attempt: SourceAttempt | None,
+    *,
+    min_samples: int = 5,
+    timeout_ratio: float = 0.6,
+) -> bool:
+    """Return whether repeated timeouts warrant source replacement."""
+    if attempt is None:
+        return False
+    statuses = tuple(attempt.recent_statuses or ((attempt.status,) if attempt.status else ()))
+    if len(statuses) < max(1, int(min_samples)):
+        return False
+    ratio = sum(status == "timeout" for status in statuses) / len(statuses)
+    return ratio >= max(0.0, min(1.0, float(timeout_ratio)))
 
 
 def save_source_health_snapshot(snapshot: SourceHealthSnapshot, path: str | Path) -> Path:

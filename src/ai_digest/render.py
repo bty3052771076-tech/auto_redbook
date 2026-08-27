@@ -13,6 +13,8 @@ from .rank import featured_ai_update
 
 CARD_SIZE = (1104, 1472)
 MAX_XHS_IMAGES = 18
+_NO_LINE_START_PUNCTUATION = "，。！？；：、）》】』’”％%"
+_NUMBER_UNIT_CHARS = "条个家项次种人万亿天年元"
 
 
 def _font(size: int, *, bold: bool = False):
@@ -76,8 +78,21 @@ def _wrap_text_pixels(
         for token in tokens:
             candidate = f"{line}{token}"
             if line and _text_width(draw, candidate, font) > max_width_px:
-                lines.append(line.rstrip())
-                line = token.lstrip()
+                if token in _NO_LINE_START_PUNCTUATION and len(line) > 1:
+                    # Keep Chinese closing punctuation attached to the text it
+                    # closes instead of starting a visually broken new line.
+                    trailing_size = 2 if line[-1:] in _NUMBER_UNIT_CHARS and line[-2:-1].isdigit() else 1
+                    trailing = line[-trailing_size:]
+                    lines.append(line[:-trailing_size].rstrip())
+                    line = f"{trailing}{token}"
+                elif token in _NUMBER_UNIT_CHARS and line[-1:].isdigit() and len(line) > 1:
+                    # Keep common number-unit pairs such as “2条” together.
+                    trailing = line[-1:]
+                    lines.append(line[:-1].rstrip())
+                    line = f"{trailing}{token}"
+                else:
+                    lines.append(line.rstrip())
+                    line = token.lstrip()
             else:
                 line = candidate
             while line and _text_width(draw, line, font) > max_width_px:
@@ -97,6 +112,86 @@ def _wrap_text_pixels(
             max_width_px=max_width_px,
         )
     return lines
+
+
+def _fits_within_lines(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font,
+    *,
+    max_width_px: int,
+    max_lines: int,
+) -> bool:
+    return len(
+        _wrap_text_pixels(
+            draw,
+            text,
+            font,
+            max_width_px=max_width_px,
+            max_lines=None,
+        )
+    ) <= max_lines
+
+
+def _complete_text_for_layout(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font,
+    *,
+    max_width_px: int,
+    max_lines: int,
+) -> str:
+    """Prefer complete sentences/clauses before applying the layout cap."""
+
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if not clean or _fits_within_lines(
+        draw,
+        clean,
+        font,
+        max_width_px=max_width_px,
+        max_lines=max_lines,
+    ):
+        return clean
+
+    sentences = [part.strip() for part in re.split(r"(?<=[。！？；;])", clean) if part.strip()]
+    for sentence in sentences:
+        if _fits_within_lines(
+            draw,
+            sentence,
+            font,
+            max_width_px=max_width_px,
+            max_lines=max_lines,
+        ):
+            return sentence
+
+    first_sentence = re.split(r"[。！？；;]", clean, maxsplit=1)[0].strip()
+    clauses = [part.strip() for part in re.split(r"[，,]", first_sentence) if part.strip()]
+    candidate = ""
+    for clause in clauses:
+        next_candidate = f"{candidate}，{clause}" if candidate else clause
+        if _fits_within_lines(
+            draw,
+            next_candidate,
+            font,
+            max_width_px=max_width_px,
+            max_lines=max_lines,
+        ):
+            candidate = next_candidate
+            continue
+        break
+    if candidate:
+        return candidate
+
+    # Last resort for a single unbroken token: keep the visible prefix without
+    # adding an ellipsis that looks like a half-written sentence.
+    lines = _wrap_text_pixels(
+        draw,
+        clean,
+        font,
+        max_width_px=max_width_px,
+        max_lines=None,
+    )
+    return "".join(lines[:max_lines]).rstrip("，,；;：:")
 
 
 def _paginate_items(items: list[AIUpdateItem], *, min_per_page: int = 2, max_per_page: int = 3) -> list[list[AIUpdateItem]]:
@@ -143,16 +238,25 @@ def _draw_wrapped(
 ) -> int:
     x, y = xy
     line_height = max(24, int(font.size * 1.35)) if hasattr(font, "size") else 28
-    lines = (
-        _wrap_text_pixels(
+    display_text = text
+    if max_lines is not None and max_width_px is not None:
+        display_text = _complete_text_for_layout(
             draw,
             text,
             font,
             max_width_px=max_width_px,
             max_lines=max_lines,
         )
+    lines = (
+        _wrap_text_pixels(
+            draw,
+            display_text,
+            font,
+            max_width_px=max_width_px,
+            max_lines=max_lines,
+        )
         if max_width_px is not None
-        else _wrap_text(text, width, max_lines=max_lines)
+        else _wrap_text(display_text, width, max_lines=max_lines)
     )
     for line in lines:
         draw.text((x, y), line, font=font, fill=fill)
@@ -332,6 +436,12 @@ def render_ai_digest_cards(
         # Keep the public argument for future expansion; current layout is tuned
         # for the Xiaohongshu vertical-card default.
         raise ValueError(f"unsupported size: {size}")
+    # Rendering is also used to rebuild cards from saved local metadata. Run
+    # the same title/summary completeness checks here so an older brief cannot
+    # reintroduce a truncated headline into the images.
+    from .generate import _ensure_chinese_brief
+
+    brief = _ensure_chinese_brief(brief)
     dest_dir.mkdir(parents=True, exist_ok=True)
     pages = _paginate_items(list(brief.items or []))
     total_pages = 1 + len(pages)

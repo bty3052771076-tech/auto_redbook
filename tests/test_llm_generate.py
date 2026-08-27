@@ -52,7 +52,7 @@ def test_coerce_text_preserves_daily_news_body_object_as_json():
     assert json.loads(out) == body_obj
 
 
-def test_generate_draft_uses_60000_max_tokens(monkeypatch):
+def test_generate_draft_uses_safe_effective_max_tokens(monkeypatch):
     captured = {}
 
     class FakeModel:
@@ -90,8 +90,71 @@ def test_generate_draft_uses_60000_max_tokens(monkeypatch):
         asset_paths=[],
     )
 
-    assert captured["kwargs"]["max_tokens"] == 60000
+    assert captured["kwargs"]["max_tokens"] == 5024
     assert captured["kwargs"]["timeout"] == 240
+
+
+def test_generate_draft_caps_effective_tokens_for_long_prompt(monkeypatch):
+    captured = {}
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "FakeResponse",
+                (),
+                {"content": '{"title":"娴嬭瘯","body":"娴嬭瘯姝ｆ枃","topics":[]}'},
+            )()
+
+    def fake_init_chat_model(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return FakeModel()
+
+    monkeypatch.setattr(generate_mod, "init_chat_model", fake_init_chat_model)
+
+    generate_mod.generate_draft(
+        LLMConfig(
+            model="fake-model",
+            api_key="fake-key",
+            base_url="https://example.invalid/v1",
+        ),
+        title_hint="每日新闻",
+        prompt_hint="长新闻规则与原文材料。" * 3000,
+        asset_paths=[],
+    )
+
+    assert 256 <= captured["kwargs"]["max_tokens"] < 60000
+    assert captured["kwargs"]["max_tokens"] <= 12000
+
+
+def test_generate_draft_retries_one_transient_request_error(monkeypatch):
+    calls = {"invoke": 0, "sleep": []}
+    monkeypatch.setenv("LLM_TRANSIENT_RETRY_MAX", "1")
+    monkeypatch.setenv("LLM_TRANSIENT_RETRY_SECONDS", "0")
+
+    class FakeModel:
+        def invoke(self, _messages):
+            calls["invoke"] += 1
+            if calls["invoke"] == 1:
+                raise RuntimeError("temporary upstream failure")
+            return type(
+                "FakeResponse",
+                (),
+                {"content": '{"title":"重试成功","body":"重试后的正文","topics":[]}'},
+            )()
+
+    monkeypatch.setattr(generate_mod, "init_chat_model", lambda *_args, **_kwargs: FakeModel())
+    monkeypatch.setattr(generate_mod.time, "sleep", lambda seconds: calls["sleep"].append(seconds))
+
+    out = generate_mod.generate_draft(
+        LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.invalid/v1"),
+        title_hint="测试",
+        prompt_hint="测试材料",
+        asset_paths=[],
+    )
+
+    assert calls["invoke"] == 2
+    assert calls["sleep"] == [0]
+    assert out["title"] == "重试成功"
 
 
 def test_generate_json_keeps_literal_json_schema_in_prompt(monkeypatch):
@@ -112,6 +175,41 @@ def test_generate_json_keeps_literal_json_schema_in_prompt(monkeypatch):
 
     assert result == {"ranked_ids": [2, 1]}
     assert any('"ranked_ids"' in str(message.content) for message in captured["messages"])
+
+
+def test_kimi_k3_omits_unsupported_temperature_for_draft_and_json(monkeypatch):
+    captured = []
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "FakeResponse",
+                (),
+                {"content": '{"title":"测试标题","body":"测试正文","topics":[]}'}
+            )()
+
+    def fake_init_chat_model(*_args, **kwargs):
+        captured.append(kwargs)
+        return FakeModel()
+
+    monkeypatch.setattr(generate_mod, "init_chat_model", fake_init_chat_model)
+    cfg = LLMConfig(
+        model="kimi-k3",
+        provider="aliyun",
+        api_key="fake-key",
+        base_url="https://example.invalid/v1",
+    )
+
+    generate_mod.generate_draft(
+        cfg,
+        title_hint="测试标题",
+        prompt_hint="测试素材",
+        asset_paths=[],
+    )
+    generate_json(cfg, system_prompt="返回JSON", user_prompt="{}")
+
+    assert len(captured) == 2
+    assert all("temperature" not in kwargs for kwargs in captured)
 
 
 def test_repair_utf8_as_gbk_mojibake_handles_one_and_two_passes():

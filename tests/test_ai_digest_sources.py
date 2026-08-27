@@ -129,6 +129,15 @@ def test_default_sources_use_current_official_pages_when_legacy_rss_endpoints_ar
     assert by_name["microsoft"].parser == "html"
 
 
+def test_default_sources_replace_known_unstable_official_endpoints():
+    by_name = {source.name: source for source in default_ai_digest_sources()}
+
+    assert by_name["ai21"].url == "https://www.ai21.com/blog/"
+    assert by_name["sensetime-sensenova"].url == "https://sensetime.com/en/research/"
+    assert "kuaishou.com" in by_name["kling"].url
+    assert "news-release" in by_name["kling"].url
+
+
 def test_default_sources_expand_model_labs_and_keep_huggingface_as_final_aggregator():
     sources = default_ai_digest_sources()
     by_name = {source.name: source for source in sources}
@@ -171,9 +180,9 @@ def test_default_sources_include_all_extended_domestic_and_global_model_feeds():
         "minicpm-v-github": ("github", "github_releases", "api.github.com/repos/OpenBMB/MiniCPM-V/releases"),
         "skywork": ("official", "html", "kunlun.com"),
         "kling": ("official", "html", "kuaishou.com"),
-        "google-gemini": ("official", "html", "ai.google.dev"),
+        "google-gemini": ("official", "html", "blog.google/products-and-platforms/products/gemini"),
         "amazon-nova": ("official", "html", "aws.amazon.com/nova/models"),
-        "ai21": ("official", "html", "docs.ai21.com/changelog"),
+        "ai21": ("official", "html", "www.ai21.com/blog"),
         "perplexity-sonar": ("official", "html", "docs.perplexity.ai/docs/sonar/models"),
         "stability-ai": ("official", "html", "stability.ai/news"),
         "black-forest-labs": ("official", "html", "bfl.ai/blog"),

@@ -16,6 +16,7 @@ from playwright.sync_api import sync_playwright
 from src.storage.events import save_event
 from src.storage.files import evidence_dir, save_execution
 from src.storage.models import Execution, Post, PublishedMetric, StepResult
+from src.publish.concurrency import xhs_upload_slot
 
 TARGET_URL = "https://creator.xiaohongshu.com/publish/publish?target=image"
 WAIT_TEXTS = [
@@ -470,9 +471,9 @@ def _published_url_candidates() -> list[str]:
 def _published_metrics_collect_cap() -> int:
     raw = (os.getenv("XHS_METRICS_MAX_ITEMS") or "").strip()
     try:
-        value = int(raw) if raw else 1000
+        value = int(raw) if raw else 2000
     except ValueError:
-        value = 1000
+        value = 2000
     return max(1, value)
 
 
@@ -539,7 +540,7 @@ def _collect_published_metric_cards(page) -> list[dict[str, str]]:
         data = page.evaluate(
             r"""
             (maxItems) => {
-              const selectors = [
+              const fallbackSelectors = [
                 'article',
                 'li',
                 'tr',
@@ -548,7 +549,11 @@ def _collect_published_metric_cards(page) -> list[dict[str, str]]:
                 '[class*="item"]',
                 '[class*="list"] > div'
               ];
-              const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
+              // Real note cards must consume the collection budget first. The
+              // fallback selectors also match many nested decorative nodes.
+              const priorityNodes = Array.from(document.querySelectorAll('.note-card'));
+              const fallbackNodes = Array.from(document.querySelectorAll(fallbackSelectors.join(',')));
+              const nodes = [...priorityNodes, ...fallbackNodes];
               const seen = new Set();
               const out = [];
               const visible = (el) => {
@@ -3098,7 +3103,7 @@ def run_publish_drafts_sync(
             pass
 
 
-def run_save_draft_sync(
+def _run_save_draft_sync_unlocked(
     post: Post,
     *,
     assets: Optional[list[str]] = None,
@@ -3493,6 +3498,33 @@ def run_save_draft_sync(
         save_execution(exec_rec)
 
     return exec_rec
+
+
+def run_save_draft_sync(
+    post: Post,
+    *,
+    assets: Optional[list[str]] = None,
+    dry_run: bool = False,
+    login_hold: int = 0,
+    login_only: bool = False,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    execution: Optional[Execution] = None,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Execution:
+    """Save one XHS draft while serializing the shared creator-center session."""
+    with xhs_upload_slot():
+        return _run_save_draft_sync_unlocked(
+            post,
+            assets=assets,
+            dry_run=dry_run,
+            login_hold=login_hold,
+            login_only=login_only,
+            wait_timeout_ms=wait_timeout_ms,
+            execution=execution,
+            headless=headless,
+            progress_callback=progress_callback,
+        )
 
 
 def run_update_draft_sync(

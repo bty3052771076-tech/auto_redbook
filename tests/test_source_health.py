@@ -9,6 +9,7 @@ from src.sources.health import (
     is_source_in_cooldown,
     load_source_health_snapshot,
     save_source_health_snapshot,
+    should_replace_source,
 )
 
 
@@ -120,3 +121,33 @@ def test_source_catalog_distinguishes_stream_page_and_aggregator_tiers():
     assert by_name["bytedance-seed"].url == "https://seed.bytedance.com/blog"
     assert by_name["huggingface"].tier == "aggregator"
     assert by_name["x"].tier == "social_backfill"
+
+
+def test_source_health_replaces_source_when_timeout_ratio_reaches_sixty_percent():
+    attempt = SourceAttempt(
+        collection="ai_digest",
+        source_name="unstable-official",
+        source_url="https://example.com/news",
+        tier="official_page",
+        status="timeout",
+        checked_at="2026-08-23T00:00:00Z",
+        recent_statuses=("timeout", "timeout", "success", "timeout", "success"),
+    )
+
+    decision = should_replace_source(attempt, min_samples=5, timeout_ratio=0.6)
+
+    assert decision is True
+
+
+def test_source_health_does_not_replace_before_minimum_sample_count():
+    attempt = SourceAttempt(
+        collection="ai_digest",
+        source_name="new-official",
+        source_url="https://example.com/news",
+        tier="official_page",
+        status="timeout",
+        checked_at="2026-08-23T00:00:00Z",
+        recent_statuses=("timeout", "timeout"),
+    )
+
+    assert should_replace_source(attempt, min_samples=5, timeout_ratio=0.6) is False

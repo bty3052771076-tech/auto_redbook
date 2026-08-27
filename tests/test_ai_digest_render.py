@@ -118,6 +118,10 @@ def test_render_ai_digest_cover_uses_featured_update_instead_of_generic_labels(m
     assert "Codex CLI浏览器自动化" in joined
     assert "来源链接已保存至本地 metadata" not in joined
     assert "长链接不写入图片，完整来源保存在本地" not in joined
+    assert not any(
+        text.lstrip().startswith(("，", "。", "！", "？", "；", "：", "、", "条"))
+        for text in drawn
+    )
 
 
 def test_render_ai_digest_item_pages_show_publish_time_and_source_without_footer(monkeypatch, tmp_path: Path):
@@ -209,3 +213,101 @@ def test_render_ai_digest_long_text_stays_inside_card_bounds(monkeypatch, tmp_pa
         left, top, right, bottom = font.getbbox(text)
         assert x + (right - left) <= CARD_SIZE[0] - 50
         assert y + (bottom - top) <= CARD_SIZE[1] - 100
+    assert not any(
+        text.lstrip().startswith(("，", "。", "！", "？", "；", "：", "、"))
+        for _xy, text, _font in drawn
+    )
+
+
+def test_render_ai_digest_prefers_complete_sentence_over_mid_sentence_ellipsis(monkeypatch, tmp_path: Path):
+    from PIL import ImageDraw
+
+    drawn: list[str] = []
+    real_text = ImageDraw.ImageDraw.text
+
+    def capture_text(self, xy, text, *args, **kwargs):
+        drawn.append(str(text))
+        return real_text(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", capture_text)
+    long_summary = (
+        "官方公告说明本次更新已完成并恢复服务。"
+        "更新同时涉及后台任务状态、接口可见性、故障监控、证书轮换和后续根因分析，"
+        "这些信息用于验证排版不会把一条完整事实截成半句。"
+        "后续还会继续观察服务恢复情况、用户操作反馈、接口调用结果和相关系统指标，"
+        "并在确认所有环节稳定后补充更详细的公开说明。"
+    )
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        subtitle="平台更新",
+        date="2026-08-22",
+        items=[
+            _item(i, long_summary, title=f"平台更新已完成并恢复服务{i}")
+            for i in range(3)
+        ],
+    )
+
+    render_ai_digest_cards(brief, tmp_path / "digest")
+
+    assert drawn
+    assert not any("…" in text for text in drawn)
+    assert sum("官方公告说明本次更新已完成并恢复服务。" in text for text in drawn) == 3
+
+
+def test_render_ai_digest_cards_normalizes_incomplete_titles_before_drawing(monkeypatch, tmp_path: Path):
+    from PIL import ImageDraw
+
+    drawn: list[str] = []
+    real_text = ImageDraw.ImageDraw.text
+
+    def capture_text(self, xy, text, *args, **kwargs):
+        drawn.append(str(text))
+        return real_text(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", capture_text)
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        date="2026-08-22",
+        items=[
+            _item(
+                1,
+                "DeepSeek 官方文档更新页面显示 DeepSeek-V4-Flash-Vision-Exp 已发布。",
+                title="DeepSeek 官方文档更新页面显示 DeepSeek",
+            )
+        ],
+    )
+
+    render_ai_digest_cards(brief, tmp_path / "digest")
+
+    assert any("DeepSeek-V4-Flash-Vision-Exp 已发布" in text for text in drawn)
+
+
+def test_render_ai_digest_keeps_chinese_punctuation_with_previous_line(monkeypatch, tmp_path: Path):
+    from PIL import ImageDraw
+
+    drawn: list[str] = []
+    real_text = ImageDraw.ImageDraw.text
+
+    def capture_text(self, xy, text, *args, **kwargs):
+        drawn.append(str(text))
+        return real_text(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", capture_text)
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        subtitle="8条官方动态：DeepSeek 新模型、OpenAI 新博客、Mistral 检索层等",
+        date="2026-08-22",
+        source_summary=(
+            "本期信源均为官方发布：DeepSeek 与腾讯云提供国内模型及平台更新；"
+            "GitHub Status、Google DeepMind、OpenAI、Mistral AI提供国外 AI 平台与工具动态。"
+            "GitHub Status 和 OpenAI 各保留2条，来源分布符合配额。"
+        ),
+        items=[_item(1, "官方公告说明本次更新已完成并恢复服务。")],
+    )
+
+    render_ai_digest_cards(brief, tmp_path / "digest")
+
+    assert not any(
+        text.lstrip().startswith(("，", "。", "！", "？", "；", "：", "、", "条"))
+        for text in drawn
+    )

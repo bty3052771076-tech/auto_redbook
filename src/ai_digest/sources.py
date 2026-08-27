@@ -58,9 +58,9 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
         AIDigestSource("mistral", "official", "https://mistral.ai/rss.xml", "Mistral AI", "rss"),
         AIDigestSource("xai", "official", "https://x.ai/news", "xAI", "html"),
         AIDigestSource("cohere", "official", "https://cohere.com/newsroom", "Cohere", "html"),
-        AIDigestSource("google-gemini", "official", "https://ai.google.dev/gemini-api/docs/models", "Google Gemini", "html"),
+        AIDigestSource("google-gemini", "official", "https://blog.google/products-and-platforms/products/gemini/", "Google Gemini", "html"),
         AIDigestSource("amazon-nova", "official", "https://aws.amazon.com/nova/models/", "Amazon Nova", "html"),
-        AIDigestSource("ai21", "official", "https://docs.ai21.com/changelog", "AI21 Labs", "html"),
+        AIDigestSource("ai21", "official", "https://www.ai21.com/blog/", "AI21 Labs", "html"),
         AIDigestSource(
             "perplexity-sonar",
             "official",
@@ -135,7 +135,7 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
         AIDigestSource(
             "sensetime-sensenova",
             "official",
-            "https://www.sensetime.com/en/news-detail/51170629?categoryId=1072",
+            "https://sensetime.com/en/research/",
             "SenseTime SenseNova",
             "html",
         ),

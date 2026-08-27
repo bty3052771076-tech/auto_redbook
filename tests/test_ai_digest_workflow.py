@@ -127,7 +127,7 @@ def test_select_adaptive_ai_digest_items_uses_all_strict_candidates_up_to_twenty
     assert meta["selection_mode"] == "adaptive_strict"
 
 
-def test_select_adaptive_ai_digest_items_uses_fallback_only_when_strict_pool_is_below_eight():
+def test_select_adaptive_ai_digest_items_does_not_backfill_low_impact_items():
     items = _distinct_updates(8)
     scores = {
         item.dedupe_key: {
@@ -141,18 +141,19 @@ def test_select_adaptive_ai_digest_items_uses_fallback_only_when_strict_pool_is_
         items,
         impact_scores=scores,
         historical_keys=set(),
-        min_items=8,
+        min_items=1,
         max_items=20,
         min_official_count=6,
         min_domestic_model_count=3,
         min_foreign_ai_count=3,
     )
 
-    assert len(selected) == 8
+    assert len(selected) == 7
     assert meta["strict_candidate_count"] == 7
-    assert meta["fallback_selected_count"] == 1
-    assert meta["selection_mode"] == "fallback_minimum"
-    assert meta["fallback_tiers"]["three_day_normal"] == 1
+    assert meta["fallback_selected_count"] == 0
+    assert meta["strict_selected_count"] == 7
+    assert meta["selection_mode"] == "adaptive_strict"
+    assert meta["low_impact_backfill"] is False
 
 
 def test_select_adaptive_ai_digest_items_relaxes_official_target_to_eligible_pool():
@@ -191,7 +192,7 @@ def test_select_adaptive_ai_digest_items_relaxes_official_target_to_eligible_poo
     assert meta["official_target_relaxed"] is True
 
 
-def test_select_adaptive_ai_digest_items_uses_older_normal_item_for_minimum_quota():
+def test_select_adaptive_ai_digest_items_excludes_older_and_normal_items():
     recent = datetime.now(timezone.utc).replace(microsecond=0)
     five_days_old = recent - timedelta(days=5)
     items = [
@@ -217,7 +218,7 @@ def test_select_adaptive_ai_digest_items_uses_older_normal_item_for_minimum_quot
         items,
         impact_scores=scores,
         historical_keys=set(),
-        min_items=8,
+        min_items=1,
         max_items=20,
         min_official_count=6,
         min_domestic_model_count=3,
@@ -225,11 +226,10 @@ def test_select_adaptive_ai_digest_items_uses_older_normal_item_for_minimum_quot
         allow_official_relaxation=True,
     )
 
-    assert len(selected) == 8
-    assert create_post.ai_digest_quota_counts(selected)["domestic_model"] == 3
-    assert meta["fallback_tiers"]["three_day_normal"] == 1
-    assert meta["fallback_tiers"]["seven_day_normal"] == 1
-    assert meta["selection_mode"] == "fallback_minimum"
+    assert len(selected) == 6
+    assert create_post.ai_digest_quota_counts(selected)["domestic_model"] == 2
+    assert meta["fallback_selected_count"] == 0
+    assert meta["selection_mode"] == "adaptive_strict"
 
 
 def test_fit_ai_digest_items_to_body_capacity_fits_all_without_links():
@@ -345,12 +345,12 @@ def test_create_daily_ai_digest_posts_sends_thirteen_strict_items_to_rewrite_llm
 
     assert captured_targets == [13]
     assert post.platform["ai_digest"]["actual_items"] == 13
-    assert post.platform["ai_digest"]["min_items"] == 8
+    assert post.platform["ai_digest"]["min_items"] == 1
     assert post.platform["ai_digest"]["max_items"] == 20
     assert post.platform["ai_digest"]["adaptive_selection"]["selection_mode"] == "adaptive_strict"
 
 
-def test_create_daily_ai_digest_posts_records_fallback_when_only_seven_are_high_impact(
+def test_create_daily_ai_digest_posts_publishes_only_the_seven_high_impact_items(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -389,10 +389,11 @@ def test_create_daily_ai_digest_posts_records_fallback_when_only_seven_are_high_
     post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
     adaptive = post.platform["ai_digest"]["adaptive_selection"]
 
-    assert post.platform["ai_digest"]["actual_items"] == 8
+    assert post.platform["ai_digest"]["actual_items"] == 7
     assert adaptive["strict_candidate_count"] == 7
-    assert adaptive["fallback_selected_count"] == 1
-    assert adaptive["selection_mode"] == "fallback_minimum"
+    assert adaptive["fallback_selected_count"] == 0
+    assert adaptive["strict_selected_count"] == 7
+    assert adaptive["selection_mode"] == "adaptive_strict"
 
 
 def test_create_daily_ai_digest_posts_can_use_legacy_exact_target_when_adaptive_is_disabled(
@@ -446,7 +447,7 @@ def test_ai_digest_post_title_uses_featured_item_and_compacts_common_wording():
     assert create_post._ai_digest_post_title(brief) == "每日AI|Claude发现加密弱点"
 
 
-def test_ai_digest_post_title_marks_multi_item_digest_instead_of_looking_like_single_news():
+def test_ai_digest_post_title_focuses_featured_topic_without_forced_count_suffix():
     brief = AIDigestBrief(
         title="每日AI讯息",
         subtitle="AI平台、模型、工具和开源动态简报",
@@ -469,8 +470,158 @@ def test_ai_digest_post_title_marks_multi_item_digest_instead_of_looking_like_si
     title = create_post._ai_digest_post_title(brief)
 
     assert title.startswith("每日AI|")
-    assert title.endswith("等8条更新")
-    assert len(title) <= 20
+    assert title == "每日AI|Cosmos3"
+    assert "等8条更新" not in title
+
+
+def test_ai_digest_post_title_preserves_complete_ascii_product_name():
+    items = [
+        AIUpdateItem(
+            title="腾讯云 TokenHub 服务条款更新及第三方部署模型说明上线",
+            summary="腾讯云 TokenHub 更新服务条款。",
+            source_name="Tencent Cloud AI",
+            source_type="official",
+            url="https://cloud.tencent.com/announce/",
+            published_at="2026-08-23T08:00:00+08:00",
+            vendor="Tencent Cloud AI",
+            product="腾讯云 TokenHub",
+        )
+    ]
+
+    items.extend(
+        AIUpdateItem(
+            title=f"AI工具更新{i}",
+            summary="AI工具发布更新。",
+            source_name=f"Source{i}",
+            source_type="official",
+            url=f"https://example.com/{i}",
+            published_at="2026-08-22T08:00:00+08:00",
+            vendor=f"Source{i}",
+        )
+        for i in range(7)
+    )
+    brief = AIDigestBrief(title="每日AI讯息", date="2026-08-23", items=items)
+
+    title = create_post._ai_digest_post_title(brief)
+
+    assert "TokenHub" in title
+    assert "等8条更新" not in title
+
+
+def test_ai_digest_prompt_topic_coverage_keeps_all_available_requested_topics():
+    topics = [
+        "Qwen3.8-Flash-Next正式发布",
+        "GLM-5.3-Flash发布",
+        "QwenWork International上线",
+        "Codex plus用户回复5小时限制",
+        "Breeze TTS 2权重公开可用",
+    ]
+    selected = [_updates(1)[0]]
+    candidates = [
+        AIUpdateItem(
+            title=topic,
+            summary=f"官方发布了{topic}的更新。",
+            source_name=f"source-{index}",
+            source_type="official",
+            url=f"https://example.com/topic-{index}",
+            published_at=_fresh_published_at(),
+            vendor=f"vendor-{index}",
+            product=topic,
+        )
+        for index, topic in enumerate(topics)
+    ]
+
+    covered, meta = create_post._ensure_ai_digest_prompt_topic_coverage(
+        selected,
+        candidates,
+        topics,
+    )
+
+    assert meta["matched"] == topics
+    assert meta["missing"] == []
+    assert all(any(topic in item.title for item in covered) for topic in topics)
+
+
+def test_ai_digest_prompt_topic_coverage_replaces_low_priority_same_source_item():
+    topic = "GLM-5.3-Flash发布"
+    selected = [
+        AIUpdateItem(
+            title="旧版公告一",
+            summary="旧版公告",
+            source_name="Z.ai 官方博客",
+            source_type="official",
+            url="https://example.com/old-1",
+            published_at=_fresh_published_at(),
+            vendor="智谱 GLM",
+        ),
+        AIUpdateItem(
+            title="旧版公告二",
+            summary="旧版公告",
+            source_name="Z.ai 官方博客",
+            source_type="official",
+            url="https://example.com/old-2",
+            published_at=_fresh_published_at(),
+            vendor="智谱 GLM",
+        ),
+    ]
+    candidate = AIUpdateItem(
+        title="GLM-5.3-Flash发布并开放模型权重",
+        summary="Z.ai 官方博客发布 GLM-5.3-Flash。",
+        source_name="Z.ai 官方博客",
+        source_type="official",
+        url="https://z.ai/blog/glm-5.3-flash",
+        published_at=_fresh_published_at(),
+        vendor="智谱 GLM",
+        product=topic,
+        tags=["官方直连"],
+    )
+
+    covered, meta = create_post._ensure_ai_digest_prompt_topic_coverage(
+        selected,
+        [candidate],
+        [topic],
+    )
+
+    assert meta["missing"] == []
+    assert meta["matched"] == [topic]
+    assert any(topic in item.title for item in covered)
+    assert max(create_post.ai_digest_source_counts(covered).values()) == 2
+
+
+def test_ai_digest_body_capacity_preserves_explicit_prompt_topics():
+    topics = [
+        "Qwen3.8-Flash-Next正式发布",
+        "GLM-5.3-Flash发布",
+        "QwenWork International上线",
+        "Codex plus用户回复5小时限制",
+        "Breeze TTS 2权重公开可用",
+    ]
+    items = [
+        AIUpdateItem(
+            title=topic,
+            summary=f"官方发布了{topic}的更新。",
+            source_name=f"official-{index}",
+            source_type="official",
+            url=f"https://example.com/topic-{index}",
+            published_at=_fresh_published_at(),
+            vendor=f"vendor-{index}",
+            product=topic,
+        )
+        for index, topic in enumerate(topics)
+    ]
+    items.extend(_updates(8))
+
+    fitted, _meta = create_post._fit_ai_digest_items_to_body_capacity(
+        items,
+        min_items=1,
+        min_official_count=1,
+        max_age_days=14,
+        min_domestic_model_count=0,
+        min_foreign_ai_count=0,
+        protected_topics=topics,
+    )
+
+    assert all(any(topic in item.title for item in fitted) for topic in topics)
 
 
 def test_ai_digest_post_title_uses_excerpt_when_featured_title_is_generic():
@@ -538,6 +689,25 @@ def test_ai_digest_post_title_keeps_open_source_action_complete_within_platform_
 
     assert title == "每日AI|CloudflareOS开源"
     assert len(title) <= create_post.MAX_IMAGE_TITLE
+
+
+def test_ai_digest_post_title_never_cuts_inside_model_token():
+    item = AIUpdateItem(
+        title="Google DeepMind Gemini3.5Transcribe 发布语音转录更新",
+        summary="Google DeepMind 发布 Gemini3.5Transcribe 的语音转录更新。",
+        source_name="Google DeepMind",
+        source_type="official",
+        url="https://deepmind.google/discover/blog/gemini-transcribe",
+        published_at="2026-08-27T08:00:00+08:00",
+        vendor="Google DeepMind",
+        product="Gemini3.5Transcribe",
+    )
+    brief = AIDigestBrief(title="姣忔棩AI璁伅", date="2026-08-27", items=[item])
+
+    title = create_post._ai_digest_post_title(brief)
+
+    assert title == "每日AI|Gemini3.5"
+    assert "Transc" not in title
 
 
 def test_create_daily_ai_digest_passes_workspace_source_health_path_to_collector(monkeypatch, tmp_path: Path):
@@ -704,18 +874,16 @@ def test_create_daily_ai_digest_posts_collects_expanded_pool_and_records_counts(
     post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
     meta = post.platform["ai_digest"]
 
-    assert collect_kwargs[0]["target_count"] == 24
-    assert meta["target_items"] == 8
-    assert meta["candidate_pool_target"] == 24
+    assert collect_kwargs[0]["target_count"] == 12
+    assert meta["target_items"] == 4
+    assert meta["candidate_pool_target"] == 12
     assert meta["selection_pool_items"] == meta["impact_review"]["evaluated_count"]
-    assert meta["actual_items"] == 8
-    assert meta["quota_counts"]["domestic_model"] >= 3
-    assert meta["quota_counts"]["foreign_ai"] >= 3
-    assert llm_kwargs[0]["target_count"] == 8
-    assert "候选池：抓取30条，近3日20条，去重后12条，发布8条" in post.body
+    assert meta["actual_items"] == 4
+    assert llm_kwargs[0]["target_count"] == 4
+    assert "候选池：抓取30条" in post.body
 
 
-def test_create_daily_ai_digest_posts_auto_expands_to_seven_days(monkeypatch, tmp_path: Path):
+def test_create_daily_ai_digest_posts_keeps_only_recent_high_impact_items(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AI_DIGEST_MAX_AGE_DAYS", raising=False)
     monkeypatch.delenv("AI_DIGEST_LOOKBACK_DAYS", raising=False)
@@ -754,13 +922,13 @@ def test_create_daily_ai_digest_posts_auto_expands_to_seven_days(monkeypatch, tm
 
     assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [14]
     assert collect_kwargs[0]["include_pool_items"] is True
-    assert meta["max_age_days"] == 7
-    assert meta["actual_items"] == 8
+    assert meta["max_age_days"] == 3
+    assert meta["actual_items"] == 5
     lookback = meta["source_meta"]["lookback"]
     assert lookback["mode"] == "auto_expand"
-    assert lookback["selected_max_age_days"] == 7
-    assert [attempt["max_age_days"] for attempt in lookback["attempts"]] == [3, 7]
-    assert [attempt["selection_pool_items"] for attempt in lookback["attempts"]] == [5, 8]
+    assert lookback["selected_max_age_days"] == 3
+    assert [attempt["max_age_days"] for attempt in lookback["attempts"]] == [3]
+    assert [attempt["selection_pool_items"] for attempt in lookback["attempts"]] == [5]
 
 
 def test_create_daily_ai_digest_posts_auto_mode_uses_best_recent_pool_after_official_sources_exhausted(
@@ -822,10 +990,10 @@ def test_create_daily_ai_digest_posts_auto_mode_uses_best_recent_pool_after_offi
     digest = post.platform["ai_digest"]
     lookback = digest["source_meta"]["lookback"]
 
-    assert lookback["selected_max_age_days"] == 7
-    assert [attempt["official_count"] for attempt in lookback["attempts"]] == [2, 3]
+    assert lookback["selected_max_age_days"] == 3
+    assert [attempt["official_count"] for attempt in lookback["attempts"]] == [2]
     assert digest["official_target_items"] == 6
-    assert digest["effective_min_official_items"] == 3
+    assert digest["effective_min_official_items"] == 2
     assert digest["official_target_met"] is False
     assert digest["actual_items"] == 8
 
@@ -896,8 +1064,8 @@ def test_create_daily_ai_digest_posts_fixed_lookback_days_does_not_expand(monkey
 
     monkeypatch.setattr(create_post, "collect_ai_digest_updates", fake_collect_ai_digest_updates)
 
-    with pytest.raises(RuntimeError, match="daily ai digest material insufficient"):
-        create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True, lookback_days=3)
+    post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True, lookback_days=3)[0]
+    assert post.platform["ai_digest"]["actual_items"] == 5
 
     assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [3]
 
@@ -1083,10 +1251,105 @@ def test_create_daily_ai_digest_fallback_selects_quotas_from_full_pool(monkeypat
     assert meta["quota_counts"]["foreign_ai"] >= 3
 
 
+def test_create_daily_ai_digest_impact_pool_preserves_region_quotas(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    pool = _updates(80)
+    calls = []
+    real_rank = create_post.rank_ai_updates
+
+    def capture_rank(items, **kwargs):
+        calls.append(dict(kwargs))
+        return real_rank(items, **kwargs)
+
+    monkeypatch.setattr(create_post, "collect_ai_digest_updates", lambda **_kwargs: (
+        pool,
+        {"sources": ["fixture"], "social_backfill_used": False},
+    ))
+    monkeypatch.setattr(create_post, "rank_ai_updates", capture_rank)
+    monkeypatch.setattr(
+        create_post,
+        "load_llm_configs",
+        lambda: (_ for _ in ()).throw(RuntimeError("no test llm")),
+    )
+
+    post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
+
+    assert post.platform["ai_digest"]["quota_counts"]["domestic_model"] >= 3
+    assert post.platform["ai_digest"]["quota_counts"]["foreign_ai"] >= 3
+    quota_preserving_pool_calls = [
+        call
+        for call in calls
+        if call.get("max_items_per_source") is None
+        and call.get("target_count") == 60
+    ]
+    assert len(quota_preserving_pool_calls) >= 2
+    assert all(
+        call.get("min_domestic_model_count") == 3
+        and call.get("min_foreign_ai_count") == 3
+        for call in quota_preserving_pool_calls
+    )
+
+
+def test_adaptive_selection_never_reuses_historical_quota_candidates():
+    pool = _updates(80)
+    # Keep the domestic model families available so this test isolates the
+    # hard historical-reuse gate instead of failing on an artificial quota
+    # shortage caused by removing every domestic fixture family.
+    historical = [pool[index] for index in (3, 4, 5, 10, 11)]
+    historical_keys = {create_post.ai_update_history_key(item) for item in historical}
+    impact_scores = {
+        item.dedupe_key: {"impact_score": 90.0, "high_impact": True}
+        for item in pool
+    }
+
+    selected, meta = create_post._select_adaptive_ai_digest_items(
+        pool,
+        impact_scores=impact_scores,
+        historical_keys=historical_keys,
+        min_items=1,
+        max_items=20,
+        min_official_count=6,
+        min_domestic_model_count=3,
+        min_foreign_ai_count=3,
+    )
+
+    assert len(selected) >= 8
+    assert {create_post.ai_update_history_key(item) for item in selected}.isdisjoint(historical_keys)
+    assert meta["historical_reused_count"] == 0
+    assert meta["max_historical_reuse"] == 0
+    assert meta["fallback_tiers"]["historical_reuse"] == 0
+    assert create_post.ai_digest_quota_counts(selected)["domestic_model"] >= 3
+    assert create_post.ai_digest_quota_counts(selected)["foreign_ai"] >= 3
+
+
+def test_adaptive_selection_fails_when_only_historical_domestic_items_remain():
+    pool = _updates(12)
+    historical = [pool[index] for index in (0, 1, 2, 7, 8, 9)]
+    historical_keys = {create_post.ai_update_history_key(item) for item in historical}
+    impact_scores = {
+        item.dedupe_key: {"impact_score": 90.0, "high_impact": True}
+        for item in pool
+    }
+
+    with pytest.raises(RuntimeError, match="high-impact material insufficient"):
+        create_post._select_adaptive_ai_digest_items(
+            pool,
+            impact_scores=impact_scores,
+            historical_keys=historical_keys,
+            min_items=8,
+            max_items=20,
+            min_official_count=6,
+            min_domestic_model_count=3,
+            min_foreign_ai_count=3,
+        )
+
+
 def test_create_daily_ai_digest_prefers_sources_not_used_by_uploaded_history(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     pool = _updates(24)
-    historical_items = pool[:8]
+    # Leave the domestic model families available so the fixture can still
+    # exercise the default three-item domestic quota after history filtering.
+    historical_items = [pool[index] for index in (3, 4, 5, 6, 10, 11, 12, 13)]
     historical_post = create_post.Post(
         title="每日AI讯息",
         status=PostStatus.saved_draft,
@@ -1117,12 +1380,12 @@ def test_create_daily_ai_digest_prefers_sources_not_used_by_uploaded_history(mon
     history_meta = post.platform["ai_digest"]["source_meta"]["historical_novelty"]
 
     assert selected_urls.isdisjoint(historical_urls)
-    assert history_meta["historical_key_count"] == 8
+    assert history_meta["historical_key_count"] == 7
     assert history_meta["novel_candidate_count"] >= 8
     assert history_meta["reused_selected_count"] == 0
 
 
-def test_create_daily_ai_digest_expands_lookback_when_history_reuse_would_hit_duplicate_gate(
+def test_create_daily_ai_digest_fails_when_history_blocks_quota(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -1174,16 +1437,8 @@ def test_create_daily_ai_digest_expands_lookback_when_history_reuse_would_hit_du
         lambda: (_ for _ in ()).throw(RuntimeError("test LLM unavailable")),
     )
 
-    post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
-    meta = post.platform["ai_digest"]["source_meta"]
-
-    assert meta["lookback"]["selected_max_age_days"] == 14
-    assert (
-        meta["historical_novelty"]["reused_selected_count"]
-        <= meta["historical_novelty"]["max_reused_before_duplicate_gate"]
-    )
-    assert [attempt["max_age_days"] for attempt in meta["lookback"]["attempts"]] == [3, 7, 14]
-    assert meta["adaptive_selection"]["fallback_tiers"]["historical_reuse"] <= 5
+    with pytest.raises(RuntimeError, match="high-impact material insufficient"):
+        create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)
 
 
 def test_create_post_with_draft_routes_daily_ai_digest(monkeypatch, tmp_path: Path):
@@ -1210,3 +1465,41 @@ def test_create_post_with_draft_routes_daily_ai_digest(monkeypatch, tmp_path: Pa
 
     assert post.title == "每日AI讯息"
     assert post.platform["ai_digest"]["mode"] == "daily_ai_digest"
+
+
+def test_ai_digest_ignores_legacy_minimum_item_environment(monkeypatch):
+    monkeypatch.setenv("AI_DIGEST_MIN_ITEMS", "7")
+    monkeypatch.delenv("AI_DIGEST_ALLOW_MIN_ITEMS_DEGRADE", raising=False)
+    assert create_post._ai_digest_min_items() == create_post.AI_DIGEST_MIN_ITEMS
+
+    monkeypatch.setenv("AI_DIGEST_ALLOW_MIN_ITEMS_DEGRADE", "1")
+    assert create_post._ai_digest_min_items() == 1
+
+
+def test_ai_digest_default_count_is_quality_driven_without_low_impact_backfill(monkeypatch):
+    monkeypatch.delenv("AI_DIGEST_MIN_ITEMS", raising=False)
+    monkeypatch.delenv("AI_DIGEST_ALLOW_MIN_ITEMS_DEGRADE", raising=False)
+    items = _distinct_updates(6)
+    scores = {
+        item.dedupe_key: {
+            "impact_score": 90.0 if index < 4 else 60.0,
+            "high_impact": index < 4,
+        }
+        for index, item in enumerate(items)
+    }
+
+    assert create_post._ai_digest_min_items() == 1
+    selected, meta = create_post._select_adaptive_ai_digest_items(
+        items,
+        impact_scores=scores,
+        historical_keys=set(),
+        max_items=20,
+        min_official_count=0,
+        min_domestic_model_count=0,
+        min_foreign_ai_count=0,
+    )
+
+    assert len(selected) == 4
+    assert all(scores[item.dedupe_key]["high_impact"] for item in selected)
+    assert meta["fallback_selected_count"] == 0
+    assert meta["selection_mode"] == "adaptive_strict"

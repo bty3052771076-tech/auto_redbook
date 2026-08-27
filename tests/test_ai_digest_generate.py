@@ -11,7 +11,7 @@ from src.ai_digest.generate import (
     parse_ai_digest_brief_json,
     render_ai_digest_body,
 )
-from src.ai_digest.models import AIUpdateItem
+from src.ai_digest.models import AIDigestBrief, AIUpdateItem
 from src.config import LLMConfig
 
 
@@ -283,6 +283,42 @@ def test_generate_ai_digest_brief_disables_volcengine_thinking_for_json(monkeypa
 
     assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
     assert captured["timeout"] == 37
+
+
+def test_generate_ai_digest_brief_omits_unsupported_temperature_for_kimi_k3(monkeypatch):
+    item = _updates(1)[0]
+    captured: dict = {}
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": (
+                        '{"title":"每日AI讯息","subtitle":"模型更新",'
+                        '"date":"2026-06-30","items":[{'
+                        '"title":"模型更新","summary":"模型发布了新的能力。",'
+                        '"url":"https://example.com/0","tags":["AI"]}],'
+                        '"source_summary":"官方来源"}'
+                    )
+                },
+            )()
+
+    def fake_init(*_args, **kwargs):
+        captured.update(kwargs)
+        return FakeModel()
+
+    monkeypatch.setattr("src.ai_digest.generate.init_chat_model", fake_init)
+
+    generate_ai_digest_brief_with_llm(
+        [LLMConfig(model="kimi-k3", api_key="fake-key", base_url="https://example.com", provider="aliyun")],
+        [item],
+        target_count=1,
+        date="2026-06-30",
+    )
+
+    assert "temperature" not in captured
 
 
 def test_ensure_chinese_item_uses_specific_raw_excerpt_when_source_title_is_generic():
@@ -1225,6 +1261,112 @@ def test_render_ai_digest_body_omits_primary_and_evidence_urls():
     assert "https://" not in body
 
 
+def test_ensure_chinese_item_repairs_titles_that_end_mid_fact_or_clause():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    deepseek = AIUpdateItem(
+        title="DeepSeek 官方文档更新页面显示 DeepSeek",
+        summary=(
+            "DeepSeek 官方文档更新页面显示 DeepSeek-V4-Flash-Vision-Exp 已发布。"
+            "该视觉实验版本为开发者提供新的模型接入选项。"
+        ),
+        source_name="DeepSeek",
+        source_type="official",
+        vendor="DeepSeek",
+        url="https://api-docs.deepseek.com/updates",
+        published_at="2026-08-21",
+        raw_excerpt="DeepSeek-V4-Flash-Vision-Exp Release",
+    )
+    stampli = AIUpdateItem(
+        title="Stampli 在截止日期紧张、设计资源有限的情况下",
+        summary=(
+            "Stampli 在截止日期紧张、设计资源有限的情况下，使用 Codex 与 ChatGPT Work "
+            "将数周发布制作压缩至几天，上线耗时减少68%。"
+        ),
+        source_name="OpenAI",
+        source_type="official",
+        vendor="Stampli",
+        url="https://openai.com/index/stampli",
+        published_at="2026-08-20",
+        raw_excerpt="Stampli used Codex and ChatGPT Work to compress weeks of launch production into days.",
+    )
+
+    repaired_deepseek = _ensure_chinese_item(deepseek)
+    repaired_stampli = _ensure_chinese_item(stampli)
+
+    assert "DeepSeek-V4-Flash-Vision-Exp" in repaired_deepseek.title
+    assert repaired_deepseek.title.endswith("已发布")
+    assert "使用 Codex 与 ChatGPT Work" in repaired_stampli.title
+    assert repaired_stampli.title.endswith("几天")
+
+
+def test_ensure_chinese_item_is_idempotent_for_repaired_mixed_language_titles():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="Mistral AI 推出 Agentic Search",
+        summary="Mistral AI 推出 Agentic Search 检索层，帮助 AI 系统在复杂文档中导航、阅读并验证信息。",
+        source_name="Mistral AI",
+        source_type="official",
+        vendor="Mistral AI",
+        url="https://mistral.ai/news/agentic-search/",
+        published_at="2026-08-20",
+        raw_excerpt="The retrieval layer that helps AI systems navigate, read, and verify information inside complex documents.",
+    )
+
+    once = _ensure_chinese_item(item)
+    twice = _ensure_chinese_item(once)
+
+    assert once.title == "Mistral AI 推出 Agentic Search"
+    assert twice.title == once.title
+
+
+def test_render_ai_digest_body_keeps_complete_source_names_and_no_dynamic_placeholders():
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        date="2026-08-22",
+        items=[
+            AIUpdateItem(
+                title="DeepSeek-V4-Flash-Vision-Exp 已发布",
+                summary="DeepSeek 发布视觉实验版本，为开发者提供新的模型接入选项。",
+                source_name="DeepSeek",
+                vendor="DeepSeek",
+                source_type="official",
+                url="https://example.com/deepseek",
+                published_at="2026-08-21",
+            ),
+            AIUpdateItem(
+                title="腾讯云 TokenHub 更新第三方模型服务条款",
+                summary="腾讯云更新服务条款并上线第三方部署模型服务特别说明。",
+                source_name="Tencent Cloud AI",
+                vendor="Tencent Cloud AI",
+                source_type="official",
+                url="https://example.com/tencent",
+                published_at="2026-08-21",
+            ),
+            AIUpdateItem(
+                title="GitHub 已解决 Copilot Cloud Agent 任务故障",
+                summary="GitHub 已恢复 Copilot Cloud Agent 任务创建和状态可见性。",
+                source_name="GitHub Status",
+                vendor="GitHub Status",
+                source_type="official",
+                url="https://example.com/github",
+                published_at="2026-08-21",
+            ),
+        ],
+    )
+
+    body = render_ai_digest_body(brief)
+
+    assert "Tencent Cloud AI：" in body
+    assert "GitHub Status：" in body
+    assert "腾讯云 TokenHub 更新第三方模型服务条款" in body
+    assert "GitHub 已解决 Copilot Cloud Agent 任务故障" in body
+    assert "Tencent Clou：" not in body
+    assert "GitHub Statu：" not in body
+    assert "动态3" not in body
+
+
 def test_render_ai_digest_body_fits_eight_items_without_links_under_platform_limit():
     items = [
         AIUpdateItem(
@@ -1268,4 +1410,37 @@ def test_render_ai_digest_compact_body_fits_without_links():
     body = render_ai_digest_body(build_fallback_brief(items, target_count=8, date="2026-08-07"))
 
     assert len(body) <= 1000
+    assert "https://" not in body
+
+
+def test_render_ai_digest_body_item_publish_time_uses_beijing_time_and_date_only():
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        date="2026-08-25",
+        items=[
+            AIUpdateItem(
+                title="OpenAI 发布开发者工具更新",
+                summary="OpenAI 更新开发者工具。",
+                source_name="OpenAI",
+                source_type="official",
+                url="https://example.com/openai",
+                published_at="2026-08-24T16:30:00Z",
+                vendor="OpenAI",
+            ),
+            AIUpdateItem(
+                title="DeepSeek 更新模型文档",
+                summary="DeepSeek 更新模型文档。",
+                source_name="DeepSeek",
+                source_type="official",
+                url="https://example.com/deepseek",
+                published_at="2026-08-25",
+                vendor="DeepSeek",
+            ),
+        ],
+    )
+
+    body = render_ai_digest_body(brief)
+
+    assert "1. OpenAI：OpenAI 发布开发者工具更新（发布时间：2026-08-25 00:30）" in body
+    assert "2. DeepSeek：DeepSeek 更新模型文档（发布时间：2026-08-25）" in body
     assert "https://" not in body
