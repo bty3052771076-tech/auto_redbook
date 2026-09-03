@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.ai_digest import collect as collect_mod
+from src.ai_digest import rank as rank_mod
 from src.ai_digest.collect import collect_ai_digest_updates, fetch_ai_digest_source
 from src.ai_digest import fetchers
 from src.ai_digest.models import AIUpdateItem
@@ -88,7 +89,16 @@ def test_default_sources_include_expandable_official_and_social_groups():
     sources = default_ai_digest_sources()
 
     names = {source.name for source in sources}
-    assert {"openai", "anthropic", "deepmind", "huggingface", "github-ai"}.issubset(names)
+    assert {
+        "openai",
+        "openai-cursor-decision",
+        "fal-h3-max",
+        "anthropic",
+        "anthropic-fable-5-1",
+        "deepmind",
+        "huggingface",
+        "github-ai",
+    }.issubset(names)
     assert {
         "zhipu-glm",
         "zcode",
@@ -127,6 +137,55 @@ def test_default_sources_use_current_official_pages_when_legacy_rss_endpoints_ar
     assert by_name["metaai"].parser == "html"
     assert by_name["microsoft"].url == "https://blogs.microsoft.com/"
     assert by_name["microsoft"].parser == "html"
+
+
+def test_default_sources_include_precision_model_release_search_queries():
+    queries = collect_mod._search_backfill_queries()
+
+    assert "Claude Fable 5.1 release Anthropic official" in queries
+
+
+def test_parse_fable_official_page_as_concrete_model_release(monkeypatch):
+    html = """
+    <html><head>
+      <meta property="datePublished" content="2026-09-01">
+    </head><body>
+      <h1>Introducing Claude Fable 5.1</h1>
+      <p>Claude Fable 5.1 is now available for coding and knowledge work.</p>
+    </body></html>
+    """
+    source = next(item for item in default_ai_digest_sources() if item.name == "anthropic-fable-5-1")
+    monkeypatch.setattr(collect_mod, "_http_get_text", lambda _url, timeout_s=12.0: html)
+
+    items = collect_mod.fetch_ai_digest_source(source, max_age_days=3)
+
+    assert len(items) == 1
+    assert items[0].source_type == "official"
+    assert items[0].published_at == "2026-09-01"
+    assert "Fable 5.1" in items[0].title
+    assert rank_mod.ai_update_category(items[0]) == "model_release"
+
+
+def test_fable_official_source_normalizes_short_navigation_title(monkeypatch):
+    source = next(item for item in default_ai_digest_sources() if item.name == "anthropic-fable-5-1")
+    short_title = AIUpdateItem(
+        title="Anthropic官方发布Claude Fable",
+        summary="Anthropic官方发布Claude Fable 5.1，面向编程和知识工作。",
+        source_name="Anthropic官方发布",
+        source_type="official",
+        url=source.url,
+        published_at="2026-09-01",
+        vendor="Anthropic",
+        product="",
+        raw_excerpt="Claude Fable 5.1 is now available.",
+    )
+    monkeypatch.setattr(collect_mod, "_http_get_text", lambda _url, timeout_s=12.0: "<html>official page</html>")
+    monkeypatch.setattr(collect_mod, "parse_official_html", lambda *_args, **_kwargs: [short_title])
+
+    items = collect_mod.fetch_ai_digest_source(source, max_age_days=3)
+
+    assert items[0].title == "Anthropic发布Claude Fable 5.1"
+    assert items[0].product == "Claude Fable 5.1"
 
 
 def test_default_sources_replace_known_unstable_official_endpoints():
@@ -628,6 +687,81 @@ def test_parse_official_html_extracts_release_lines_as_official_candidates():
     assert items[0].source_type == "official"
     assert items[0].source_name == "百度千帆"
     assert "ERNIE X1.1" in " ".join(item.title for item in items)
+
+
+def test_parse_official_html_preserves_newsroom_list_dates_and_detail_links():
+    html = """
+    <html><body>
+      <ul class="PublicationList">
+        <li class="PublicationList-item">
+          <a href="/news/improving-alignment-security-efforts">
+            <div class="meta"><time>Aug 31, 2026</time><span>Announcements</span></div>
+            <span class="title">Improving our alignment and security efforts</span>
+          </a>
+        </li>
+        <li class="PublicationList-item">
+          <a href="/news/model-hardware-standard-research-preview">
+            <div class="meta"><time>Aug 27, 2026</time><span>Announcements</span></div>
+            <span class="title">Previewing the Model Hardware Standard</span>
+          </a>
+        </li>
+      </ul>
+    </body></html>
+    """
+
+    items = parse_official_html(
+        html,
+        source_name="Anthropic",
+        vendor="Anthropic",
+        base_url="https://www.anthropic.com/news",
+    )
+
+    assert [item.title for item in items] == [
+        "Improving our alignment and security efforts",
+        "Previewing the Model Hardware Standard",
+    ]
+    assert [item.published_at for item in items] == ["2026-08-31", "2026-08-27"]
+    assert [item.url for item in items] == [
+        "https://www.anthropic.com/news/improving-alignment-security-efforts",
+        "https://www.anthropic.com/news/model-hardware-standard-research-preview",
+    ]
+
+
+def test_anthropic_newsroom_fetch_enriches_cards_with_detail_facts(monkeypatch):
+    source = AIDigestSource(
+        "anthropic",
+        "official",
+        "https://www.anthropic.com/news",
+        "Anthropic",
+        "html",
+    )
+    listing_html = """
+    <ul>
+      <li><a href="/news/improving-alignment-security-efforts">
+        <time>Aug 31, 2026</time><span class="title">Improving our alignment and security efforts</span>
+      </a></li>
+    </ul>
+    """
+    detail_html = """
+    <article>
+      <h1>Improving our alignment and security efforts</h1>
+      <p>On July 30, we reported three incidents in which Claude models gained unauthorized access to real computer systems during evaluation.</p>
+      <p>We are working with independent reviewers to analyze the incidents and strengthen safeguards.</p>
+    </article>
+    """
+
+    def fake_get(url, *, timeout_s=12.0):
+        return listing_html if url.endswith("/news") else detail_html
+
+    monkeypatch.setattr(collect_mod, "_http_get_text", fake_get)
+
+    items = fetch_ai_digest_source(source)
+
+    assert len(items) == 1
+    assert items[0].published_at == "2026-08-31"
+    assert items[0].url == "https://www.anthropic.com/news/improving-alignment-security-efforts"
+    assert "Claude models gained unauthorized access" in items[0].raw_excerpt
+    assert len(items[0].raw_excerpt) > len(items[0].title)
 
 
 def test_parse_official_html_ignores_navigation_when_an_official_article_body_exists():

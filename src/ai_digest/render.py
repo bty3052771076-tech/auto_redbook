@@ -282,20 +282,69 @@ def _featured_item(brief: AIDigestBrief) -> AIUpdateItem | None:
     return featured_ai_update(list(brief.items or []))
 
 
+def _cover_title_parts(
+    brief_title: str,
+    featured: AIUpdateItem | None,
+) -> tuple[str, str]:
+    """Return a stable cover label and a separately wrapped headline."""
+
+    clean = re.sub(r"\s+", " ", (brief_title or "").strip())
+    for separator in ("|", "｜"):
+        if separator not in clean:
+            continue
+        label, headline = (part.strip() for part in clean.split(separator, 1))
+        if label and headline:
+            return label, headline
+
+    label = "每日AI讯息"
+    if clean and clean != label:
+        return label, clean
+    return label, (featured.title or "").strip() if featured else ""
+
+
 def _render_cover(brief: AIDigestBrief, path: Path) -> None:
     img, draw = _new_card()
     title_font = _font(68, bold=True)
+    headline_font = _font(48, bold=True)
     subtitle_font = _font(34)
     body_font = _font(30)
     small_font = _font(24)
 
     draw.text((70, 42), "AI动态简报", font=small_font, fill="#f4dfbf")
-    draw.text((96, 300), brief.title or "每日AI讯息", font=title_font, fill="#1f292e")
-    draw.text((100, 402), brief.date or "", font=subtitle_font, fill="#b75f35")
-    subtitle = brief.subtitle or "AI平台、模型、工具和开源动态简报"
-    _draw_wrapped(
+    featured = _featured_item(brief)
+    cover_label, cover_headline = _cover_title_parts(brief.title, featured)
+    title_y = 252
+    title_bottom = _draw_wrapped(
         draw,
-        (100, 492),
+        (96, title_y),
+        cover_label,
+        title_font,
+        width=20,
+        fill="#1f292e",
+        line_gap=8,
+        max_lines=1,
+        max_width_px=CARD_SIZE[0] - 192,
+    )
+    headline_bottom = title_bottom
+    if cover_headline:
+        headline_bottom = _draw_wrapped(
+            draw,
+            (100, title_bottom + 14),
+            cover_headline,
+            headline_font,
+            width=24,
+            fill="#39454b",
+            line_gap=8,
+            max_lines=2,
+            max_width_px=CARD_SIZE[0] - 200,
+        )
+    date_y = headline_bottom + 16
+    draw.text((100, date_y), brief.date or "", font=subtitle_font, fill="#b75f35")
+    subtitle = brief.subtitle or "AI平台、模型、工具和开源动态简报"
+    subtitle_y = date_y + 58
+    subtitle_bottom = _draw_wrapped(
+        draw,
+        (100, subtitle_y),
         subtitle,
         subtitle_font,
         width=25,
@@ -304,14 +353,18 @@ def _render_cover(brief: AIDigestBrief, path: Path) -> None:
         max_lines=3,
         max_width_px=CARD_SIZE[0] - 200,
     )
-
-    featured = _featured_item(brief)
-    draw.rounded_rectangle([100, 690, CARD_SIZE[0] - 100, 920], radius=30, fill="#1f292e")
-    draw.text((132, 720), "今日重点", font=small_font, fill="#f4dfbf")
+    featured_top = max(690, subtitle_bottom + 28)
+    featured_bottom = featured_top + 230
+    draw.rounded_rectangle(
+        [100, featured_top, CARD_SIZE[0] - 100, featured_bottom],
+        radius=30,
+        fill="#1f292e",
+    )
+    draw.text((132, featured_top + 30), "今日重点", font=small_font, fill="#f4dfbf")
     if featured:
         _draw_wrapped(
             draw,
-            (132, 764),
+            (132, featured_top + 74),
             featured.title,
             body_font,
             width=27,
@@ -330,22 +383,21 @@ def _render_cover(brief: AIDigestBrief, path: Path) -> None:
         )
         if meta:
             draw.text(
-                (132, 872),
+                (132, featured_bottom - 48),
                 _fit_text(draw, meta, small_font, max_width_px=CARD_SIZE[0] - 264),
                 font=small_font,
                 fill="#d7c4a7",
             )
 
-    source = brief.source_summary or "官方源为主，社交源用于补充与验证。"
     _draw_wrapped(
         draw,
-        (100, 990),
-        source,
+        (100, featured_bottom + 42),
+        brief.source_summary or "官方源为主，社交源用于补充与验证。",
         body_font,
         width=30,
         fill="#4e5a60",
         line_gap=12,
-        max_lines=6,
+        max_lines=4,
         max_width_px=CARD_SIZE[0] - 200,
     )
     img.save(path, format="PNG")
@@ -358,7 +410,13 @@ def _render_items_page(brief: AIDigestBrief, page_items: list[AIUpdateItem], pat
     body_font = _font(27)
     meta_font = _font(22)
 
-    draw.text((70, 42), f"{brief.title or '每日AI讯息'}  {page_no}/{total_pages}", font=header_font, fill="#f4dfbf")
+    header_label, _ = _cover_title_parts(brief.title, _featured_item(brief))
+    draw.text(
+        (70, 42),
+        f"{_fit_text(draw, header_label, header_font, max_width_px=CARD_SIZE[0] - 140)}  {page_no}/{total_pages}",
+        font=header_font,
+        fill="#f4dfbf",
+    )
     top = 222
     bottom = CARD_SIZE[1] - 146
     gap = 26

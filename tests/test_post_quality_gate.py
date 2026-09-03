@@ -213,6 +213,58 @@ def test_batch_gate_rejects_daily_ai_digest_with_mostly_same_source_items():
     assert any(issue.code == "historical_duplicate" for issue in report.issues)
 
 
+def test_batch_gate_ignores_generic_historical_digest_item_but_keeps_concrete_event_check():
+    current = Post(
+        title="每日AI讯息",
+        platform={
+            "ai_digest": {
+                "items": [
+                    {
+                        "title": "GPT-5.3-Codex模型发布",
+                        "summary": "OpenAI发布GPT-5.3-Codex模型并说明了具体能力。",
+                        "source_name": "OpenAI",
+                        "source_type": "official",
+                        "url": "https://openai.com/news/gpt-5.3-codex",
+                        "published_at": "2026-09-01T00:00:00Z",
+                        "vendor": "OpenAI",
+                        "raw_excerpt": "OpenAI发布GPT-5.3-Codex模型并说明了具体能力。",
+                    }
+                ]
+            }
+        },
+    )
+    generic_historical = Post(
+        title="每日AI讯息",
+        status=PostStatus.saved_draft,
+        uploaded=True,
+        platform={
+            "ai_digest": {
+                "items": [
+                    {
+                        "title": "GitHub Status披露gpt-5.3-codex的AI产品变化",
+                        "summary": "GitHub Status披露gpt-5.3-codex的AI产品变化。",
+                        "source_name": "GitHub Status",
+                        "source_type": "official",
+                        "url": "https://www.githubstatus.com/",
+                        "published_at": "2026-08-31T17:58:00Z",
+                        "vendor": "GitHub",
+                        "product": "gpt-5.3-codex",
+                        "raw_excerpt": "GitHub Status披露gpt-5.3-codex的AI产品变化。",
+                    }
+                ]
+            }
+        },
+    )
+
+    report = validate_post_batch(
+        [current],
+        expected_count=1,
+        historical_posts=[generic_historical],
+    )
+
+    assert report.ok
+
+
 def test_image_inspection_rejects_blank_or_broken_images(tmp_path):
     blank = tmp_path / "blank.png"
     Image.new("RGB", (320, 420), "white").save(blank)

@@ -72,6 +72,7 @@ from src.workflow.create_post import (
     create_post_with_draft,
     regenerate_daily_news_post_image,
 )
+from src.wool.workflow import create_daily_wool_posts
 from src.workflow.pipeline import (
     FreeModelPlan,
     FreeQuotaUnavailableError,
@@ -92,6 +93,7 @@ app = typer.Typer(
     context_settings={"terminal_width": 140, "max_content_width": 140},
 )
 DAILY_AI_DIGEST_TITLE = "每日AI讯息"
+DAILY_WOOL_TITLE = "每日羊毛"
 
 
 def _jsonable_quota_result(provider: str, result: dict) -> dict:
@@ -1132,9 +1134,16 @@ def _is_daily_ai_digest_title(title: str) -> bool:
     return (title or "").strip().replace(" ", "") == DAILY_AI_DIGEST_TITLE
 
 
+def _is_daily_wool_title(title: str) -> bool:
+    return (title or "").strip().replace(" ", "") == DAILY_WOOL_TITLE
+
+
 def _emit_missing_assets_hint(title: str, *, dry_run: bool = False) -> None:
     if _is_daily_ai_digest_title(title):
         typer.echo("note: 每日AI讯息会自动渲染本地简报图，无需本地素材或 AI 生图。")
+        return
+    if _is_daily_wool_title(title):
+        typer.echo("note: 每日羊毛会按核验结果自动选择本地羊图，无需提供素材或调用付费生图。")
         return
     if not dry_run:
         typer.echo("未找到素材文件，将自动查找配图（如已启用 AUTO_IMAGE 且配置了图片 API）。")
@@ -1144,6 +1153,8 @@ def _generation_stage_for_title(title: str) -> str:
     title_norm = (title or "").strip()
     if _is_daily_ai_digest_title(title_norm):
         return "生成每日AI讯息"
+    if _is_daily_wool_title(title_norm):
+        return "生成每日羊毛"
     if title_norm == "每日新闻":
         return "生成每日新闻"
     return "生成草稿"
@@ -1548,12 +1559,15 @@ def create(
         typer.echo("count 必须 >= 1")
         raise typer.Exit(code=1)
 
-    requested_count = 1 if _is_daily_ai_digest_title(title_norm) else count
+    requested_count = 1 if (_is_daily_ai_digest_title(title_norm) or _is_daily_wool_title(title_norm)) else count
     if requested_count != count:
-        typer.echo(
-            "note: 每日AI讯息会生成 1 条简报草稿，并按质量自动选择 8-20 条动态；"
-            "AI_DIGEST_MAX_ITEMS 只控制上限。"
-        )
+        if _is_daily_ai_digest_title(title_norm):
+            typer.echo(
+                "note: 每日AI讯息会生成 1 条简报草稿，并按质量自动选择 8-20 条动态；"
+                "AI_DIGEST_MAX_ITEMS 只控制上限。"
+            )
+        else:
+            typer.echo("note: 每日羊毛会生成 1 条按当日福利核验结果选择配图的草稿。")
 
     started_at = now_iso()
     run_errors: list[str] = []
@@ -1572,6 +1586,19 @@ def create(
                 count=1,
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
+                lookback_days=lookback_days,
+            )
+        except Exception as exc:
+            typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
+            posts = []
+            generation_failed_count = requested_count
+            run_errors.append(str(exc))
+    elif _is_daily_wool_title(title_norm):
+        try:
+            posts = create_daily_wool_posts(
+                asset_paths=asset_paths,
+                copy_assets=not no_copy,
+                count=1,
                 lookback_days=lookback_days,
             )
         except Exception as exc:
@@ -2057,12 +2084,15 @@ def auto(
         typer.echo("count 必须 >= 1")
         raise typer.Exit(code=1)
 
-    requested_count = 1 if _is_daily_ai_digest_title(title_norm) else count
+    requested_count = 1 if (_is_daily_ai_digest_title(title_norm) or _is_daily_wool_title(title_norm)) else count
     if requested_count != count:
-        typer.echo(
-            "note: 每日AI讯息会生成 1 条简报草稿，并按质量自动选择 8-20 条动态；"
-            "AI_DIGEST_MAX_ITEMS 只控制上限。"
-        )
+        if _is_daily_ai_digest_title(title_norm):
+            typer.echo(
+                "note: 每日AI讯息会生成 1 条简报草稿，并按质量自动选择 8-20 条动态；"
+                "AI_DIGEST_MAX_ITEMS 只控制上限。"
+            )
+        else:
+            typer.echo("note: 每日羊毛会生成 1 条按当日福利核验结果选择配图的草稿。")
 
     started_at = now_iso()
     run_errors: list[str] = []
@@ -2077,7 +2107,7 @@ def auto(
                 wait_timeout=wait_timeout,
                 metrics_max_age_hours=metrics_max_age_hours,
                 quota_max_age_hours=quota_max_age_hours,
-                require_image=not _is_daily_ai_digest_title(title_norm),
+                require_image=not (_is_daily_ai_digest_title(title_norm) or _is_daily_wool_title(title_norm)),
             )
         except FreeQuotaUnavailableError as exc:
             _emit_progress_event("auto", "选择免费模型", "failed", str(exc))
@@ -2113,6 +2143,20 @@ def auto(
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
                 lookback_days=lookback_days,
+            )
+        except Exception as exc:
+            typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
+            posts = []
+            generation_failed_count = requested_count
+            run_errors.append(str(exc))
+    elif _is_daily_wool_title(title_norm):
+        try:
+            posts = create_daily_wool_posts(
+                asset_paths=asset_paths,
+                copy_assets=not no_copy,
+                count=1,
+                lookback_days=lookback_days,
+                progress=lambda stage, detail: _emit_progress_event("auto", stage, "in_progress", detail),
             )
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
@@ -3380,6 +3424,11 @@ def retry(
     ),
     login_hold: int = typer.Option(0, help="seconds to wait for manual login"),
     wait_timeout: int = typer.Option(300, help="seconds to wait for publish UI"),
+    platform: str = typer.Option(
+        "xhs",
+        "--platform",
+        help="draft destination: xhs, toutiao, or both",
+    ),
     force: bool = typer.Option(False, help="retry even if last run was not failed"),
 ):
     """Retry saving a draft (new attempt)."""
@@ -3399,6 +3448,7 @@ def retry(
         headless=headless,
         login_hold=login_hold,
         wait_timeout=wait_timeout,
+        platform=platform,
         force=True,
     )
 

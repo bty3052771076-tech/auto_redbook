@@ -232,6 +232,96 @@ def test_select_adaptive_ai_digest_items_excludes_older_and_normal_items():
     assert meta["selection_mode"] == "adaptive_strict"
 
 
+def test_select_adaptive_ai_digest_items_rescues_recent_official_release_when_llm_misses_it():
+    item = AIUpdateItem(
+        title="GLM-5.3-Flash model release",
+        summary="Official model release with open weights and a multimodal architecture.",
+        source_name="Z.ai",
+        source_type="official",
+        url="https://z.ai/blog/glm-5-3-flash",
+        published_at=_fresh_published_at(),
+        vendor="Z.ai",
+        product="GLM-5.3-Flash",
+        raw_excerpt="Z.ai official model release announcement.",
+        tags=["AI", "region:domestic"],
+    )
+    scores = {
+        item.dedupe_key: {
+            "impact_score": 58.0,
+            "high_impact": False,
+        }
+    }
+
+    selected, meta = create_post._select_adaptive_ai_digest_items(
+        [item],
+        impact_scores=scores,
+        historical_keys=set(),
+        min_items=1,
+        max_items=20,
+        min_official_count=1,
+        min_domestic_model_count=0,
+        min_foreign_ai_count=0,
+    )
+
+    assert [entry.title for entry in selected] == [item.title]
+    assert meta["impact_rescue_count"] == 1
+    assert meta["selection_mode"] == "adaptive_strict_rescue"
+
+
+def test_select_adaptive_ai_digest_items_rejects_lifecycle_notice_even_if_llm_marks_high():
+    item = AIUpdateItem(
+        title="腾讯云 DeepSeek-V4-Flash 模型下线及升级通知",
+        summary="DeepSeek-V4-Flash API 服务将下线并进行升级，请用户迁移到新版本。",
+        source_name="Tencent Cloud AI",
+        source_type="official",
+        url="https://cloud.tencent.com/announce/deepseek-v4-flash",
+        published_at=_fresh_published_at(),
+        vendor="DeepSeek",
+        product="DeepSeek-V4-Flash",
+        raw_excerpt="模型下线、升级和迁移说明。",
+        tags=["AI", "region:domestic"],
+    )
+
+    with pytest.raises(RuntimeError, match="high-impact material insufficient"):
+        create_post._select_adaptive_ai_digest_items(
+            [item],
+            impact_scores={item.dedupe_key: {"high_impact": True}},
+            historical_keys=set(),
+            min_items=1,
+            max_items=20,
+            min_official_count=0,
+            min_domestic_model_count=0,
+            min_foreign_ai_count=0,
+        )
+
+
+def test_select_adaptive_ai_digest_items_rejects_non_model_infrastructure_notice():
+    item = AIUpdateItem(
+        title="【云数据库 MySQL】关于部分 API 接入 CAM 鉴权公告",
+        summary="部分数据库 API 接入 CAM 鉴权，属于云数据库服务配置通知。",
+        source_name="Tencent Cloud AI",
+        source_type="official",
+        url="https://cloud.tencent.com/announce/",
+        published_at=_fresh_published_at(),
+        vendor="Tencent Cloud AI",
+        product="",
+        raw_excerpt="云数据库 MySQL API 鉴权说明。",
+        tags=["AI", "region:domestic"],
+    )
+
+    with pytest.raises(RuntimeError, match="high-impact material insufficient"):
+        create_post._select_adaptive_ai_digest_items(
+            [item],
+            impact_scores={item.dedupe_key: {"high_impact": True}},
+            historical_keys=set(),
+            min_items=1,
+            max_items=20,
+            min_official_count=0,
+            min_domestic_model_count=0,
+            min_foreign_ai_count=0,
+        )
+
+
 def test_fit_ai_digest_items_to_body_capacity_fits_all_without_links():
     items = [
         item.model_copy(
@@ -645,6 +735,289 @@ def test_ai_digest_post_title_uses_excerpt_when_featured_title_is_generic():
     assert create_post._ai_digest_post_title(brief) == "每日AI|Cloudflare智能体周"
 
 
+def test_ai_digest_post_title_does_not_use_social_bullet_fragment_as_subject():
+    item = AIUpdateItem(
+        title="OpenAI DevelopersAI接口发布新进展",
+        summary="OpenAI Developers 分享了开发者接口相关的近期变化。",
+        source_name="X：OpenAI Developers (@OpenAIDevs)",
+        source_type="social",
+        url="https://x.com/OpenAIDevs/status/1",
+        published_at=_fresh_published_at(),
+        vendor="OpenAI Developers",
+        product="",
+        raw_excerpt="• Give me TL; details are available in the thread.",
+        tags=["AI"],
+    )
+    brief = AIDigestBrief(title="每日AI讯息", date="2026-08-29", items=[item])
+
+    title = create_post._ai_digest_post_title(brief)
+
+    assert "Give" not in title
+    assert title == "每日AI|OpenAI开发者"
+
+
+def test_ai_digest_items_put_explicit_model_release_before_other_ai_updates():
+    social = AIUpdateItem(
+        title="OpenAI开发者动态",
+        summary="OpenAI 开发者分享近期接口变化。",
+        source_name="OpenAI Developers",
+        source_type="social",
+        url="https://x.com/OpenAIDevs/status/2",
+        published_at=_fresh_published_at(),
+        vendor="OpenAI Developers",
+        product="",
+        raw_excerpt="OpenAI developer update.",
+        tags=["AI", "region:foreign"],
+    )
+    release = AIUpdateItem(
+        title="HY4 preview 模型发布",
+        summary="HY4 preview is open to selected testers with new model weights.",
+        source_name="The Beijing News",
+        source_type="search",
+        url="https://example.com/hy4-preview",
+        published_at=_fresh_published_at(),
+        vendor="HY4",
+        product="HY4",
+        raw_excerpt="HY4 preview model release.",
+        tags=["AI", "region:domestic"],
+    )
+
+    ordered = create_post._prioritize_ai_digest_model_releases([social, release])
+
+    assert ordered[0].title == "HY4 preview 模型发布"
+
+
+def test_ai_digest_post_title_keeps_hy4_release_action_complete():
+    item = AIUpdateItem(
+        title="腾讯混元Hy4 Preview模型发布",
+        summary="腾讯混元发布并开源 Hy4 Preview 模型。",
+        source_name="pandaily.com",
+        source_type="search",
+        url="https://pandaily.com/tencent-hunyuan-hy4-preview-open-source-aug2026",
+        published_at=_fresh_published_at(),
+        vendor="腾讯混元",
+        product="Hy4 Preview",
+        raw_excerpt="Tencent Hunyuan released and open-sourced Hy4 preview.",
+    )
+    brief = AIDigestBrief(title="每日AI讯息", date="2026-08-29", items=[item])
+
+    assert create_post._ai_digest_post_title(brief) == "每日AI|Hy4Preview发布"
+
+
+def test_ai_digest_prompt_search_queries_include_claude_fable_release():
+    assert create_post._ai_digest_prompt_search_queries("Claude Fable 5.1") == ["Claude Fable 5.1"]
+
+
+def test_ai_digest_post_title_keeps_claude_fable_version():
+    item = AIUpdateItem(
+        title="Anthropic发布Claude Fable 5.1",
+        summary="Anthropic官方发布Claude Fable 5.1，面向编程和知识工作。",
+        source_name="Anthropic官方发布",
+        source_type="official",
+        url="https://www.anthropic.com/claude/fable",
+        published_at="2026-09-01",
+        vendor="Anthropic",
+        product="Claude Fable 5.1",
+    )
+    brief = AIDigestBrief(title="每日AI讯息", date="2026-09-02", items=[item])
+
+    assert create_post._ai_digest_post_title(brief, preferred_topics=["Claude Fable 5.1"]) == "每日AI|ClaudeFable5.1"
+
+
+def test_ai_digest_body_fit_keeps_valid_short_selected_set():
+    items = [
+        AIUpdateItem(
+            title="Anthropic发布Claude Fable 5.1",
+            summary="Anthropic官方发布Claude Fable 5.1，面向编程和知识工作。",
+            source_name="Anthropic官方发布",
+            source_type="official",
+            url="https://www.anthropic.com/claude/fable",
+            published_at="2026-09-01",
+            vendor="Anthropic",
+            product="Claude Fable 5.1",
+        ),
+        AIUpdateItem(
+            title="OpenAI发布新模型能力",
+            summary="OpenAI官方发布新的模型能力更新。",
+            source_name="OpenAI官方",
+            source_type="official",
+            url="https://openai.com/index/example-release",
+            published_at="2026-09-02",
+            vendor="OpenAI",
+            product="GPT",
+        ),
+    ]
+
+    fitted, meta = create_post._fit_ai_digest_items_to_body_capacity(
+        items,
+        min_items=1,
+        min_official_count=6,
+        max_age_days=14,
+        min_domestic_model_count=0,
+        min_foreign_ai_count=0,
+        protected_topics=["Claude Fable 5.1"],
+    )
+
+    assert len(fitted) == 2
+    assert meta["body_length"] > 0
+
+
+def test_ai_digest_prompt_matches_openai_cursor_event_across_english_source_text():
+    item = AIUpdateItem(
+        title="Our decision on Cursor following its acquisition by SpaceX",
+        summary="OpenAI will wind down its contract providing OpenAI models to Cursor.",
+        source_name="OpenAI",
+        source_type="official",
+        url="https://openai.com/index/our-decision-on-cursor-following-its-acquisition-by-spacex/",
+        published_at=_fresh_published_at(),
+        vendor="OpenAI",
+        raw_excerpt="OpenAI notified SpaceX that it intends to wind down its contract providing OpenAI models to Cursor.",
+    )
+
+    assert create_post._ai_digest_prompt_topic_matches(item, "OpenAI宣布断供Cursor") is True
+
+
+def test_ai_digest_prompt_matches_minimax_h3_max_fal_event_across_english_source_text():
+    item = AIUpdateItem(
+        title="Introducing H3 Max by fal",
+        summary="H3 Max is available today on fal and generates a 5-second video in approximately 3 seconds.",
+        source_name="fal / MiniMax",
+        source_type="official",
+        url="https://fal.ai/learn/devs/introducing-h3-max-by-fal",
+        published_at=_fresh_published_at(),
+        vendor="fal / MiniMax",
+        raw_excerpt="Today we're releasing H3 Max, a post-trained version of MiniMax H3 developed by fal Research.",
+    )
+
+    assert create_post._ai_digest_prompt_topic_matches(item, "MiniMax H3 Max在Fal.ai发布") is True
+
+
+def test_ai_digest_post_title_prefers_requested_topic_over_newer_unrelated_item():
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        date="2026-08-29",
+        items=[
+            AIUpdateItem(
+                title="OpenAI拟停止向Cursor提供模型",
+                summary="OpenAI官方公告称，计划于2026年11月12日停止向Cursor提供OpenAI模型。",
+                source_name="OpenAI 官方公告",
+                source_type="official",
+                url="https://openai.com/index/our-decision-on-cursor-following-its-acquisition-by-spacex/",
+                published_at="2026-08-28",
+                vendor="OpenAI",
+            ),
+            AIUpdateItem(
+                title="医疗供应链应转向自主AI库存室",
+                summary="医疗行业机构发布了AI库存管理建议。",
+                source_name="HIT Consultant",
+                source_type="aggregator",
+                url="https://example.com/medical-ai",
+                published_at="2026-08-29",
+                vendor="Gartner",
+            ),
+        ],
+    )
+
+    title = create_post._ai_digest_post_title(
+        brief,
+        preferred_topics=["OpenAI宣布断供Cursor"],
+    )
+
+    assert title == "每日AI|OpenAI停供Cursor"
+
+
+def test_prompt_topic_coverage_deduplicates_multiple_sources_for_one_requested_event():
+    first = AIUpdateItem(
+        title="腾讯发布新模型HY4 preview",
+        summary="腾讯混元发布 HY4 preview 模型。",
+        source_name="百度新闻",
+        source_type="search",
+        url="https://example.com/hy4-baijia",
+        published_at=_fresh_published_at(),
+        vendor="腾讯混元",
+        confidence_score=0.82,
+    )
+    second = first.model_copy(
+        update={
+            "source_name": "International Business Times",
+            "url": "https://example.com/hy4-ibt",
+            "confidence_score": 0.6,
+        }
+    )
+
+    covered, meta = create_post._ensure_ai_digest_prompt_topic_coverage(
+        [first, second],
+        [first, second],
+        ["HY4 preview"],
+    )
+
+    assert len(covered) == 1
+    assert covered[0].url == first.url
+    assert meta["matched"] == ["HY4 preview"]
+
+
+def test_prompt_topic_can_be_restored_from_full_candidate_pool_after_body_fit():
+    topic = "HY4 preview"
+    selected = [
+        AIUpdateItem(
+            title="OpenAI开发者工具更新",
+            summary="OpenAI开发者工具更新。",
+            source_name="OpenAI",
+            source_type="official",
+            url="https://openai.com/news/tool-update",
+            published_at=_fresh_published_at(),
+            vendor="OpenAI",
+            raw_excerpt="OpenAI developer tool update.",
+        )
+    ]
+    full_pool = [
+        *selected,
+        AIUpdateItem(
+            title="AI模型发布新进展",
+            summary="腾讯混元 Hy4 Preview 模型发布并开源。",
+            source_name="pandaily.com",
+            source_type="search",
+            url="https://pandaily.com/tencent-hunyuan-hy4-preview-open-source-aug2026",
+            published_at=_fresh_published_at(),
+            vendor="腾讯混元",
+            raw_excerpt="Tencent Hunyuan released and open-sourced Hy4 preview.",
+        ),
+    ]
+
+    restored, meta = create_post._ensure_ai_digest_prompt_topic_coverage(selected, full_pool, [topic])
+
+    assert meta["missing"] == []
+    assert any("Hy4" in item.summary for item in restored)
+
+
+def test_prompt_topic_fallback_keeps_the_validated_item_count_after_llm_failure():
+    items = [
+        AIUpdateItem(
+            title=f"模型发布{i}",
+            summary=f"模型发布{i}。",
+            source_name=f"来源{i}",
+            source_type="official",
+            url=f"https://example.com/release-{i}",
+            published_at=_fresh_published_at(),
+            vendor=f"厂商{i}",
+            raw_excerpt=f"Model release {i}.",
+        )
+        for i in range(4)
+    ]
+    brief = create_post.build_fallback_brief(items, target_count=4)
+
+    finalized = create_post._finalize_ai_digest_brief(
+        brief,
+        generation_mode="fallback",
+        target_count=4,
+        min_official_count=0,
+        max_age_days=3,
+        preserve_validated_order=True,
+    )
+
+    assert len(finalized.items) == 4
+
+
 def test_ai_digest_post_title_uses_newest_featured_item_instead_of_first_source_tier():
     brief = AIDigestBrief(
         title="每日AI讯息",
@@ -771,11 +1144,21 @@ def test_create_daily_ai_digest_posts_uses_llm_brief_for_chinese_items(monkeypat
     def fake_generate_ai_digest_brief_with_llm(_cfgs, items, **kwargs):
         calls.append(items)
         llm_kwargs.append(kwargs)
+        brief_items = [chinese_item]
+        source_counts = {"OpenAI": 1}
+        for candidate in items:
+            source = candidate.vendor or candidate.source_name
+            if source_counts.get(source, 0) >= 2:
+                continue
+            brief_items.append(candidate)
+            source_counts[source] = source_counts.get(source, 0) + 1
+            if len(brief_items) >= 8:
+                break
         return AIDigestBrief(
             title="每日AI讯息",
             subtitle="AI平台与工具更新",
             date=kwargs.get("date") or "2026-06-30",
-            items=[chinese_item, *items[1:8]],
+            items=brief_items,
             source_summary="主要来源：OpenAI。",
         )
 
@@ -1344,6 +1727,30 @@ def test_adaptive_selection_fails_when_only_historical_domestic_items_remain():
         )
 
 
+def test_adaptive_selection_keeps_explicit_verified_topic_even_if_supervisor_scores_low():
+    item = AIUpdateItem(
+        title="OpenAI拟停止向Cursor提供模型",
+        summary="OpenAI官方公告称，计划于2026年11月12日停止向Cursor提供OpenAI模型。",
+        source_name="OpenAI 官方公告",
+        source_type="official",
+        url="https://openai.com/index/our-decision-on-cursor-following-its-acquisition-by-spacex/",
+        published_at=_fresh_published_at(),
+        vendor="OpenAI",
+    )
+
+    selected, _meta = create_post._select_adaptive_ai_digest_items(
+        [item],
+        impact_scores={item.dedupe_key: {"impact_score": 20.0, "high_impact": False}},
+        historical_keys={create_post.ai_update_history_key(item)},
+        protected_topics=["OpenAI宣布断供Cursor"],
+        min_items=1,
+        max_items=20,
+        min_official_count=0,
+    )
+
+    assert [candidate.url for candidate in selected] == [item.url]
+
+
 def test_create_daily_ai_digest_prefers_sources_not_used_by_uploaded_history(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     pool = _updates(24)
@@ -1383,6 +1790,47 @@ def test_create_daily_ai_digest_prefers_sources_not_used_by_uploaded_history(mon
     assert history_meta["historical_key_count"] == 7
     assert history_meta["novel_candidate_count"] >= 8
     assert history_meta["reused_selected_count"] == 0
+
+
+def test_uploaded_ai_digest_history_ignores_generic_previous_item(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    valid = AIUpdateItem(
+        title="OpenAI发布开发者工具",
+        summary="OpenAI发布开发者工具并说明了具体使用范围。",
+        source_name="OpenAI",
+        source_type="official",
+        url="https://openai.com/news/tool",
+        published_at="2026-09-01T00:00:00Z",
+        vendor="OpenAI",
+        raw_excerpt="OpenAI发布开发者工具并说明了具体使用范围。",
+    )
+    generic = AIUpdateItem(
+        title="Claude发布新进展",
+        summary="X：Anthropic披露Claude发布新进展的AI产品变化；当前可核实信息以原始标题为准。",
+        source_name="X：Anthropic (@AnthropicAI)",
+        source_type="social",
+        url="https://x.com/AnthropicAI/status/generic",
+        published_at="2026-09-01T00:00:00Z",
+        vendor="Anthropic",
+        raw_excerpt="We're sharing an update on our alignment and security efforts.",
+    )
+    historical_post = create_post.Post(
+        title="每日AI讯息",
+        status=PostStatus.saved_draft,
+        uploaded=True,
+        platform={
+            "ai_digest": {
+                "mode": "daily_ai_digest",
+                "items": [valid.model_dump(), generic.model_dump()],
+            }
+        },
+    )
+    monkeypatch.setattr(create_post, "list_posts", lambda: [historical_post], raising=False)
+
+    keys = create_post._uploaded_ai_digest_history_keys()
+
+    assert create_post.ai_update_history_key(valid) in keys
+    assert create_post.ai_update_history_key(generic) not in keys
 
 
 def test_create_daily_ai_digest_fails_when_history_blocks_quota(

@@ -10,6 +10,8 @@ from typing import Iterable, Mapping
 
 from PIL import Image, ImageStat, UnidentifiedImageError
 
+from src.ai_digest.models import AIUpdateItem
+from src.ai_digest.rank import ai_update_history_key, ai_update_quality_issues
 from src.storage.models import Post, PostStatus
 
 
@@ -183,6 +185,24 @@ def _ai_digest_item_keys(post: Post) -> set[str]:
     for raw_item in raw_items:
         if not isinstance(raw_item, Mapping):
             continue
+        try:
+            item = AIUpdateItem.model_validate(raw_item)
+        except Exception:
+            item = None
+        if item is not None:
+            title = re.sub(r"\s+", "", item.title or "")
+            # A previous draft with a generic generated headline must not
+            # block a corrected retry. Concrete items still use event-level
+            # keys so mirrored URLs cannot bypass the duplicate check.
+            if (
+                "generic_title" in ai_update_quality_issues(item)
+                or re.search(r"(?:发布|推出|上线)新进展$", title)
+            ):
+                continue
+            event_key = ai_update_history_key(item)
+            if event_key:
+                keys.add(event_key)
+                continue
         url = _normalized_url(raw_item.get("url"))
         if url:
             keys.add(f"url:{url}")

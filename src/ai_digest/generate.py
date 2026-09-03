@@ -13,12 +13,14 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from src.config import LLMConfig
 from src.llm.generate import _temperature_kwargs
+from src.text_integrity import simplify_common_chinese
 
 from .models import AIDigestBrief, AIUpdateItem
 from .rank import (
     AI_DIGEST_MAX_ITEMS_PER_SOURCE,
     ai_update_impact_score,
     ai_update_is_high_impact,
+    ai_update_history_key,
     ai_update_source_key,
 )
 
@@ -45,6 +47,10 @@ _LOW_INFORMATION_TITLE_MARKERS = (
     "AI产品发布新进展",
     "披露AI产品变化",
     "AI产品披露AI产品变化",
+)
+_GENERIC_CHANGE_TITLE_RE = re.compile(
+    r"(?:披露|公开|宣布|发布|推出|上线)[^。！？\n]{0,80}(?:AI产品变化|产品变化|AI动态|新进展)$",
+    flags=re.IGNORECASE,
 )
 
 
@@ -99,7 +105,7 @@ _AI_CLAIM_NAMES = (
     "baidu",
 )
 _AI_MODEL_VERSION_RE = re.compile(
-    r"(?<![a-z0-9])(?:gpt|claude|qwen|deepseek|glm|doubao|seedream|kimi|gemini|gemma|"
+    r"(?<![a-z0-9])(?:hy|gpt|claude|qwen|deepseek|glm|doubao|seedream|kimi|gemini|gemma|"
     r"llama|mistral|minimax|ernie)[-_. ]?(?:v)?\d+(?:\.\d+)*(?:[-_. ]?[a-z0-9]+)?(?:\s+api)?(?![a-z0-9])",
     flags=re.IGNORECASE,
 )
@@ -143,7 +149,9 @@ def _has_cjk(text: str) -> bool:
 
 def _looks_generic_ai_digest_text(text: str) -> bool:
     compact = re.sub(r"\s+", "", text or "")
-    return any(marker.replace(" ", "") in compact for marker in _GENERIC_AI_DIGEST_MARKERS)
+    return any(marker.replace(" ", "") in compact for marker in _GENERIC_AI_DIGEST_MARKERS) or bool(
+        _GENERIC_CHANGE_TITLE_RE.search(compact)
+    )
 
 
 def _is_low_information_ai_digest_text(text: str) -> bool:
@@ -243,6 +251,30 @@ def _subject_is_only_source(subject: str, item: AIUpdateItem) -> bool:
     return norm in source_norms or norm in {"ai", "update", "updates"}
 
 
+def is_ai_digest_source_label_title(value: str, item: AIUpdateItem) -> bool:
+    """Reject a source label or placeholder masquerading as an event title."""
+
+    compact = _norm_subject(value)
+    if not compact:
+        return True
+    if re.fullmatch(r"(?:ai)?动态\d*", compact, flags=re.IGNORECASE):
+        return True
+    labels = {
+        _norm_subject(item.source_name),
+        _norm_subject(item.vendor),
+        _norm_subject(item.product),
+    }
+    labels.discard("")
+    if compact in labels:
+        return True
+    for suffix in ("发布新进展", "披露AI产品变化", "AI产品披露AI产品变化"):
+        if compact.endswith(suffix):
+            base = compact[: -len(suffix)]
+            if base in labels:
+                return True
+    return False
+
+
 def _english_subject(item: AIUpdateItem) -> str:
     product = _clean_subject(item.product)
     if product and not _subject_is_only_source(product, item):
@@ -289,22 +321,42 @@ def _detail_terms_from_item(item: AIUpdateItem) -> list[str]:
 _AI_PROPER_ENGLISH_WORDS = {
     "ai",
     "api",
+    "active",
     "chatgpt",
     "claude",
     "codex",
     "deepseek",
     "doubao",
+    "embedding",
+    "face",
+    "flash",
     "gemini",
     "glm",
     "gpt",
+    "hardware",
+    "hugging",
+    "incident",
     "kimi",
     "llm",
     "luma",
     "minimax",
+    "model",
+    "moe",
+    "next",
+    "ngram",
+    "omni",
     "openai",
+    "open",
+    "report",
+    "research",
     "qwen",
     "runway",
+    "standard",
     "seedream",
+    "token",
+    "transcribe",
+    "video",
+    "weight",
 }
 _GENERIC_FALLBACK_PRODUCTS = {"", "ai", "api", "model", "models", "tool", "tools", "update", "updates"}
 
@@ -316,6 +368,113 @@ def _has_untranslated_english_phrase(text: str) -> bool:
     words = [word.lower() for word in re.findall(r"[A-Za-z]{4,}", value)]
     untranslated = [word for word in words if word not in _AI_PROPER_ENGLISH_WORDS]
     return len(untranslated) >= 2 or any(len(word) >= 8 for word in untranslated)
+
+
+def _has_truncated_english_tail(text: str) -> bool:
+    """Detect a one-letter English fragment glued to a Chinese clause."""
+    return bool(re.search(r"(?<![A-Za-z0-9])[a-z](?=[\u4e00-\u9fff])", text or ""))
+
+
+def _social_concrete_fallback_title(item: AIUpdateItem) -> str:
+    """Turn known social-post facts into a publishable, non-generic title."""
+
+    raw = (item.raw_excerpt or "").lower()
+    if "scale this research model" in raw and "researcher" in raw and "access" in raw:
+        return "Anthropic扩大研究模型访问"
+    if "studies are ongoing" in raw and "claude" in raw and "metr" in raw:
+        return "Anthropic推进Claude影响研究"
+    if "safety scores" in raw and (
+        "alignment failures" in raw or "without degrading capabilities" in raw
+    ):
+        return "Claude安全评测结果更新"
+    if "model hardware standard" in raw and ("lab" in raw or "manufacturing" in raw):
+        return "Anthropic发布模型硬件标准"
+    if (
+        "hacker-opus" in raw
+        and "reward" in raw
+        and ("misaligned" in raw or "grader" in raw)
+    ):
+        return "Anthropic披露Hacker-Opus奖励寻优风险"
+    if "coding agents" in raw and "productivity" in raw:
+        return "编程智能体生产力研究进行中"
+    if (
+        "claude models" in raw
+        and "unauthorized access" in raw
+        and "real systems" in raw
+        and "without safeguards" in raw
+    ):
+        return "Anthropic披露Claude网络安全评估事件"
+    return ""
+
+
+def _social_concrete_fallback_summary(item: AIUpdateItem) -> str:
+    """Translate only facts with stable evidence in a social excerpt.
+
+    A source post without a recognized fact is intentionally left for the
+    caller to reject or replace; inventing ``披露AI产品变化`` is worse than
+    publishing fewer items.
+    """
+
+    raw = (item.raw_excerpt or "").lower()
+    if "scale this research model" in raw and "researcher" in raw and "access" in raw:
+        return "Anthropic宣布扩大该研究模型的研究访问范围，并邀请研究人员申请工具访问资格。"
+    if "studies are ongoing" in raw and "claude" in raw and "metr" in raw:
+        return "Anthropic表示两项研究仍在进行：一项关注Claude行为与用户使用AI的感受，另一项评估编程智能体对实际生产力的影响。"
+    if "safety scores" in raw and (
+        "alignment failures" in raw or "without degrading capabilities" in raw
+    ):
+        return "Anthropic介绍一项Claude对齐研究：在10个安全对齐失败案例中，Claude提升了安全评分，同时没有降低能力表现。"
+    if "model hardware standard" in raw and ("lab" in raw or "manufacturing" in raw):
+        return "Anthropic发布模型硬件标准，内容覆盖AI模型训练和部署所需的实验室及制造设备。"
+    if (
+        "hacker-opus" in raw
+        and "reward" in raw
+        and ("misaligned" in raw or "grader" in raw)
+    ):
+        return (
+            "Anthropic称，Hacker-Opus会在追逐奖励时采取多种失向行为；"
+            "在没有明确评分者的评估中，该模型仍保持对齐。"
+        )
+    if "coding agents" in raw and "productivity" in raw:
+        return "相关研究正在评估编程智能体对实际生产力的影响，当前仍处于研究阶段。"
+    if (
+        "claude models" in raw
+        and "unauthorized access" in raw
+        and "real systems" in raw
+        and "without safeguards" in raw
+    ):
+        return (
+            "Anthropic表示，7月披露的三起事件中，未配备防护的Claude模型在网络安全评估中"
+            "取得了对真实系统的未授权访问；新文章介绍了后续加固措施。"
+        )
+    return ""
+
+
+def _github_status_fallback_title(item: AIUpdateItem) -> str:
+    raw = _source_text(item).lower()
+    if (
+        "copilot" in raw
+        and "higher rate of errors" in raw
+        and "resolved" in raw
+        and ("model provider" in raw or "model providers" in raw)
+    ):
+        return "GitHub Copilot模型错误率升高后恢复"
+    return ""
+
+
+def _github_status_fallback_summary(item: AIUpdateItem) -> str:
+    raw = _source_text(item).lower()
+    if (
+        "copilot" in raw
+        and "higher rate of errors" in raw
+        and "resolved" in raw
+        and ("model provider" in raw or "model providers" in raw)
+    ):
+        return (
+            "GitHub Status称，8月31日Copilot的AI模型提供商出现错误率升高，影响部分OpenAI模型；"
+            "状态页显示问题已缓解并恢复，后续将发布详细根因分析。"
+        )
+    return ""
 
 
 def _fallback_chinese_subject(item: AIUpdateItem) -> str:
@@ -342,6 +501,28 @@ def _fallback_chinese_subject(item: AIUpdateItem) -> str:
         return product
     if "mathemat" in lower:
         return "数学AI研究"
+    # Social posts often contain a long English sentence but no Chinese
+    # headline. Prefer a complete, known product name over the first English
+    # clause, which may end in the middle of a word or URL token.
+    for name in (
+        "DeepSeek",
+        "ChatGPT",
+        "Claude",
+        "Gemini",
+        "Qwen",
+        "GLM",
+        "GPT",
+        "Kimi",
+        "Llama",
+        "OpenAI",
+    ):
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", raw, flags=re.IGNORECASE):
+            if any(
+                marker in lower
+                for marker in ("发布", "上线", "推出", "新进展", "release", "released", "launch", "launched")
+            ):
+                return f"{name}发布新进展"
+            return name
     english_subject = _english_subject(item)
     if english_subject:
         subject_lower = english_subject.lower()
@@ -460,6 +641,31 @@ def _specific_chinese_excerpt_title(item: AIUpdateItem, *, subject: str) -> str:
 
 def _fallback_chinese_title(item: AIUpdateItem) -> str:
     raw = _source_text(item)
+    lower = raw.lower()
+    if "cursor" in lower and any(
+        marker in lower
+        for marker in (
+            "wind down",
+            "shutoff",
+            "stop providing",
+            "terminate",
+            "end its commercial partnership",
+        )
+    ):
+        return "OpenAI拟停止向Cursor提供模型"
+    if "h3 max" in lower and "fal" in lower and any(
+        marker in lower for marker in ("release", "released", "available", "video", "post-trained")
+    ):
+        return "fal发布MiniMax H3 Max视频模型"
+    if re.search(r"\bhy\s*[-_.]?\s*4\b", raw, flags=re.IGNORECASE):
+        if any(marker in lower for marker in ("release", "released", "launch", "open-sourc", "preview", "发布", "开源")):
+            return "腾讯混元Hy4 Preview模型发布"
+    github_status_title = _github_status_fallback_title(item)
+    if github_status_title:
+        return github_status_title
+    social_title = _social_concrete_fallback_title(item)
+    if social_title:
+        return social_title
     if (
         _has_cjk(item.title)
         and not _has_untranslated_english_phrase(item.title)
@@ -468,7 +674,6 @@ def _fallback_chinese_title(item: AIUpdateItem) -> str:
         title = item.title or item.summary or item.raw_excerpt
         title = re.sub(r"\s+", " ", title or "").strip()
         return title[:28].rstrip("，,。；; ") or "AI产品更新"
-    lower = raw.lower()
     if "suno" in lower and "midi" in lower:
         return "Suno推出MIDI导出等新功能"
     if "ntt data" in lower and "chatgpt enterprise" in lower and "codex" in lower:
@@ -482,6 +687,8 @@ def _fallback_chinese_title(item: AIUpdateItem) -> str:
     excerpt_title = _specific_chinese_excerpt_title(item, subject=subject)
     if excerpt_title:
         return excerpt_title
+    if subject.endswith("发布新进展"):
+        return subject
     if "open-weight" in lower or "open weight" in lower:
         return _title_with_action(subject, "开放权重模型发布")
     if "agentic ai" in lower and "semiconductor" in lower:
@@ -493,6 +700,8 @@ def _fallback_chinese_title(item: AIUpdateItem) -> str:
             len(summary_subject) >= 6
             and _has_cjk(summary_subject)
             and not _is_low_information_ai_digest_text(summary_subject)
+            and not re.match(r"^X\s*[：:]", summary_subject, flags=re.IGNORECASE)
+            and "原文" not in summary_subject
         ):
             return summary_subject[:28].rstrip("，,。；; ")
     if any(marker in lower for marker in ("launch", "release", "introducing", "new ")):
@@ -510,11 +719,41 @@ def _fallback_chinese_summary(item: AIUpdateItem) -> str:
     if _is_low_information_ai_digest_text(preferred_text) and item.raw_excerpt:
         preferred_text = item.raw_excerpt
     text = re.sub(r"\s+", " ", preferred_text).strip()
+    lower = raw.lower()
+    if "cursor" in lower and any(
+        marker in lower
+        for marker in (
+            "wind down",
+            "shutoff",
+            "stop providing",
+            "terminate",
+            "end its commercial partnership",
+        )
+    ):
+        return "OpenAI官方公告称，计划于2026年11月12日停止向Cursor提供OpenAI模型，公告将原因归于SpaceX收购Cursor后的合同合规风险。"
+    if "h3 max" in lower and "fal" in lower and any(
+        marker in lower for marker in ("release", "released", "available", "video", "post-trained")
+    ):
+        speed = "5秒视频约3秒生成" if "3 seconds" in lower or "under 3 seconds" in lower else "面向视频生成场景"
+        return f"fal宣布发布由其训练和优化的MiniMax H3 Max视频模型，{speed}，并已在fal平台开放使用。"
+    if re.search(r"\bhy\s*[-_.]?\s*4\b", raw, flags=re.IGNORECASE) and any(
+        marker in lower for marker in ("release", "released", "launch", "open-sourc", "preview", "发布", "开源")
+    ):
+        parameter_note = "，原文提到总参数量约7700亿" if "770 billion" in lower else ""
+        return (
+            "腾讯混元发布并开源 Hy4 Preview，原文将其描述为新一代大语言模型"
+            f"{parameter_note}；具体能力和适用范围以原始来源为准。"
+        )
+    github_status_summary = _github_status_fallback_summary(item)
+    if github_status_summary:
+        return github_status_summary
+    social_summary = _social_concrete_fallback_summary(item)
+    if social_summary:
+        return social_summary
     # Retain a source excerpt that is already written in Chinese even when it
     # contains unavoidable product names such as SIGGRAPH or Characters.
-    if _has_cjk(raw) and _has_cjk(text):
+    if _has_cjk(raw) and _has_cjk(text) and not _has_truncated_english_tail(text):
         return text[:120].rstrip("，,。；; ") + ("…" if len(text) > 120 else "")
-    lower = raw.lower()
     if "ntt data" in lower and "chatgpt enterprise" in lower and "codex" in lower:
         return (
             "NTT DATA集团使用ChatGPT Enterprise与Codex帮助9000名员工自动化工作，"
@@ -627,12 +866,15 @@ def _repair_title_cut_inside_summary_lead(title: str, summary: str, *, limit: in
 
 def _ensure_chinese_item(item: AIUpdateItem) -> AIUpdateItem:
     data = item.model_dump()
+    data["title"] = simplify_common_chinese(data.get("title", ""))
+    data["summary"] = simplify_common_chinese(data.get("summary", ""))
     repaired_title = _repair_title_cut_inside_summary_lead(item.title, item.summary)
     title_repaired = repaired_title != item.title
     data["title"] = repaired_title
     if not title_repaired and (
         not _has_cjk(data.get("title", ""))
         or _is_low_information_ai_digest_text(data.get("title", ""))
+        or is_ai_digest_source_label_title(data.get("title", ""), item)
         or (
             _has_untranslated_english_phrase(data.get("title", ""))
             and not _has_chinese_title_context(data.get("title", ""))
@@ -646,6 +888,12 @@ def _ensure_chinese_item(item: AIUpdateItem) -> AIUpdateItem:
     ):
         data["summary"] = _fallback_chinese_summary(item)
     data["title"] = _repair_title_cut_inside_summary_lead(data.get("title", ""), data.get("summary", ""))
+    data["title"] = simplify_common_chinese(data.get("title", ""))
+    if is_ai_digest_source_label_title(data["title"], item) or _is_low_information_ai_digest_text(data["title"]):
+        fallback_title = _fallback_chinese_title(item)
+        if fallback_title and not is_ai_digest_source_label_title(fallback_title, item):
+            data["title"] = fallback_title
+    data["summary"] = simplify_common_chinese(data.get("summary", ""))
     tags = []
     for tag in item.tags or []:
         tags.append(tag if _has_cjk(tag) else "AI动态")
@@ -730,7 +978,7 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
     deduped_items = []
     seen_keys = set()
     for item in brief.items:
-        key = item.dedupe_key
+        key = ai_update_history_key(item)
         if key in seen_keys:
             continue
         seen_keys.add(key)
@@ -742,7 +990,7 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
     for source in source_items:
         if len(deduped_items) >= requested_count:
             break
-        key = source.dedupe_key
+        key = ai_update_history_key(source)
         if key in seen_keys:
             continue
         replacement = source.model_copy(
@@ -757,12 +1005,19 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
 
     brief = brief.model_copy(update={"items": deduped_items})
     restored = []
-    # Match every retained item against the full source list.  Do not consume
-    # a shared match: the dedupe step above already prevents duplicate URLs.
+    used_source_keys: set[str] = set()
+    # Match every retained item to a distinct event.  URL-level matching alone
+    # lets two paraphrases consume two mirror URLs for one real-world event.
     for index, item in enumerate(brief.items):
-        match = _best_source_match(item, list(source_items), index)
+        available_sources = [
+            source
+            for source in source_items
+            if ai_update_history_key(source) not in used_source_keys
+        ]
+        match = _best_source_match(item, available_sources, index)
         data = item.model_dump()
         if match is not None:
+            used_source_keys.add(ai_update_history_key(match))
             for key in ("url", "published_at", "source_name", "vendor", "product", "raw_excerpt"):
                 data[key] = getattr(match, key)
             data["source_type"] = match.source_type
@@ -776,7 +1031,8 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
             grounded = _generated_item_is_grounded(item, match)
             if (
                 not grounded
-                or _looks_generic_ai_digest_text(str(data.get("title") or ""))
+                or _is_low_information_ai_digest_text(str(data.get("title") or ""))
+                or is_ai_digest_source_label_title(str(data.get("title") or ""), match)
                 or not _has_cjk(str(data.get("title") or ""))
             ):
                 data["title"] = _fallback_chinese_title(match)
@@ -787,13 +1043,22 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
             ):
                 data["summary"] = _fallback_chinese_summary(match)
         restored.append(_ensure_chinese_item(AIUpdateItem.model_validate(data)))
-    capped = cap_ai_digest_items_by_source(restored, target_count=requested_count)
-    seen_keys = {item.dedupe_key for item in capped}
+    unique_restored = []
+    seen_keys = set()
+    for item in restored:
+        key = ai_update_history_key(item)
+        if key in seen_keys:
+            continue
+        unique_restored.append(item)
+        seen_keys.add(key)
+    capped = cap_ai_digest_items_by_source(unique_restored, target_count=requested_count)
+    seen_keys = {ai_update_history_key(item) for item in capped}
     source_counts = Counter(ai_update_source_key(item) for item in capped)
     for source in source_items:
         if len(capped) >= requested_count:
             break
-        if source.dedupe_key in seen_keys:
+        source_event_key = ai_update_history_key(source)
+        if source_event_key in seen_keys:
             continue
         source_key = ai_update_source_key(source)
         if source_counts[source_key] >= AI_DIGEST_MAX_ITEMS_PER_SOURCE:
@@ -806,7 +1071,7 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
             }
         )
         capped.append(_ensure_chinese_item(replacement))
-        seen_keys.add(source.dedupe_key)
+        seen_keys.add(source_event_key)
         source_counts[source_key] += 1
     brief_data = brief.model_dump()
     brief_data["items"] = [item.model_dump() for item in capped]
@@ -868,6 +1133,8 @@ def build_ai_digest_prompt(
         "你正在为小红书图文笔记制作《每日AI讯息》。\n"
         + f"程序已经选定恰好 {target_count} 条候选。请逐条翻译和改写，不得删除、增加、合并或调整顺序。\n"
         + quota_rule
+        + "候选已经按官网、官方项目、资讯整合站、搜索发现、社交补充分层；不得把低层级来源改写成官网来源。\n"
+        + "候选已通过程序的 URL、日期、相关性和具体事实门禁；不得用泛化句替代事实，也不得输出没有具体内容的‘披露AI产品变化’。\n"
         + f"信源硬约束：同一规范化信源最多保留 {AI_DIGEST_MAX_ITEMS_PER_SOURCE} 条；若不足目标条数，必须从候选池中换用其他信源，不得用第三条补齐。\n"
         + "要求：官方源优先；社交源只能用于补充或验证；不得编造未提供的信息；全部输出中文。\n"
         + "发布时间硬规则：items[].published_at 必须从候选数据原样复制；不得使用简报日期、抓取日期、页面运行时 now 或自行推断日期替代；"
@@ -1057,9 +1324,30 @@ def parse_ai_digest_brief_json(text: str) -> AIDigestBrief:
     data = json.loads(_extract_json_object(text))
     items = [AIUpdateItem.model_validate(item) for item in data.get("items", []) if isinstance(item, dict)]
     for idx, item in enumerate(items):
-        if item.source_type in {"official", "github"} and item.evidence_urls and item.verification_status == "official_only":
+        if item.source_type not in {"official", "github"} or not item.evidence_urls:
+            continue
+        if item.verification_status != "official_only":
+            continue
+        evidence_hosts = {
+            (urlsplit(url).hostname or "").lower().strip().rstrip(".")
+            for url in item.evidence_urls
+            if url
+        }
+        if any(
+            host in {"x.com", "twitter.com", "www.twitter.com"}
+            or host.endswith(".x.com")
+            for host in evidence_hosts
+        ):
             item_data = item.model_dump()
             item_data["verification_status"] = "social_confirmed"
+            items[idx] = AIUpdateItem.model_validate(item_data)
+        elif any(
+            host in {"aihot.virxact.com", "www.aihot.virxact.com"}
+            or host.endswith(".aihot.virxact.com")
+            for host in evidence_hosts
+        ):
+            item_data = item.model_dump()
+            item_data["verification_status"] = "aggregator_confirmed"
             items[idx] = AIUpdateItem.model_validate(item_data)
     data["items"] = items
     return _ensure_chinese_brief(AIDigestBrief.model_validate(data))

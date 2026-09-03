@@ -12,6 +12,7 @@ from src.ai_digest.generate import (
     render_ai_digest_body,
 )
 from src.ai_digest.models import AIDigestBrief, AIUpdateItem
+from src.ai_digest import generate as generate_mod
 from src.config import LLMConfig
 
 
@@ -42,6 +43,240 @@ def test_build_ai_digest_prompt_requires_structured_json_and_source_trace():
     assert "JSON" in prompt
     assert "evidence_urls" in prompt
     assert "AI动态0" in prompt
+    assert "具体事实门禁" in prompt
+    assert "官网、官方项目、资讯整合站、搜索发现、社交补充" in prompt
+
+
+def test_ensure_chinese_item_converts_common_traditional_source_title():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="騰訊發表Hy4 Preview模型 躋身陸頂尖AI陣營",
+        summary="騰訊發布 Hy4 Preview 模型，提供新的模型能力。",
+        source_name="工商時報",
+        source_type="search",
+        url="https://example.com/hy4",
+        published_at="2026-08-28T13:36:10Z",
+        vendor="騰訊",
+        product="Hy4 Preview",
+        raw_excerpt="騰訊發表Hy4 Preview模型。",
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert "騰訊" not in result.title
+    assert "腾讯" in result.title
+    assert "陸" not in result.title
+
+
+def test_ensure_chinese_item_gives_hy4_search_result_a_complete_release_title():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="pandaily.comAI模型发布新进展",
+        summary="pandaily.com披露AI模型的新进展。",
+        source_name="pandaily.com",
+        source_type="search",
+        url="https://pandaily.com/tencent-hunyuan-hy4-preview-open-source-aug2026",
+        published_at="2026-08-28T07:32:03Z",
+        vendor="pandaily.com",
+        raw_excerpt="On August 28, Tencent Hunyuan released and open-sourced Hy4 preview, its next-generation large language model with 770 billion total parameters.",
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "腾讯混元Hy4 Preview模型发布"
+    assert "7700亿" in result.summary
+
+
+def test_ensure_chinese_item_does_not_keep_a_social_url_fragment_as_title():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="Claude reliably improve发布新进展",
+        summary="X：Anthropic披露Claude的新进展，原文明确涉及评测基准。",
+        source_name="X：Anthropic (@AnthropicAI)",
+        source_type="social",
+        url="https://x.com/AnthropicAI/status/2093386531247718425",
+        published_at="2026-08-28T17:13:36Z",
+        vendor="Anthropic",
+        raw_excerpt="Across 10 alignment failures, Claude reliably improved safety scores without degrading capabilities. https://t.co/WD7FjlXXtc",
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "Claude安全评测结果更新"
+    assert "WD7FjlXXtc" not in result.title
+    assert "d的新进展" not in result.summary
+    assert "安全评分" in result.summary
+
+
+def test_ensure_chinese_item_replaces_source_label_and_generic_title_with_fact():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="PublicTvEnglish",
+        summary="Public Tv English披露OpenAI发布新进展的AI产品变化。",
+        source_name="Public Tv English",
+        source_type="search",
+        url="https://english.publictv.in/openai-to-terminate-cursor-model-access-following-spacex-acquisition/",
+        published_at="2026-08-29T10:49:16Z",
+        vendor="Public Tv English",
+        raw_excerpt=(
+            "OpenAI decided to end its commercial partnership with coding platform Cursor. "
+            "Cursor's direct access to OpenAI models is set to terminate on November 12, 2026."
+        ),
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "OpenAI拟停止向Cursor提供模型"
+    assert "PublicTvEnglish" not in result.title
+    assert "发布新进展" not in result.title
+    assert "2026年11月12日" in result.summary
+
+
+def test_ensure_chinese_item_turns_anthropic_research_post_into_a_concrete_fact():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="AnthropicAI模型披露AI产品变化",
+        summary="X：Anthropic (@AnthropicAI)披露AnthropicAI模型的AI产品变化；当前可核实信息以原始标题、摘录和来源链接为准。",
+        source_name="X：Anthropic (@AnthropicAI)",
+        source_type="social",
+        url="https://x.com/AnthropicAI/status/2092661578177171522",
+        published_at="2026-08-27T01:12:54Z",
+        vendor="Anthropic",
+        raw_excerpt=(
+            "Now, we want to scale this research model. If you're a researcher and would like access "
+            "to our tools to pursue work you can't otherwise do today, we'd like to hear from you."
+        ),
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "Anthropic扩大研究模型访问"
+    assert "邀请研究人员申请工具访问资格" in result.summary
+    assert "披露AI产品变化" not in result.title
+    assert "当前可核实信息" not in result.summary
+
+
+def test_ensure_chinese_item_turns_anthropic_claude_studies_post_into_a_concrete_fact():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="Claude披露AI产品变化",
+        summary="X：Anthropic (@AnthropicAI)披露Claude的AI产品变化；当前可核实信息以原始标题、摘录和来源链接为准。",
+        source_name="X：Anthropic (@AnthropicAI)",
+        source_type="social",
+        url="https://x.com/AnthropicAI/status/2092661577086636154",
+        published_at="2026-08-27T01:12:54Z",
+        vendor="Anthropic",
+        raw_excerpt=(
+            "The other two studies are ongoing: HIP Lab is studying how Claude's behavior relates to "
+            "how people feel when using AI, while METR is estimating real-world productivity gains from coding agents."
+        ),
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "Anthropic推进Claude影响研究"
+    assert "用户使用AI的感受" in result.summary
+    assert "实际生产力" in result.summary
+    assert "披露AI产品变化" not in result.title
+
+
+def test_ensure_chinese_item_turns_anthropic_security_update_into_a_concrete_fact():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="Claude发布新进展",
+        summary="X：Anthropic披露Claude发布新进展的AI产品变化；当前可核实信息以原始标题、摘录和来源链接为准。",
+        source_name="X：Anthropic (@AnthropicAI)",
+        source_type="social",
+        url="https://x.com/AnthropicAI/status/2094557124038951170",
+        published_at="2026-08-31T22:45:08Z",
+        vendor="Anthropic",
+        raw_excerpt=(
+            "We're sharing an update on our alignment and security efforts. In July, we reported three incidents "
+            "in which Claude models, running without safeguards in cybersecurity evaluations, gained unauthorized "
+            "access to real systems. In a new post, we describe: 1. How we've secured"
+        ),
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "Anthropic披露Claude网络安全评估事件"
+    assert "未授权访问" in result.summary
+    assert "发布新进展" not in result.title
+
+
+def test_ensure_chinese_item_turns_github_status_model_incident_into_a_concrete_fact():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="gpt-5.3-codex披露AI产品变化",
+        summary="GitHub Status披露gpt-5.3-codex的AI产品变化；当前可核实信息以原始标题和摘录为准。",
+        source_name="GitHub Status",
+        source_type="official",
+        url="https://www.githubstatus.com/incidents/7fxts6gmq5gr",
+        published_at="2026-08-31T09:58:14Z",
+        vendor="GitHub Status",
+        raw_excerpt=(
+            "Aug 31, 09:58 UTC Resolved - This incident has been resolved. A detailed root cause analysis will be shared. "
+            "The issues with our upstream model provider have been resolved, and gpt-5.3-codex and the gpt-5.6 family "
+            "are once again available in Copilot products. Aug 31, 09:22 UTC Update - Copilot is experiencing a higher "
+            "rate of errors for OpenAI models."
+        ),
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "GitHub Copilot模型错误率升高后恢复"
+    assert "错误率升高" in result.summary
+    assert "披露AI产品变化" not in result.title
+
+
+def test_ensure_chinese_item_turns_openai_cursor_notice_into_a_concrete_fact():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="Our decision on Cursor following its acquisition by SpaceX",
+        summary="OpenAI will wind down its contract providing OpenAI models to Cursor.",
+        source_name="OpenAI",
+        source_type="official",
+        url="https://openai.com/index/our-decision-on-cursor-following-its-acquisition-by-spacex/",
+        published_at="2026-08-28T06:00:00Z",
+        vendor="OpenAI",
+        raw_excerpt="OpenAI intends to wind down its contract providing OpenAI models to Cursor, with a proposed shutoff date of November 12, 2026.",
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "OpenAI拟停止向Cursor提供模型"
+    assert "2026年11月12日" in result.summary
+    assert "披露AI产品变化" not in result.summary
+
+
+def test_ensure_chinese_item_turns_fal_h3_max_notice_into_a_concrete_fact():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="Introducing H3 Max by fal",
+        summary="H3 Max is available today on fal.",
+        source_name="fal / MiniMax",
+        source_type="official",
+        url="https://fal.ai/learn/devs/introducing-h3-max-by-fal",
+        published_at="2026-08-27T08:00:00Z",
+        vendor="fal / MiniMax",
+        raw_excerpt="Today we're releasing H3 Max, a post-trained version of MiniMax H3 developed by fal Research. It generates a 5-second video in approximately 3 seconds.",
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "fal发布MiniMax H3 Max视频模型"
+    assert "5秒视频约3秒生成" in result.summary
+    assert "披露AI产品变化" not in result.summary
 
 
 def test_build_ai_digest_prompt_requires_chinese_translation_for_foreign_updates():
@@ -935,6 +1170,34 @@ def test_parse_ai_digest_brief_json_accepts_llm_output():
     assert "官方源" in brief.source_summary
 
 
+def test_parse_ai_digest_brief_json_keeps_official_status_for_official_evidence():
+    raw = """
+    {
+      "title": "每日AI讯息",
+      "date": "2026-08-30",
+      "items": [
+        {
+          "title": "Qwen3.8模型发布",
+          "summary": "Qwen发布新模型并公布开放权重方式。",
+          "source_name": "Qwen 官方博客",
+          "source_type": "official",
+          "verification_status": "official_only",
+          "url": "https://qwen.ai/blog?id=qwen3.8",
+          "published_at": "2026-08-30",
+          "vendor": "Qwen",
+          "product": "Qwen3.8",
+          "raw_excerpt": "Qwen发布新模型并公布开放权重方式。",
+          "evidence_urls": ["https://qwen.ai/blog?id=qwen3.8"]
+        }
+      ]
+    }
+    """
+
+    brief = parse_ai_digest_brief_json(raw)
+
+    assert brief.items[0].verification_status == "official_only"
+
+
 def test_build_fallback_brief_keeps_about_ten_items_and_source_summary():
     source_diverse = [
         item.model_copy(update={"source_name": f"Vendor{i}", "vendor": f"Vendor{i}"})
@@ -1465,3 +1728,53 @@ def test_render_ai_digest_body_does_not_invent_time_for_date_only_source():
 
     assert "发布时间：2026-08-26" in body
     assert "发布时间：2026-08-26 08:00" not in body
+
+
+def test_restore_traceable_items_dedupes_same_event_across_social_urls():
+    sources = [
+        AIUpdateItem(
+            title="Anthropic Hacker-Opus simulation attacked Hugging Face",
+            summary="Hacker-Opus simulated an attack on Hugging Face.",
+            source_name="Anthropic",
+            source_type="social",
+            url="https://x.com/AnthropicAI/status/1",
+            published_at="2026-09-01T00:07:54Z",
+            vendor="Anthropic",
+            raw_excerpt="Anthropic's Hacker-Opus simulation attempted an attack on Hugging Face.",
+        ),
+        AIUpdateItem(
+            title="Anthropic Hacker-Opus attacked third-party infrastructure",
+            summary="The simulation reported an attack on third-party infrastructure.",
+            source_name="Anthropic",
+            source_type="social",
+            url="https://x.com/AnthropicAI/status/2",
+            published_at="2026-09-01T00:07:53Z",
+            vendor="Anthropic",
+            raw_excerpt="Anthropic reported a Hacker-Opus attack on third-party infrastructure in a simulation.",
+        ),
+        AIUpdateItem(
+            title="OpenAI launches a documented developer tool",
+            summary="OpenAI launches a documented developer tool.",
+            source_name="OpenAI",
+            source_type="official",
+            url="https://openai.com/news/tool",
+            published_at="2026-09-01T01:00:00Z",
+            vendor="OpenAI",
+            raw_excerpt="OpenAI launches a documented developer tool.",
+        ),
+    ]
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        date="2026-09-01",
+        items=[
+            sources[0].model_copy(update={"title": "Anthropic Hacker-Opus事件一"}),
+            sources[1].model_copy(update={"title": "Anthropic Hacker-Opus事件二"}),
+            sources[2],
+        ],
+    )
+
+    restored = generate_mod._restore_traceable_ai_digest_items(brief, sources)
+
+    assert len(restored.items) == 2
+    assert len({generate_mod.ai_update_history_key(item) for item in restored.items}) == 2
+    assert sum("Hacker-Opus" in item.title for item in restored.items) == 1

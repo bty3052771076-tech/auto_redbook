@@ -124,6 +124,39 @@ def test_render_ai_digest_cover_uses_featured_update_instead_of_generic_labels(m
     )
 
 
+def test_render_ai_digest_cover_splits_section_label_from_headline(monkeypatch, tmp_path: Path):
+    drawn: list[str] = []
+
+    from PIL import ImageDraw
+
+    real_text = ImageDraw.ImageDraw.text
+
+    def capture_text(self, xy, text, *args, **kwargs):
+        drawn.append(str(text))
+        return real_text(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", capture_text)
+    item = _item(
+        1,
+        "GitHub Status称，Copilot的AI模型提供商出现错误率升高，状态页显示问题已缓解并恢复。",
+        title="GitHub Copilot模型错误率升高后恢复",
+        published_at="2026-08-31T09:58:14Z",
+    )
+    brief = AIDigestBrief(
+        title="每日AI讯息 | Copilot模型错误率升高后恢复",
+        subtitle="平台故障与模型安全评估",
+        date="2026-09-01",
+        items=[item],
+        source_summary="本期包含 GitHub Status 与 Anthropic 的公开更新。",
+    )
+
+    render_ai_digest_cards(brief, tmp_path / "digest")
+
+    assert "每日AI讯息" in drawn
+    assert any("Copilot模型错误率升高后恢复" in text for text in drawn)
+    assert not any("每日AI讯息 |" in text or "每日AI讯息｜" in text for text in drawn)
+
+
 def test_render_ai_digest_item_pages_show_publish_time_and_source_without_footer(monkeypatch, tmp_path: Path):
     drawn: list[str] = []
 

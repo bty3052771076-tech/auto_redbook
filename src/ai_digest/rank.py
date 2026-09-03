@@ -76,6 +76,27 @@ _MODEL_VARIANT_RE = re.compile(
     r"[\s._-]*(?:v)?\d+(?:\.\d+)?[\s._-]+(?P<suffix>[a-z0-9]+)\b",
     flags=re.IGNORECASE,
 )
+_GENERIC_MODEL_VERSION_RE = re.compile(
+    r"\b(?P<family>[A-Za-z]{2,})[-_ ]*(?:v)?(?P<version>\d+(?:\.\d+)?)(?:[-_ ]+(?P<suffix>[A-Za-z][A-Za-z0-9]*))?\b",
+    flags=re.IGNORECASE,
+)
+_NON_MODEL_VERSION_FAMILIES = {
+    "status",
+    "issue",
+    "issues",
+    "post",
+    "posts",
+    "comment",
+    "comments",
+    "commit",
+    "commits",
+    "page",
+    "pages",
+    "item",
+    "items",
+    "update",
+    "updates",
+}
 _MODEL_FAMILY_MERGED_SUFFIXES = {"pro", "max", "flash", "lite", "preview", "exp", "speciale"}
 _MODEL_HISTORY_VARIANT_WORDS = {
     "air",
@@ -95,6 +116,10 @@ _MODEL_HISTORY_VARIANT_WORDS = {
     "vision",
     "exp",
 }
+_EXPLICIT_EVENT_MARKERS = (
+    ("model-hardware-standard", ("model hardware standard", "mhs")),
+    ("openai-jalapeno", ("jalapeno", "jalapeño")),
+)
 AI_DIGEST_MAX_ITEMS_PER_SOURCE = 2
 _MODEL_RELEASE_MARKERS = (
     "模型",
@@ -119,6 +144,46 @@ _MODEL_RELEASE_MARKERS = (
     "seedream",
     "deepseek",
     "llama",
+)
+_MODEL_RELEASE_ACTION_MARKERS = (
+    "release",
+    "released",
+    "launch",
+    "launched",
+    "introducing",
+    "available",
+    "general availability",
+    "open weight",
+    "open-weight",
+    "open weights",
+    "open-weights",
+    "发布",
+    "上线",
+    "推出",
+    "开放权重",
+    "正式发布",
+    "preview",
+    "预览",
+    "预览版",
+    "公开预览",
+    "内测",
+)
+_MODEL_LIFECYCLE_MARKERS = (
+    "下线",
+    "下架",
+    "停用",
+    "弃用",
+    "迁移",
+    "升级通知",
+    "维护通知",
+    "deprecat",
+    "sunset",
+    "retire",
+    "retirement",
+    "end of life",
+    "migration notice",
+    "upgrade notice",
+    "service notice",
 )
 _BENCHMARK_MARKERS = ("benchmark", "bench", "eval", "评测", "基准", "测试集")
 _FINANCIAL_MODEL_MARKERS = (
@@ -403,6 +468,60 @@ def _parse_published_datetime(value: str) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+_EXPLICIT_EVENT_DATE_RE = re.compile(
+    r"(?:"
+    r"(?P<year>20\d{2})\s*(?:年|[-./])\s*"
+    r"(?P<month>1[0-2]|0?[1-9])\s*(?:月|[-./])\s*"
+    r"(?P<day>3[01]|[12]\d|0?[1-9])\s*日?"
+    r"|"
+    r"(?P<month_only>1[0-2]|0?[1-9])\s*月\s*"
+    r"(?P<day_only>3[01]|[12]\d|0?[1-9])\s*日"
+    r")"
+)
+_EVENT_DATE_ACTION_RE = re.compile(
+    r"(?i)(?:上线|发布|发布于|推出|开放|开源|公测|可用|released?|launched?|available)"
+)
+
+
+def _explicit_model_event_datetime(item: AIUpdateItem) -> datetime | None:
+    """Find an explicit model event date stated near a release action."""
+
+    excerpt = re.sub(r"\s+", " ", item.raw_excerpt or "").strip()
+    if not excerpt or not _contains_any_marker(
+        _text_blob(item),
+        ("模型", "model", "glm", "qwen", "gpt", "deepseek", "llm", "ai"),
+    ):
+        return None
+    published = _parse_published_datetime(item.published_at)
+    fallback_year = published.year if published is not None else datetime.now(BEIJING_TZ).year
+    for match in _EXPLICIT_EVENT_DATE_RE.finditer(excerpt):
+        context = excerpt[max(0, match.start() - 24) : min(len(excerpt), match.end() + 32)]
+        if not _EVENT_DATE_ACTION_RE.search(context):
+            continue
+        try:
+            event_date = datetime(
+                int(match.group("year") or fallback_year),
+                int(match.group("month") or match.group("month_only")),
+                int(match.group("day") or match.group("day_only")),
+                tzinfo=BEIJING_TZ,
+            ).astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        # A page can mention a future planned release or an expiry date. Only
+        # let an explicit earlier event date override the page timestamp.
+        if published is None or event_date <= published:
+            return event_date
+    return None
+
+
+def ai_update_effective_published_datetime(item: AIUpdateItem) -> datetime | None:
+    """Return the event date when the source states one, otherwise page date."""
+
+    published = _parse_published_datetime(item.published_at)
+    event_date = _explicit_model_event_datetime(item)
+    return event_date or published
+
+
 def _as_datetime(value: datetime | date | None) -> datetime:
     if isinstance(value, datetime):
         dt = value
@@ -485,6 +604,76 @@ def _contains_any_marker(value: str, markers: tuple[str, ...]) -> bool:
     return any(_contains_marker(value, marker) for marker in markers)
 
 
+def _explicit_event_key(value: str) -> str:
+    for event_key, markers in _EXPLICIT_EVENT_MARKERS:
+        if _contains_any_marker(value, markers):
+            return event_key
+    return ""
+
+
+def _stable_cross_source_event_key(item: AIUpdateItem) -> str:
+    """Identify high-risk events whose wording and URLs vary by source."""
+    blob = _text_blob(item)
+    if (
+        _contains_any_marker(blob, ("claude fable", "claude-fable"))
+        and _contains_any_marker(blob, ("5.1", "5-1"))
+        and _contains_any_marker(blob, ("anthropic", "claude"))
+    ):
+        # Anthropic's Fable announcement has appeared under multiple official
+        # URLs, including a combined Fable/Mythos announcement page.
+        return "anthropic-claude-fable-5-1-release"
+    if _contains_any_marker(blob, ("牛来", "oxalpha")) and _contains_any_marker(
+        blob,
+        ("模型", "model", "glm", "智谱", "zhipu", "z.ai"),
+    ):
+        return "zhipu-niulai-model"
+    if (
+        _contains_marker(blob, "hy4")
+        and _contains_any_marker(blob, ("腾讯", "混元", "tencent", "hunyuan"))
+        and _contains_any_marker(
+            blob,
+            ("发布", "开源", "release", "released", "launch", "launched", "disclos"),
+        )
+    ):
+        return "tencent-hunyuan-hy4-release"
+    if (
+        _contains_marker(blob, "openai")
+        and _contains_marker(blob, "cursor")
+        and _contains_any_marker(
+            blob,
+            (
+                "停止",
+                "终止",
+                "断供",
+                "wind down",
+                "terminate",
+                "termination",
+                "shutoff",
+                "end its commercial partnership",
+            ),
+        )
+    ):
+        return "openai-cursor-model-access"
+    if (
+        _contains_marker(blob, "hacker-opus")
+        and _contains_any_marker(blob, ("anthropic",))
+        and _contains_any_marker(
+            blob,
+            (
+                "hugging face",
+                "third-party infrastructure",
+                "attack",
+                "越界",
+                "攻击",
+            ),
+        )
+    ):
+        # Anthropic's Hacker-Opus simulation can produce several social posts
+        # describing the same test with different URLs and wording.
+        return "anthropic-hacker-opus-simulation"
+    return ""
+
+
 def _url_topic_text(url: str) -> str:
     try:
         parts = [unquote(part) for part in urlsplit(url or "").path.split("/") if part.strip()]
@@ -539,6 +728,24 @@ def _model_family_topic_key(item: AIUpdateItem) -> str:
 
 
 def _semantic_topic_key(item: AIUpdateItem) -> str:
+    semantic_blob = " ".join(
+        part
+        for part in (item.title, item.summary, item.raw_excerpt, _url_topic_text(item.url))
+        if part and part.strip()
+    )
+    # Some social feeds publish several URLs for one named standard or event.
+    # Keep a stable event key so URL-level provenance does not defeat dedupe.
+    explicit_event = _explicit_event_key(semantic_blob)
+    if explicit_event:
+        return f"event:{explicit_event}"
+    stable_event = _stable_cross_source_event_key(item)
+    if stable_event:
+        return f"event:{stable_event}"
+    normalized_excerpt = re.sub(r"https?://\S+", " ", item.raw_excerpt or "")
+    normalized_excerpt = re.sub(r"\s+", " ", normalized_excerpt).strip().lower()
+    if len(normalized_excerpt) >= 80:
+        excerpt_hash = hashlib.sha256(normalized_excerpt.encode("utf-8")).hexdigest()[:24]
+        return f"event:excerpt:{excerpt_hash}"
     model_family_key = _model_family_topic_key(item)
     if model_family_key:
         return model_family_key
@@ -601,6 +808,9 @@ def _history_event_key(item: AIUpdateItem) -> str:
     # ``raw_excerpt`` survives LLM rewriting and is the most stable event
     # descriptor when comparing a saved digest with a newly fetched source.
     blob = (item.raw_excerpt or item.title or item.summary or _text_blob(item)).lower()
+    explicit_event = _explicit_event_key(blob)
+    if explicit_event:
+        return explicit_event
     if _contains_any_marker(blob, ("harness",)):
         return "harness"
     if _contains_any_marker(blob, ("billing", "pricing", "price", "计费", "收费", "价格")):
@@ -625,11 +835,19 @@ def ai_update_history_key(item: AIUpdateItem) -> str:
     so the same release is blocked without suppressing a different update on
     that page.
     """
+    stable_event = _stable_cross_source_event_key(item)
+    if stable_event:
+        return f"event:{stable_event}"
     topic = _model_history_topic_key(item) or _semantic_topic_key(item) or f"title:{item.title_key}"
     # A named model version identifies the release event across official
     # vendor pages, cloud catalogs, and mirrored documentation URLs.
-    if topic.startswith("model:"):
+    if topic.startswith(("model:", "event:")):
         return f"{topic}|event:{_history_event_key(item)}"
+    normalized_excerpt = re.sub(r"https?://\S+", " ", item.raw_excerpt or "")
+    normalized_excerpt = re.sub(r"\s+", " ", normalized_excerpt).strip().lower()
+    if len(normalized_excerpt) >= 80:
+        excerpt_hash = hashlib.sha256(normalized_excerpt.encode("utf-8")).hexdigest()[:24]
+        return f"event:excerpt:{excerpt_hash}"
     raw_url = item.normalized_url or ""
     if raw_url:
         parsed = urlsplit(raw_url)
@@ -680,6 +898,70 @@ def _trace_url(item: AIUpdateItem) -> str:
     return ""
 
 
+_PLACEHOLDER_TITLE_RE = re.compile(
+    r"^(?:ai)?动态\d*$|"
+    r"^(?:.+?)(?:发布ai动态|披露ai产品变化|公开了与ai有关的动态)$",
+    flags=re.IGNORECASE,
+)
+_GENERIC_TITLE_SUFFIXES = (
+    "发布新进展",
+    "披露AI产品变化",
+    "AI产品披露AI产品变化",
+)
+_GENERIC_CHANGE_TITLE_RE = re.compile(
+    r"(?:披露|公开|宣布)[^。！？\n]{0,80}(?:AI产品变化|产品变化)$",
+    flags=re.IGNORECASE,
+)
+
+
+def ai_update_quality_issues(item: AIUpdateItem) -> tuple[str, ...]:
+    """Return deterministic quality issues before an item reaches the LLM.
+
+    A source can be recent and technically related to AI while still carrying
+    only a label or navigation text. Such records are not useful editorial
+    material and tend to become ``动态3``/``披露产品变化`` after rewriting.
+    """
+
+    issues: list[str] = []
+    if not _trace_url(item):
+        issues.append("missing_url")
+
+    title = re.sub(r"\s+", "", item.title or "")
+    title_lower = title.lower()
+    if not title:
+        issues.append("missing_title")
+    if title and _PLACEHOLDER_TITLE_RE.fullmatch(title):
+        issues.append("placeholder_title")
+    if title and _GENERIC_CHANGE_TITLE_RE.search(title):
+        issues.append("generic_title")
+
+    summary = re.sub(r"\s+", " ", item.summary or "").strip()
+    excerpt = re.sub(r"\s+", " ", item.raw_excerpt or "").strip()
+    title_key = _normalize_token(title)
+    content_keys = {
+        _normalize_token(value)
+        for value in (summary, excerpt)
+        if value
+    }
+    has_named_model = bool(
+        _MODEL_FAMILY_VERSION_RE.search(
+            " ".join((item.title, item.product, _url_topic_text(item.url)))
+        )
+    )
+    is_compact_official_release = item.source_type in {"official", "github"} and has_named_model
+    if not summary and not excerpt:
+        issues.append("contentless")
+    elif title_key and content_keys and content_keys <= {title_key} and not is_compact_official_release:
+        issues.append("contentless")
+    elif any(title_lower.endswith(suffix.lower()) for suffix in _GENERIC_TITLE_SUFFIXES):
+        # Keep a generic feed headline only when its excerpt has enough facts
+        # for the generator to derive a concrete subject.
+        if len(excerpt or summary) < 48 or not has_named_model:
+            issues.append("contentless")
+
+    return tuple(dict.fromkeys(issues))
+
+
 def _source_priority(item: AIUpdateItem) -> int:
     return {"official": 4, "github": 4, "aggregator": 2, "search": 2, "social": 1}.get(item.source_type, 0)
 
@@ -691,6 +973,54 @@ def ai_update_attention_score(item: AIUpdateItem) -> float:
         score += 0.08
     score += _source_priority(item) * 0.005
     return round(score, 6)
+
+
+def _has_explicit_model_release(item: AIUpdateItem) -> bool:
+    """Return whether the headline identifies a model version being released."""
+    headline_fields = f"{item.title} {item.product}".strip().lower()
+    url_topic = _url_topic_text(item.url).lower()
+    headline_blob = f"{headline_fields} {url_topic}".strip()
+    release_evidence_blob = f"{headline_blob} {item.summary} {item.raw_excerpt}".lower()
+    has_named_model_version = bool(_MODEL_FAMILY_VERSION_RE.search(headline_fields))
+    if not has_named_model_version:
+        generic_match = _GENERIC_MODEL_VERSION_RE.search(headline_fields)
+        if generic_match and generic_match.group("family").lower() not in _NON_MODEL_VERSION_FAMILIES:
+            has_named_model_version = True
+    # Search backfills may carry the model only in a slug (for example,
+    # ``tencent-hunyuan-hy4-preview-open-source``). A social URL's numeric
+    # ``status/209...`` identifier must never count as a model version.
+    if not has_named_model_version and not re.search(r"\b(?:status|issues?|comments?|commits?)/?\b", url_topic):
+        generic_match = _GENERIC_MODEL_VERSION_RE.search(url_topic)
+        if generic_match and generic_match.group("family").lower() not in _NON_MODEL_VERSION_FAMILIES:
+            has_named_model_version = True
+    return has_named_model_version and _contains_any_marker(
+        release_evidence_blob,
+        _MODEL_RELEASE_ACTION_MARKERS,
+    )
+
+
+def ai_update_is_lifecycle_notice(item: AIUpdateItem) -> bool:
+    """Identify notices about an existing service lifecycle, not a new release.
+
+    A genuine release may mention migration or an upgrade path, so lifecycle
+    markers only win when the item does not also contain an explicit named
+    model release action.
+    """
+    blob = _text_blob(item).lower()
+    return _contains_any_marker(blob, _MODEL_LIFECYCLE_MARKERS) and not _has_explicit_model_release(item)
+
+
+def ai_update_is_non_model_infrastructure_notice(item: AIUpdateItem) -> bool:
+    """Reject generic cloud/database notices from the AI-news impact pool."""
+    headline_blob = " ".join(
+        part.strip()
+        for part in (item.title, item.product, _url_topic_text(item.url))
+        if part and part.strip()
+    ).lower()
+    return _contains_any_marker(headline_blob, _NON_MODEL_INFRASTRUCTURE_MARKERS) and not _contains_any_marker(
+        headline_blob,
+        ("model", "模型", "大模型", "llm", "vlm"),
+    )
 
 
 def ai_update_category(item: AIUpdateItem) -> str:
@@ -710,8 +1040,13 @@ def ai_update_category(item: AIUpdateItem) -> str:
         if any(marker in headline_blob for marker in ("case study", "case studies", "案例", "adoption", "采用", "普及")):
             return "business_case"
         return "discussion"
-    if any(marker in blob for marker in _MODEL_RELEASE_MARKERS):
+    if _has_explicit_model_release(item):
         return "model_release"
+    if _contains_any_marker(
+        headline_blob,
+        ("model update", "model updates", "model change", "model changes", "模型更新", "模型变化", "模型升级"),
+    ):
+        return "technical_tool"
     if any(marker in blob for marker in _BENCHMARK_MARKERS):
         return "benchmark"
     if any(marker in blob for marker in _TECHNICAL_MARKERS):
@@ -755,6 +1090,8 @@ def ai_update_impact_score(item: AIUpdateItem) -> float:
 
 
 def ai_update_is_high_impact(item: AIUpdateItem, *, threshold: float = 75.0) -> bool:
+    if ai_update_is_lifecycle_notice(item) or ai_update_is_non_model_infrastructure_notice(item):
+        return False
     category = ai_update_category(item)
     if category not in {"model_release", "benchmark", "technical_tool", "research"}:
         return False
@@ -764,6 +1101,8 @@ def ai_update_is_high_impact(item: AIUpdateItem, *, threshold: float = 75.0) -> 
 
 def ai_update_is_relevant(item: AIUpdateItem) -> bool:
     """Reject query matches that mention AI only incidentally in article text."""
+    if ai_update_is_non_model_infrastructure_notice(item):
+        return False
     content_parts = [
         re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", part.lower())
         for part in (item.title, item.summary, item.raw_excerpt)
@@ -902,7 +1241,7 @@ def filter_recent_ai_updates(
         if require_url and not _trace_url(item):
             continue
         if max_age_days is not None:
-            published = _parse_published_datetime(item.published_at)
+            published = ai_update_effective_published_datetime(item)
             if published is None:
                 continue
             published_date = _beijing_date(published)
@@ -963,6 +1302,7 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
     by_key: OrderedDict[str, AIUpdateItem] = OrderedDict()
     title_keys: dict[str, str] = {}
     topic_keys: dict[str, str] = {}
+    stable_event_keys: dict[str, str] = {}
     shared_official_urls = Counter(
         item.normalized_url
         for item in items
@@ -980,6 +1320,8 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
             # entries. Preserve distinct titles from that same official page;
             # semantic-topic deduplication below still merges the same update.
             key = f"{key}|title:{item.title_key}"
+        stable_event = _stable_cross_source_event_key(item)
+        stable_lookup_key = f"event:{stable_event}" if stable_event else ""
         title_key = item.title_key
         semantic_key = _semantic_topic_key(item)
         # Generic categories such as ``topic:benchmark`` are not event
@@ -1001,6 +1343,8 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
         existing_key = title_keys.get(title_key)
         if not existing_key and semantic_lookup_key:
             existing_key = topic_keys.get(semantic_lookup_key)
+        if not existing_key and stable_lookup_key:
+            existing_key = stable_event_keys.get(stable_lookup_key)
         if existing_key and existing_key in by_key:
             merged = by_key[existing_key]
             if key in by_key and key != existing_key:
@@ -1015,6 +1359,8 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
                 title_keys[title_key] = existing_key
             if semantic_lookup_key:
                 topic_keys[semantic_lookup_key] = existing_key
+            if stable_lookup_key:
+                stable_event_keys[stable_lookup_key] = existing_key
             continue
         if key in by_key:
             winner = _prefer_item(by_key[key], item)
@@ -1026,6 +1372,8 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
             title_keys[title_key] = key
         if semantic_lookup_key:
             topic_keys[semantic_lookup_key] = key
+        if stable_lookup_key:
+            stable_event_keys[stable_lookup_key] = key
     return list(by_key.values())
 
 
@@ -1088,6 +1436,7 @@ def _timestamp_key(item: AIUpdateItem) -> str:
 
 def _rank_sort_key(item: AIUpdateItem):
     return (
+        int(_has_explicit_model_release(item)),
         _published_day_key(item),
         ai_update_category_priority(item),
         ai_update_attention_score(item),
@@ -1343,7 +1692,7 @@ def rank_ai_updates(
             now=now,
             require_url=True,
         )
-        if ai_update_is_relevant(item)
+        if ai_update_is_relevant(item) and not ai_update_quality_issues(item)
     ]
     deduped = _dedupe_updates(
         relevant

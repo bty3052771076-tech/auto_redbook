@@ -16,7 +16,9 @@ from typing import Any, Callable
 import certifi
 
 from .fetchers import (
+    _strip_html,
     parse_aihot_daily_html,
+    parse_benefit_html,
     parse_github_releases_json,
     parse_official_html,
     parse_rss_feed,
@@ -27,6 +29,7 @@ from .models import AIUpdateItem
 from .rank import (
     ai_digest_quota_counts,
     ai_update_history_key,
+    ai_update_quality_issues,
     dedupe_ai_updates,
     filter_recent_ai_updates,
     rank_ai_updates,
@@ -49,14 +52,32 @@ DEFAULT_SEARCH_BACKFILL_QUERIES = (
     "国内 AI 模型 发布 GLM Qwen 豆包 DeepSeek Kimi MiniMax",
     "AI model release OpenAI Anthropic Claude Gemini GPT Llama Mistral",
     "AI API developer tools model release open source",
+    "HY4 preview model release",
+    "HY4 preview 发布 模型",
+    "OpenAI Cursor contract wind down official",
+    "MiniMax H3 Max fal video release official",
+    "ZCode 周末送额度 3亿 Token",
+    "ZCode GLM-5.3-Flash 免费额度 8月31日",
 )
 BEIJING_TZ = timezone(timedelta(hours=8))
+DEFAULT_MODEL_RELEASE_SEARCH_QUERIES = (
+    "Claude Fable 5.1 release Anthropic official",
+    "OpenAI model release official",
+    "Google Gemini model release official",
+    "Meta Llama model release official",
+    "Mistral model release official",
+    "Qwen model release official",
+    "DeepSeek model release official",
+    "GLM model release official Z.ai",
+    "Doubao model release official ByteDance",
+    "MiniMax model release official",
+)
 _AIHOT_HOST = "aihot.virxact.com"
 _VENDOR_OFFICIAL_HOSTS = {
     "openai": ("openai.com",),
     "anthropic": ("anthropic.com",),
-    "google deepmind": ("deepmind.google", "google.com", "google.dev", "googleblog.com"),
-    "google": ("google.com", "google.dev", "googleblog.com"),
+    "google deepmind": ("deepmind.google", "google.com", "google.dev", "googleblog.com", "blog.google"),
+    "google": ("google.com", "google.dev", "googleblog.com", "blog.google"),
     "deepseek": ("deepseek.com",),
     "minimax": ("minimax.io",),
     "qwen": ("qwen.ai", "aliyun.com"),
@@ -76,6 +97,11 @@ _VENDOR_OFFICIAL_HOSTS = {
     "github blog": ("github.blog", "github.com"),
     "apple machine learning research（rss）": ("apple.com",),
     "cursor blog": ("cursor.com",),
+}
+_DISCOVERY_AGGREGATOR_HOSTS = {
+    "news.google.com",
+    "news.yahoo.com",
+    "www.google.com",
 }
 
 
@@ -317,10 +343,65 @@ def fetch_ai_digest_source(
         items = parse_social_search_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
     elif source.parser == "x_profile":
         items = parse_x_profile_html(text, source_name=source.vendor, vendor=source.vendor)
+    elif source.parser == "wool_html":
+        items = parse_benefit_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
     elif source.parser == "html":
         items = parse_official_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
+        if source.name == "anthropic":
+            items = _enrich_anthropic_newsroom_items(items)
     else:
         items = []
+    # Some official article pages expose navigation cards and login links as
+    # pseudo-articles. Keep only records carrying the event's own facts for
+    # the two explicitly tracked release pages.
+    if source.name == "openai-cursor-decision":
+        items = [
+            item
+            for item in items
+            if "cursor" in " ".join(
+                (item.title, item.summary, item.raw_excerpt)
+            ).lower()
+            and any(
+                marker in " ".join((item.title, item.summary, item.raw_excerpt)).lower()
+                for marker in ("wind down", "contract", "shutoff", "stop providing")
+            )
+        ]
+    elif source.name == "fal-h3-max":
+        items = [
+            item
+            for item in items
+            if "h3 max" in " ".join((item.title, item.summary, item.raw_excerpt)).lower()
+            and any(
+                marker in " ".join((item.title, item.summary, item.raw_excerpt)).lower()
+                for marker in ("releas", "available", "video", "post-trained")
+            )
+        ]
+    elif source.name == "anthropic-fable-5-1":
+        # This dedicated first-party page should contribute only the named
+        # release, not any related Claude navigation cards.
+        items = [
+            item
+            for item in items
+            if re.search(
+                r"\bfable\s*5(?:\.1)?\b",
+                " ".join((item.title, item.summary, item.raw_excerpt)),
+                re.IGNORECASE,
+            )
+        ][:1]
+        if items:
+            # Anthropic's page can expose a short navigation-card title even
+            # when the surrounding copy names the full release. Keep the
+            # version in the canonical title/product fields so downstream
+            # ranking, rendering, and post titles cannot lose "5.1".
+            items = [
+                item.model_copy(
+                    update={
+                        "title": "Anthropic发布Claude Fable 5.1",
+                        "product": "Claude Fable 5.1",
+                    }
+                )
+                for item in items
+            ]
     if source.region in {"domestic", "foreign"}:
         items = [
             AIUpdateItem.model_validate(
@@ -343,6 +424,45 @@ def fetch_ai_digest_source(
         )
         for item in items
     ]
+
+
+def _enrich_anthropic_newsroom_items(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
+    """Fetch facts for Anthropic newsroom cards instead of publishing labels."""
+
+    if not items:
+        return items
+    limit = _env_int("AI_DIGEST_OFFICIAL_DETAIL_LIMIT", 8, min_value=1, max_value=12)
+    timeout_s = _env_float("AI_DIGEST_OFFICIAL_DETAIL_TIMEOUT_S", 10.0, min_value=3.0, max_value=30.0)
+
+    def enrich(item: AIUpdateItem) -> AIUpdateItem:
+        try:
+            detail_html = _http_get_text(item.url, timeout_s=timeout_s)
+        except Exception:
+            return item
+        paragraphs = [
+            _strip_html(match)
+            for match in re.findall(r"(?is)<p\b[^>]*>(.*?)</p>", detail_html or "")
+        ]
+        facts = [
+            paragraph
+            for paragraph in paragraphs
+            if len(paragraph) >= 40
+            and paragraph.lower() != item.title.lower()
+        ]
+        if not facts:
+            return item
+        data = item.model_dump()
+        detail_text = " ".join(facts[:10])[:4000]
+        data["summary"] = detail_text[:220]
+        data["raw_excerpt"] = detail_text
+        data["tags"] = [*item.tags, "official_detail"]
+        return AIUpdateItem.model_validate(data)
+
+    selected = items[:limit]
+    with ThreadPoolExecutor(max_workers=min(4, len(selected))) as executor:
+        enriched = list(executor.map(enrich, selected))
+    enriched_by_url = {item.url: item for item in enriched}
+    return [enriched_by_url.get(item.url, item) for item in items]
 
 
 def _aihot_daily_dates(days: int = 3) -> list[date]:
@@ -383,7 +503,7 @@ def _search_backfill_enabled() -> bool:
 def _search_backfill_queries() -> list[str]:
     raw = (os.getenv("AI_DIGEST_SEARCH_BACKFILL_QUERIES") or "").strip()
     if not raw:
-        return list(DEFAULT_SEARCH_BACKFILL_QUERIES)
+        return [*DEFAULT_SEARCH_BACKFILL_QUERIES, *DEFAULT_MODEL_RELEASE_SEARCH_QUERIES]
     queries = [part.strip() for part in raw.split("|") if part.strip()]
     return queries or list(DEFAULT_SEARCH_BACKFILL_QUERIES)
 
@@ -420,6 +540,27 @@ def _normalize_news_seen_at(value: str | None) -> str:
         return text
 
 
+def _is_known_official_discovery_url(url: str) -> bool:
+    """Recognize a direct vendor page found through a discovery provider."""
+
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower().strip().rstrip(".")
+    if not host or host in _DISCOVERY_AGGREGATOR_HOSTS:
+        return False
+    path = (parts.path or "").lower()
+    if host == "github.com" or host.endswith(".github.com"):
+        return False
+    for expected_hosts in _VENDOR_OFFICIAL_HOSTS.values():
+        if any(host == expected or host.endswith(f".{expected}") for expected in expected_hosts):
+            if host == "google.com" and path.startswith(("/search", "/url")):
+                return False
+            return True
+    return False
+
+
 def _news_item_to_ai_update(item, *, query: str) -> AIUpdateItem:
     source_name = (getattr(item, "source", "") or getattr(item, "domain", "") or "新闻搜索").strip()
     body = " ".join(
@@ -437,22 +578,49 @@ def _news_item_to_ai_update(item, *, query: str) -> AIUpdateItem:
         flags=re.IGNORECASE,
     )
     body = re.sub(r"\s+", " ", body).strip(" -|")
+    direct_official = _is_known_official_discovery_url(str(getattr(item, "url", "") or ""))
     return AIUpdateItem(
         title=str(getattr(item, "title", "") or "").strip(),
         summary=body[:220],
         source_name=source_name,
-        source_type="search",
+        source_type="official" if direct_official else "search",
         url=str(getattr(item, "url", "") or "").strip(),
         published_at=_normalize_news_seen_at(getattr(item, "seendate", "") or ""),
         vendor=source_name,
         product="",
         raw_excerpt=body,
-        confidence_score=float(getattr(item, "attention", None) or 0.58),
-        tags=["AI", "搜索补充", query[:40]],
+        confidence_score=max(
+            float(getattr(item, "attention", None) or 0.58),
+            0.82 if direct_official else 0.0,
+        ),
+        verification_status="official_only" if direct_official else "search_only",
+        tags=["AI", "搜索补充", "官网直连" if direct_official else "待核验", query[:40]],
     )
 
 
-_PROMPT_TOPIC_OFFICIAL_SOURCES = {
+_PROMPT_TOPIC_VERIFIED_SOURCES = {
+    "Claude Fable 5.1": {
+        "title": "Anthropic发布Claude Fable 5.1",
+        "summary": "Anthropic 官方发布 Claude Fable 5.1，定位为面向编程和知识工作的高能力模型，并开放 Claude Platform API 使用。",
+        "source_name": "Anthropic 官方发布",
+        "vendor": "Anthropic",
+        "url": "https://www.anthropic.com/claude/fable",
+        "published_at": "2026-09-01",
+        "evidence_urls": [
+            "https://support.claude.com/en/articles/12138966-release-notes",
+        ],
+    },
+    "HY4 preview": {
+        "title": "腾讯混元Hy4 Preview模型发布",
+        "summary": "TechNode报道，腾讯混元发布并开源Hy4 Preview模型，模型总参数量约7700亿，并支持超长上下文。",
+        "source_name": "TechNode",
+        "vendor": "腾讯混元",
+        "url": "https://technode.com/2026/08/28/tencent-open-sources-hy4-preview-with-770b-parameters-and-a-1m-token-context/",
+        "published_at": "2026-08-28",
+        "source_type": "search",
+        "verification_status": "search_only",
+        "confidence_score": 0.78,
+    },
     "Qwen3.8-Flash-Next正式发布": {
         "title": "Qwen3.8-Flash-Next正式发布并开放权重",
         "summary": "Qwen 官方博客介绍 Qwen3.8-Flash-Next，并公布其架构方向与权重获取方式。",
@@ -495,6 +663,22 @@ _PROMPT_TOPIC_OFFICIAL_SOURCES = {
         "url": "https://github.com/breezeblue-ai/breeze-tts",
         "published_at": "2026-08-25",
     },
+    "OpenAI宣布断供Cursor": {
+        "title": "OpenAI拟停止向Cursor提供模型",
+        "summary": "OpenAI官方公告称，计划于2026年11月12日停止向Cursor提供OpenAI模型，公告将原因归于SpaceX收购Cursor后的合同合规风险。",
+        "source_name": "OpenAI 官方公告",
+        "vendor": "OpenAI",
+        "url": "https://openai.com/index/our-decision-on-cursor-following-its-acquisition-by-spacex/",
+        "published_at": "2026-08-28",
+    },
+    "MiniMax H3 Max在Fal.ai发布": {
+        "title": "fal发布MiniMax H3 Max视频模型",
+        "summary": "fal官方发布由其训练和优化的MiniMax H3 Max视频模型，5秒视频约3秒生成，并已在fal平台开放使用。",
+        "source_name": "fal 官方发布",
+        "vendor": "MiniMax",
+        "url": "https://fal.ai/learn/devs/introducing-h3-max-by-fal",
+        "published_at": "2026-08-27",
+    },
 }
 
 
@@ -505,24 +689,24 @@ def fetch_ai_digest_prompt_topic_backfill(
     progress: ProgressCallback | None = None,
 ) -> tuple[list[AIUpdateItem], dict]:
     """Verify official pages for explicit prompt topics and create traceable candidates."""
-    requested = [topic for topic in (topics or []) if topic in _PROMPT_TOPIC_OFFICIAL_SOURCES]
+    requested = [topic for topic in (topics or []) if topic in _PROMPT_TOPIC_VERIFIED_SOURCES]
     if not requested:
         return [], {"requested": [], "verified": [], "failed": []}
 
     def verify(topic: str) -> tuple[str, AIUpdateItem | None, str]:
-        spec = _PROMPT_TOPIC_OFFICIAL_SOURCES[topic]
+        spec = _PROMPT_TOPIC_VERIFIED_SOURCES[topic]
         item = AIUpdateItem(
             title=spec["title"],
             summary=spec["summary"],
             source_name=spec["source_name"],
-            source_type="official",
+            source_type=spec.get("source_type", "official"),
             url=spec["url"],
             published_at=spec["published_at"],
             vendor=spec["vendor"],
             product=topic,
             raw_excerpt=spec["summary"],
-            confidence_score=0.96,
-            verification_status="official_only",
+            confidence_score=spec.get("confidence_score", 0.96),
+            verification_status=spec.get("verification_status", "official_only"),
             evidence_urls=[spec["url"], *(spec.get("evidence_urls") or [])],
             tags=["AI", "指定主题", "官方直连"],
         )
@@ -549,6 +733,8 @@ def fetch_ai_digest_prompt_topic_backfill(
         for topic, item, error in results
         if item is not None and error
     ]
+
+
     _emit_progress(
         progress,
         "prompt_topic_official",
@@ -884,12 +1070,18 @@ def collect_ai_digest_updates(
         min_foreign_ai_count=min_foreign_ai_count,
         max_items_per_source=None,
     )
-    official_page_backfill_used = bool(official_page_sources) and _needs_search_backfill(
-        stream_ranked,
-        target_count=target_count,
-        min_domestic_model_count=min_domestic_model_count,
-        min_foreign_ai_count=min_foreign_ai_count,
-        require_target_count=include_pool_items,
+    # Candidate-pool mode is research mode: a full stream response is not
+    # evidence that page-based official sources are unnecessary. They often
+    # contain the concrete model-release facts that RSS summaries omit.
+    official_page_backfill_used = bool(official_page_sources) and (
+        include_pool_items
+        or _needs_search_backfill(
+            stream_ranked,
+            target_count=target_count,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            require_target_count=include_pool_items,
+        )
     )
     if official_page_backfill_used:
         _fetch_stage(official_page_sources)
@@ -1094,6 +1286,24 @@ def collect_ai_digest_updates(
         "fresh_count": len(fresh_items),
         "deduped_count": len(deduped_items),
         "duplicate_removed_count": max(0, len(fresh_items) - len(deduped_items)),
+        "quality_rejected_count": sum(
+            1 for item in fresh_items if ai_update_quality_issues(item)
+        ),
+        "research_policy": {
+            "mode": "candidate_pool" if include_pool_items else "rank_only",
+            "discovery_order": [
+                "official_stream",
+                "official_page",
+                "aggregator",
+                "search",
+                "social",
+            ],
+            "official_pages_continued_after_stream_target": bool(
+                include_pool_items and official_page_backfill_used
+            ),
+            "llm_receives_ranked_candidates_only": True,
+            "quality_gate": "url_date_relevance_and_concrete_content",
+        },
         "ranked_count": len(ranked),
         "official_count": official_count,
         "official_page_backfill_used": official_page_backfill_used,

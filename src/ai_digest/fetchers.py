@@ -238,10 +238,12 @@ _OFFICIAL_HTML_KEYWORDS = (
     "多模态",
     "视觉",
     "语音",
+    "claude",
+    "fable",
 )
 
 _OFFICIAL_HTML_EN_KEYWORD_RE = re.compile(
-    r"\b(?:ai|api|glm|ernie|qwen|kimi|doubao|minimax|abab|model|models|release|releases|changelog|agent)\b",
+    r"\b(?:ai|api|claude|fable|glm|ernie|qwen|kimi|doubao|minimax|abab|model|models|release|releases|changelog|agent)\b",
     re.IGNORECASE,
 )
 
@@ -315,6 +317,8 @@ _OFFICIAL_HTML_RELEASE_SIGNALS = (
     "announce",
     "announced",
     "changelog",
+    "introducing",
+    "available",
 )
 
 
@@ -355,6 +359,91 @@ def _official_article_body_html(html_text: str) -> str:
         elif not token.group(0).rstrip().endswith("/>"):
             depth += 1
     return raw[match.end() :]
+
+
+class _OfficialListingCollector(HTMLParser):
+    """Collect dated article cards from official newsroom listing pages."""
+
+    def __init__(self):
+        super().__init__()
+        self.items: list[tuple[str, str, str]] = []
+        self._href = ""
+        self._all_text: list[str] = []
+        self._title_text: list[str] = []
+        self._time_text: list[str] = []
+        self._title_depth = 0
+        self._time_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        attrs_dict = dict(attrs)
+        if tag == "a" and not self._href:
+            self._href = str(attrs_dict.get("href") or "").strip()
+            self._all_text = []
+            self._title_text = []
+            self._time_text = []
+            self._title_depth = 0
+            self._time_depth = 0
+            return
+        if not self._href:
+            return
+        if tag == "time":
+            self._time_depth += 1
+        if tag in {"span", "div"} and "title" in str(attrs_dict.get("class") or "").lower():
+            self._title_depth += 1
+
+    def handle_data(self, data):
+        if not self._href:
+            return
+        text = re.sub(r"\s+", " ", data or "").strip()
+        if not text:
+            return
+        self._all_text.append(text)
+        if self._time_depth:
+            self._time_text.append(text)
+        if self._title_depth:
+            self._title_text.append(text)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if not self._href:
+            return
+        if tag == "time" and self._time_depth:
+            self._time_depth -= 1
+            return
+        if tag == "span" and self._title_depth:
+            self._title_depth -= 1
+            return
+        if tag != "a":
+            return
+        title = " ".join(self._title_text or self._all_text).strip()
+        date_text = " ".join(self._time_text or self._all_text).strip()
+        published = _extract_release_date(date_text)
+        if self._href and title and published:
+            self.items.append((self._href, title, published))
+        self._href = ""
+        self._all_text = []
+        self._title_text = []
+        self._time_text = []
+        self._title_depth = 0
+        self._time_depth = 0
+
+
+def _parse_official_listing_items(html_text: str) -> list[tuple[str, str, str]]:
+    parser = _OfficialListingCollector()
+    try:
+        parser.feed(html_text or "")
+    except Exception:
+        return []
+    seen: set[tuple[str, str]] = set()
+    items: list[tuple[str, str, str]] = []
+    for href, title, published in parser.items:
+        key = (href, title.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append((href, title, published))
+    return items
 
 
 def _looks_like_official_ai_update(text: str, vendor: str) -> bool:
@@ -444,6 +533,24 @@ def parse_official_html(
     page_release_date = _extract_page_release_date(html_text)
     article_html = _official_article_body_html(html_text)
 
+    listing_items = _parse_official_listing_items(html_text)
+    if listing_items:
+        return [
+            AIUpdateItem(
+                title=title[:160],
+                summary=title[:220],
+                source_name=source_name,
+                source_type="official",
+                url=urljoin(base_url, href),
+                published_at=published,
+                vendor=vendor,
+                product="",
+                raw_excerpt=title[:4000],
+                tags=["AI", "official", vendor],
+            )
+            for href, title, published in listing_items[:30]
+        ]
+
     for line in _html_lines(article_html):
         line_date = _extract_release_date(line)
         if line_date:
@@ -503,6 +610,100 @@ def parse_official_html(
             break
 
     return _apply_page_release_date(items, page_release_date)
+
+
+_BENEFIT_HTML_MARKERS = (
+    "免费",
+    "额度",
+    "领取",
+    "赠送",
+    "重置",
+    "试用",
+    "token",
+    "credit",
+    "quota",
+    "bonus",
+    "claim",
+    "reset",
+    "weekend",
+)
+_BENEFIT_HTML_NOISE = (
+    "首页",
+    "AI视频创作馆",
+    "工具库",
+    "变现学习营",
+    "AI提示词",
+    "相关工具",
+    "相关文章",
+    "登录查看",
+    "浏览",
+    "点赞",
+    "AI营销与获客",
+    "Token计费模式",
+)
+
+
+def parse_benefit_html(
+    html_text: str,
+    *,
+    source_name: str,
+    vendor: str,
+    base_url: str = "",
+) -> list[AIUpdateItem]:
+    """Extract one traceable benefit notice from an AI news article page."""
+    article_html = _official_article_body_html(html_text)
+    lines = _html_lines(article_html)
+    if not lines:
+        return []
+    heading_match = re.search(r"(?is)<h1\b[^>]*>(?P<title>.*?)</h1>", html_text or "")
+    title = _strip_html(heading_match.group("title")) if heading_match else ""
+    if title:
+        for index, line in enumerate(lines):
+            if title in line or line in title:
+                lines = lines[index:]
+                break
+    stop_markers = ("相关工具", "相关文章", "所有提示词", "登录查看完整")
+    for index, line in enumerate(lines):
+        if index > 0 and any(marker in line for marker in stop_markers):
+            lines = lines[:index]
+            break
+    body = " ".join(lines)
+    lowered = body.lower()
+    if not any(marker.lower() in lowered for marker in _BENEFIT_HTML_MARKERS):
+        return []
+
+    if not title:
+        title = next(
+            (
+                line
+                for line in lines
+                if any(marker.lower() in line.lower() for marker in _BENEFIT_HTML_MARKERS)
+                and len(line) <= 160
+            ),
+            lines[0],
+        )
+    published_at = _extract_page_release_date(html_text) or _extract_release_date(body)
+    fact_lines = [
+        line
+        for line in lines
+        if any(marker.lower() in line.lower() for marker in _BENEFIT_HTML_MARKERS)
+        and not any(noise in line for noise in _BENEFIT_HTML_NOISE)
+    ]
+    summary = " ".join(fact_lines[:3]) or body
+    return [
+        AIUpdateItem(
+            title=title[:160],
+            summary=summary[:220],
+            source_name=source_name,
+            source_type="official",
+            url=base_url,
+            published_at=published_at,
+            vendor=vendor,
+            product="",
+            raw_excerpt=" ".join(fact_lines[:18])[:4000] or body[:4000],
+            tags=["AI", "benefit", vendor],
+        )
+    ]
 
 
 class _LinkCollector(HTMLParser):

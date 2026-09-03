@@ -20,6 +20,7 @@ from src.ai_digest.generate import (
     build_fallback_brief,
     evaluate_ai_digest_impact_with_llm,
     generate_ai_digest_brief_with_llm,
+    is_ai_digest_source_label_title,
     render_ai_digest_body,
 )
 from src.ai_digest.models import AIDigestBrief, AIUpdateItem
@@ -29,6 +30,11 @@ from src.ai_digest.rank import (
     ai_digest_quota_counts,
     ai_digest_source_counts,
     ai_update_history_key,
+    ai_update_is_high_impact,
+    ai_update_is_lifecycle_notice,
+    ai_update_is_non_model_infrastructure_notice,
+    ai_update_category,
+    ai_update_quality_issues,
     ai_update_source_key,
     dedupe_ai_updates,
     filter_recent_ai_updates,
@@ -933,6 +939,26 @@ def _prioritize_all_daily_news_conflicts(items: list[Any]) -> list[Any]:
     conflicts = [item for item in items if _daily_news_conflict_signal(item)]
     ordinary = [item for item in items if not _daily_news_conflict_signal(item)]
     return [*conflicts, *ordinary]
+
+
+def _daily_news_candidate_batch_indices(
+    pending_indices: list[int],
+    *,
+    accepted_conflict_count: int,
+    required_international_conflict_count: int,
+    conflict_by_index: dict[int, bool],
+    batch_size: int = 2,
+) -> list[int]:
+    """Select the next bounded batch without crossing an unmet protected lane."""
+    if not pending_indices:
+        return []
+    if accepted_conflict_count < required_international_conflict_count:
+        return [
+            index
+            for index in pending_indices
+            if conflict_by_index.get(index, False)
+        ][:batch_size]
+    return pending_indices[:batch_size]
 
 
 def _source_lookup_concurrency() -> int:
@@ -3823,6 +3849,11 @@ def _daily_news_professional_reporting_instruction() -> str:
     return (
         "权威发布写法：只写已核实、可追溯且与主题直接相关的事实；无法由提供材料支持的内容宁可删去，不得以猜测补全。"
         "标题必须与正文的已核事实范围一致，准确概括核心变化，不夸大、不制造悬念、不写来源不明的结论。\n"
+        "核心任务是完整说明新闻事件，而不是发表观看新闻后的感受。"
+        "内容字段必须脱离评价也能独立、完整地概括整个事件。"
+        "写作前先在内部核对材料已明确提供的主体、时间、地点、核心行为、关键数据、原因或背景、当前结果，"
+        "再按新闻逻辑组织成文；材料未提供的要素不得猜测或补写，也不要输出核对清单。"
+        "事实叙述应占正文主要篇幅，评价不得替代、压缩或重复事实叙述。\n"
         "采用重要性递减的短消息结构：首句直接交代最重要的已证实事件及当前状态；随后补充理解该事件所必需的主体、时间、变化、数据或背景；"
         "结尾仅保留已核进展、明确的信息边界或必要的下一步安排。不以感叹、设问、口号、比喻或泛泛判断开场。\n"
         "严格区分已发生事实、来源表述、计划安排和分析判断：计划要写明“计划/拟/将”，单方信息必须明确归因，推断要写明不确定性；"
@@ -3865,9 +3896,9 @@ def _daily_news_prompt(
         "title：标题必须是12-18字的简体中文总结标题，理想约15字；必须由你基于新闻标题/摘要/原文摘录重新概括，不得直接照抄新闻原始标题；不得机械截断长标题；必须包含具体事件关键词；不要加“每日新闻｜”前缀，不得仅为“每日新闻”，不得出现日文假名；不得以“如/如果/若/一旦”等条件词开头，不能只写半句条件，必须写清新闻动作或结果。\n"
         "body：正文必须通顺，必须严格使用下面 4 个中文字段标签，不得增加字段，不得使用旧标签“原文标题/要点摘要/新闻内容/点评/发布时间”：\n"
         "内容：\n"
-        "<150字以内的完整中文段落，必须基于原文正文严谨总结事实；句子自然衔接，不堆砌网页导航、栏目名、浏览器升级提示、来源页噪声；不得写站内推荐/相关阅读/下一篇文章标题，例如“权威数读”“新华视点”“记者手记”“特色产业赋能”“中国摩托加速”；不写未经证实的细节，不写“目前可以确认的信息主要来自”等模板句>\n\n"
+        "<材料事实充分时建议220-350字；材料较短时可以少于220字，但必须尽可能完整交代事件，不得为了凑字补写事实。内容字段必须脱离评价也能独立成立，优先覆盖材料已有的主体、时间、地点、核心行为、关键数据、原因或背景、当前结果；按事件因果或时间顺序自然衔接，不堆砌网页导航、栏目名、浏览器升级提示、来源页噪声；不得写站内推荐/相关阅读/下一篇文章标题，例如“权威数读”“新华视点”“记者手记”“特色产业赋能”“中国摩托加速”；不写未经证实的细节，不写“目前可以确认的信息主要来自”等模板句>\n\n"
         "评价：\n"
-        "<必须写1-2句基于现有事实的客观评价；信息不足时说明判断边界，不得留空；不得套用与新闻主题无关的 AI/版权/经贸/供应链等模板>\n\n"
+        "<评价限制为1句且不超过60字，放在完整事实叙述之后；只概括该事件最直接的意义、影响或待确认变量，不写个人感受、口号、建议和泛泛而谈；评价不得替代、压缩或重复事实叙述；信息不足时说明判断边界，不得留空；不得套用与新闻主题无关的 AI/版权/经贸/供应链等模板>\n\n"
         "日期：YYYY-MM-DD\n\n"
         "来源：来源名称（不要写网址）\n"
         "长度约束：body 总长度（含换行）务必 <= 900 字符，避免写太长导致发布失败。\n"
@@ -4627,11 +4658,15 @@ def _ai_digest_min_items() -> int:
 def _ai_digest_prompt_search_queries(prompt_hint: str) -> list[str]:
     """Turn explicit requested AI topics into targeted search backfills."""
     requested_topics = (
+        "Claude Fable 5.1",
+        "HY4 preview",
         "Qwen3.8-Flash-Next正式发布",
         "GLM-5.3-Flash发布",
         "QwenWork International上线",
         "Codex plus用户回复5小时限制",
         "Breeze TTS 2权重公开可用",
+        "OpenAI宣布断供Cursor",
+        "MiniMax H3 Max在Fal.ai发布",
     )
     hint = re.sub(r"\s+", " ", str(prompt_hint or "")).strip()
     return [topic for topic in requested_topics if topic in hint]
@@ -4649,6 +4684,23 @@ def _ai_digest_topic_text(item: AIUpdateItem) -> str:
     ).lower()
 
 
+def _ai_digest_prompt_topic_matches(item: AIUpdateItem, topic: str) -> bool:
+    """Match a requested event using stable aliases across Chinese/English sources."""
+
+    text = _ai_digest_topic_text(item)
+    topic_key = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", topic, flags=re.IGNORECASE).lower()
+    if topic_key and topic_key in text:
+        return True
+    aliases = {
+        "openai宣布断供cursor": (("openai", "cursor"),),
+        "minimaxh3max在falai发布": (("h3", "max", "fal"), ("minimax", "h3", "max")),
+    }
+    for group in aliases.get(topic_key, ()):
+        if all(term in text for term in group):
+            return True
+    return False
+
+
 def _ensure_ai_digest_prompt_topic_coverage(
     selected: list[AIUpdateItem],
     candidates: list[AIUpdateItem],
@@ -4662,14 +4714,39 @@ def _ensure_ai_digest_prompt_topic_coverage(
     source_counts = dict(ai_digest_source_counts(output))
     matched: list[str] = []
     missing: list[str] = []
-    pool = [*output, *candidates]
     requested_keys = {
         re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", topic, flags=re.IGNORECASE).lower()
         for topic in requested_topics
     }
     for topic in requested_topics:
+        topic_output_matches = [
+            (index, item)
+            for index, item in enumerate(output)
+            if _ai_digest_prompt_topic_matches(item, topic)
+        ]
+        if len(topic_output_matches) > 1:
+            keep_index, _keep_item = max(
+                topic_output_matches,
+                key=lambda pair: (
+                    pair[1].source_type in {"official", "github"},
+                    float(pair[1].confidence_score or 0.0),
+                    len(pair[1].evidence_urls or []),
+                    pair[1].published_at,
+                ),
+            )
+            for index, removed in reversed(topic_output_matches):
+                if index == keep_index:
+                    continue
+                output.pop(index)
+                source_key = ai_update_source_key(removed)
+                source_counts[source_key] = max(0, source_counts.get(source_key, 0) - 1)
+            # Multiple URLs for one event intentionally share a stable
+            # history key. Rebuild from the retained output so removing a
+            # duplicate cannot also remove the key of the item we kept.
+            selected_keys = {ai_update_history_key(item) for item in output}
         topic_key = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", topic, flags=re.IGNORECASE).lower()
-        matches = [item for item in pool if topic_key and topic_key in _ai_digest_topic_text(item)]
+        pool = [*output, *candidates]
+        matches = [item for item in pool if _ai_digest_prompt_topic_matches(item, topic)]
         selected_match = next(
             (item for item in matches if ai_update_history_key(item) in selected_keys),
             None,
@@ -4719,6 +4796,21 @@ def _ensure_ai_digest_prompt_topic_coverage(
     return output, {"requested": list(requested_topics), "matched": matched, "missing": missing}
 
 
+def _prioritize_ai_digest_model_releases(items: Iterable[AIUpdateItem]) -> list[AIUpdateItem]:
+    """Reorder the final validated set so explicit model releases lead."""
+    values = list(items or [])
+    if len(values) < 2:
+        return values
+    return rank_ai_updates(
+        values,
+        target_count=len(values),
+        min_official_count=len(values) + 1,
+        allow_social_backfill=True,
+        max_age_days=14,
+        max_items_per_source=None,
+    )
+
+
 def _missing_ai_digest_prompt_topics(
     items: Iterable[AIUpdateItem],
     requested_topics: Iterable[str],
@@ -4727,7 +4819,7 @@ def _missing_ai_digest_prompt_topics(
     missing: list[str] = []
     for topic in requested_topics:
         topic_key = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", topic, flags=re.IGNORECASE).lower()
-        if not topic_key or not any(topic_key in _ai_digest_topic_text(item) for item in available):
+        if not topic_key or not any(_ai_digest_prompt_topic_matches(item, topic) for item in available):
             missing.append(topic)
     return missing
 
@@ -4779,9 +4871,10 @@ def _finalize_ai_digest_brief(
     max_age_days: int,
     min_domestic_model_count: int = 0,
     min_foreign_ai_count: int = 0,
+    preserve_validated_order: bool = False,
 ) -> AIDigestBrief:
     """Keep a validated LLM rewrite intact; only rank deterministic fallbacks."""
-    if generation_mode == "llm":
+    if generation_mode == "llm" or preserve_validated_order:
         return brief
     return _rank_brief_ai_digest_items(
         brief,
@@ -4929,9 +5022,19 @@ def _uploaded_ai_digest_history_keys() -> set[str]:
             if not isinstance(raw_item, dict):
                 continue
             try:
-                key = ai_update_history_key(AIUpdateItem.model_validate(raw_item))
+                item = AIUpdateItem.model_validate(raw_item)
             except Exception:
                 continue
+            title = re.sub(r"\s+", "", item.title or "")
+            # Do not let a known placeholder/generic title from an earlier
+            # failed draft poison the next run's history gate. Concrete items
+            # from the same draft remain eligible for deduplication.
+            if (
+                "generic_title" in ai_update_quality_issues(item)
+                or re.search(r"(?:发布|推出|上线)新进展$", title)
+            ):
+                continue
+            key = ai_update_history_key(item)
             if key and key not in {"/|title:", "title:|title:"}:
                 keys.add(key)
     return keys
@@ -4942,12 +5045,14 @@ def _select_adaptive_ai_digest_items(
     *,
     impact_scores: dict[str, dict[str, object]],
     historical_keys: set[str],
+    protected_topics: Iterable[str] | None = None,
     min_items: int = AI_DIGEST_MIN_ITEMS,
     max_items: int = 20,
     min_official_count: int = 6,
     min_domestic_model_count: int = AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS,
     min_foreign_ai_count: int = AI_DIGEST_MIN_FOREIGN_AI_ITEMS,
     allow_official_relaxation: bool = True,
+    impact_threshold: float = 75.0,
 ) -> tuple[list[AIUpdateItem], dict[str, Any]]:
     minimum = max(1, int(min_items or AI_DIGEST_MIN_ITEMS))
     maximum = max(minimum, min(20, int(max_items or 20)))
@@ -4976,10 +5081,47 @@ def _select_adaptive_ai_digest_items(
         row = impact_scores.get(item.dedupe_key) or {}
         return bool(row.get("high_impact"))
 
-    novel = [item for item in ranked_all if ai_update_history_key(item) not in historical_keys]
-    strict_available = [
-        item for item in novel if item.dedupe_key in recent_keys[3] and is_high(item)
+    protected_topic_list = list(protected_topics or [])
+
+    def is_protected(item: AIUpdateItem) -> bool:
+        return any(
+            _ai_digest_prompt_topic_matches(item, topic)
+            for topic in protected_topic_list
+        )
+
+    novel = [
+        item
+        for item in ranked_all
+        if (ai_update_history_key(item) not in historical_keys or is_protected(item))
+        and not ai_update_is_lifecycle_notice(item)
+        and not ai_update_is_non_model_infrastructure_notice(item)
     ]
+    strict_available = [
+        item
+        for item in novel
+        if item.dedupe_key in recent_keys[3]
+        and (is_high(item) or is_protected(item))
+    ]
+    impact_rescue_count = 0
+    if len(strict_available) < minimum:
+        # The LLM reviewer can miss a clear official release when a source
+        # uses a compact card or an unfamiliar product name. Rescue only
+        # recent, deterministic high-impact items, and only to reach the
+        # configured minimum; stale and generic items remain ineligible.
+        strict_keys = {item.dedupe_key for item in strict_available}
+        deterministic_rescue = [
+            item
+            for item in novel
+            if item.dedupe_key in recent_keys[3]
+            and item.dedupe_key not in strict_keys
+            and ai_update_is_high_impact(item, threshold=impact_threshold)
+        ]
+        for item in deterministic_rescue:
+            strict_available.append(item)
+            strict_keys.add(item.dedupe_key)
+            impact_rescue_count += 1
+            if len(strict_available) >= minimum:
+                break
     strict_ranked = rank_ai_updates(
         strict_available,
         target_count=maximum,
@@ -5057,7 +5199,11 @@ def _select_adaptive_ai_digest_items(
     tiers_used: list[str] = []
 
     selected_keys = {item.dedupe_key for item in selected}
-    reused_selected = sum(1 for item in selected if ai_update_history_key(item) in historical_keys)
+    reused_selected = sum(
+        1
+        for item in selected
+        if ai_update_history_key(item) in historical_keys and not is_protected(item)
+    )
     if reused_selected > max_historical_reuse:
         error = (
             f"daily ai digest historical novelty insufficient: 历史资讯复用{reused_selected}条，"
@@ -5087,13 +5233,14 @@ def _select_adaptive_ai_digest_items(
     strict_selected = sum(1 for item in selected if item.dedupe_key in strict_keys)
     fallback_selected = max(0, len(selected) - strict_selected)
     return selected, {
-        "selection_mode": "adaptive_strict",
+        "selection_mode": "adaptive_strict_rescue" if impact_rescue_count else "adaptive_strict",
         "quality_gate": "recent_high_impact_only",
         "low_impact_backfill": False,
         "min_items": minimum,
         "max_items": maximum,
         "strict_candidate_count": strict_target,
         "strict_selected_count": strict_selected,
+        "impact_rescue_count": impact_rescue_count,
         "fallback_selected_count": fallback_selected,
         "fallback_tiers": selected_tier_counts,
         "fallback_tiers_used": tiers_used,
@@ -5181,15 +5328,21 @@ def _fit_ai_digest_items_to_body_capacity(
 ) -> tuple[list[AIUpdateItem], dict[str, int]]:
     item_list = list(items or [])
     requested = len(item_list)
+    protected_topic_list = list(protected_topics or [])
     topic_keys = [
         re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(topic or ""), flags=re.IGNORECASE).lower()
-        for topic in (protected_topics or [])
+        for topic in protected_topic_list
     ]
     protected: list[AIUpdateItem] = []
     protected_history_keys: set[str] = set()
     optional: list[AIUpdateItem] = []
     for item in item_list:
-        if any(key and key in _ai_digest_topic_text(item) for key in topic_keys):
+        if any(
+            topic
+            and _ai_digest_prompt_topic_matches(item, topic)
+            for topic, key in zip(protected_topic_list, topic_keys)
+            if key
+        ):
             history_key = ai_update_history_key(item)
             if history_key not in protected_history_keys:
                 protected.append(item)
@@ -5210,33 +5363,47 @@ def _fit_ai_digest_items_to_body_capacity(
     last_length = 0
     for target in range(requested, minimum - 1, -1):
         optional_target = max(0, target - len(protected))
-        ranked_optional = rank_ai_updates(
-            optional,
-            target_count=optional_target,
-            min_official_count=optional_target + 1,
-            allow_social_backfill=True,
-            max_age_days=max_age_days,
-            min_domestic_model_count=max(0, min_domestic_model_count - ai_digest_quota_counts(protected)["domestic_model"]),
-            min_foreign_ai_count=max(0, min_foreign_ai_count - ai_digest_quota_counts(protected)["foreign_ai"]),
-        ) if optional_target else []
-        if not protected:
-            selected = ranked_optional[:optional_target]
-        else:
-            selected = []
-            selected_keys: set[str] = set()
-            for candidate in [*protected, *ranked_optional[:optional_target]]:
-                key = ai_update_history_key(candidate)
-                if key in selected_keys:
-                    continue
-                selected.append(candidate)
-                selected_keys.add(key)
         effective_official_min = min(max(0, int(min_official_count or 0)), target)
+        effective_domestic_min = min(max(0, int(min_domestic_model_count or 0)), target)
+        effective_foreign_min = min(max(0, int(min_foreign_ai_count or 0)), target)
+        # The adaptive selector has already validated this exact set. Keep it
+        # intact on the first pass; re-ranking here can discard the protected
+        # requested topic and turn a valid short digest into an empty result.
+        if target == requested:
+            selected = item_list
+        else:
+            ranked_optional = rank_ai_updates(
+                optional,
+                target_count=optional_target,
+                min_official_count=min(optional_target + 1, target),
+                allow_social_backfill=True,
+                max_age_days=max_age_days,
+                min_domestic_model_count=max(
+                    0,
+                    effective_domestic_min - ai_digest_quota_counts(protected)["domestic_model"],
+                ),
+                min_foreign_ai_count=max(
+                    0,
+                    effective_foreign_min - ai_digest_quota_counts(protected)["foreign_ai"],
+                ),
+            ) if optional_target else []
+            if not protected:
+                selected = ranked_optional[:optional_target]
+            else:
+                selected = []
+                selected_keys: set[str] = set()
+                for candidate in [*protected, *ranked_optional[:optional_target]]:
+                    key = ai_update_history_key(candidate)
+                    if key in selected_keys:
+                        continue
+                    selected.append(candidate)
+                    selected_keys.add(key)
         if _ai_digest_selection_error(
             selected,
             target_count=target,
             min_official_count=effective_official_min,
-            min_domestic_model_count=min_domestic_model_count,
-            min_foreign_ai_count=min_foreign_ai_count,
+            min_domestic_model_count=effective_domestic_min,
+            min_foreign_ai_count=effective_foreign_min,
             max_age_days=max_age_days,
         ):
             continue
@@ -5257,18 +5424,48 @@ def _fit_ai_digest_items_to_body_capacity(
     )
 
 
-def _ai_digest_post_title(brief: AIDigestBrief) -> str:
+def _ai_digest_post_title(
+    brief: AIDigestBrief,
+    *,
+    preferred_topics: Iterable[str] | None = None,
+) -> str:
     prefix = "每日AI|"
     fallback = "今日AI热点速览"
-    featured = featured_ai_update(list(brief.items or []))
+    digest_items = list(brief.items or [])
+    featured = None
+    for topic in preferred_topics or []:
+        featured = next(
+            (item for item in digest_items if _ai_digest_prompt_topic_matches(item, topic)),
+            None,
+        )
+        if featured is not None:
+            break
+    featured = featured or featured_ai_update(digest_items)
     featured_title = str(featured.title if featured is not None else "").strip()
     generic_title = bool(
-        re.search(r"(?:模型|产品|工具|智能体|API)?发布新进展$", re.sub(r"\s+", "", featured_title))
+        re.search(
+            r"(?:模型|产品|工具|智能体|API)?发布新进展$|披露AI产品变化$|AI产品披露AI产品变化$",
+            re.sub(r"\s+", "", featured_title),
+        )
     )
+    if featured is not None and is_ai_digest_source_label_title(featured_title, featured):
+        # Never promote a source label (for example, PublicTvEnglish) to the
+        # post title. Use the same fact-grounded fallback as the item cards.
+        from src.ai_digest.generate import _fallback_chinese_title
+
+        featured_title = _fallback_chinese_title(featured)
+        generic_title = True
     if generic_title and featured is not None:
         raw_subject = str(featured.raw_excerpt or featured.summary or "").strip()
         vendor = re.sub(r"(?i)\s*(?:blog|官网|official)$", "", str(featured.vendor or "").strip())
         raw_subject = re.split(r"[，。；;｜|]", raw_subject, maxsplit=1)[0]
+        raw_subject = raw_subject.strip()
+        if (
+            raw_subject.startswith(("•", "·", "-", "—", "*"))
+            or re.search(r"(?i)\b(?:give me|follow|like|subscribe|thread)\b", raw_subject)
+            or (len(_CJK_CHAR_RE.findall(raw_subject)) < 2 and not re.search(r"(?i)\b(?:gpt|glm|qwen|claude|gemini|deepseek|kimi|llama)\b", raw_subject))
+        ):
+            raw_subject = ""
         if vendor:
             raw_subject = re.sub(rf"^{re.escape(vendor)}\s*", "", raw_subject, flags=re.IGNORECASE)
         raw_subject = re.sub(r"^启动(?:为期)?(?:[一二三四五六七八九十\d]+(?:天|周|日))?的?", "", raw_subject)
@@ -5277,6 +5474,32 @@ def _ai_digest_post_title(brief: AIDigestBrief) -> str:
         raw_subject = re.sub(r"\s+", "", raw_subject).strip("，,。；;：:、-—| ")
         if raw_subject:
             featured_title = raw_subject if raw_subject.lower().startswith(vendor.lower()) else f"{vendor}{raw_subject}"
+        else:
+            vendor = re.sub(r"^X\s*[：:]\s*", "", vendor).strip()
+            vendor = re.sub(r"\s*\(@[^)]*\)", "", vendor).strip()
+            vendor_labels = {
+                "OpenAI Developers": "OpenAI开发者",
+                "Claude Developers": "Claude开发者",
+                "GitHub Status": "GitHub状态",
+            }
+            featured_title = vendor_labels.get(vendor, vendor) if vendor else fallback
+    preferred_topic_keys = {
+        re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(topic or ""), flags=re.IGNORECASE).lower()
+        for topic in preferred_topics or []
+    }
+    if featured is not None:
+        if any("hy4" in key and "preview" in key for key in preferred_topic_keys):
+            if _ai_digest_prompt_topic_matches(featured, "HY4 preview"):
+                featured_title = "Hy4Preview发布"
+        elif any("claudefable" in key for key in preferred_topic_keys):
+            if _ai_digest_prompt_topic_matches(featured, "Claude Fable 5.1"):
+                featured_title = "ClaudeFable5.1"
+        elif any("openai" in key and "cursor" in key for key in preferred_topic_keys):
+            if _ai_digest_prompt_topic_matches(featured, "OpenAI宣布断供Cursor"):
+                featured_title = "OpenAI停供Cursor"
+        elif any("minimax" in key and "h3" in key and "max" in key for key in preferred_topic_keys):
+            if _ai_digest_prompt_topic_matches(featured, "MiniMax H3 Max在Fal.ai发布"):
+                featured_title = "fal发布H3Max"
     subject = re.split(r"[，。；;｜|]", featured_title, maxsplit=1)[0]
     subject_parts = re.split(r"[：:]", subject, maxsplit=1)
     if len(subject_parts) == 2 and len(subject_parts[1].strip()) >= 4:
@@ -5289,6 +5512,10 @@ def _ai_digest_post_title(brief: AIDigestBrief) -> str:
     # The body and cover already communicate the digest item count. Keeping
     # it out of the title leaves room for the complete featured product name.
     suffix = ""
+    if featured is not None and ai_update_category(featured) == "model_release":
+        hy4_match = re.search(r"(?i)hy\s*[-_.]?\s*4\s*preview", subject)
+        if hy4_match:
+            subject = "Hy4Preview发布"
     if suffix:
         product = str(featured.product if featured is not None else "").strip()
         if product:
@@ -5381,6 +5608,7 @@ def create_daily_ai_digest_posts(
         progress("collect_pool", f"in_progress mode={lookback_meta['mode']} windows={lookback_windows}")
     auto_collection_items: list[AIUpdateItem] | None = None
     auto_collection_meta: dict[str, Any] = {}
+    evaluation_pool: list[AIUpdateItem] = []
     if lookback_meta["mode"] == "auto_expand":
         collection_days = max(lookback_windows)
         if progress is not None:
@@ -5478,6 +5706,52 @@ def create_daily_ai_digest_posts(
             min_foreign_ai_count=min_foreign_ai_count,
             max_items_per_source=None,
         )
+        recent_review_items = filter_recent_ai_updates(
+            list(auto_collection_items or []),
+            max_age_days=min(3, max(lookback_windows)),
+            require_url=True,
+        )
+        if recent_review_items:
+            # Ranking may spend the supervisor budget on older or more
+            # established sources. Keep every fresh traceable candidate in
+            # the review pool so a reviewer miss cannot turn a valid current
+            # release into a false material-shortage error.
+            recent_review_items = rank_ai_updates(
+                recent_review_items,
+                target_count=len(recent_review_items),
+                min_official_count=len(recent_review_items) + 1,
+                allow_social_backfill=True,
+                max_age_days=min(3, max(lookback_windows)),
+                min_domestic_model_count=0,
+                min_foreign_ai_count=0,
+                max_items_per_source=None,
+            )
+            recent_keys = {item.dedupe_key for item in recent_review_items}
+            evaluation_pool = dedupe_ai_updates(
+                [
+                    *recent_review_items,
+                    *[item for item in evaluation_pool if item.dedupe_key not in recent_keys],
+                ]
+            )
+            if len(evaluation_pool) > supervisor_limit:
+                bounded_review_pool = rank_ai_updates(
+                    evaluation_pool,
+                    target_count=supervisor_limit,
+                    min_official_count=supervisor_limit + 1,
+                    allow_social_backfill=True,
+                    max_age_days=max(lookback_windows),
+                    min_domestic_model_count=min_domestic_model_count,
+                    min_foreign_ai_count=min_foreign_ai_count,
+                    max_items_per_source=None,
+                )
+                bounded_keys = {item.dedupe_key for item in bounded_review_pool}
+                evaluation_pool = dedupe_ai_updates(
+                    [
+                        *recent_review_items,
+                        *[item for item in bounded_review_pool if item.dedupe_key not in recent_keys],
+                        *[item for item in evaluation_pool if item.dedupe_key not in bounded_keys],
+                    ]
+                )
         selection_pool_count = len(evaluation_pool)
         try:
             impact_threshold = float((os.getenv("AI_DIGEST_HIGH_IMPACT_SCORE") or "75").strip())
@@ -5514,17 +5788,36 @@ def create_daily_ai_digest_posts(
                 f"high_impact={high_count} threshold={impact_threshold:g}",
             )
 
+        selection_historical_keys = set(historical_keys)
+        explicit_topic_history_exemptions = {
+            ai_update_history_key(item)
+            for item in (auto_collection_items or [])
+            if any(
+                _ai_digest_prompt_topic_matches(item, topic)
+                for topic in prompt_search_queries
+            )
+        }
+        selection_historical_keys.difference_update(explicit_topic_history_exemptions)
+        if progress is not None and explicit_topic_history_exemptions:
+            progress(
+                "history_gate",
+                f"explicit_topic_exemptions={len(explicit_topic_history_exemptions)} "
+                "reason=explicit_requested_topics",
+            )
+
         try:
             items, adaptive_selection_meta = _select_adaptive_ai_digest_items(
                 evaluation_pool,
                 impact_scores=impact_scores,
-                historical_keys=historical_keys,
+                historical_keys=selection_historical_keys,
+                protected_topics=prompt_search_queries,
                 min_items=minimum_count,
                 max_items=max_items,
                 min_official_count=min_official_count,
                 min_domestic_model_count=min_domestic_model_count,
                 min_foreign_ai_count=min_foreign_ai_count,
                 allow_official_relaxation=True,
+                impact_threshold=impact_threshold,
             )
             topic_candidates = [*(evaluation_pool or []), *(auto_collection_items or [])]
             items, prompt_topic_meta = _ensure_ai_digest_prompt_topic_coverage(
@@ -5532,6 +5825,7 @@ def create_daily_ai_digest_posts(
                 topic_candidates,
                 prompt_search_queries,
             )
+            items = _prioritize_ai_digest_model_releases(items)
             adaptive_selection_meta["prompt_topic_coverage"] = prompt_topic_meta
             if prompt_topic_meta["missing"]:
                 raise RuntimeError(
@@ -5577,12 +5871,18 @@ def create_daily_ai_digest_posts(
         source_meta["adaptive_selection"] = adaptive_selection_meta
         source_meta["historical_novelty"] = {
             "historical_key_count": len(historical_keys),
+            "selection_historical_key_count": len(selection_historical_keys),
+            "explicit_topic_history_exemptions": len(explicit_topic_history_exemptions),
             "candidate_count_before_history_filter": len(evaluation_pool),
             "novel_candidate_count": sum(
-                1 for item in evaluation_pool if ai_update_history_key(item) not in historical_keys
+                1
+                for item in evaluation_pool
+                if ai_update_history_key(item) not in selection_historical_keys
             ),
             "reused_candidate_count": sum(
-                1 for item in evaluation_pool if ai_update_history_key(item) in historical_keys
+                1
+                for item in evaluation_pool
+                if ai_update_history_key(item) in selection_historical_keys
             ),
             "reused_selected_count": adaptive_selection_meta.get("historical_reused_count", 0),
             "max_reused_before_duplicate_gate": adaptive_selection_meta.get("max_historical_reuse", 0),
@@ -5823,6 +6123,13 @@ def create_daily_ai_digest_posts(
 
     # Save unfiltered source items for the quota-safe fallback
     raw_items_for_fallback = list(items or [])
+    prompt_topic_candidates = dedupe_ai_updates(
+        [
+            *raw_items_for_fallback,
+            *(evaluation_pool or []),
+            *(auto_collection_items or []),
+        ]
+    )
     if adaptive_mode:
         items, body_capacity_meta = _fit_ai_digest_items_to_body_capacity(
             items,
@@ -5855,7 +6162,7 @@ def create_daily_ai_digest_posts(
         if prompt_search_queries:
             items, post_fit_topic_meta = _ensure_ai_digest_prompt_topic_coverage(
                 items,
-                raw_items_for_fallback,
+                prompt_topic_candidates,
                 prompt_search_queries,
             )
             adaptive_selection_meta["post_fit_prompt_topic_coverage"] = post_fit_topic_meta
@@ -5881,6 +6188,18 @@ def create_daily_ai_digest_posts(
                 source_meta["body_capacity"] = body_capacity_meta
 
     generation_target = target_count
+    # Adaptive mode may intentionally publish fewer than the historical
+    # quota targets when only a small set of fresh, high-impact items remains.
+    # Keep the LLM prompt and final validator aligned with that actual target.
+    effective_min_official_count = min(effective_min_official_count, generation_target)
+    effective_min_domestic_model_count = min(
+        effective_min_domestic_model_count,
+        generation_target,
+    )
+    effective_min_foreign_ai_count = min(
+        effective_min_foreign_ai_count,
+        generation_target,
+    )
     generation_mode = "llm"
     llm_error = ""
     llm_items = _prepare_ai_digest_llm_items(items, target_count=generation_target)
@@ -5926,7 +6245,28 @@ def create_daily_ai_digest_posts(
         max_age_days=max_age_days,
         min_domestic_model_count=effective_min_domestic_model_count,
         min_foreign_ai_count=effective_min_foreign_ai_count,
+        preserve_validated_order=bool(prompt_search_queries),
     )
+    final_prompt_topic_meta: dict[str, Any] = {}
+    if prompt_search_queries:
+        final_topic_items, final_prompt_topic_meta = _ensure_ai_digest_prompt_topic_coverage(
+            list(brief.items or []),
+            dedupe_ai_updates([*(items or []), *(prompt_topic_candidates or [])]),
+            prompt_search_queries,
+        )
+        if len(final_topic_items) != len(brief.items or []):
+            brief = _with_ai_digest_items(brief, final_topic_items)
+            generation_target = len(final_topic_items)
+            effective_min_official_count = min(effective_min_official_count, generation_target)
+            effective_min_domestic_model_count = min(
+                effective_min_domestic_model_count,
+                generation_target,
+            )
+            effective_min_foreign_ai_count = min(
+                effective_min_foreign_ai_count,
+                generation_target,
+            )
+        adaptive_selection_meta["final_prompt_topic_coverage"] = final_prompt_topic_meta
     final_error = _ai_digest_selection_error(
         brief.items,
         target_count=generation_target,
@@ -6024,7 +6364,7 @@ def create_daily_ai_digest_posts(
     post = Post(
         type="image",
         status=PostStatus.draft,
-        title=_ai_digest_post_title(brief),
+        title=_ai_digest_post_title(brief, preferred_topics=prompt_search_queries),
         body=rendered_body,
         topics=["每日AI讯息", "AI动态", "人工智能"],
         platform={
@@ -6960,20 +7300,40 @@ def _run_parallel_daily_news_candidates(
             prefilter_signatures.append(signature)
     skipped_quality_count = prefiltered_duplicates
 
+    pending_indices = sorted(prepared_by_index)
+    conflict_by_index = {
+        index: bool(
+            original_conflict_by_index.get(index, False)
+            or _daily_news_conflict_signal(prepared_by_index[index][0], prepared_by_index[index][3])
+        )
+        for index in pending_indices
+    }
+
     # Two candidate workers feed two independent model queues. The workers
     # only prepare local objects; XHS upload happens later in apps.cli's
     # existing serial loop.
     with ModelWorkQueues(llm_workers=2, image_workers=2) as model_queues:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="redbook-candidate") as workers:
-            for offset in range(0, len(picks), 2):
+            while pending_indices:
                 if (
                     len(posts) >= target_count
                     and accepted_conflict_count >= required_international_conflict_count
                 ):
                     break
+                batch_indices = _daily_news_candidate_batch_indices(
+                    pending_indices,
+                    accepted_conflict_count=accepted_conflict_count,
+                    required_international_conflict_count=required_international_conflict_count,
+                    conflict_by_index=conflict_by_index,
+                )
+                if not batch_indices:
+                    break
+                pending_indices = [
+                    index for index in pending_indices if index not in batch_indices
+                ]
                 batch = [
                     (index, picks[index - 1])
-                    for index in range(offset + 1, min(offset + 3, len(picks) + 1))
+                    for index in batch_indices
                     if index in prepared_by_index
                 ]
                 if not batch:

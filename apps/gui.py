@@ -3260,6 +3260,9 @@ def main() -> None:
     ttk.Button(quick_titles, text="每日AI讯息", command=lambda: title_var.set("每日AI讯息")).pack(
         side="left", padx=(8, 0)
     )
+    ttk.Button(quick_titles, text="每日羊毛", command=lambda: title_var.set("每日羊毛")).pack(
+        side="left", padx=(8, 0)
+    )
     ttk.Button(quick_titles, text="每日假新闻", command=lambda: title_var.set("每日假新闻")).pack(
         side="left", padx=(8, 0)
     )

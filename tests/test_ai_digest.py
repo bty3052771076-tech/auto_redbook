@@ -8,6 +8,9 @@ from src.ai_digest import rank as rank_mod
 from src.ai_digest.rank import (
     ai_digest_quota_counts,
     ai_digest_source_counts,
+    ai_update_category,
+    ai_update_is_high_impact,
+    ai_update_quality_issues,
     ai_update_source_key,
     rank_ai_updates,
 )
@@ -53,6 +56,61 @@ def test_ai_update_item_normalizes_url_key_and_source_type():
     assert item.source_type == "official"
     assert item.dedupe_key == "url:https://openai.com/news/example/"
     assert item.verification_status == "official_only"
+
+
+def test_hy4_preview_is_classified_as_a_model_release():
+    item = _item(
+        "HY4 preview",
+        source_name="HY4 官方",
+        vendor="HY4",
+        product="HY4",
+        url="https://example.com/hy4-preview",
+        summary="HY4 preview is open to selected testers with the new model weights.",
+    )
+
+    assert ai_update_category(item) == "model_release"
+
+
+def test_model_shutdown_or_upgrade_notice_is_not_high_impact_filler():
+    item = _item(
+        "腾讯云 DeepSeek-V4-Flash 模型下线及升级通知",
+        source_name="Tencent Cloud AI",
+        vendor="DeepSeek",
+        product="DeepSeek-V4-Flash",
+        url="https://cloud.tencent.com/announce/deepseek-v4-flash",
+        summary="DeepSeek-V4-Flash API 服务将下线并进行升级，请用户迁移到新版本。",
+        raw_excerpt="模型下线、升级和迁移说明。",
+    )
+
+    assert ai_update_is_high_impact(item) is False
+
+
+def test_non_model_database_api_notice_is_not_high_impact_ai_news():
+    item = _item(
+        "【云数据库 MySQL】关于部分 API 接入 CAM 鉴权公告",
+        source_name="Tencent Cloud AI",
+        vendor="Tencent Cloud AI",
+        product="",
+        url="https://cloud.tencent.com/announce/",
+        summary="部分数据库 API 接入 CAM 鉴权，属于云数据库服务配置通知。",
+        raw_excerpt="云数据库 MySQL API 鉴权说明。",
+    )
+
+    assert ai_update_is_high_impact(item) is False
+
+
+def test_non_model_database_api_notice_is_not_relevant_for_digest_ranking():
+    item = _item(
+        "【云数据库 MySQL】关于部分 API 接入 CAM 鉴权公告",
+        source_name="Tencent Cloud AI",
+        vendor="Tencent Cloud AI",
+        product="",
+        url="https://cloud.tencent.com/announce/",
+        summary="部分数据库 API 接入 CAM 鉴权，属于云数据库服务配置通知。",
+        raw_excerpt="云数据库 MySQL API 鉴权说明。",
+    )
+
+    assert rank_mod.ai_update_is_relevant(item) is False
 
 
 def test_ai_digest_official_count_requires_a_direct_official_url():
@@ -650,6 +708,95 @@ def test_rank_ai_updates_prioritizes_technical_model_updates_over_discussion_on_
     assert rank_mod.ai_update_category(today_discussion) == "discussion"
 
 
+def test_ai_update_category_recognizes_hy4_release_as_model_release():
+    item = _item(
+        "HY4 model release and open weights",
+        source_name="HY4 Lab",
+        url="https://hy4.example.com/releases/hy4",
+        published_at="2026-08-28T08:00:00Z",
+        summary="HY4 is officially released with open weights and inference access.",
+        raw_excerpt="Official HY4 model release and open-weight announcement.",
+        product="HY4",
+    )
+
+    assert rank_mod.ai_update_category(item) == "model_release"
+
+
+def test_ai_update_category_does_not_promote_generic_model_mentions_to_release():
+    item = _item(
+        "Anthropic expands developer access",
+        source_name="Anthropic",
+        url="https://www.anthropic.com/news/developer-access",
+        published_at="2026-08-28T08:00:00Z",
+        summary="The update discusses how a model is used in the existing developer product.",
+        raw_excerpt="A product access update that mentions a model but does not announce a release.",
+        product="Claude Code",
+    )
+
+    assert rank_mod.ai_update_category(item) != "model_release"
+
+
+def test_rank_ai_updates_puts_concrete_model_release_before_newer_discussion():
+    release = _item(
+        "HY4 model release and open weights",
+        source_name="HY4 Lab",
+        url="https://hy4.example.com/releases/hy4",
+        published_at="2026-08-28T08:00:00Z",
+        summary="HY4 is officially released with open weights.",
+        raw_excerpt="Official HY4 model release and open-weight announcement.",
+        product="HY4",
+    )
+    discussion = _item(
+        "Why AI specialization is inevitable",
+        source_name="Hugging Face",
+        url="https://huggingface.co/blog/ai-specialization",
+        published_at="2026-08-29T01:00:00Z",
+        summary="An opinion article discusses the future direction of AI specialization.",
+        raw_excerpt="An opinion about why AI specialization may be inevitable.",
+        product="",
+    )
+
+    ranked = rank_ai_updates(
+        [discussion, release],
+        target_count=2,
+        min_official_count=1,
+        max_age_days=3,
+        now=datetime(2026, 8, 29, 12, 0, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    assert [item.title for item in ranked] == [release.title, discussion.title]
+
+
+def test_social_status_id_is_not_mistaken_for_a_model_release():
+    item = _item(
+        "Claude reliability research update",
+        source_name="Anthropic",
+        source_type="social",
+        url="https://x.com/AnthropicAI/status/2093386531247718425",
+        published_at="2026-08-29T01:00:00Z",
+        summary="Anthropic reports a safety benchmark update.",
+        raw_excerpt="Claude improved safety scores without degrading capabilities.",
+        product="",
+    )
+
+    assert rank_mod.ai_update_category(item) != "model_release"
+
+
+def test_hy4_search_slug_can_be_a_model_release():
+    item = _item(
+        "AI model release update",
+        source_name="pandaily.com",
+        source_type="search",
+        url="https://pandaily.com/tencent-hunyuan-hy4-preview-open-source-aug2026",
+        published_at="2026-08-28T07:32:03Z",
+        summary="Tencent Hunyuan released and open-sourced Hy4 preview.",
+        raw_excerpt="Tencent Hunyuan released and open-sourced Hy4 preview.",
+        product="",
+    )
+
+    assert rank_mod.ai_update_category(item) == "model_release"
+
+
 def test_ai_update_category_keeps_opinion_discussion_as_supplement_even_with_generic_model_words():
     item = _item(
         "Hugging Face Why Specialization Is Inevitable更新",
@@ -828,6 +975,40 @@ def test_rank_ai_updates_rejects_official_item_that_only_repeats_product_name():
     assert [item.url for item in ranked] == [substantive.url]
 
 
+def test_rank_ai_updates_rejects_contentless_placeholder_digest_items():
+    placeholder = _item(
+        "AnthropicAI模型披露AI产品变化",
+        source_name="Anthropic",
+        vendor="Anthropic",
+        product="AI model",
+        url="https://anthropic.com/news/placeholder",
+        summary="AnthropicAI模型披露AI产品变化。",
+        raw_excerpt="AnthropicAI模型披露AI产品变化。",
+        published_at="2026-07-29T03:00:00Z",
+    )
+    dynamic_placeholder = _item(
+        "动态3",
+        source_name="AI HOT",
+        vendor="AI HOT",
+        product="",
+        url="https://aihot.virxact.com/items/3",
+        source_type="aggregator",
+        summary="动态3。",
+        raw_excerpt="动态3。",
+        published_at="2026-07-29T03:00:00Z",
+    )
+
+    assert "contentless" in ai_update_quality_issues(placeholder)
+    assert "placeholder_title" in ai_update_quality_issues(dynamic_placeholder)
+    assert rank_ai_updates(
+        [placeholder, dynamic_placeholder],
+        target_count=2,
+        min_official_count=1,
+        max_age_days=3,
+        now=datetime(2026, 7, 29, 16, tzinfo=timezone(timedelta(hours=8))),
+    ) == []
+
+
 def test_rank_ai_updates_keeps_official_named_model_version_card():
     compact_release = _item(
         "GLM-5.3",
@@ -904,6 +1085,28 @@ def test_ai_update_history_key_normalizes_trailing_slash_for_same_official_event
     assert rank_mod.ai_update_history_key(without_slash) == rank_mod.ai_update_history_key(with_slash)
 
 
+def test_ai_update_history_key_dedupes_claude_fable_release_across_official_urls():
+    previous = _item(
+        "Anthropic 发布 Claude Fable 5.1",
+        source_name="Anthropic",
+        vendor="Anthropic",
+        url="https://www.anthropic.com/claude/fable",
+        summary="Anthropic 发布 Claude Fable 5.1，面向编程和知识工作。",
+        raw_excerpt="Anthropic officially released Claude Fable 5.1 for coding and knowledge work.",
+    )
+    rewritten = previous.model_copy(
+        update={
+            "title": "Anthropic 发布 Claude Fable 5.1 与 Claude Mythos 5.1",
+            "url": "https://www.anthropic.com/claude-fable-and-mythos-5-1",
+            "summary": "Anthropic introduced Claude Fable 5.1 and Claude Mythos 5.1.",
+            "raw_excerpt": "Introducing Claude Fable 5.1 and Claude Mythos 5.1 for coding and knowledge work.",
+        }
+    )
+
+    assert rank_mod.ai_update_history_key(previous) == "event:anthropic-claude-fable-5-1-release"
+    assert rank_mod.ai_update_history_key(previous) == rank_mod.ai_update_history_key(rewritten)
+
+
 def test_ai_update_history_key_dedupes_same_generic_listing_item_by_raw_excerpt():
     previous = _item(
         "Tencent Cloud TokenHub service terms update and third-party deployment note",
@@ -927,6 +1130,147 @@ def test_ai_update_history_key_dedupes_same_generic_listing_item_by_raw_excerpt(
 
     assert rank_mod.ai_update_history_key(previous) == rank_mod.ai_update_history_key(rewritten)
     assert rank_mod.ai_update_history_key(previous) != rank_mod.ai_update_history_key(different_item)
+
+
+def test_ai_update_history_key_dedupes_hy4_release_across_media_urls():
+    previous = _item(
+        "腾讯混元 Hy4 Preview模型发布",
+        source_name="TechNode",
+        url="https://technode.com/2026/08/28/tencent-open-sources-hy4-preview/",
+        summary="腾讯混元发布并开源 Hy4 Preview 模型。",
+        raw_excerpt="Tencent Hunyuan released and open-sourced Hy4 preview.",
+    )
+    rewritten = _item(
+        "腾讯混元Hy4 Preview模型发布",
+        source_name="Andhrabhoomi",
+        url="https://www.deccanchronicle.com/technology/tencent-hy4-preview",
+        summary="腾讯混元发布并开源 Hy4 Preview，原文提到总参数量约7700亿。",
+        raw_excerpt="The model, called Hy4 preview, uses a mixture-of-experts design.",
+    )
+
+    assert rank_mod.ai_update_history_key(previous) == rank_mod.ai_update_history_key(rewritten)
+
+
+def test_ai_update_history_key_recognizes_hy4_english_disclosure_as_release():
+    item = _item(
+        "Tencent discloses AI self-improvement loop: Hy4 Preview",
+        source_name="TechTimes",
+        vendor="TechTimes",
+        source_type="search",
+        url="https://www.techtimes.com/articles/hy4-preview",
+        summary="Tencent discloses the Hy4 Preview model.",
+        raw_excerpt="Tencent discloses AI self-improvement loop: Hy4 Preview.",
+    )
+
+    assert rank_mod.ai_update_history_key(item) == "event:tencent-hunyuan-hy4-release"
+
+
+def test_ai_update_history_key_dedupes_zhipu_niulai_across_article_and_social_urls():
+    article = _item(
+        "智谱认领牛来模型，GLM-5.3-Flash开启半价",
+        source_name="Smzdm",
+        source_type="aggregator",
+        url="https://post.smzdm.com/p/anvx8mpp/",
+        summary="匿名模型牛来由智谱认领，GLM-5.3-Flash开启半价。",
+        raw_excerpt="8月20日悄没声上线的匿名模型牛来（OxAlpha）由智谱认领。",
+        product="GLM-5.3-Flash",
+    )
+    social = article.model_copy(
+        update={
+            "source_name": "X：Z.ai",
+            "source_type": "social",
+            "url": "https://x.com/Zai_org/status/1",
+            "title": "Z.ai回应匿名模型OxAlpha与GLM-5.3-Flash",
+            "summary": "Z.ai回应被称为牛来的匿名模型 OxAlpha。",
+            "raw_excerpt": "Z.ai回应匿名模型 OxAlpha（牛来）及 GLM-5.3-Flash。",
+        }
+    )
+
+    assert rank_mod.ai_update_history_key(article) == "event:zhipu-niulai-model"
+    assert rank_mod.ai_update_history_key(article) == rank_mod.ai_update_history_key(social)
+
+
+def test_filter_recent_ai_updates_uses_explicit_model_event_date_from_excerpt():
+    item = _item(
+        "智谱认领牛来模型，GLM-5.3-Flash开启半价",
+        source_name="Smzdm",
+        source_type="aggregator",
+        url="https://post.smzdm.com/p/anvx8mpp/",
+        published_at="2026-08-31T19:47:23Z",
+        summary="匿名模型牛来由智谱认领，GLM-5.3-Flash开启半价。",
+        raw_excerpt="8月20日悄没声上线的匿名模型牛来（OxAlpha）由智谱认领。",
+        product="GLM-5.3-Flash",
+    )
+
+    filtered = rank_mod.filter_recent_ai_updates(
+        [item],
+        max_age_days=3,
+        now=datetime(2026, 9, 1, 12, tzinfo=timezone.utc),
+    )
+
+    assert filtered == []
+
+
+def test_ai_update_history_key_dedupes_openai_cursor_model_access_event():
+    previous = _item(
+        "OpenAI拟停止向Cursor提供模型",
+        source_name="OpenAI",
+        url="https://openai.com/index/our-decision-on-cursor-following-its-acquisition-by-spacex/",
+        summary="OpenAI计划停止向Cursor提供OpenAI模型。",
+        raw_excerpt="OpenAI intends to wind down its contract providing OpenAI models to Cursor.",
+    )
+    rewritten = _item(
+        "OpenAI拟停止向Cursor提供模型",
+        source_name="Public TV English",
+        url="https://english.publictv.in/openai-to-terminate-cursor-model-access/",
+        summary="OpenAI将终止向Cursor提供模型访问，计划于2026年11月12日生效。",
+        raw_excerpt="OpenAI decided to end its commercial partnership with Cursor and terminate direct access.",
+    )
+
+    assert rank_mod.ai_update_history_key(previous) == rank_mod.ai_update_history_key(rewritten)
+
+
+def test_ai_update_history_key_dedupes_anthropic_hacker_opus_simulation():
+    first = _item(
+        "Anthropic Hacker-Opus simulation attacked Hugging Face",
+        source_name="Anthropic",
+        vendor="Anthropic",
+        source_type="social",
+        url="https://x.com/AnthropicAI/status/1",
+        summary="Hacker-Opus simulated an attack on Hugging Face.",
+        raw_excerpt="Anthropic's Hacker-Opus simulation attempted an attack on Hugging Face.",
+    )
+    rewritten = first.model_copy(
+        update={
+            "title": "Anthropic Hacker-Opus越界攻击第三方基础设施",
+            "url": "https://x.com/AnthropicAI/status/2",
+            "summary": "模拟网络评估中 Hacker-Opus 越界攻击第三方基础设施。",
+            "raw_excerpt": "Anthropic reported a Hacker-Opus attack on third-party infrastructure in a simulation.",
+        }
+    )
+
+    assert rank_mod.ai_update_history_key(first) == rank_mod.ai_update_history_key(rewritten)
+
+
+def test_rank_ai_updates_rejects_model_name_inside_generic_change_title():
+    generic = _item(
+        "GitHub Status披露gpt-5.3-codex的AI产品变化",
+        source_name="GitHub Status",
+        vendor="GitHub",
+        product="gpt-5.3-codex",
+        url="https://www.githubstatus.com/",
+        summary="GitHub Status披露gpt-5.3-codex的AI产品变化。",
+        raw_excerpt="GitHub Status披露gpt-5.3-codex的AI产品变化。",
+    )
+
+    assert "generic_title" in rank_mod.ai_update_quality_issues(generic)
+    assert rank_mod.rank_ai_updates(
+        [generic],
+        target_count=1,
+        min_official_count=0,
+        max_age_days=3,
+        now=datetime(2026, 9, 1, 16, tzinfo=timezone(timedelta(hours=8))),
+    ) == []
 
 
 def test_ai_update_history_key_preserves_decimal_model_versions():
@@ -980,6 +1324,81 @@ def test_dedupe_ai_updates_keeps_generic_topics_from_distinct_vendors():
 
     assert {item.source_name for item in deduped} == {"OpenAI", "Anthropic"}
     assert len(deduped) == 3
+
+
+def test_dedupe_ai_updates_merges_mhs_posts_with_different_social_urls():
+    first = _item(
+        "Anthropic Model Hardware Standard covers lab equipment",
+        source_type="social",
+        source_name="X: Anthropic",
+        vendor="Anthropic",
+        url="https://x.com/AnthropicAI/status/1",
+        raw_excerpt="Model Hardware Standard (MHS) covers lab and manufacturing equipment.",
+    )
+    second = first.model_copy(
+        update={
+            "title": "Anthropic starts the MHS research preview",
+            "url": "https://x.com/AnthropicAI/status/2",
+            "raw_excerpt": "The first phase of the Model Hardware Standard (MHS) research preview starts today.",
+        }
+    )
+
+    deduped = rank_mod.dedupe_ai_updates([first, second])
+
+    assert len(deduped) == 1
+    assert rank_mod.ai_update_history_key(first) == rank_mod.ai_update_history_key(second)
+
+
+def test_dedupe_ai_updates_merges_same_social_text_with_different_tracking_urls():
+    first = _item(
+        "OpenAI deploys Jalapeno in its compute infrastructure",
+        source_type="social",
+        source_name="X: OpenAI",
+        vendor="OpenAI",
+        url="https://x.com/OpenAI/status/1",
+        raw_excerpt=(
+            "We plan to begin deploying Jalapeno in OpenAI's compute infrastructure by year-end. "
+            "It is the first step in a multigenerational roadmap. https://t.co/first"
+        ),
+    )
+    second = first.model_copy(
+        update={
+            "url": "https://x.com/OpenAI/status/2",
+            "raw_excerpt": (
+                "We plan to begin deploying Jalapeno in OpenAI's compute infrastructure by year-end. "
+                "It is the first step in a multigenerational roadmap. https://t.co/second"
+            ),
+        }
+    )
+
+    deduped = rank_mod.dedupe_ai_updates([first, second])
+
+    assert len(deduped) == 1
+    assert rank_mod.ai_update_history_key(first) == rank_mod.ai_update_history_key(second)
+
+
+def test_dedupe_ai_updates_merges_named_jalapeno_event_across_different_text():
+    first = _item(
+        "OpenAI deploys Jalapeno in its compute infrastructure",
+        source_type="social",
+        source_name="X: OpenAI",
+        vendor="OpenAI",
+        url="https://x.com/OpenAI/status/10",
+        raw_excerpt="OpenAI says Jalapeno will enter its compute infrastructure by year-end.",
+    )
+    second = first.model_copy(
+        update={
+            "title": "OpenAI shares a Jalapeño infrastructure update",
+            "url": "https://x.com/OpenAI/status/11",
+            "summary": "The Jalapeño deployment is part of a longer-term compute roadmap.",
+            "raw_excerpt": "The company describes Jalapeño as a step in a multigenerational compute roadmap.",
+        }
+    )
+
+    deduped = rank_mod.dedupe_ai_updates([first, second])
+
+    assert len(deduped) == 1
+    assert rank_mod.ai_update_history_key(first) == rank_mod.ai_update_history_key(second)
 
 
 def test_rank_ai_updates_rejects_search_results_about_stocks_banking_and_filings():

@@ -219,6 +219,29 @@ def test_daily_news_all_conflict_candidates_are_processed_before_ordinary_news()
     assert ordered[:2] == [conflict, late_conflict]
 
 
+def test_daily_news_batch_does_not_submit_ordinary_story_before_conflict_quota():
+    conflict_by_index = {1: False, 2: True, 3: False, 4: True}
+
+    assert create_post._daily_news_candidate_batch_indices(
+        [1, 2, 3, 4],
+        accepted_conflict_count=0,
+        required_international_conflict_count=2,
+        conflict_by_index=conflict_by_index,
+    ) == [2, 4]
+    assert create_post._daily_news_candidate_batch_indices(
+        [1, 3, 4],
+        accepted_conflict_count=1,
+        required_international_conflict_count=2,
+        conflict_by_index=conflict_by_index,
+    ) == [4]
+    assert create_post._daily_news_candidate_batch_indices(
+        [1, 3],
+        accepted_conflict_count=2,
+        required_international_conflict_count=2,
+        conflict_by_index=conflict_by_index,
+    ) == [1, 3]
+
+
 def test_relevance_score_matches_chinese_world_cup_prompt_to_english_headline():
     item = NewsItem(
         title="World Cup 2026: France power on after Morocco win",
@@ -849,7 +872,8 @@ def test_daily_news_prompt_requires_chinese_translation_no_url_and_target_length
 
     assert "必须全部使用简体中文" in prompt
     assert "英文新闻" in prompt and "翻译" in prompt
-    assert "150字以内" in prompt
+    assert "建议220-350字" in prompt
+    assert "150字以内" not in prompt
     for key in ("内容", "评价", "日期", "来源"):
         assert key in prompt
     assert "不得输出 URL" in prompt
@@ -1292,6 +1316,31 @@ def test_daily_news_prompt_requires_a_fact_bound_comment_and_forbids_generic_com
     assert "评价须明确现有事实边界" in prompt
     assert "不得写“这类新闻适合先看事实，再看影响”" in prompt
     assert "正文必须通顺" in prompt
+
+
+def test_daily_news_prompt_prioritizes_complete_event_summary_over_commentary():
+    picked = NewsItem(
+        title="Court announces judgment in a major financial case",
+        url="https://example.com/judgment",
+        source="Example News",
+        domain="example.com",
+        seendate="2026-09-03T08:00:00Z",
+        description="The court announced the defendants, charges, penalties and recovery arrangements.",
+        content=(
+            "The report includes the court, hearing date, defendants, conduct, charges, "
+            "penalties, affected parties and the current status of asset recovery."
+        ),
+    )
+
+    prompt = _daily_news_prompt(picked, "财经 法治")
+
+    assert "内容字段必须脱离评价也能独立、完整地概括整个事件" in prompt
+    assert "主体、时间、地点、核心行为、关键数据、原因或背景、当前结果" in prompt
+    assert "事实叙述应占正文主要篇幅" in prompt
+    assert "评价不得替代、压缩或重复事实叙述" in prompt
+    assert "评价限制为1句且不超过60字" in prompt
+    assert "建议220-350字" in prompt
+    assert "150字以内" not in prompt
 
 
 def test_daily_news_fact_comment_covers_earnings_rating_and_partnership_signals():

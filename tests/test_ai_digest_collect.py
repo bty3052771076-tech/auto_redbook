@@ -64,6 +64,47 @@ def test_prompt_topic_official_backfill_verifies_and_returns_all_requested_topic
     ]
 
 
+def test_prompt_topic_official_backfill_supports_cursor_and_h3_max(monkeypatch):
+    monkeypatch.setattr(collect_mod, "_http_get_text", lambda _url, timeout_s=12.0: "<html>official page</html>" * 20)
+    topics = ["OpenAI宣布断供Cursor", "MiniMax H3 Max在Fal.ai发布"]
+
+    items, meta = collect_mod.fetch_ai_digest_prompt_topic_backfill(topics=topics)
+
+    assert meta["verified"] == topics
+    assert [item.title for item in items] == [
+        "OpenAI拟停止向Cursor提供模型",
+        "fal发布MiniMax H3 Max视频模型",
+    ]
+    assert all(item.url and item.published_at for item in items)
+
+
+def test_prompt_topic_official_backfill_supports_claude_fable_5_1(monkeypatch):
+    monkeypatch.setattr(collect_mod, "_http_get_text", lambda _url, timeout_s=12.0: "<html>official page</html>" * 20)
+
+    items, meta = collect_mod.fetch_ai_digest_prompt_topic_backfill(topics=["Claude Fable 5.1"])
+
+    assert meta["verified"] == ["Claude Fable 5.1"]
+    assert len(items) == 1
+    assert items[0].source_type == "official"
+    assert items[0].vendor == "Anthropic"
+    assert items[0].url == "https://www.anthropic.com/claude/fable"
+    assert items[0].published_at == "2026-09-01"
+    assert "Fable 5.1" in items[0].title
+
+
+def test_prompt_topic_backfill_marks_hy4_as_search_verified_not_official(monkeypatch):
+    monkeypatch.setattr(collect_mod, "_http_get_text", lambda _url, timeout_s=12.0: "<html>source page</html>" * 20)
+
+    items, meta = collect_mod.fetch_ai_digest_prompt_topic_backfill(topics=["HY4 preview"])
+
+    assert meta["verified"] == ["HY4 preview"]
+    assert len(items) == 1
+    assert items[0].source_name == "TechNode"
+    assert items[0].source_type == "search"
+    assert items[0].verification_status == "search_only"
+    assert items[0].url.startswith("https://technode.com/")
+
+
 def test_collect_ai_digest_updates_passes_prompt_topics_to_forced_search_backfill(monkeypatch):
     sources = [
         AIDigestSource("official", "official", "https://example.com/rss", "Fixture", "rss"),
@@ -88,6 +129,25 @@ def test_collect_ai_digest_updates_passes_prompt_topics_to_forced_search_backfil
     )
 
     assert captured["queries"] == ["Qwen3.8-Flash-Next正式发布"]
+
+
+def test_news_discovery_promotes_direct_official_model_pages_before_llm_selection():
+    discovered = NewsItem(
+        title="Gemini model release",
+        url="https://blog.google/technology/ai/gemini-model-release/",
+        source="Google News",
+        description="Google introduced a new Gemini model with stronger reasoning and API availability.",
+        content="Google introduced a new Gemini model with stronger reasoning and API availability.",
+        domain="blog.google",
+        seendate="20260830T010000Z",
+    )
+
+    converted = collect_mod._news_item_to_ai_update(discovered, query="AI model release")
+
+    assert converted.source_type == "official"
+    assert converted.verification_status == "official_only"
+    assert "官网直连" in converted.tags
+    assert converted.confidence_score >= 0.8
 
 
 def test_collect_ai_digest_updates_skips_social_when_official_sources_are_enough():
@@ -358,6 +418,51 @@ def test_collect_ai_digest_does_not_fetch_official_pages_when_streams_fill_the_p
     assert calls == ["official-stream"]
     assert len(items) == 2
     assert meta["official_page_backfill_used"] is False
+
+
+def test_collect_ai_digest_research_pool_continues_to_official_pages_after_streams_fill_target():
+    calls: list[str] = []
+    sources = [
+        AIDigestSource(
+            "official-page",
+            "official",
+            "https://example.com/page",
+            "Page",
+            "html",
+            tier="official_page",
+        ),
+        AIDigestSource(
+            "official-stream",
+            "official",
+            "https://example.com/feed",
+            "Stream",
+            "rss",
+            tier="official_stream",
+        ),
+    ]
+
+    def fake_fetch(source):
+        calls.append(source.name)
+        if source.name == "official-stream":
+            return [_item("stream-1"), _item("stream-2")]
+        return [_item("page-1")]
+
+    items, meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=2,
+        min_official_count=1,
+        allow_social_backfill=False,
+        max_age_days=3,
+        now=datetime(2026, 6, 30, 9, tzinfo=timezone.utc),
+        include_pool_items=True,
+    )
+
+    assert calls == ["official-stream", "official-page"]
+    assert len(items) == 2
+    assert len(meta["_deduped_items"]) == 3
+    assert any(item.title == "page-1" for item in meta["_deduped_items"])
+    assert meta["official_page_backfill_used"] is True
 
 
 def test_collect_ai_digest_fills_requested_candidate_pool_before_stopping_sources():
