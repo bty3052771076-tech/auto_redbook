@@ -1976,6 +1976,23 @@ def _extract_draft_count(page) -> Optional[int]:
     return None
 
 
+def _draft_count_poll_iterations(before_count: Optional[int]) -> int:
+    """Return a bounded count-poll budget; no baseline means no useful poll.
+
+    When the creator center does not expose its draft count, comparing the
+    count can never prove a save.  The old path still slept 30 seconds before
+    falling back to the draft-list/title readback that is required anyway.
+    """
+    if before_count is None:
+        return 0
+    raw = (os.getenv("XHS_DRAFT_COUNT_POLL_S") or "10").strip()
+    try:
+        seconds = int(raw)
+    except ValueError:
+        seconds = 10
+    return max(0, min(30, seconds))
+
+
 def _extract_upload_count(page) -> Optional[int]:
     try:
         loc = page.locator("text=/\\b\\d+\\s*\\/\\s*18\\b/")
@@ -3240,10 +3257,6 @@ def _run_save_draft_sync_unlocked(
                     steps[-1].detail = f"{len(assets)} files via {method}"
                     if not uploaded:
                         raise RuntimeError("file input not found")
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=60000)
-                    except Exception:
-                        pass
                     steps[-1].status = "success"
                     _step("wait_for_upload_complete", "in_progress", "")
                     confirmed = _wait_for_upload_ready(
@@ -3372,7 +3385,7 @@ def _run_save_draft_sync_unlocked(
                 except PlaywrightTimeoutError:
                     pass
                 after_count = before_count
-                for _ in range(30):
+                for _ in range(_draft_count_poll_iterations(before_count)):
                     after_count = _extract_draft_count(page)
                     if (
                         before_count is not None

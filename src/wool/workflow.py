@@ -123,6 +123,7 @@ def create_daily_wool_posts(
     lookback_days: object = None,
     now: datetime | date | None = None,
     progress: WoolProgress | None = None,
+    performance_mode: str | None = None,
 ) -> list[Post]:
     """Create one Daily Wool draft; the publisher is intentionally one post."""
     del asset_paths
@@ -133,7 +134,12 @@ def create_daily_wool_posts(
         max_age_days = 3
     if progress:
         progress("collect", f"in_progress window={max_age_days}d")
-    offers, collect_meta = collect_daily_wool_offers(now=now, max_age_days=max_age_days, progress=progress)
+    offers, collect_meta = collect_daily_wool_offers(
+        now=now,
+        max_age_days=max_age_days,
+        progress=progress,
+        performance_mode=performance_mode,
+    )
     if progress:
         progress("collect", f"success offers={len(offers)}")
     fallback_title, fallback_body = _deterministic_copy(offers, max_age_days=max_age_days)

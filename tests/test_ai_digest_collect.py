@@ -659,6 +659,39 @@ def test_collect_ai_digest_uses_aggregator_before_social_and_stops_when_pool_is_
     assert meta["social_backfill_used"] is False
 
 
+def test_collect_ai_digest_can_force_social_backfill_for_short_lived_benefits(monkeypatch):
+    monkeypatch.setenv("AI_DIGEST_SEARCH_BACKFILL", "0")
+    calls: list[str] = []
+    sources = [
+        AIDigestSource("official", "official", "https://example.com/rss", "Official", "rss"),
+        AIDigestSource("aihot", "aggregator", "https://aihot.example/daily", "AI HOT", "aihot_daily"),
+        AIDigestSource("x-tibo", "social", "https://x.example/tibo", "Tibo", "social_html"),
+    ]
+
+    def fake_fetch(source):
+        calls.append(source.name)
+        if source.kind == "official":
+            return [_item("official-1")]
+        if source.kind == "aggregator":
+            return [_item(f"aggregator-{i}", "aggregator") for i in range(7)]
+        return [_item("Codex reset free quota", "social")]
+
+    _items, meta = collect_ai_digest_updates(
+        sources=sources,
+        fetch_source=fake_fetch,
+        target_count=8,
+        min_official_count=6,
+        allow_social_backfill=True,
+        force_social_backfill=True,
+        max_age_days=3,
+        now=datetime(2026, 6, 30, 9, tzinfo=timezone.utc),
+    )
+
+    assert calls == ["official", "aihot", "x-tibo"]
+    assert meta["social_backfill_used"] is True
+    assert meta["social_backfill_forced"] is True
+
+
 def test_collect_ai_digest_updates_uses_aggregators_before_search_and_social(monkeypatch):
     calls: list[str] = []
     sources = [

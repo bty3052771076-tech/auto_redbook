@@ -12,6 +12,7 @@ __pycache__/
 data/
 logs/
 exports/
+.agents/
 AGENT.md
 CODING_PROGRESS.md
 

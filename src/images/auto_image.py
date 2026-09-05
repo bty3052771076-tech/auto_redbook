@@ -935,6 +935,70 @@ def fetch_and_download_related_images(
             metas.append(meta)
         return paths, metas
 
+    if provider_name in ("minimax", "mini-max", "tokenplan", "token-plan"):
+        from src.images.minimax_images import generate_minimax_image
+
+        if requested_count is None and not (os.getenv("AUTO_IMAGE_COUNT") or "").strip():
+            count = 1
+
+        minimax_timeout_s = float(os.getenv("MINIMAX_IMAGE_TIMEOUT_S") or 180.0)
+        minimax_download_timeout_s = float(os.getenv("MINIMAX_IMAGE_DOWNLOAD_TIMEOUT_S") or 60.0)
+        max_attempts = max(1, int(os.getenv("MINIMAX_IMAGE_MAX_ATTEMPTS") or 1))
+        retry_sleep_s = float(os.getenv("MINIMAX_IMAGE_RETRY_SLEEP_S") or 2.0)
+        prompt = _build_aliyun_image_prompt(
+            title=title, body=body, topics=topics, prompt_hint=prompt_hint
+        )
+        if len(prompt) > 1500:
+            raise ValueError(
+                "MiniMax image prompt exceeds 1500 characters after grounding; "
+                "shorten the image intent instead of truncating facts."
+            )
+        post_id = dest_dir.parent.name if dest_dir.name == "assets" else dest_dir.name
+        paths: list[Path] = []
+        metas: list[dict[str, Any]] = []
+        for _ in range(count):
+            errors: list[str] = []
+            result = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    result = generate_minimax_image(
+                        post_id=post_id,
+                        prompt=prompt,
+                        dest_dir=dest_dir,
+                        timeout_s=minimax_timeout_s,
+                        download_timeout_s=minimax_download_timeout_s,
+                    )
+                    break
+                except Exception as exc:
+                    errors.append(str(exc))
+                    message = str(exc).lower()
+                    permanent = any(
+                        marker in message
+                        for marker in ("api_key missing", "401", "403", "invalid prompt", "1500", "insufficient")
+                    )
+                    if permanent or attempt >= max_attempts:
+                        if permanent:
+                            raise
+                        raise ImageGenerationAbandoned(
+                            provider="minimax", attempts=attempt, errors=errors[-3:]
+                        ) from exc
+                    time.sleep(max(0.0, retry_sleep_s))
+            if result is None:
+                raise ImageGenerationAbandoned(
+                    provider="minimax", attempts=max_attempts, errors=errors[-3:]
+                )
+            paths.append(result.path)
+            metas.append(
+                {
+                    **result.meta,
+                    "query_original": query_original,
+                    "attempt": len(errors) + 1,
+                    "attempt_max": max_attempts,
+                    "attempt_errors": errors[-3:],
+                }
+            )
+        return paths, metas
+
     query_used = query_original
     if provider_name == "pexels":
         hint = _pexels_query_hint(query_original)
@@ -961,7 +1025,7 @@ def fetch_and_download_related_images(
                 )
             else:
                 raise RuntimeError(
-                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels, aliyun, volcengine, siliconflow"
+                    f"unsupported IMAGE_PROVIDER={provider_name!r}; supported: pexels, aliyun, volcengine, siliconflow, minimax"
                 )
         except Exception as exc:
             last_err = str(exc)

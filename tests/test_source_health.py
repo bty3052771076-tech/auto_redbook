@@ -151,3 +151,29 @@ def test_source_health_does_not_replace_before_minimum_sample_count():
     )
 
     assert should_replace_source(attempt, min_samples=5, timeout_ratio=0.6) is False
+
+
+def test_source_health_replaces_mixed_failure_statuses_at_threshold():
+    attempt = SourceAttempt(
+        collection="daily_news",
+        source_name="unstable-api",
+        source_url="https://example.com/news",
+        tier="keyed_api",
+        status="error",
+        checked_at="2026-08-23T00:00:00Z",
+        recent_statuses=("error", "http_error", "success", "success", "success"),
+    )
+
+    assert should_replace_source(attempt, min_samples=5, timeout_ratio=0.6) is False
+
+    attempt = SourceAttempt(
+        collection="daily_news",
+        source_name="unstable-api",
+        source_url="https://example.com/news",
+        tier="keyed_api",
+        status="error",
+        checked_at="2026-08-23T00:00:00Z",
+        recent_statuses=("error", "http_error", "empty", "transport_error", "success"),
+    )
+
+    assert should_replace_source(attempt, min_samples=5, timeout_ratio=0.6) is True

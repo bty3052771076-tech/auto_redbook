@@ -105,6 +105,21 @@ _BENEFIT_DETAIL_MARKERS = (
 )
 
 
+def _has_concrete_reset_benefit(text: str) -> bool:
+    lowered = (text or "").lower()
+    english_signal = (
+        "banked reset" in lowered
+        and "credit" in lowered
+        and any(marker in lowered for marker in ("redeem", "apply", "paid chatgpt", "eligible"))
+    )
+    chinese_signal = (
+        "银行重置" in lowered
+        and "符合条件" in lowered
+        and any(marker in lowered for marker in ("账户", "自行使用", "到账"))
+    )
+    return english_signal or chinese_signal
+
+
 def _normalized_benefit_amounts(text: str) -> tuple[str, ...]:
     values: set[str] = set()
     for match in re.finditer(
@@ -185,7 +200,14 @@ def _has_concrete_benefit_evidence(text: str) -> bool:
     has_detail = any(_contains_marker(lowered, marker) for marker in _BENEFIT_DETAIL_MARKERS)
     has_amount = bool(_BENEFIT_AMOUNT_RE.search(lowered))
     has_window = any(marker in lowered for marker in ("截止", "有效期", "expires", "valid until", "本周", "周末"))
-    return has_action and has_detail and (has_amount or has_window or "免费额度" in lowered or "free quota" in lowered)
+    if _has_concrete_reset_benefit(lowered):
+        return True
+    return has_action and has_detail and (
+        has_amount
+        or has_window
+        or "免费额度" in lowered
+        or "free quota" in lowered
+    )
 
 
 def _evidence_tag(source_type: str) -> str:
@@ -342,6 +364,7 @@ def collect_daily_wool_offers(
     sources=None,
     fetch_source=None,
     progress: WoolProgress | None = None,
+    performance_mode: str | None = None,
 ) -> tuple[list[WoolOffer], dict[str, Any]]:
     if progress:
         progress("collect", f"in_progress window={max_age_days}d")
@@ -355,7 +378,11 @@ def collect_daily_wool_offers(
         now=now,
         include_pool_items=True,
         force_search_backfill=True,
+        # Wool signals are often short-lived announcements on official social
+        # accounts. A full generic candidate pool must not suppress this tier.
+        force_social_backfill=True,
         search_backfill_queries=WOOL_SEARCH_QUERIES,
+        performance_mode=performance_mode,
         progress=(lambda stage, detail: progress(stage, detail)) if progress else None,
     )
     offers = extract_wool_offers(updates, now=now, max_age_days=max_age_days)

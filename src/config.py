@@ -13,6 +13,11 @@ class LLMConfig:
     api_key: str
     base_url: Optional[str] = None
     provider: str = "custom"
+    # Billing provenance is intentionally separate from provider identity.
+    # A MiniMax Token Plan key is not a free-tier key and may share a pool
+    # with purchased credits after the subscription allowance is exhausted.
+    cost_class: str = "free"
+    account_scope: str = ""
 
 
 DEFAULT_LLM_BASE_URL = "https://api.ppinfra.com/openai"
@@ -20,6 +25,21 @@ DEFAULT_LLM_MODEL = "deepseek/deepseek-v3-0324"
 DEFAULT_ALIYUN_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_VOLCENGINE_LLM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_SILICONFLOW_LLM_BASE_URL = "https://api.siliconflow.cn/v1"
+DEFAULT_MINIMAX_LLM_BASE_URL = "https://api.minimax.cn/v1"
+DEFAULT_MINIMAX_QUOTA_URL = "https://www.minimaxi.com/v1/token_plan/remains"
+MINIMAX_LLM_MODELS = [
+    "MiniMax-M3",
+    "MiniMax-M2.7",
+    "MiniMax-M2.7-highspeed",
+    "MiniMax-M2.5",
+    "MiniMax-M2.5-highspeed",
+    "MiniMax-M2.1",
+    "MiniMax-M2.1-highspeed",
+    "MiniMax-M2",
+]
+DEFAULT_MINIMAX_LLM_MODEL = MINIMAX_LLM_MODELS[0]
+MINIMAX_IMAGE_MODELS = ["image-01", "image-01-live"]
+DEFAULT_MINIMAX_IMAGE_MODEL = MINIMAX_IMAGE_MODELS[0]
 ALIYUN_FREE_LLM_MODELS = [
     "qwen3.7-plus",
     "deepseek-v4-flash",
@@ -325,6 +345,62 @@ def _load_siliconflow_llm_configs(*, include_default_model: bool = True) -> list
     ]
 
 
+def _load_minimax_llm_configs(*, include_default_model: bool = True) -> list[LLMConfig]:
+    """Load only the MiniMax Token Plan subscription credential.
+
+    A normal pay-as-you-go key is intentionally not accepted through this
+    path.  The provider must be opted in explicitly so free-first auto mode
+    never silently spends a subscription/credit pool.
+    """
+    env_key = os.getenv("MINIMAX_TOKEN_PLAN_API_KEY") or ""
+    env_base = os.getenv("MINIMAX_BASE_URL") or os.getenv("MINIMAX_LLM_BASE_URL")
+    env_model = os.getenv("MINIMAX_LLM_MODEL")
+    env_models = os.getenv("MINIMAX_LLM_MODELS")
+    file_cfg = _parse_llm_key_file(Path("docs/minimax_api-key.md"))
+
+    api_key = (env_key or file_cfg.get("api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "MiniMax Token Plan api_key missing: set MINIMAX_TOKEN_PLAN_API_KEY "
+            "or create local docs/minimax_api-key.md (api_key=...)."
+        )
+    billing_mode = (
+        os.getenv("MINIMAX_BILLING_MODE")
+        or file_cfg.get("billing_mode")
+        or "subscription_only"
+    ).strip().lower()
+    if billing_mode not in {"subscription_only", "subscription"}:
+        raise RuntimeError(
+            "MiniMax requires MINIMAX_BILLING_MODE=subscription_only; "
+            "paygo is not accepted by the subscription provider adapter."
+        )
+    if _env_enabled("MINIMAX_ALLOW_PAID_CREDITS") or _env_enabled("MINIMAX_ALLOW_PAYGO"):
+        raise RuntimeError(
+            "MiniMax paid credits/paygo are disabled by policy; unset "
+            "MINIMAX_ALLOW_PAID_CREDITS and MINIMAX_ALLOW_PAYGO."
+        )
+
+    file_base = (file_cfg.get("base_url") or "").strip()
+    base_url = (env_base or file_base or DEFAULT_MINIMAX_LLM_BASE_URL).strip().rstrip("/")
+    models = _split_models(env_models or "")
+    if not models:
+        models = [
+            (env_model or DEFAULT_MINIMAX_LLM_MODEL).strip()
+        ] if include_default_model or env_model else []
+    return [
+        LLMConfig(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            provider="minimax",
+            cost_class="subscription_included",
+            account_scope="token_plan",
+        )
+        for model in models
+        if model
+    ]
+
+
 def _normalize_llm_provider(value: str) -> str:
     raw = (value or "").strip().lower()
     if not raw:
@@ -343,12 +419,16 @@ def _normalize_llm_provider(value: str) -> str:
         "siliconflow": "siliconflow",
         "silicon": "siliconflow",
         "sf": "siliconflow",
+        "minimax": "minimax",
+        "mini-max": "minimax",
+        "tokenplan": "minimax",
+        "token-plan": "minimax",
         "default": "auto",
     }
     raw = aliases.get(raw, raw)
-    if raw not in {"auto", "aliyun", "volcengine", "siliconflow", "ppinfra"}:
+    if raw not in {"auto", "aliyun", "volcengine", "siliconflow", "minimax", "ppinfra"}:
         raise RuntimeError(
-            f"Unsupported LLM_PROVIDER={value!r}; supported: auto, aliyun, volcengine, siliconflow, ppinfra"
+            f"Unsupported LLM_PROVIDER={value!r}; supported: auto, aliyun, volcengine, siliconflow, minimax, ppinfra"
         )
     return raw
 
@@ -377,6 +457,17 @@ def load_llm_configs(
     if provider in ("auto", "siliconflow"):
         configs.extend(_load_siliconflow_llm_configs(include_default_model=provider != "auto"))
 
+    # Subscription resources are opt-in in auto mode.  A key alone must not
+    # turn a paid/shared pool into the free-first route.  An enabled but empty
+    # local slot is ignored in auto mode so existing free providers continue
+    # to work until the user fills the key.
+    if provider == "minimax":
+        configs.extend(_load_minimax_llm_configs(include_default_model=True))
+    elif provider == "auto" and _env_enabled("MINIMAX_USE_SUBSCRIPTION"):
+        minimax_file_cfg = _parse_llm_key_file(Path("docs/minimax_api-key.md"))
+        if (os.getenv("MINIMAX_TOKEN_PLAN_API_KEY") or minimax_file_cfg.get("api_key") or "").strip():
+            configs.extend(_load_minimax_llm_configs(include_default_model=False))
+
     if provider == "ppinfra" or allow_paid_fallback:
         fallback_cfg = _load_fallback_llm_config(llm_file=llm_file)
         if fallback_cfg:
@@ -394,12 +485,14 @@ def load_llm_configs(
             raise RuntimeError(
                 "No Aliyun, Volcengine, or SiliconFlow LLM configuration is available in free-first auto mode. "
                 "Configure ALIYUN_LLM_API_KEY, VOLCENGINE_API_KEY, or SILICONFLOW_API_KEY; "
+                "use LLM_PROVIDER=minimax only for an explicitly authorized Token Plan subscription; "
                 "explicitly set LLM_PROVIDER=ppinfra, "
                 "or set ALLOW_PAID_LLM_FALLBACK=1 to opt in to PPInfra after both platforms fail."
             )
         raise RuntimeError(
             "LLM api_key missing: set ALIYUN_LLM_API_KEY (or ALIYUN_IMAGE_API_KEY/DASHSCOPE_API_KEY), "
-            "VOLCENGINE_API_KEY/ARK_API_KEY, or SILICONFLOW_API_KEY; "
+            "VOLCENGINE_API_KEY/ARK_API_KEY, SILICONFLOW_API_KEY, or "
+            "MINIMAX_TOKEN_PLAN_API_KEY; "
             "or set LLM_API_KEY / docs/llm_api-key.md "
             "(see README.md for configuration examples)"
         )

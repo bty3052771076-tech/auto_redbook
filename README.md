@@ -9,7 +9,7 @@ Auto Redbook 是一个运行在 Windows 本地的中文内容生产与草稿分�
 - 材料发帖：支持单条/多条文件，也支持 GUI 直接粘贴文字；材料模式需要材料时间，但不套用在线新闻的日期窗口。
 - 多平台草稿：支持小红书、今日头条或两个平台；保存后会回到创作者中心进行标题、正文和图片读回验证。
 - 已发布数据：全量同步浏览、点赞、评论、收藏等指标，并生成后续选题分析。
-- 免费额度：读取 Aliyun 百炼、Volcengine Ark 和 SiliconFlow 的官方控制台或模型列表信息，在 GUI 中搜索、排序和选择模型。
+- 模型额度：读取 Aliyun 百炼、Volcengine Ark、SiliconFlow 的免费额度，以及 MiniMax Token Plan 的订阅共享额度，在 GUI 中搜索、排序和选择模型。
 - 配图策略：普通新闻优先 AI 生图，失败时可以回退 Pexels；每日 AI 讯息使用本地简报卡片渲染。
 
 ## 快速开始
@@ -56,6 +56,25 @@ SiliconFlow：
     $env:SILICONFLOW_LLM_MODEL="deepseek-ai/DeepSeek-V3"
     $env:SILICONFLOW_IMAGE_MODEL="Kwai-Kolors/Kolors"
 
+MiniMax Token Plan（订阅额度，不等同于免费额度）：
+
+    $env:LLM_PROVIDER="minimax"
+    $env:IMAGE_PROVIDER="minimax"
+    $env:MINIMAX_TOKEN_PLAN_API_KEY="YOUR_MINIMAX_TOKEN_PLAN_API_KEY"
+    $env:MINIMAX_LLM_MODEL="MiniMax-M3"
+    $env:MINIMAX_IMAGE_MODEL="image-01"
+    $env:MINIMAX_BILLING_MODE="subscription_only"
+    $env:MINIMAX_ALLOW_PAID_CREDITS="0"
+    $env:MINIMAX_ALLOW_PAYGO="0"
+
+MiniMax 也可以在 GUI 的配置页面填写 `MINIMAX_TOKEN_PLAN_API_KEY`，或写入项目根目录本地的 `.env.gui`。不要把真实 key 写入 README、命令历史、截图或 Git 已跟踪文件。`minimax-quota` 只读取模型目录和共享订阅额度，不会通过试调用探测额度；平台侧是否会在订阅用尽后转扣已购积分，仍需在账户侧确认。
+
+直接运行 CLI 时，请在当前 PowerShell 会话设置同名环境变量，或创建仅本地使用的 `docs/minimax_api-key.md`：
+
+    api_key=YOUR_MINIMAX_TOKEN_PLAN_API_KEY
+
+`.env.gui` 由 GUI 读取并传给 CLI 子进程，不是 CLI 的隐式配置来源；以上两个位置都已被 `.gitignore` 忽略。
+
 建议始终开启费用保护：
 
     $env:ALLOW_PAID_LLM_FALLBACK="0"
@@ -82,6 +101,7 @@ auto 模式只选择最新额度快照中已验证、未过期且剩余额度为
     .\.venv\Scripts\python.exe -m apps.cli aliyun-quota --all-free --login-hold 600 --wait-timeout 120
     .\.venv\Scripts\python.exe -m apps.cli volcengine-quota --all-free --login-hold 600 --wait-timeout 120
     .\.venv\Scripts\python.exe -m apps.cli siliconflow-quota --all-free --login-hold 600 --wait-timeout 120
+    .\.venv\Scripts\python.exe -m apps.cli minimax-quota --save-raw
 
 同步完成后，可以用无窗口方式读取已有登录态：
 
@@ -149,3 +169,15 @@ auto 模式只选择最新额度快照中已验证、未过期且剩余额度为
 ## License
 
 本仓库主要用于个人本地自动化和工程案例研究。使用第三方平台、模型和新闻内容时，请遵守对应平台的服务条款、版权要求和当地法律法规。
+## Speed-first mode
+
+The default scheduler is `balanced`. Use `--performance-mode speed` when shorter wall time is more important than the widest discovery pass:
+
+```powershell
+.\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --keywords "AI模型发布" --count 10 --performance-mode speed --headless --no-preflight --login-hold 0 --wait-timeout 600
+.\.venv\Scripts\python.exe -m apps.cli auto --title "每日AI讯息" --count 1 --performance-mode speed --headless --no-preflight --login-hold 0 --wait-timeout 600
+```
+
+Speed mode uses a bounded completion-first coordinator and parallel AI search discovery. LLM and image generation remain in separate queues: MiniMax LLM uses up to five workers when the run is explicitly locked to MiniMax, other LLM providers use up to two, and image generation uses up to two. Xiaohongshu upload remains serial. It does not bypass freshness, deduplication, source-quality, image-quality, subscription-only, or remote readback checks.
+
+The mode is also available as `运行模式` in the GUI automatic-posting page. Use `balanced` when source coverage is more important than latency. Runtime events are stored under `data/runs/<run_id>/events.jsonl`; sensitive key names and values are excluded from telemetry.

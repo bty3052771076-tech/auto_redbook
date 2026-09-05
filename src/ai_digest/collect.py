@@ -19,6 +19,7 @@ from .fetchers import (
     _strip_html,
     parse_aihot_daily_html,
     parse_benefit_html,
+    parse_codex_reset_html,
     parse_github_releases_json,
     parse_official_html,
     parse_rss_feed,
@@ -44,6 +45,9 @@ from src.sources.health import (
     save_source_health_snapshot,
     should_replace_source,
 )
+from src.workflow.performance import PerformancePolicy
+from src.sources.request_budget import RequestBudget
+from src.ai_digest.search_plan import build_search_plan
 
 
 FetchSource = Callable[[AIDigestSource], list[AIUpdateItem]]
@@ -345,6 +349,8 @@ def fetch_ai_digest_source(
         items = parse_x_profile_html(text, source_name=source.vendor, vendor=source.vendor)
     elif source.parser == "wool_html":
         items = parse_benefit_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
+    elif source.parser == "codex_reset":
+        items = parse_codex_reset_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
     elif source.parser == "html":
         items = parse_official_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
         if source.name == "anthropic":
@@ -757,29 +763,43 @@ def fetch_ai_digest_search_backfill(
     max_records: int | None = None,
     timeout_s: float | None = None,
     progress: ProgressCallback | None = None,
+    performance_mode: str | None = None,
 ) -> tuple[list[AIUpdateItem], dict]:
     from src.news.daily_news import fetch_daily_news_candidates, filter_recent_news_items
 
-    query_list = queries or _search_backfill_queries()
+    policy = (
+        PerformancePolicy.from_value(performance_mode)
+        if performance_mode is not None
+        else PerformancePolicy.from_environment()
+    )
+    search_plan = build_search_plan(
+        list(queries or _search_backfill_queries()),
+        performance_mode=policy.mode,
+    )
+    query_list = list(search_plan.queries)
     record_limit = max_records or _search_backfill_max_records()
     request_timeout_s = timeout_s if timeout_s is not None else _search_backfill_timeout_s()
+    request_budget = RequestBudget(
+        max_in_flight=search_plan.max_concurrency
+    )
     fetched = []
     errors: list[str] = []
     per_query: list[dict] = []
-    for query in query_list:
+    def fetch_one(query: str) -> tuple[str, list[AIUpdateItem], dict, str | None]:
         try:
             _emit_progress(
                 progress,
                 "search_backfill_query",
                 f"in_progress query={query[:60]} max_records={record_limit} window={max_age_days or 3}d",
             )
-            candidates, meta = fetch_daily_news_candidates(
-                query,
-                max_records=record_limit,
-                search_days=max_age_days or 3,
-                timeout_s=request_timeout_s,
-                expand_query_variants=False,
-            )
+            with request_budget.slot(timeout=request_timeout_s):
+                candidates, meta = fetch_daily_news_candidates(
+                    query,
+                    max_records=record_limit,
+                    search_days=max_age_days or 3,
+                    timeout_s=request_timeout_s,
+                    expand_query_variants=False,
+                )
             recent, date_meta = filter_recent_news_items(
                 list(candidates),
                 tz_name=str((meta or {}).get("tz") or os.getenv("NEWS_TZ") or "Asia/Shanghai"),
@@ -791,24 +811,37 @@ def fetch_ai_digest_search_backfill(
                 for item in recent
                 if str(getattr(item, "title", "") or "").strip() and str(getattr(item, "url", "") or "").strip()
             ]
-            fetched.extend(converted)
-            per_query.append(
-                {
-                    "query": query,
-                    "raw_count": len(candidates),
-                    "recent_count": len(recent),
-                    "converted_count": len(converted),
-                    "date_window": date_meta,
-                }
-            )
+            row = {
+                "query": query,
+                "raw_count": len(candidates),
+                "recent_count": len(recent),
+                "converted_count": len(converted),
+                "date_window": date_meta,
+            }
             _emit_progress(
                 progress,
                 "search_backfill_query",
                 f"success query={query[:60]} raw={len(candidates)} recent={len(recent)} converted={len(converted)}",
             )
+            return query, converted, row, None
         except Exception as exc:
-            errors.append(f"{query}: {exc}")
             _emit_progress(progress, "search_backfill_query", f"failed query={query[:60]} error={exc}")
+            return query, [], {}, str(exc)
+
+    if policy.is_speed_first and len(query_list) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(search_plan.max_concurrency, len(query_list)),
+            thread_name_prefix="ai-search-backfill",
+        ) as executor:
+            results = list(executor.map(fetch_one, query_list))
+    else:
+        results = [fetch_one(query) for query in query_list]
+    for query, converted, row, error in results:
+        fetched.extend(converted)
+        if row:
+            per_query.append(row)
+        if error:
+            errors.append(f"{query}: {error}")
     return fetched, {"queries": per_query, "errors": errors}
 
 
@@ -847,6 +880,7 @@ def collect_ai_digest_updates(
     include_pool_items: bool = False,
     force_search_backfill: bool = False,
     force_aggregator_backfill: bool = False,
+    force_social_backfill: bool = False,
     progress: ProgressCallback | None = None,
     source_health_path: str | Path | None = None,
     source_cooldown_seconds: int | None = None,
@@ -855,8 +889,14 @@ def collect_ai_digest_updates(
     batch_timeout_s: float | None = None,
     exclude_history_keys: set[str] | None = None,
     search_backfill_queries: list[str] | None = None,
+    performance_mode: str | None = None,
 ) -> tuple[list[AIUpdateItem], dict]:
     resolved = sources if sources is not None else resolve_ai_digest_sources()
+    performance_policy = (
+        PerformancePolicy.from_value(performance_mode)
+        if performance_mode is not None
+        else PerformancePolicy.from_environment()
+    )
     source_timeout_s = _env_float("AI_DIGEST_SOURCE_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
     cooldown_seconds = (
         _env_int("AI_DIGEST_SOURCE_COOLDOWN_S", 300, min_value=0, max_value=3600)
@@ -1200,6 +1240,7 @@ def collect_ai_digest_updates(
             now=now,
             queries=search_backfill_queries,
             progress=progress,
+            performance_mode=performance_policy.mode,
         )
         fetched.extend(_exclude_history_items(extra, "search_backfill"))
         errors.extend(search_backfill_meta.get("errors") or [])
@@ -1234,12 +1275,15 @@ def collect_ai_digest_updates(
     if (
         allow_social_backfill
         and social_sources
-        and _needs_search_backfill(
-            ranked,
-            target_count=target_count,
-            min_domestic_model_count=min_domestic_model_count,
-            min_foreign_ai_count=min_foreign_ai_count,
-            require_target_count=include_pool_items,
+        and (
+            force_social_backfill
+            or _needs_search_backfill(
+                ranked,
+                target_count=target_count,
+                min_domestic_model_count=min_domestic_model_count,
+                min_foreign_ai_count=min_foreign_ai_count,
+                require_target_count=include_pool_items,
+            )
         )
     ):
         social_backfill_used = True
@@ -1311,6 +1355,7 @@ def collect_ai_digest_updates(
         "search_backfill_used": search_backfill_used,
         "aggregator_backfill_used": aggregator_backfill_used,
         "aggregator_backfill_forced": bool(force_aggregator_backfill),
+        "social_backfill_forced": bool(force_social_backfill),
         "detail_source_resolution": detail_source_resolution,
         "search_backfill": search_backfill_meta,
         "quota_counts": ai_digest_quota_counts(ranked),

@@ -13,6 +13,7 @@ from src.ai_digest.models import AIUpdateItem
 from src.ai_digest.fetchers import (
     parse_aihot_daily_html,
     parse_github_releases_json,
+    parse_codex_reset_html,
     parse_official_html,
     parse_rss_feed,
     parse_social_search_html,

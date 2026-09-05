@@ -33,6 +33,11 @@ from src.siliconflow.quota import (
     format_siliconflow_quota_records,
     run_collect_siliconflow_quota_sync,
 )
+from src.minimax.quota import (
+    MINIMAX_TOKEN_PLAN_REMAINS_URL,
+    format_minimax_quota_records,
+    run_collect_minimax_quota_sync,
+)
 from src.analytics.post_sync import sync_published_metrics_to_posts
 from src.analytics.published_metrics import analyze_published_metrics, render_published_metrics_analysis
 from src.ai_digest.collect import collect_ai_digest_updates
@@ -81,6 +86,7 @@ from src.workflow.pipeline import (
     load_quota_records,
 )
 from src.workflow.quality_gate import validate_post_batch
+from src.workflow.performance import PerformancePolicy, RunContext
 from src.workflow.vision_review import (
     VisionReviewResult,
     configured_vision_review_model,
@@ -181,7 +187,16 @@ def _configured_free_provider_keys() -> dict[str, bool]:
         or (os.getenv("SF_API_KEY") or "").strip()
         or _key_file_has_api_key(Path("docs") / "siliconflow_api-key.md")
     )
-    return {"aliyun": aliyun, "volcengine": volcengine, "siliconflow": siliconflow}
+    minimax = bool(
+        (os.getenv("MINIMAX_TOKEN_PLAN_API_KEY") or "").strip()
+        or _key_file_has_api_key(Path("docs") / "minimax_api-key.md")
+    )
+    return {
+        "aliyun": aliyun,
+        "volcengine": volcengine,
+        "siliconflow": siliconflow,
+        "minimax": minimax,
+    }
 
 
 def _refresh_metrics_for_preflight(
@@ -270,6 +285,10 @@ def _refresh_quotas_for_preflight(
                 progress_callback=_progress,
             ),
         ),
+        (
+            "minimax",
+            lambda: run_collect_minimax_quota_sync(progress_callback=_progress),
+        ),
     )
     enabled = {str(provider or "").strip().lower() for provider in providers}
     for provider, collect in collectors:
@@ -313,10 +332,13 @@ def _selected_model_from_environment(kind: str, provider: str) -> str:
                 or os.getenv("SF_LLM_MODEL")
                 or ""
             ).strip()
+        if provider_name == "minimax":
+            return (os.getenv("MINIMAX_LLM_MODEL") or "").strip()
         candidates = [
             (os.getenv("ALIYUN_LLM_MODEL") or "").strip(),
             (os.getenv("VOLCENGINE_LLM_MODEL") or os.getenv("ARK_LLM_MODEL") or "").strip(),
             (os.getenv("SILICONFLOW_LLM_MODEL") or os.getenv("SF_LLM_MODEL") or "").strip(),
+            (os.getenv("MINIMAX_LLM_MODEL") or "").strip(),
         ]
     else:
         if provider_name == "aliyun":
@@ -333,10 +355,13 @@ def _selected_model_from_environment(kind: str, provider: str) -> str:
                 or os.getenv("SF_IMAGE_MODEL")
                 or ""
             ).strip()
+        if provider_name == "minimax":
+            return (os.getenv("MINIMAX_IMAGE_MODEL") or "").strip()
         candidates = [
             (os.getenv("ALIYUN_IMAGE_MODEL") or "").strip(),
             (os.getenv("VOLCENGINE_IMAGE_MODEL") or os.getenv("ARK_IMAGE_MODEL") or "").strip(),
             (os.getenv("SILICONFLOW_IMAGE_MODEL") or os.getenv("SF_IMAGE_MODEL") or "").strip(),
+            (os.getenv("MINIMAX_IMAGE_MODEL") or "").strip(),
         ]
     selected = [model for model in candidates if model]
     return selected[0] if len(selected) == 1 else ""
@@ -354,6 +379,10 @@ def _explicit_quota_providers() -> set[str]:
         "siliconflow": "siliconflow",
         "silicon": "siliconflow",
         "sf": "siliconflow",
+        "minimax": "minimax",
+        "mini-max": "minimax",
+        "tokenplan": "minimax",
+        "token-plan": "minimax",
     }
     values = (
         os.getenv("LLM_PROVIDER"),
@@ -371,6 +400,7 @@ def _prepare_auto_pipeline(
     metrics_max_age_hours: float,
     quota_max_age_hours: float,
     require_image: bool,
+    refresh_quotas: bool = True,
     metrics_path: Path = Path("data") / "analytics" / "published_metrics_latest.csv",
     quota_dir: Path = Path("data") / "quota",
     provider_keys: Mapping[str, bool] | None = None,
@@ -416,8 +446,17 @@ def _prepare_auto_pipeline(
                 )
 
     key_states = dict(provider_keys or _configured_free_provider_keys())
+    subscription_requested = (
+        (os.getenv("LLM_PROVIDER") or "").strip().lower() in {"minimax", "mini-max", "tokenplan", "token-plan"}
+        or (os.getenv("IMAGE_PROVIDER") or "").strip().lower() in {"minimax", "mini-max", "tokenplan", "token-plan"}
+        or (os.getenv("MINIMAX_USE_SUBSCRIPTION") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     configured_providers = [
-        provider for provider in ("aliyun", "volcengine", "siliconflow") if key_states.get(provider, False)
+        provider
+        for provider in ("aliyun", "volcengine", "siliconflow", "minimax")
+        if key_states.get(provider, False)
+        and (provider != "minimax" or subscription_requested)
     ]
     explicit_providers = _explicit_quota_providers()
     if explicit_providers:
@@ -437,7 +476,15 @@ def _prepare_auto_pipeline(
     quota_refresh_needed = not configured_providers or any(
         snapshot is None or not snapshot.fresh for snapshot in fresh_states
     )
-    if quota_refresh_needed:
+    if quota_refresh_needed and not refresh_quotas:
+        quota_mode = "snapshot_only"
+        _emit_progress_event(
+            "auto",
+            "同步免费额度",
+            "success",
+            "已按请求跳过同步，仅使用现有额度快照",
+        )
+    elif quota_refresh_needed:
         quota_refresh_timeout = wait_timeout
         if headless:
             try:
@@ -452,7 +499,13 @@ def _prepare_auto_pipeline(
             )
         refresh_providers = tuple(configured_providers or ("aliyun", "volcengine", "siliconflow"))
         provider_label = " + ".join(
-            "阿里云" if provider == "aliyun" else "火山引擎" if provider == "volcengine" else "硅基流动"
+            "阿里云"
+            if provider == "aliyun"
+            else "火山引擎"
+            if provider == "volcengine"
+            else "硅基流动"
+            if provider == "siliconflow"
+            else "MiniMax Token Plan"
             for provider in refresh_providers
         )
         _emit_progress_event(
@@ -476,6 +529,7 @@ def _prepare_auto_pipeline(
 
     records, rejected = load_quota_records(
         quota_dir=quota_dir,
+        providers=tuple(configured_providers or ("aliyun", "volcengine", "siliconflow", "minimax")),
         now=current,
         max_age=quota_max_age,
         provider_keys=key_states,
@@ -487,6 +541,7 @@ def _prepare_auto_pipeline(
         # keep any provider records that the fresh pass rejected as stale.
         stale_records, stale_rejected = load_quota_records(
             quota_dir=quota_dir,
+            providers=tuple(configured_providers or ("aliyun", "volcengine", "siliconflow", "minimax")),
             now=current,
             max_age=timedelta(hours=max(24.0, quota_max_age_hours * 4)),
             provider_keys=key_states,
@@ -520,13 +575,13 @@ def _prepare_auto_pipeline(
     requested_llm_provider = (os.getenv("LLM_PROVIDER") or "auto").strip().lower()
     requested_image_provider = (os.getenv("IMAGE_PROVIDER") or "auto").strip().lower()
     plan_records = records
-    if requested_llm_provider in {"aliyun", "volcengine", "siliconflow"}:
+    if requested_llm_provider in {"aliyun", "volcengine", "siliconflow", "minimax"}:
         plan_records = [
             record
             for record in plan_records
             if record.kind != "llm" or record.provider == requested_llm_provider
         ]
-    if requested_image_provider in {"aliyun", "volcengine", "siliconflow"}:
+    if requested_image_provider in {"aliyun", "volcengine", "siliconflow", "minimax"}:
         plan_records = [
             record
             for record in plan_records
@@ -541,6 +596,10 @@ def _prepare_auto_pipeline(
         require_image=require_image,
         rejected=rejected,
         allow_paid_fallback=(os.getenv("ALLOW_PAID_LLM_FALLBACK") or "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        allow_subscription=requested_llm_provider == "minimax"
+        or requested_image_provider == "minimax"
+        or (os.getenv("MINIMAX_USE_SUBSCRIPTION") or "").strip().lower()
         in {"1", "true", "yes", "on"},
     )
     _emit_progress_event(
@@ -1264,7 +1323,12 @@ def _record_generation_run(
     errors: list[str],
 ) -> None:
     llm_provider = _env_first("LLM_PROVIDER") or "auto"
-    if llm_provider in {"volcengine", "ark"}:
+    if llm_provider in {"minimax", "mini-max", "tokenplan", "token-plan"}:
+        llm_models = _env_first(
+            "MINIMAX_LLM_MODELS",
+            "MINIMAX_LLM_MODEL",
+        )
+    elif llm_provider in {"volcengine", "ark"}:
         llm_models = _env_first(
             "VOLCENGINE_LLM_MODELS",
             "VOLCENGINE_LLM_MODEL",
@@ -1285,7 +1349,12 @@ def _record_generation_run(
             "LLM_MODEL",
         )
     image_provider = _env_first("IMAGE_PROVIDER") or "local/auto"
-    if image_provider in {"volcengine", "ark", "doubao", "seedream"}:
+    if image_provider in {"minimax", "mini-max", "tokenplan", "token-plan"}:
+        image_models = _env_first(
+            "MINIMAX_IMAGE_MODELS",
+            "MINIMAX_IMAGE_MODEL",
+        )
+    elif image_provider in {"volcengine", "ark", "doubao", "seedream"}:
         image_models = _env_first(
             "VOLCENGINE_IMAGE_MODELS",
             "VOLCENGINE_IMAGE_MODEL",
@@ -2043,6 +2112,16 @@ def auto(
         "--preflight/--no-preflight",
         help="check published metrics and free model quotas before generation",
     ),
+    performance_mode: str = typer.Option(
+        "balanced",
+        "--performance-mode",
+        help="workflow scheduler: balanced (default) or speed",
+    ),
+    refresh_quotas: bool = typer.Option(
+        True,
+        "--refresh-quotas/--no-refresh-quotas",
+        help="whether preflight may refresh provider quota pages; disable to use the already-synced snapshots only",
+    ),
     metrics_max_age_hours: float = typer.Option(
         24.0,
         "--metrics-max-age-hours",
@@ -2060,6 +2139,11 @@ def auto(
     """Generate content then save draft in one command."""
     title_norm = _repair_cli_text((title or "").strip(), field="title")
     prompt_norm = _repair_cli_text((prompt or "").strip(), field="prompt")
+    try:
+        performance_policy = PerformancePolicy.from_value(performance_mode)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}")
+        raise typer.Exit(code=1)
     try:
         platform_norm = normalize_publish_platform(platform)
         target_platforms = publish_targets(platform_norm)
@@ -2097,6 +2181,12 @@ def auto(
     started_at = now_iso()
     run_errors: list[str] = []
     generation_failed_count = 0
+    run_context = RunContext.create(
+        performance_policy.mode,
+        telemetry_dir=Path("data") / "runs",
+        model_config={"mode": performance_policy.mode},
+    )
+    run_context.record("prepare", "in_progress", title=title_norm, count=requested_count)
 
     _warn_headless_login_hold(headless, login_hold)
     if preflight:
@@ -2108,6 +2198,7 @@ def auto(
                 metrics_max_age_hours=metrics_max_age_hours,
                 quota_max_age_hours=quota_max_age_hours,
                 require_image=not (_is_daily_ai_digest_title(title_norm) or _is_daily_wool_title(title_norm)),
+                refresh_quotas=refresh_quotas,
             )
         except FreeQuotaUnavailableError as exc:
             _emit_progress_event("auto", "选择免费模型", "failed", str(exc))
@@ -2143,6 +2234,7 @@ def auto(
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
                 lookback_days=lookback_days,
+                performance_mode=performance_policy.mode,
             )
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
@@ -2157,6 +2249,7 @@ def auto(
                 count=1,
                 lookback_days=lookback_days,
                 progress=lambda stage, detail: _emit_progress_event("auto", stage, "in_progress", detail),
+                performance_mode=performance_policy.mode,
             )
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
@@ -2214,6 +2307,7 @@ def auto(
                 material_time=material_time_norm,
                 progress_callback=_daily_news_generation_progress,
                 post_quality_callback=post_quality_callback,
+                performance_mode=performance_policy.mode,
             )
         except PartialDailyNewsError as exc:
             typer.echo(f"partial daily news: generated={len(exc.posts)}/{exc.requested_count}; {exc}")
@@ -2566,6 +2660,13 @@ def auto(
         and upload_failed == 0
     )
     completed = dry_run or failed_total == 0 or partial_success
+    run_context.record(
+        "upload",
+        "success" if completed else "failed",
+        generated=len(posts),
+        uploaded=uploaded,
+        failed=failed_total,
+    )
     _emit_progress_event(
         "auto",
         "完成",
@@ -2906,6 +3007,42 @@ def siliconflow_quota(
     _emit_progress_event("siliconflow-quota", "同步硅基流动额度", "success", f"records={len(result.get('records', []))}")
 
 
+@app.command("minimax-quota")
+def minimax_quota(
+    model: Optional[list[str]] = typer.Option(
+        None,
+        "--model",
+        help="Filter MiniMax text/image model IDs; may be repeated.",
+    ),
+    save_raw: bool = typer.Option(False, "--save-raw", help="save the sanitized Token Plan snapshot under data/quota"),
+    snapshot_dir: Optional[Path] = typer.Option(None, "--snapshot-dir", help="directory for the quota snapshot"),
+):
+    """Read MiniMax Token Plan model catalogue and shared usage, without inference."""
+    typer.echo("MiniMax Token Plan quota")
+    typer.echo(f"official-remains-url: {MINIMAX_TOKEN_PLAN_REMAINS_URL}")
+    typer.echo("note: this is a read-only subscription usage request; it never probes a billable model.")
+
+    def _progress(message: str) -> None:
+        typer.echo(message)
+
+    _emit_progress_event("minimax-quota", "同步 MiniMax 额度", "in_progress")
+    result = run_collect_minimax_quota_sync(
+        models=[item.strip() for item in (model or []) if item and item.strip()] or None,
+        all_models=not bool(model),
+        progress_callback=_progress,
+    )
+    typer.echo(format_minimax_quota_records(result.get("records", [])))
+    typer.echo(f"official-usage-url: {result.get('usage_url') or 'https://platform.minimaxi.com/console/usage'}")
+    if save_raw or result.get("records"):
+        snapshot_path = _save_quota_snapshot("minimax", result, snapshot_dir=snapshot_dir)
+        typer.echo(f"snapshot: {snapshot_path}")
+    if result.get("errors"):
+        typer.echo(f"errors: {result['errors']}")
+        _emit_progress_event("minimax-quota", "同步 MiniMax 额度", "failed", f"errors={len(result['errors'])}")
+        raise typer.Exit(code=1)
+    _emit_progress_event("minimax-quota", "同步 MiniMax 额度", "success", f"records={len(result.get('records', []))}")
+
+
 @app.command("sync-quotas")
 def sync_quotas(
     aliyun_model: Optional[list[str]] = typer.Option(
@@ -2922,6 +3059,11 @@ def sync_quotas(
         None,
         "--siliconflow-model",
         help="Filter SiliconFlow models; may be repeated. Defaults to configured SiliconFlow quota models.",
+    ),
+    minimax_model: Optional[list[str]] = typer.Option(
+        None,
+        "--minimax-model",
+        help="Filter MiniMax Token Plan models; may be repeated.",
     ),
     headless: bool = typer.Option(
         False,
@@ -3009,6 +3151,23 @@ def sync_quotas(
         _emit_progress_event("sync-quotas", "同步硅基流动额度", "warning", f"errors={len(siliconflow_result['errors'])}")
     else:
         _emit_progress_event("sync-quotas", "同步硅基流动额度", "success", f"records={len(siliconflow_result.get('records', []))}")
+
+    typer.echo("")
+    _emit_progress_event("sync-quotas", "同步 MiniMax 额度", "in_progress", f"all_models={all_free}")
+    typer.echo("MiniMax Token Plan quota")
+    minimax_result = run_collect_minimax_quota_sync(
+        models=None if all_free else [m.strip() for m in (minimax_model or []) if m and m.strip()] or None,
+        all_models=all_free,
+        progress_callback=_progress,
+    )
+    typer.echo(format_minimax_quota_records(minimax_result.get("records", [])))
+    minimax_snapshot = _save_quota_snapshot("minimax", minimax_result, snapshot_dir=snapshot_dir)
+    typer.echo(f"snapshot: {minimax_snapshot}")
+    if minimax_result.get("errors"):
+        warnings.append(f"minimax: {minimax_result['errors']}")
+        _emit_progress_event("sync-quotas", "同步 MiniMax 额度", "warning", f"errors={len(minimax_result['errors'])}")
+    else:
+        _emit_progress_event("sync-quotas", "同步 MiniMax 额度", "success", f"records={len(minimax_result.get('records', []))}")
 
     if warnings:
         typer.echo(f"warnings: {warnings}")

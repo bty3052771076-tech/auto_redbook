@@ -12,9 +12,10 @@ from typing import Any, Iterable, Iterator, Mapping
 
 
 FREE_PROVIDERS = ("aliyun", "volcengine", "siliconflow")
+SUBSCRIPTION_PROVIDERS = ("minimax",)
 DEFAULT_QUOTA_MAX_AGE = timedelta(hours=2)
 
-_PROVIDER_ORDER = {"volcengine": 0, "aliyun": 1, "siliconflow": 2}
+_PROVIDER_ORDER = {"volcengine": 0, "aliyun": 1, "siliconflow": 2, "minimax": 3}
 _TEXT_MODEL_PREFERENCE = (
     "glm-5.2",
     "deepseek-v4-flash",
@@ -101,6 +102,8 @@ class QuotaModelRecord:
     expires_at: datetime | None
     snapshot_path: Path
     captured_at: datetime
+    cost_class: str = "free"
+    quota_pool: str = ""
 
     @property
     def remaining_ratio(self) -> float:
@@ -119,6 +122,8 @@ class ModelChoice:
     unit: str
     snapshot_path: Path
     captured_at: datetime
+    cost_class: str = "free"
+    quota_pool: str = ""
     capability_score: float = 0.0
     quota_score: float = 0.0
     selection_score: float = 0.0
@@ -147,6 +152,8 @@ class ModelChoice:
             quota_score=quota_score,
             selection_score=selection_score,
             selection_reason=selection_reason,
+            cost_class=record.cost_class,
+            quota_pool=record.quota_pool,
         )
 
 
@@ -174,6 +181,12 @@ class FreeModelPlan:
         elif self.llm.provider == "siliconflow":
             values["SILICONFLOW_LLM_MODEL"] = self.llm.model
             values["SILICONFLOW_LLM_MODELS"] = self.llm.model
+        elif self.llm.provider == "minimax":
+            values["MINIMAX_LLM_MODEL"] = self.llm.model
+            values["MINIMAX_LLM_MODELS"] = self.llm.model
+            values["MINIMAX_BILLING_MODE"] = "subscription_only"
+            values["MINIMAX_ALLOW_PAID_CREDITS"] = "0"
+            values["MINIMAX_ALLOW_PAYGO"] = "0"
         if self.image is not None:
             values["IMAGE_PROVIDER"] = self.image.provider
             if self.image.provider == "aliyun":
@@ -185,6 +198,12 @@ class FreeModelPlan:
             elif self.image.provider == "siliconflow":
                 values["SILICONFLOW_IMAGE_MODEL"] = self.image.model
                 values["SILICONFLOW_IMAGE_MODELS"] = self.image.model
+            elif self.image.provider == "minimax":
+                values["MINIMAX_IMAGE_MODEL"] = self.image.model
+                values["MINIMAX_IMAGE_MODELS"] = self.image.model
+                values["MINIMAX_BILLING_MODE"] = "subscription_only"
+                values["MINIMAX_ALLOW_PAID_CREDITS"] = "0"
+                values["MINIMAX_ALLOW_PAYGO"] = "0"
         if self.vision is not None:
             values["VLM_REVIEW_PROVIDER"] = self.vision.provider
             values["VLM_REVIEW_MODEL"] = self.vision.model
@@ -313,8 +332,8 @@ def load_quota_records(
 
     for raw_provider in providers:
         provider = str(raw_provider or "").strip().lower()
-        if provider not in FREE_PROVIDERS:
-            rejected.append(f"{provider or 'unknown'}: unsupported free provider")
+        if provider not in (*FREE_PROVIDERS, *SUBSCRIPTION_PROVIDERS):
+            rejected.append(f"{provider or 'unknown'}: unsupported model provider")
             continue
         if provider_keys is not None and not key_states.get(provider, False):
             rejected.append(f"{provider}: API key is not configured")
@@ -392,6 +411,11 @@ def load_quota_records(
                     expires_at=expires_at,
                     snapshot_path=snapshot.path,
                     captured_at=snapshot.captured_at,
+                    cost_class=str(
+                        raw.get("cost_class")
+                        or ("subscription_included" if provider in SUBSCRIPTION_PROVIDERS else "free")
+                    ).strip().lower(),
+                    quota_pool=str(raw.get("quota_pool") or "").strip(),
                 )
             )
     return accepted, rejected
@@ -457,7 +481,8 @@ def _llm_selection_reason(record: QuotaModelRecord) -> str:
     capability = llm_capability_score(record.model)
     quota = _quota_headroom_score(record)
     score = llm_selection_score(record)
-    return f"能力{capability:.0f}/100 + 免费额度{quota:.0f}/100 = 综合{score:.2f}"
+    quota_label = "免费额度" if record.cost_class == "free" else "订阅额度"
+    return f"能力{capability:.0f}/100 + {quota_label}{quota:.0f}/100 = 综合{score:.2f}"
 
 
 def _choose_llm(
@@ -542,8 +567,18 @@ def build_free_model_plan(
     require_image: bool = True,
     rejected: Iterable[str] = (),
     allow_paid_fallback: bool = False,
+    allow_subscription: bool = False,
 ) -> FreeModelPlan:
     items = list(records)
+    if allow_subscription:
+        items = [
+            item
+            for item in items
+            if item.cost_class == "free"
+            or (item.cost_class == "subscription_included" and item.provider in SUBSCRIPTION_PROVIDERS)
+        ]
+    else:
+        items = [item for item in items if item.cost_class == "free"]
     rejected_items = tuple(str(reason) for reason in rejected)
     if explicit_llm_model and not any(
         record.kind == "llm" and record.model.lower() == explicit_llm_model.lower()

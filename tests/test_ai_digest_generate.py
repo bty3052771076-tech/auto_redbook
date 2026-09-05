@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from src.ai_digest.generate import (
@@ -10,6 +12,7 @@ from src.ai_digest.generate import (
     parse_ai_digest_impact_json,
     parse_ai_digest_brief_json,
     render_ai_digest_body,
+    validate_ai_digest_concrete_content,
 )
 from src.ai_digest.models import AIDigestBrief, AIUpdateItem
 from src.ai_digest import generate as generate_mod
@@ -45,6 +48,30 @@ def test_build_ai_digest_prompt_requires_structured_json_and_source_trace():
     assert "AI动态0" in prompt
     assert "具体事实门禁" in prompt
     assert "官网、官方项目、资讯整合站、搜索发现、社交补充" in prompt
+    assert "禁止‘披露AI产品变化’" in prompt
+    assert "summary 首句" in prompt
+
+
+def test_validate_ai_digest_concrete_content_rejects_vague_change_summary():
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        date="2026-09-05",
+        items=[
+            AIUpdateItem(
+                title="Anthropic披露AI产品变化",
+                summary="Anthropic披露相关内容。",
+                source_name="Anthropic",
+                source_type="official",
+                url="https://www.anthropic.com/news/example",
+                published_at="2026-09-05T08:00:00Z",
+                vendor="Anthropic",
+                product="Claude",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="明确主体"):
+        validate_ai_digest_concrete_content(brief)
 
 
 def test_ensure_chinese_item_converts_common_traditional_source_title():
@@ -496,7 +523,7 @@ def test_generate_ai_digest_brief_disables_volcengine_thinking_for_json(monkeypa
                     "content": (
                         '{"title":"每日AI讯息","subtitle":"模型更新",'
                         '"date":"2026-06-30","items":[{'
-                        '"title":"OpenAI更新工具","summary":"开发者工具有更新。",'
+                            '"title":"OpenAI发布开发者工具更新","summary":"OpenAI发布开发者工具，新增浏览器自动化和更严格的终端权限。",'
                         '"url":"https://example.com/0","tags":["AI"]}],'
                         '"source_summary":"主要来源：OpenAI。"}'
                     )
@@ -533,7 +560,7 @@ def test_generate_ai_digest_brief_omits_unsupported_temperature_for_kimi_k3(monk
                     "content": (
                         '{"title":"每日AI讯息","subtitle":"模型更新",'
                         '"date":"2026-06-30","items":[{'
-                        '"title":"模型更新","summary":"模型发布了新的能力。",'
+                            '"title":"OpenAI发布开发者工具更新","summary":"OpenAI发布开发者工具，新增浏览器自动化和更严格的终端权限。",'
                         '"url":"https://example.com/0","tags":["AI"]}],'
                         '"source_summary":"官方来源"}'
                     )
@@ -774,15 +801,15 @@ def test_generate_ai_digest_brief_restores_each_llm_item_to_a_distinct_source(mo
 def test_generate_ai_digest_brief_dedupes_duplicate_urls_and_fills_from_unused_sources(monkeypatch):
     sources = [
         AIUpdateItem(
-            title=f"Model {index} release",
-            summary=f"Model {index} adds a documented AI capability.",
+            title=f"Vendor {index}发布Model-{index}模型",
+            summary=f"Vendor {index}发布Model-{index}，官方说明新增文本生成能力并开放API测试。",
             source_name=f"Official source {index}",
             source_type="official",
             url=f"https://official.example/items/{index}",
             published_at="2026-08-20T08:00:00Z",
             vendor=f"Vendor {index}",
             product=f"Model-{index}",
-            raw_excerpt=f"Official release details for model {index}.",
+            raw_excerpt=f"Vendor {index}发布Model-{index}，新增文本生成能力并开放API测试。",
         )
         for index in range(5)
     ]
@@ -793,12 +820,12 @@ def test_generate_ai_digest_brief_dedupes_duplicate_urls_and_fills_from_unused_s
         def invoke(self, _messages):
             items = [
                 {
-                    "title": f"Model update {index}",
-                    "summary": "官方来源披露了模型能力更新。",
+                        "title": f"Vendor {url.rsplit('/', 1)[-1]}发布Model-{url.rsplit('/', 1)[-1]}模型",
+                        "summary": f"Vendor {url.rsplit('/', 1)[-1]}发布Model-{url.rsplit('/', 1)[-1]}，官方说明新增文本生成能力并开放API测试。",
                     "url": url,
                     "tags": ["AI"],
                 }
-                for index, url in enumerate(duplicate_urls, 1)
+                for url in duplicate_urls
             ]
             return type("Resp", (), {"content": __import__("json").dumps({
                 "title": "每日AI讯息",
@@ -1170,6 +1197,35 @@ def test_parse_ai_digest_brief_json_accepts_llm_output():
     assert "官方源" in brief.source_summary
 
 
+def test_parse_ai_digest_brief_json_ignores_trailing_second_json_object():
+    payload = {
+        "title": "每日AI讯息",
+        "date": "2026-09-05",
+        "items": [
+            {
+                "title": "模型发布测试",
+                "summary": "官方发布了新的模型能力。",
+                "source_name": "官方博客",
+                "source_type": "official",
+                "url": "https://example.com/model",
+                "published_at": "2026-09-05T08:00:00Z",
+                "vendor": "示例厂商",
+                "product": "TestModel",
+                "evidence_urls": ["https://example.com/model"],
+            }
+        ],
+    }
+    trailing = {"title": "should not be merged"}
+
+    brief = parse_ai_digest_brief_json(
+        json.dumps(payload, ensure_ascii=False) + json.dumps(trailing, ensure_ascii=False)
+    )
+
+    assert brief.title == "每日AI讯息"
+    assert len(brief.items) == 1
+    assert brief.items[0].title == "模型发布测试"
+
+
 def test_parse_ai_digest_brief_json_keeps_official_status_for_official_evidence():
     raw = """
     {
@@ -1328,7 +1384,8 @@ def test_build_fallback_brief_preserves_chinese_action_after_long_english_subjec
     out = build_fallback_brief([item], target_count=1, date="2026-07-29").items[0]
 
     assert len(out.title) <= 28
-    assert "发布新进展" in out.title
+    assert "发布新进展" not in out.title
+    assert "AI编程智能体" in out.title
     assert any("\u4e00" <= char <= "\u9fff" for char in out.title)
 
 

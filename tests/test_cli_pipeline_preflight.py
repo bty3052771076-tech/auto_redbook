@@ -122,6 +122,41 @@ def test_prepare_auto_pipeline_reuses_fresh_metrics_and_quota(monkeypatch, tmp_p
     assert report.model_plan.image.model == "doubao-seedream-4-5-251128"
 
 
+def test_prepare_auto_pipeline_snapshot_only_never_refreshes_quota(monkeypatch, tmp_path):
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+    metrics = tmp_path / "data" / "analytics" / "published_metrics_latest.csv"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_text("title,likes\n测试,1\n", encoding="utf-8")
+    os.utime(metrics, (now.timestamp(), now.timestamp()))
+    quota_dir = tmp_path / "data" / "quota"
+    snapshot = _write_quota(quota_dir, "volcengine", _free_records(), now)
+    os.utime(snapshot, (now.timestamp(),) * 2)
+    called = {"quotas": 0}
+    monkeypatch.setattr(
+        cli,
+        "_refresh_quotas_for_preflight",
+        lambda **_kwargs: called.__setitem__("quotas", called["quotas"] + 1),
+    )
+
+    report = cli._prepare_auto_pipeline(
+        headless=True,
+        login_hold=0,
+        wait_timeout=30,
+        metrics_max_age_hours=24,
+        quota_max_age_hours=2,
+        require_image=True,
+        refresh_quotas=False,
+        metrics_path=metrics,
+        quota_dir=quota_dir,
+        provider_keys={"aliyun": True, "volcengine": True},
+        now=now,
+    )
+
+    assert called == {"quotas": 0}
+    assert report.quota_mode == "snapshot_only"
+    assert report.model_plan.llm.model == "glm-5.2"
+
+
 def test_prepare_auto_pipeline_reuses_recent_valid_quota_after_empty_snapshot(monkeypatch, tmp_path):
     now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
     metrics = tmp_path / "data" / "analytics" / "published_metrics_latest.csv"

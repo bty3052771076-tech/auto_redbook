@@ -706,6 +706,63 @@ def parse_benefit_html(
     ]
 
 
+def parse_codex_reset_html(
+    html_text: str,
+    *,
+    source_name: str,
+    vendor: str,
+    base_url: str = "",
+) -> list[AIUpdateItem]:
+    """Extract the current Codex reset event from a public tracker.
+
+    The tracker embeds the reset event and the quoted X post in its public
+    page data. Treat the result as an aggregator lead, while retaining the
+    direct X URL as evidence for later review.
+    """
+    raw = html_text or ""
+    reset_match = re.search(r'\\"resetAt\\":\\"(?P<value>20[0-9]{2}-[0-9]{2}-[0-9]{2}T[^\\"]+)\\"', raw)
+    note_match = re.search(r'\\"note\\":\\"(?P<value>(?:\\\\.|[^\\"])*)\\"', raw)
+    source_match = re.search(
+        r'\\"resetAt\\":\\"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[^\\"]+\\".{0,700}?\\"source\\":\\"(?P<value>https?://[^\\"]+)\\"',
+        raw,
+    )
+    if not reset_match or not note_match:
+        return []
+    reset_at = reset_match.group("value")
+    try:
+        note = json.loads(f'"{note_match.group("value")}"')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        note = note_match.group("value")
+    if "reset" not in f"{note} {raw[:25000]}".lower():
+        return []
+    evidence_url = source_match.group("value") if source_match else ""
+    try:
+        evidence_url = json.loads(f'"{evidence_url}"') if "\\" in evidence_url else evidence_url
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    summary = (
+        "公开重置追踪页记录：OpenAI Codex向尚未获得GPT-6 Astra的部分付费ChatGPT用户发放银行重置；"
+        "重置可由符合条件的用户自行使用，最终资格和到账情况以账户页面为准。"
+    )
+    return [
+        AIUpdateItem(
+            title="OpenAI Codex向符合条件的付费用户发放银行重置",
+            summary=summary,
+            source_name=source_name,
+            source_type="aggregator",
+            url=base_url,
+            published_at=reset_at,
+            vendor=vendor,
+            product="Codex banked reset",
+            raw_excerpt=f"{summary} 追踪页引用的公开帖：{evidence_url}".strip(),
+            confidence_score=0.78,
+            verification_status="aggregator_confirmed",
+            evidence_urls=[url for url in (evidence_url, base_url) if url],
+            tags=["AI", "benefit", "Codex", "banked_reset"],
+        )
+    ]
+
+
 class _LinkCollector(HTMLParser):
     def __init__(self):
         super().__init__()

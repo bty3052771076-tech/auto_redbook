@@ -26,6 +26,8 @@ from apps.gui import (
     DEFAULT_LLM_PROVIDER,
     IMAGE_SOURCE_OPTIONS,
     LLM_PROVIDER_OPTIONS,
+    MINIMAX_IMAGE_MODEL_OPTIONS,
+    MINIMAX_LLM_MODEL_OPTIONS,
     PublishedMetricTableRow,
     QuotaDashboardRow,
     DEFAULT_SILICONFLOW_QUOTA_MODELS,
@@ -237,8 +239,8 @@ def test_gui_exposes_publish_platform_selector():
 
 
 def test_gui_exposes_llm_and_image_provider_model_options():
-    assert LLM_PROVIDER_OPTIONS == ["aliyun", "volcengine", "siliconflow", "ppinfra", "auto"]
-    assert IMAGE_SOURCE_OPTIONS == ["local", "auto", "aliyun", "volcengine", "siliconflow", "pexels"]
+    assert LLM_PROVIDER_OPTIONS == ["aliyun", "volcengine", "siliconflow", "minimax", "ppinfra", "auto"]
+    assert IMAGE_SOURCE_OPTIONS == ["local", "auto", "aliyun", "volcengine", "siliconflow", "minimax", "pexels"]
     assert "qwen3.7-plus" in ALIYUN_LLM_MODEL_OPTIONS
     assert "deepseek-v4-flash" in ALIYUN_LLM_MODEL_OPTIONS
     assert "doubao-seed-2-1-turbo-260628" in VOLCENGINE_LLM_MODEL_OPTIONS
@@ -249,6 +251,8 @@ def test_gui_exposes_llm_and_image_provider_model_options():
     assert "Qwen/Qwen3-32B" in SILICONFLOW_LLM_MODEL_OPTIONS
     assert "Qwen/Qwen-Image" in SILICONFLOW_IMAGE_MODEL_OPTIONS
     assert "Kwai-Kolors/Kolors" in SILICONFLOW_IMAGE_MODEL_OPTIONS
+    assert "MiniMax-M3" in MINIMAX_LLM_MODEL_OPTIONS
+    assert "image-01" in MINIMAX_IMAGE_MODEL_OPTIONS
     assert ALIYUN_IMAGE_MODEL_OPTIONS == [
         "wan2.7-image",
         "wan2.7-image-pro",

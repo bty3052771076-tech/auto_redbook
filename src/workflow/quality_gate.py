@@ -177,6 +177,34 @@ def _ai_digest_metadata(post: Post) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _daily_wool_metadata(post: Post) -> Mapping[str, object]:
+    value = (post.platform or {}).get("daily_wool")
+    return value if isinstance(value, Mapping) else {}
+
+
+def _daily_wool_event_keys(post: Post) -> set[str]:
+    metadata = _daily_wool_metadata(post)
+    raw_offers = metadata.get("offers")
+    if not isinstance(raw_offers, list):
+        return set()
+    keys: set[str] = set()
+    for raw_offer in raw_offers:
+        if not isinstance(raw_offer, Mapping):
+            continue
+        url = _normalized_url(raw_offer.get("url"))
+        published = _parse_date(raw_offer.get("published_at"))
+        title = re.sub(
+            r"[^a-z0-9\u4e00-\u9fff]+",
+            "",
+            str(raw_offer.get("title") or "").lower(),
+        )
+        if url and published is not None:
+            keys.add(f"url:{url}|date:{published.isoformat()}")
+        elif title and published is not None:
+            keys.add(f"title:{title}|date:{published.isoformat()}")
+    return keys
+
+
 def _ai_digest_item_keys(post: Post) -> set[str]:
     raw_items = _ai_digest_metadata(post).get("items")
     if not isinstance(raw_items, list):
@@ -218,6 +246,19 @@ def _ai_digest_item_keys(post: Post) -> set[str]:
 
 
 def _same_event(left: Post, right: Post) -> bool:
+    left_wool = _daily_wool_metadata(left)
+    right_wool = _daily_wool_metadata(right)
+    if left_wool or right_wool:
+        # Daily Wool uses a generic post title by design. Compare concrete
+        # offer identities instead of treating every "今日有AI福利" card as
+        # the same event.
+        if not left_wool or not right_wool:
+            return False
+        left_keys = _daily_wool_event_keys(left)
+        right_keys = _daily_wool_event_keys(right)
+        if left_keys or right_keys:
+            return bool(left_keys & right_keys)
+        return bool(left_wool.get("has_wool") is False and right_wool.get("has_wool") is False)
     left_digest = _ai_digest_metadata(left)
     right_digest = _ai_digest_metadata(right)
     if left_digest or right_digest:

@@ -6,6 +6,7 @@ import random
 import re
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
@@ -3134,6 +3135,325 @@ def read_manual_material_source_info(path: str | Path) -> dict[str, Any]:
     return info
 
 
+@dataclass
+class _NewsProviderFetchResult:
+    provider: str
+    candidates: list[NewsItem]
+    chosen_query: str = ""
+    queries_used: list[str] | None = None
+    source_api: dict[str, Any] | None = None
+    used_time_range: bool = False
+    item_count: int = 0
+    dated_count: int = 0
+    url_count: int = 0
+    elapsed_seconds: float = 0.0
+    error: Exception | None = None
+
+
+def _news_provider_query_plan(
+    provider: str,
+    queries: list[str],
+    *,
+    exhaustive_sources: bool,
+) -> list[str]:
+    provider_queries = (
+        queries[:1]
+        if provider in ("file", "manual", "hotnews", "bbc_rss", "alphavantage", "finnhub")
+        else list(queries)
+    )
+    if exhaustive_sources:
+        provider_queries = provider_queries[: _positive_env_int(
+            "NEWS_EXHAUSTIVE_PROVIDER_QUERY_LIMIT",
+            DEFAULT_EXHAUSTIVE_PROVIDER_QUERY_LIMIT,
+        )]
+    if provider == "google_rss_cn" and exhaustive_sources:
+        official_queries = [
+            f"{query} site:{domain}"
+            for query in provider_queries[:1]
+            for domain in CN_OFFICIAL_NEWS_DOMAINS[: _positive_env_int(
+                "NEWS_EXHAUSTIVE_OFFICIAL_RSS_DOMAIN_LIMIT",
+                DEFAULT_EXHAUSTIVE_OFFICIAL_RSS_DOMAIN_LIMIT,
+            )]
+        ]
+        provider_queries = [*provider_queries, *official_queries]
+    return provider_queries
+
+
+def _fetch_news_provider(
+    provider: str,
+    *,
+    queries: list[str],
+    default_queries: list[str],
+    hint_query: str,
+    aggregate_empty_prompt: bool,
+    max_records: int,
+    from_iso: str,
+    to_iso: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    timeout_s: float,
+    exhaustive_sources: bool,
+    auto_provider_selection: bool,
+    manual_materials_file: str,
+) -> _NewsProviderFetchResult:
+    """Fetch one provider without mutating the aggregate collection state."""
+    started = time.perf_counter()
+    provider_candidates: list[NewsItem] = []
+    chosen_query = queries[0] if queries else DEFAULT_QUERY
+    chosen_source_api: dict[str, Any] = {"provider": provider}
+    queries_used: list[str] = []
+    used_time_range = False
+    provider_error: Exception | None = None
+    provider_queries = _news_provider_query_plan(
+        provider,
+        queries,
+        exhaustive_sources=exhaustive_sources,
+    )
+    provider_timeout_s = _provider_request_timeout_s(
+        provider,
+        requested_timeout_s=timeout_s,
+        exhaustive_sources=exhaustive_sources,
+    )
+
+    for query in provider_queries:
+        if hint_query and query in default_queries and provider_candidates:
+            break
+        chosen_query = query
+        try:
+            if provider == "newsapi":
+                api_key, base_url = _load_newsapi_config()
+                chosen_source_api = {"provider": "newsapi", "base_url": base_url}
+                sort_by = "relevancy" if hint_query and query not in default_queries else "publishedAt"
+                raw = _newsapi_fetch_articles(
+                    api_key=api_key,
+                    base_url=base_url,
+                    query=query,
+                    from_iso=from_iso,
+                    to_iso=to_iso,
+                    sort_by=sort_by,
+                    page_size=max_records,
+                    timeout_s=provider_timeout_s,
+                )
+                if not raw and not exhaustive_sources:
+                    raw = _newsapi_fetch_articles(
+                        api_key=api_key,
+                        base_url=base_url,
+                        query=query,
+                        from_iso=None,
+                        to_iso=None,
+                        sort_by=sort_by,
+                        page_size=max_records,
+                        timeout_s=provider_timeout_s,
+                    )
+                in_range = [
+                    item for item in raw
+                    if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                ]
+                candidates = in_range or raw
+                used_time_range = used_time_range or bool(in_range)
+                if hint_query and query not in default_queries and _best_relevance(candidates, query) <= 0.0:
+                    candidates = []
+            elif provider == "gnews":
+                api_key, base_url = _load_gnews_config()
+                chosen_source_api = {"provider": "gnews", "base_url": base_url}
+                raw = _gnews_fetch_articles(
+                    api_key=api_key,
+                    base_url=base_url,
+                    query=query,
+                    from_iso=from_iso,
+                    to_iso=to_iso,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                )
+                if not raw and not exhaustive_sources:
+                    raw = _gnews_fetch_articles(
+                        api_key=api_key,
+                        base_url=base_url,
+                        query=query,
+                        from_iso=None,
+                        to_iso=None,
+                        max_records=max_records,
+                        timeout_s=provider_timeout_s,
+                    )
+                in_range = [
+                    item for item in raw
+                    if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                ]
+                candidates = in_range or raw
+                used_time_range = used_time_range or bool(in_range)
+                if hint_query and query not in default_queries and _best_relevance(candidates, query) <= 0.0:
+                    candidates = []
+            elif provider == "juhe":
+                cfg = _load_juhe_config()
+                chosen_source_api = {
+                    "provider": "juhe",
+                    "news_base_url": cfg.news_base_url,
+                    "finance_base_url": cfg.finance_base_url,
+                }
+                raw = _juhe_fetch_articles(
+                    news_key=cfg.news_key,
+                    finance_key=cfg.finance_key,
+                    news_base_url=cfg.news_base_url,
+                    finance_base_url=cfg.finance_base_url,
+                    query=query,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                    fetch_detail=not exhaustive_sources or not auto_provider_selection,
+                )
+                in_range = [
+                    item for item in raw
+                    if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                ]
+                candidates = in_range or raw
+                used_time_range = used_time_range or bool(in_range)
+            elif provider == "newsdata":
+                api_key = _load_additional_news_source_key("newsdata")
+                chosen_source_api = {"provider": "newsdata", "base_url": NEWSDATA_BASE_URL}
+                raw = _newsdata_fetch_articles(
+                    api_key=api_key,
+                    query=query,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                )
+                candidates = [
+                    item for item in raw
+                    if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                ] or raw
+                used_time_range = used_time_range or bool(candidates)
+                if hint_query and query not in default_queries and _best_relevance(candidates, query) <= 0.0:
+                    candidates = []
+            elif provider == "alphavantage":
+                api_key = _load_additional_news_source_key("alphavantage")
+                chosen_source_api = {"provider": "alphavantage", "base_url": ALPHAVANTAGE_BASE_URL}
+                raw = _alphavantage_fetch_articles(
+                    api_key=api_key,
+                    query=query,
+                    from_iso=from_iso,
+                    to_iso=to_iso,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                )
+                candidates = [
+                    item for item in raw
+                    if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                ] or raw
+                used_time_range = used_time_range or bool(candidates)
+            elif provider == "thenewsapi":
+                api_token = _load_additional_news_source_key("thenewsapi")
+                chosen_source_api = {"provider": "thenewsapi", "base_url": THENEWSAPI_BASE_URL}
+                raw = _thenewsapi_fetch_articles(
+                    api_token=api_token,
+                    query=query,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                    from_iso=from_iso,
+                    to_iso=to_iso,
+                )
+                candidates = [
+                    item for item in raw
+                    if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                ] or raw
+                used_time_range = used_time_range or bool(candidates)
+                if hint_query and query not in default_queries and _best_relevance(candidates, query) <= 0.0:
+                    candidates = []
+            elif provider == "finnhub":
+                api_key = _load_additional_news_source_key("finnhub")
+                chosen_source_api = {"provider": "finnhub", "base_url": FINNHUB_BASE_URL}
+                raw = _finnhub_fetch_articles(
+                    api_key=api_key,
+                    query=query,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                )
+                candidates = [
+                    item for item in raw
+                    if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                ] or raw
+                used_time_range = used_time_range or bool(candidates)
+            elif provider in {"google_rss", "google_rss_cn"}:
+                is_cn_rss = provider == "google_rss_cn"
+                chosen_source_api = {
+                    "provider": provider,
+                    "base_url": _google_news_rss_base_url(),
+                    "hl": "zh-CN" if is_cn_rss else (os.getenv("GOOGLE_NEWS_RSS_HL") or "en-US").strip(),
+                    "gl": "CN" if is_cn_rss else (os.getenv("GOOGLE_NEWS_RSS_GL") or "US").strip(),
+                }
+                candidates = _google_rss_fetch_articles(
+                    query=query,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                    language="zh-CN" if is_cn_rss else None,
+                    country="CN" if is_cn_rss else None,
+                )
+            elif provider == "bbc_rss":
+                chosen_source_api = {
+                    "provider": "bbc_rss",
+                    "feeds": [BBC_RSS_FEEDS[key] for key in _bbc_rss_feed_keys(query)],
+                }
+                candidates = _bbc_rss_fetch_articles(
+                    prompt_hint=query,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                )
+            elif provider == "hotnews":
+                base_url = _hotnews_base_url()
+                platforms = _hotnews_platforms()
+                chosen_source_api = {
+                    "provider": "hotnews",
+                    "base_url": base_url,
+                    "platforms": platforms,
+                }
+                candidates = _hotnews_fetch_articles(
+                    base_url=base_url,
+                    platforms=platforms,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                )
+            elif provider == "manual":
+                if not manual_materials_file:
+                    raise RuntimeError(
+                        "NEWS_MATERIALS_FILE or --news-materials-file is required when NEWS_PROVIDER=manual"
+                    )
+                chosen_source_api = {"provider": "manual", "file_path": manual_materials_file}
+                candidates = load_manual_news_materials_file(
+                    manual_materials_file,
+                    max_records=max_records,
+                )
+            else:
+                file_path = (os.getenv("NEWS_CANDIDATES_FILE") or "").strip()
+                if not file_path:
+                    raise RuntimeError("NEWS_CANDIDATES_FILE is required when NEWS_PROVIDER=file")
+                chosen_source_api = {"provider": "file", "file_path": file_path}
+                candidates = _file_fetch_articles(path=file_path, max_records=max_records)
+
+            candidates = [replace(item, provider=provider) for item in candidates]
+            if candidates:
+                provider_candidates.extend(_dedupe_candidates(candidates))
+                provider_candidates = _dedupe_candidates(provider_candidates)
+                queries_used.append(query)
+                if not (aggregate_empty_prompt or (hint_query and query not in default_queries)):
+                    break
+                if len(provider_candidates) >= max_records and provider != "google_rss_cn":
+                    break
+        except Exception as exc:
+            provider_error = exc
+            break
+
+    return _NewsProviderFetchResult(
+        provider=provider,
+        candidates=provider_candidates,
+        chosen_query=chosen_query,
+        queries_used=queries_used,
+        source_api=chosen_source_api,
+        used_time_range=used_time_range,
+        item_count=len(provider_candidates),
+        dated_count=sum(1 for item in provider_candidates if str(item.seendate or "").strip()),
+        url_count=sum(1 for item in provider_candidates if str(item.url or "").strip()),
+        elapsed_seconds=time.perf_counter() - started,
+        error=provider_error,
+    )
+
+
 def fetch_daily_news_candidates(
     prompt_hint: str,
     *,
@@ -3336,6 +3656,79 @@ def fetch_daily_news_candidates(
     minimum_qualified = max(0, int(minimum_qualified_records or 0))
     min_diverse_sources = _positive_env_int("NEWS_MIN_DIVERSE_PROVIDERS", 3)
     provider_total = len(provider_plan)
+
+    # Provider I/O is independent. Prefetch only providers that would pass the
+    # existing replacement/cooldown checks, then merge their results below in
+    # provider-plan order so ranking and metadata remain deterministic.
+    prefetched_provider_results: dict[str, _NewsProviderFetchResult] = {}
+    provider_collection_concurrency = 1
+    if auto_provider_selection and exhaustive_sources and len(provider_plan) > 1:
+        provider_collection_concurrency = min(
+            len(provider_plan),
+            _positive_env_int("NEWS_PROVIDER_CONCURRENCY", 4),
+        )
+        prefetch_providers: list[str] = []
+        for provider in provider_plan:
+            previous_attempt = persisted_health_attempts.get(provider)
+            if (
+                previous_attempt is not None
+                and previous_attempt.source_url == _news_provider_health_url(provider)
+                and should_replace_source(previous_attempt)
+            ):
+                continue
+            if is_source_in_cooldown(previous_attempt, cooldown_seconds=cooldown_seconds):
+                continue
+            prefetch_providers.append(provider)
+            if progress_callback is not None:
+                progress_callback(
+                    "信源采集",
+                    "in_progress",
+                    {
+                        "provider": provider,
+                        "source_index": provider_plan.index(provider) + 1,
+                        "source_total": provider_total,
+                        "mode": "parallel_prefetch",
+                    },
+                )
+
+        def _prefetch_one(provider: str) -> _NewsProviderFetchResult:
+            return _fetch_news_provider(
+                provider,
+                queries=queries,
+                default_queries=default_queries,
+                hint_query=hint_query,
+                aggregate_empty_prompt=aggregate_empty_prompt,
+                max_records=max_records,
+                from_iso=from_iso,
+                to_iso=to_iso,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                timeout_s=timeout_s,
+                exhaustive_sources=exhaustive_sources,
+                auto_provider_selection=auto_provider_selection,
+                manual_materials_file=manual_materials_file,
+            )
+
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(provider_collection_concurrency, len(prefetch_providers))),
+            thread_name_prefix="redbook-news-source",
+        ) as provider_workers:
+            futures = {
+                provider_workers.submit(_prefetch_one, provider): provider
+                for provider in prefetch_providers
+            }
+            for future in as_completed(futures):
+                provider = futures[future]
+                try:
+                    prefetched_provider_results[provider] = future.result()
+                except Exception as exc:
+                    prefetched_provider_results[provider] = _NewsProviderFetchResult(
+                        provider=provider,
+                        candidates=[],
+                        elapsed_seconds=0.0,
+                        error=exc,
+                    )
+
     for provider_index, provider in enumerate(provider_plan, start=1):
         if progress_callback is not None:
             progress_callback(
@@ -3409,30 +3802,26 @@ def fetch_daily_news_candidates(
         provider_dated_count = 0
         provider_url_count = 0
         provider_candidates: list[NewsItem] = []
-        provider_queries = (
-            queries[:1]
-            if provider in ("file", "manual", "hotnews", "bbc_rss", "alphavantage", "finnhub")
-            else queries
-        )
-        if exhaustive_sources:
-            provider_queries = provider_queries[: _positive_env_int(
-                "NEWS_EXHAUSTIVE_PROVIDER_QUERY_LIMIT",
-                DEFAULT_EXHAUSTIVE_PROVIDER_QUERY_LIMIT,
-            )]
-        if provider == "google_rss_cn" and exhaustive_sources:
-            # Keep the generic CN search, then explicitly ask for official
-            # mainland newsrooms so a broad aggregator cannot crowd them out.
-            # Two domains per pass are enough for a diverse pool; the domain
-            # cap later preserves room for all other sources.
-            official_queries = [
-                f"{q} site:{domain}"
-                for q in provider_queries[:1]
-                for domain in CN_OFFICIAL_NEWS_DOMAINS[: _positive_env_int(
-                    "NEWS_EXHAUSTIVE_OFFICIAL_RSS_DOMAIN_LIMIT",
-                    DEFAULT_EXHAUSTIVE_OFFICIAL_RSS_DOMAIN_LIMIT,
-                )]
-            ]
-            provider_queries = [*provider_queries, *official_queries]
+        prefetched = prefetched_provider_results.get(provider)
+        if prefetched is not None:
+            provider_started = time.perf_counter() - max(0.0, prefetched.elapsed_seconds)
+            provider_error = prefetched.error
+            provider_candidates = list(prefetched.candidates)
+            candidates = list(prefetched.candidates)
+            provider_item_count = prefetched.item_count
+            provider_dated_count = prefetched.dated_count
+            provider_url_count = prefetched.url_count
+            chosen_query = prefetched.chosen_query or chosen_query
+            chosen_source_api = prefetched.source_api or chosen_source_api
+            used_time_range = used_time_range or prefetched.used_time_range
+            queries_used.extend(prefetched.queries_used or [])
+            provider_queries: list[str] = []
+        else:
+            provider_queries = _news_provider_query_plan(
+                provider,
+                queries,
+                exhaustive_sources=exhaustive_sources,
+            )
         provider_timeout_s = _provider_request_timeout_s(
             provider,
             requested_timeout_s=timeout_s,
@@ -3704,6 +4093,9 @@ def fetch_daily_news_candidates(
                 # spending the full timeout budget on every query variant.
                 break
         elapsed_seconds = time.perf_counter() - provider_started
+        if provider_error is not None and prefetched is not None:
+            last_err = f"{provider}/{chosen_query}: {provider_error}"
+            provider_errors.append(last_err)
         if provider_error is not None:
             health_attempt = SourceAttempt(
                 collection="daily_news",
@@ -3839,6 +4231,7 @@ def fetch_daily_news_candidates(
         "query": chosen_query,
         "provider_plan": provider_plan,
         "provider_attempts": provider_attempts,
+        "provider_collection_concurrency": provider_collection_concurrency,
     }
 
     health_snapshot_path = _persist_health_snapshot()

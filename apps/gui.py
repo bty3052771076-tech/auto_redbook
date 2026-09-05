@@ -27,6 +27,11 @@ from src.config import (
     DEFAULT_VOLCENGINE_LLM_MODEL,
     DEFAULT_SILICONFLOW_LLM_BASE_URL,
     DEFAULT_SILICONFLOW_LLM_MODEL,
+    DEFAULT_MINIMAX_LLM_BASE_URL,
+    DEFAULT_MINIMAX_LLM_MODEL,
+    DEFAULT_MINIMAX_IMAGE_MODEL,
+    MINIMAX_IMAGE_MODELS,
+    MINIMAX_LLM_MODELS,
     VOLCENGINE_AVAILABLE_LLM_MODELS,
     SILICONFLOW_FREE_LLM_MODELS,
     SILICONFLOW_IMAGE_MODELS,
@@ -90,14 +95,15 @@ LOG_FLUSH_MAX_CHARS = 24_000
 LOG_MAX_CHARS = 220_000
 FILTER_REFRESH_DEBOUNCE_MS = 140
 
-LLM_PROVIDER_OPTIONS = ["aliyun", "volcengine", "siliconflow", "ppinfra", "auto"]
+LLM_PROVIDER_OPTIONS = ["aliyun", "volcengine", "siliconflow", "minimax", "ppinfra", "auto"]
 IMAGE_SOURCE_LOCAL = "local"
-IMAGE_PROVIDER_OPTIONS = ["auto", "aliyun", "volcengine", "siliconflow", "pexels"]
+IMAGE_PROVIDER_OPTIONS = ["auto", "aliyun", "volcengine", "siliconflow", "minimax", "pexels"]
 IMAGE_SOURCE_OPTIONS = [IMAGE_SOURCE_LOCAL] + IMAGE_PROVIDER_OPTIONS
 
 ALIYUN_LLM_MODEL_OPTIONS = list(ALIYUN_FREE_LLM_MODELS)
 VOLCENGINE_LLM_MODEL_OPTIONS = list(VOLCENGINE_AVAILABLE_LLM_MODELS)
 SILICONFLOW_LLM_MODEL_OPTIONS = list(SILICONFLOW_FREE_LLM_MODELS)
+MINIMAX_LLM_MODEL_OPTIONS = list(MINIMAX_LLM_MODELS)
 PPINFRA_LLM_MODEL_OPTIONS = [DEFAULT_LLM_MODEL]
 AUTO_LLM_MODEL_OPTION = "自动模型列表（顺序回退）"
 
@@ -118,9 +124,11 @@ VOLCENGINE_IMAGE_MODEL_OPTIONS = [
     "doubao-seedream-4-0-250828",
 ]
 SILICONFLOW_IMAGE_MODEL_OPTIONS = list(SILICONFLOW_IMAGE_MODELS)
+MINIMAX_IMAGE_MODEL_OPTIONS = list(MINIMAX_IMAGE_MODELS)
 DEFAULT_ALIYUN_IMAGE_MODELS = ALIYUN_IMAGE_MODEL_OPTIONS[0]
 DEFAULT_VOLCENGINE_IMAGE_MODELS = VOLCENGINE_IMAGE_MODEL_OPTIONS[0]
 DEFAULT_SILICONFLOW_IMAGE_MODELS = SILICONFLOW_IMAGE_MODEL_OPTIONS[0]
+DEFAULT_MINIMAX_IMAGE_MODELS = DEFAULT_MINIMAX_IMAGE_MODEL
 DEFAULT_ALIYUN_QUOTA_MODELS = ["glm-5.2", "qwen-image-2.0-pro-2026-06-22"]
 DEFAULT_VOLCENGINE_QUOTA_MODELS = [
     "glm-5.2",
@@ -205,6 +213,8 @@ class QuotaDashboardRow:
     display_value: str = "未知"
     source_mode: str = ""
     snapshot_name: str = ""
+    cost_class: str = "free"
+    quota_pool: str = ""
 
 
 @dataclass(frozen=True)
@@ -239,12 +249,13 @@ _SOURCE_HEALTH_STATUS_ORDER = {
 }
 
 
-_QUOTA_PROVIDER_ORDER = {"aliyun": 0, "volcengine": 1, "siliconflow": 2}
+_QUOTA_PROVIDER_ORDER = {"aliyun": 0, "volcengine": 1, "siliconflow": 2, "minimax": 3}
 _QUOTA_KIND_ORDER = {"llm": 0, "image": 1, "unknown": 2}
 _QUOTA_PROVIDER_SEARCH_ALIASES = {
     "aliyun": "aliyun ali 阿里云 百炼 bailian",
     "volcengine": "volcengine volcano 火山引擎 ark",
     "siliconflow": "siliconflow silicon sf 硅基流动",
+    "minimax": "minimax mini max tokenplan Token Plan",
 }
 QUOTA_DASHBOARD_SORT_OPTIONS: tuple[tuple[str, str], ...] = (
     ("default", "平台 / 类型 / 模型"),
@@ -709,6 +720,7 @@ def _quota_number_text(value: int | float) -> str:
 
 def _quota_display_value(record: Mapping[str, Any]) -> str:
     status = str(record.get("status") or "unknown")
+    cost_class = str(record.get("cost_class") or "").strip().lower()
     remaining = _as_quota_number(record.get("remaining"))
     total = _as_quota_number(record.get("total"))
     unit = str(record.get("unit") or "").strip()
@@ -720,13 +732,16 @@ def _quota_display_value(record: Mapping[str, Any]) -> str:
         "no_free_quota": "无免费额度",
         "expired": "已过期",
         "exhausted": "已用完",
+        "subscription_available": "订阅内额度",
     }
     if remaining is not None and total is not None:
         suffix = f" {unit}" if unit else ""
-        return f"{_quota_number_text(remaining)}/{_quota_number_text(total)}{suffix}"
+        value = f"{_quota_number_text(remaining)}/{_quota_number_text(total)}{suffix}"
+        return f"{value} · 订阅共享池" if cost_class == "subscription_included" else value
     if remaining is not None:
         suffix = f" {unit}" if unit else ""
-        return f"{_quota_number_text(remaining)}{suffix}"
+        value = f"{_quota_number_text(remaining)}{suffix}"
+        return f"{value} · 订阅共享池" if cost_class == "subscription_included" else value
     return status_labels.get(status, status or "未知")
 
 
@@ -780,7 +795,7 @@ def _quota_selectable_kind(kind: str, model: str) -> str:
     )
     if any(marker in model_lc for marker in image_markers):
         return "image"
-    llm_prefixes = ("glm-", "deepseek-", "kimi-", "qwen", "doubao-", "moonshot-", "baichuan-", "yi-", "zai-org/")
+    llm_prefixes = ("glm-", "deepseek-", "kimi-", "qwen", "doubao-", "moonshot-", "baichuan-", "yi-", "zai-org/", "minimax-")
     if model_lc.startswith(llm_prefixes) or any(
         marker in model_lc for marker in ("/glm-", "/deepseek-", "/kimi-", "/qwen-", "/qwen3", "/qwen2")
     ):
@@ -792,9 +807,9 @@ def quota_dashboard_selection_target(row: QuotaDashboardRow) -> tuple[str, str, 
     provider = (row.provider or "").strip().lower()
     model = (row.model or "").strip()
     kind = _quota_selectable_kind(row.kind, model)
-    if provider not in {"aliyun", "volcengine", "siliconflow"} or kind not in {"llm", "image"} or not model:
+    if provider not in {"aliyun", "volcengine", "siliconflow", "minimax"} or kind not in {"llm", "image"} or not model:
         return None
-    if (row.status or "").strip().lower() != "available":
+    if (row.status or "").strip().lower() not in {"available", "subscription_available"}:
         return None
     if row.remaining is None or row.remaining <= 0:
         return None
@@ -915,6 +930,8 @@ def build_quota_dashboard_rows(
                     display_value=_quota_display_value(record),
                     source_mode=source_mode,
                     snapshot_name=snapshot_name,
+                    cost_class=str(record.get("cost_class") or "free").strip().lower(),
+                    quota_pool=str(record.get("quota_pool") or "").strip(),
                 )
             )
     return sorted(
@@ -1138,7 +1155,7 @@ def model_options_from_quota_rows(
 def load_latest_quota_snapshots(
     *,
     quota_dir: Path | None = None,
-    providers: Iterable[str] = ("aliyun", "volcengine", "siliconflow"),
+    providers: Iterable[str] = ("aliyun", "volcengine", "siliconflow", "minimax"),
 ) -> dict[str, dict[str, Any]]:
     root = quota_dir or PROJECT_ROOT / "data" / "quota"
     snapshots: dict[str, dict[str, Any]] = {}
@@ -1759,6 +1776,7 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             str(params.get("assets_glob") or DEFAULT_ASSETS_GLOB),
         )
         count = int(params.get("count") or 1)
+        performance_mode = str(params.get("performance_mode") or "balanced").strip().lower()
         lookback_days = normalize_optional_day_count(params.get("lookback_days"))
         single_news_material_file = str(params.get("single_news_material_file") or "").strip()
         news_materials_file = str(
@@ -1790,6 +1808,7 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         if assets_glob:
             args.extend(["--assets-glob", assets_glob])
         args.extend(["--count", str(count)])
+        args.extend(["--performance-mode", performance_mode])
         if no_copy:
             args.append("--no-copy")
 
@@ -1937,7 +1956,7 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             args.extend(["--max-age-days", max_age_days])
         return args
 
-    if subcommand in ("aliyun-quota", "volcengine-quota", "siliconflow-quota"):
+    if subcommand in ("aliyun-quota", "volcengine-quota", "siliconflow-quota", "minimax-quota"):
         raw_models = params.get("models") or []
         if isinstance(raw_models, str):
             models = [m.strip() for m in re.split(r"[,;\s]+", raw_models) if m.strip()]
@@ -1950,25 +1969,32 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
         login_hold = int(params.get("login_hold") or 0)
         wait_timeout = int(params.get("wait_timeout") or 120)
 
-        if all_free:
-            args.append("--all-free")
-        else:
+        if subcommand == "minimax-quota":
             for model in models:
                 args.extend(["--model", model])
-        if headless:
-            args.append("--headless")
-        if save_raw:
-            args.append("--save-raw")
-        if visible_only:
-            args.append("--visible-only")
-        args.extend(["--login-hold", str(login_hold)])
-        args.extend(["--wait-timeout", str(wait_timeout)])
+            if save_raw:
+                args.append("--save-raw")
+        else:
+            if all_free:
+                args.append("--all-free")
+            else:
+                for model in models:
+                    args.extend(["--model", model])
+            if headless:
+                args.append("--headless")
+            if save_raw:
+                args.append("--save-raw")
+            if visible_only:
+                args.append("--visible-only")
+            args.extend(["--login-hold", str(login_hold)])
+            args.extend(["--wait-timeout", str(wait_timeout)])
         return args
 
     if subcommand == "sync-quotas":
         raw_aliyun_models = params.get("aliyun_models") or []
         raw_volcengine_models = params.get("volcengine_models") or []
         raw_siliconflow_models = params.get("siliconflow_models") or []
+        raw_minimax_models = params.get("minimax_models") or []
         if isinstance(raw_aliyun_models, str):
             aliyun_models = [m.strip() for m in re.split(r"[,;\s]+", raw_aliyun_models) if m.strip()]
         else:
@@ -1981,6 +2007,10 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             siliconflow_models = [m.strip() for m in re.split(r"[,;\s]+", raw_siliconflow_models) if m.strip()]
         else:
             siliconflow_models = [str(m).strip() for m in raw_siliconflow_models if str(m).strip()]
+        if isinstance(raw_minimax_models, str):
+            minimax_models = [m.strip() for m in re.split(r"[,;\s]+", raw_minimax_models) if m.strip()]
+        else:
+            minimax_models = [str(m).strip() for m in raw_minimax_models if str(m).strip()]
         headless = bool(params.get("headless") or False)
         visible_only = bool(params.get("visible_only") or False)
         all_free = bool(params.get("all_free", True))
@@ -1997,6 +2027,8 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
                 args.extend(["--volcengine-model", model])
             for model in siliconflow_models:
                 args.extend(["--siliconflow-model", model])
+            for model in minimax_models:
+                args.extend(["--minimax-model", model])
         if headless:
             args.append("--headless")
         if visible_only:
@@ -2070,20 +2102,42 @@ def build_provider_env_overrides(
         env.pop("ALIYUN_LLM_MODELS", None)
         env.pop("VOLCENGINE_LLM_MODEL", None)
         env.pop("VOLCENGINE_LLM_MODELS", None)
+        env.pop("MINIMAX_LLM_MODEL", None)
+        env.pop("MINIMAX_LLM_MODELS", None)
+    elif provider == "minimax":
+        selected = model if model and model != AUTO_LLM_MODEL_OPTION else DEFAULT_MINIMAX_LLM_MODEL
+        env["MINIMAX_LLM_MODEL"] = selected
+        env["MINIMAX_LLM_MODELS"] = selected
+        env["MINIMAX_BILLING_MODE"] = "subscription_only"
+        env["MINIMAX_ALLOW_PAID_CREDITS"] = "0"
+        env["MINIMAX_ALLOW_PAYGO"] = "0"
+        env.pop("LLM_MODEL", None)
+        env.pop("ALIYUN_LLM_MODEL", None)
+        env.pop("ALIYUN_LLM_MODELS", None)
+        env.pop("VOLCENGINE_LLM_MODEL", None)
+        env.pop("VOLCENGINE_LLM_MODELS", None)
+        env.pop("SILICONFLOW_LLM_MODEL", None)
+        env.pop("SILICONFLOW_LLM_MODELS", None)
     else:
         if model == AUTO_LLM_MODEL_OPTION or not model:
             env.pop("ALIYUN_LLM_MODEL", None)
             env.pop("ALIYUN_LLM_MODELS", None)
             env.pop("VOLCENGINE_LLM_MODEL", None)
             env.pop("VOLCENGINE_LLM_MODELS", None)
+            env.pop("MINIMAX_LLM_MODEL", None)
+            env.pop("MINIMAX_LLM_MODELS", None)
             env.pop("LLM_MODEL", None)
             env.pop("SILICONFLOW_LLM_MODEL", None)
             env.pop("SILICONFLOW_LLM_MODELS", None)
+            env.pop("MINIMAX_LLM_MODEL", None)
+            env.pop("MINIMAX_LLM_MODELS", None)
         elif model in ALIYUN_LLM_MODEL_OPTIONS:
             env["ALIYUN_LLM_MODEL"] = model
             env["ALIYUN_LLM_MODELS"] = model
             env.pop("VOLCENGINE_LLM_MODEL", None)
             env.pop("VOLCENGINE_LLM_MODELS", None)
+            env.pop("MINIMAX_LLM_MODEL", None)
+            env.pop("MINIMAX_LLM_MODELS", None)
         elif model in VOLCENGINE_LLM_MODEL_OPTIONS:
             env["VOLCENGINE_LLM_MODEL"] = model
             env["VOLCENGINE_LLM_MODELS"] = model
@@ -2111,6 +2165,8 @@ def build_provider_env_overrides(
         env.pop("VOLCENGINE_IMAGE_MODELS", None)
         env.pop("SILICONFLOW_IMAGE_MODEL", None)
         env.pop("SILICONFLOW_IMAGE_MODELS", None)
+        env.pop("MINIMAX_IMAGE_MODEL", None)
+        env.pop("MINIMAX_IMAGE_MODELS", None)
         return env
 
     if img_provider not in IMAGE_PROVIDER_OPTIONS:
@@ -2124,6 +2180,8 @@ def build_provider_env_overrides(
         env.pop("VOLCENGINE_IMAGE_MODELS", None)
         env.pop("SILICONFLOW_IMAGE_MODEL", None)
         env.pop("SILICONFLOW_IMAGE_MODELS", None)
+        env.pop("MINIMAX_IMAGE_MODEL", None)
+        env.pop("MINIMAX_IMAGE_MODELS", None)
         return env
     env["IMAGE_PROVIDER"] = img_provider
 
@@ -2150,6 +2208,21 @@ def build_provider_env_overrides(
         env.pop("ALIYUN_IMAGE_MODELS", None)
         env.pop("VOLCENGINE_IMAGE_MODEL", None)
         env.pop("VOLCENGINE_IMAGE_MODELS", None)
+        env.pop("MINIMAX_IMAGE_MODEL", None)
+        env.pop("MINIMAX_IMAGE_MODELS", None)
+    elif img_provider == "minimax":
+        selected_image = (image_model or DEFAULT_MINIMAX_IMAGE_MODELS).strip()
+        env["MINIMAX_IMAGE_MODEL"] = selected_image
+        env["MINIMAX_IMAGE_MODELS"] = selected_image
+        env["MINIMAX_BILLING_MODE"] = "subscription_only"
+        env["MINIMAX_ALLOW_PAID_CREDITS"] = "0"
+        env["MINIMAX_ALLOW_PAYGO"] = "0"
+        env.pop("ALIYUN_IMAGE_MODEL", None)
+        env.pop("ALIYUN_IMAGE_MODELS", None)
+        env.pop("VOLCENGINE_IMAGE_MODEL", None)
+        env.pop("VOLCENGINE_IMAGE_MODELS", None)
+        env.pop("SILICONFLOW_IMAGE_MODEL", None)
+        env.pop("SILICONFLOW_IMAGE_MODELS", None)
     else:
         env.pop("ALIYUN_IMAGE_MODEL", None)
         env.pop("ALIYUN_IMAGE_MODELS", None)
@@ -2157,6 +2230,8 @@ def build_provider_env_overrides(
         env.pop("VOLCENGINE_IMAGE_MODELS", None)
         env.pop("SILICONFLOW_IMAGE_MODEL", None)
         env.pop("SILICONFLOW_IMAGE_MODELS", None)
+        env.pop("MINIMAX_IMAGE_MODEL", None)
+        env.pop("MINIMAX_IMAGE_MODELS", None)
 
     return env
 
@@ -2783,6 +2858,8 @@ def main() -> None:
                     else "火山引擎 Ark"
                     if row.provider == "volcengine"
                     else "硅基流动"
+                    if row.provider == "siliconflow"
+                    else "MiniMax Token Plan"
                 )
                 quota_rows_canvas.create_text(
                     x0,
@@ -3206,6 +3283,7 @@ def main() -> None:
             {
                 "all_free": True,
                 "siliconflow_models": DEFAULT_SILICONFLOW_QUOTA_MODELS,
+                "minimax_models": MINIMAX_LLM_MODEL_OPTIONS + MINIMAX_IMAGE_MODEL_OPTIONS,
                 "headless": quota_sync_headless_var.get(),
                 "visible_only": quota_sync_visible_only_var.get(),
                 "login_hold": DEFAULT_LOGIN_HOLD if not quota_sync_headless_var.get() else 0,
@@ -3244,6 +3322,9 @@ def main() -> None:
     assets_var = tk.StringVar(value=DEFAULT_ASSETS_GLOB)
     count_var = tk.IntVar(value=1)
     lookback_days_var = tk.StringVar(value="")
+    performance_mode_var = tk.StringVar(
+        value=_env_default("WORKFLOW_PERFORMANCE_MODE", "balanced") or "balanced"
+    )
     no_copy_var = tk.BooleanVar(value=False)
     dry_run_var = tk.BooleanVar(value=False)
     headless_var = tk.BooleanVar(value=False)
@@ -3326,6 +3407,20 @@ def main() -> None:
         wraplength=620,
     ).grid(row=7, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=5)
 
+    ttk.Label(auto_grid, text="运行模式").grid(row=8, column=0, sticky="w", pady=5)
+    ttk.Combobox(
+        auto_grid,
+        textvariable=performance_mode_var,
+        values=("balanced", "speed"),
+        state="readonly",
+        width=12,
+    ).grid(row=8, column=1, sticky="w", pady=5, padx=(10, 0))
+    ttk.Label(
+        auto_grid,
+        text="speed：完成一个候选就补下一个；LLM/生图仍各最多 2 个并发。",
+        style="Muted.TLabel",
+    ).grid(row=8, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=5)
+
     auto_grid.pack(fill="x")
 
     model_panel = ttk.Frame(tab_auto, style="Panel.TFrame", padding=(12, 10))
@@ -3347,6 +3442,7 @@ def main() -> None:
             _env_default("ALIYUN_LLM_MODEL")
             or _env_default("VOLCENGINE_LLM_MODEL")
             or _env_default("SILICONFLOW_LLM_MODEL")
+            or _env_default("MINIMAX_LLM_MODEL")
             or _env_default("LLM_MODEL")
             or DEFAULT_ALIYUN_LLM_MODEL
         )
@@ -3365,6 +3461,7 @@ def main() -> None:
             _env_default("ALIYUN_IMAGE_MODEL")
             or _env_default("VOLCENGINE_IMAGE_MODEL")
             or _env_default("SILICONFLOW_IMAGE_MODEL")
+            or _env_default("MINIMAX_IMAGE_MODEL")
             or DEFAULT_ALIYUN_IMAGE_MODELS
         )
     )
@@ -3436,6 +3533,16 @@ def main() -> None:
                 )
             )
             fallback = DEFAULT_SILICONFLOW_LLM_MODEL
+        elif provider == "minimax":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="minimax",
+                    kind="llm",
+                    fallback=MINIMAX_LLM_MODEL_OPTIONS,
+                )
+            )
+            fallback = DEFAULT_MINIMAX_LLM_MODEL
         else:
             values = [AUTO_LLM_MODEL_OPTION]
             fallback = AUTO_LLM_MODEL_OPTION
@@ -3485,6 +3592,19 @@ def main() -> None:
             image_model_box["values"] = values
             if image_model_var.get() not in values:
                 image_model_var.set(values[0] if values else DEFAULT_SILICONFLOW_IMAGE_MODELS)
+            image_model_box.configure(state="normal")
+        elif source == "minimax":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="minimax",
+                    kind="image",
+                    fallback=MINIMAX_IMAGE_MODEL_OPTIONS,
+                )
+            )
+            image_model_box["values"] = values
+            if image_model_var.get() not in values:
+                image_model_var.set(values[0] if values else DEFAULT_MINIMAX_IMAGE_MODELS)
             image_model_box.configure(state="normal")
         else:
             image_model_box.configure(state="disabled")
@@ -3561,6 +3681,7 @@ def main() -> None:
             "login_hold": login_hold_var.get(),
             "wait_timeout": wait_timeout_var.get(),
             "force": force_var.get(),
+            "performance_mode": performance_mode_var.get(),
         }
         _run_command("auto", params, _auto_env())
 
@@ -3686,6 +3807,8 @@ def main() -> None:
         material_llm_model_value = _env_default("VOLCENGINE_LLM_MODEL", DEFAULT_VOLCENGINE_LLM_MODEL)
     elif material_llm_provider_value == "siliconflow":
         material_llm_model_value = _env_default("SILICONFLOW_LLM_MODEL", DEFAULT_SILICONFLOW_LLM_MODEL)
+    elif material_llm_provider_value == "minimax":
+        material_llm_model_value = _env_default("MINIMAX_LLM_MODEL", DEFAULT_MINIMAX_LLM_MODEL)
     else:
         material_llm_model_value = _env_default("LLM_MODEL", DEFAULT_LLM_MODEL)
     material_llm_model_var = tk.StringVar(value=material_llm_model_value)
@@ -3701,6 +3824,8 @@ def main() -> None:
         material_image_model_value = _env_default("VOLCENGINE_IMAGE_MODEL", DEFAULT_VOLCENGINE_IMAGE_MODELS)
     elif material_image_source_value == "siliconflow":
         material_image_model_value = _env_default("SILICONFLOW_IMAGE_MODEL", DEFAULT_SILICONFLOW_IMAGE_MODELS)
+    elif material_image_source_value == "minimax":
+        material_image_model_value = _env_default("MINIMAX_IMAGE_MODEL", DEFAULT_MINIMAX_IMAGE_MODELS)
     else:
         material_image_model_value = DEFAULT_ALIYUN_IMAGE_MODELS
     material_image_model_var = tk.StringVar(value=material_image_model_value)
@@ -3979,6 +4104,16 @@ def main() -> None:
                 )
             )
             fallback = DEFAULT_SILICONFLOW_LLM_MODEL
+        elif provider == "minimax":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="minimax",
+                    kind="llm",
+                    fallback=MINIMAX_LLM_MODEL_OPTIONS,
+                )
+            )
+            fallback = DEFAULT_MINIMAX_LLM_MODEL
         else:
             values = [AUTO_LLM_MODEL_OPTION]
             fallback = AUTO_LLM_MODEL_OPTION
@@ -4033,6 +4168,20 @@ def main() -> None:
                 material_image_model_var.set(values[0] if values else DEFAULT_SILICONFLOW_IMAGE_MODELS)
             material_image_model_box.configure(state="normal")
             material_model_hint_var.set("硅基流动生图：使用下方选定的模型；请确认余额或免费额度。")
+        elif source == "minimax":
+            values = list(
+                model_options_from_quota_rows(
+                    quota_dashboard_all_rows,
+                    provider="minimax",
+                    kind="image",
+                    fallback=MINIMAX_IMAGE_MODEL_OPTIONS,
+                )
+            )
+            material_image_model_box["values"] = values
+            if material_image_model_var.get() not in values:
+                material_image_model_var.set(values[0] if values else DEFAULT_MINIMAX_IMAGE_MODELS)
+            material_image_model_box.configure(state="normal")
+            material_model_hint_var.set("MiniMax 生图：使用 Token Plan 订阅内共享额度；请确认费用保护。")
         else:
             material_image_model_box.configure(state="disabled")
             material_model_hint_var.set("本地素材或 Pexels：不调用生图模型；本面板只影响材料发帖。")
@@ -4191,6 +4340,7 @@ def main() -> None:
                     "aliyun": "阿里云百炼",
                     "volcengine": "火山引擎 Ark",
                     "siliconflow": "硅基流动",
+                    "minimax": "MiniMax Token Plan",
                 }.get(row.provider, row.provider or "未知平台")
                 material_quota_canvas.create_text(
                     x0,
@@ -5573,12 +5723,14 @@ def main() -> None:
         ("DashScope Key (DASHSCOPE_API_KEY)", "DASHSCOPE_API_KEY", "", True),
         ("Volcengine Ark Key (VOLCENGINE_API_KEY)", "VOLCENGINE_API_KEY", "", True),
         ("SiliconFlow Key (SILICONFLOW_API_KEY)", "SILICONFLOW_API_KEY", "", True),
+        ("MiniMax Token Plan Key (MINIMAX_TOKEN_PLAN_API_KEY)", "MINIMAX_TOKEN_PLAN_API_KEY", "", True),
         ("ppinfra Key (LLM_API_KEY)", "LLM_API_KEY", "", True),
         ("NewsAPI Key (NEWS_API_KEY)", "NEWS_API_KEY", "", True),
         ("Pexels Key (PEXELS_API_KEY)", "PEXELS_API_KEY", "", True),
         ("Aliyun LLM Base URL", "ALIYUN_LLM_BASE_URL", DEFAULT_ALIYUN_LLM_BASE_URL, False),
         ("Volcengine Ark Base URL", "VOLCENGINE_LLM_BASE_URL", DEFAULT_VOLCENGINE_LLM_BASE_URL, False),
         ("SiliconFlow Base URL", "SILICONFLOW_LLM_BASE_URL", DEFAULT_SILICONFLOW_LLM_BASE_URL, False),
+        ("MiniMax Base URL", "MINIMAX_BASE_URL", DEFAULT_MINIMAX_LLM_BASE_URL, False),
         ("ppinfra Base URL", "LLM_BASE_URL", DEFAULT_LLM_BASE_URL, False),
         ("Aliyun Image Size", "ALIYUN_IMAGE_SIZE", DEFAULT_ALIYUN_IMAGE_SIZE, False),
         ("Volcengine Image Size", "VOLCENGINE_IMAGE_SIZE", DEFAULT_VOLCENGINE_IMAGE_SIZE, False),

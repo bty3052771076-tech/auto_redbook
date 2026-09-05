@@ -34,6 +34,7 @@ _DEFAULT_WOOL_SOURCE_NAMES = {
     "aihot-daily",
     "huggingface",
     "chooseai-zcode-weekend",
+    "codex-reset-observatory",
 }
 
 
@@ -43,6 +44,19 @@ def _split_names(value: str) -> set[str]:
 
 def default_wool_sources() -> list[AIDigestSource]:
     sources = default_ai_digest_sources()
+    sources.append(
+        AIDigestSource(
+            "codex-reset-observatory",
+            "aggregator",
+            "https://codex.gussuriworks.com/en",
+            "Codex Reset Observatory",
+            "codex_reset",
+            tier="aggregator",
+            region="global",
+            topics=("codex", "quota", "reset"),
+            priority=12,
+        )
+    )
     configured = _split_names(os.getenv("WOOL_SOURCES", ""))
     allowed = configured or _DEFAULT_WOOL_SOURCE_NAMES
     return [source for source in sources if source.name in allowed and source.enabled]

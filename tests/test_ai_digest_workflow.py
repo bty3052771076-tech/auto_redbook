@@ -756,6 +756,25 @@ def test_ai_digest_post_title_does_not_use_social_bullet_fragment_as_subject():
     assert title == "每日AI|OpenAI开发者"
 
 
+def test_ai_digest_post_title_rejects_truncated_ascii_fragment():
+    item = AIUpdateItem(
+        title="to5MacIt",
+        summary="OpenAI发布Codex重置。",
+        source_name="9to5Mac",
+        source_type="search",
+        url="https://example.com/codex-reset",
+        published_at=_fresh_published_at(),
+        vendor="9to5Mac",
+        raw_excerpt="OpenAI发布Codex重置。",
+    )
+    brief = AIDigestBrief(title="每日AI讯息", date="2026-09-04", items=[item])
+
+    title = create_post._ai_digest_post_title(brief)
+
+    assert title == "每日AI|OpenAI发布Codex重置"
+    assert "to5MacIt" not in title
+
+
 def test_ai_digest_items_put_explicit_model_release_before_other_ai_updates():
     social = AIUpdateItem(
         title="OpenAI开发者动态",

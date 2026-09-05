@@ -1792,6 +1792,21 @@ def test_daily_news_title_strips_column_prefix_and_preserves_balanced_quotes():
     assert 10 <= len(title) <= 18
 
 
+def test_daily_news_title_strips_short_llm_column_prefix():
+    picked = NewsItem(
+        title="某国宣布新一轮关税措施",
+        url="https://example.com/tariff",
+        source="国际通讯社",
+        domain="example.com",
+        description="某国政府宣布对多个贸易伙伴启动新一轮关税措施，引发市场和外交层面的关注。",
+    )
+
+    title = _normalize_daily_news_title("国际热点｜某国宣布新一轮关税措施", picked, "国际新闻")
+
+    assert title == "某国宣布新一轮关税措施"
+    assert _daily_news_quality_issue(title, "内容：\n某国政府宣布对多个贸易伙伴启动新一轮关税措施。\n\n评价：\n事件仍在发展。\n\n日期：2026-09-05\n\n来源：国际通讯社", "国际新闻") == ""
+
+
 def test_daily_news_title_strips_finance_column_and_summarizes_water_transport():
     picked = NewsItem(
         title="财经聚焦｜多个重大水运工程缘何按下“快进键”",

@@ -141,6 +141,73 @@ def test_batch_gate_rejects_uploaded_historical_source_duplicate(tmp_path):
     assert any(issue.code == "historical_duplicate" for issue in report.issues)
 
 
+def test_batch_gate_compares_daily_wool_offers_not_generic_title(tmp_path):
+    image_path = _image(tmp_path / "wool.png")
+    current = Post(
+        title="每日羊毛|今日有AI福利",
+        status=PostStatus.draft,
+        assets=[AssetInfo(path=str(image_path), kind="image")],
+        platform={
+            "daily_wool": {
+                "has_wool": True,
+                "offers": [
+                    {
+                        "title": "OpenAI Codex向符合条件的付费用户发放银行重置",
+                        "url": "https://codex.gussuriworks.com/en",
+                        "published_at": "2026-09-04T11:34:46+08:00",
+                    }
+                ],
+            }
+        },
+    )
+    historical = Post(
+        title="每日羊毛|今日有AI福利",
+        status=PostStatus.saved_draft,
+        uploaded=True,
+        platform={
+            "daily_wool": {
+                "has_wool": True,
+                "offers": [
+                    {
+                        "title": "ZCode周末活动赠送GLM额度",
+                        "url": "https://www.chooseai.net/news/6285/",
+                        "published_at": "2026-08-28T00:00:00+08:00",
+                    }
+                ],
+            }
+        },
+    )
+
+    report = validate_post_batch([current], expected_count=1, historical_posts=[historical])
+
+    assert report.ok
+
+
+def test_batch_gate_rejects_same_daily_wool_offer(tmp_path):
+    image_path = _image(tmp_path / "wool.png")
+    offer = {
+        "title": "OpenAI Codex向符合条件的付费用户发放银行重置",
+        "url": "https://codex.gussuriworks.com/en",
+        "published_at": "2026-09-04T11:34:46+08:00",
+    }
+    current = Post(
+        title="每日羊毛|今日有AI福利",
+        assets=[AssetInfo(path=str(image_path), kind="image")],
+        platform={"daily_wool": {"has_wool": True, "offers": [offer]}},
+    )
+    historical = Post(
+        title="每日羊毛|今日有AI福利",
+        status=PostStatus.published,
+        uploaded=True,
+        platform={"daily_wool": {"has_wool": True, "offers": [offer]}},
+    )
+
+    report = validate_post_batch([current], expected_count=1, historical_posts=[historical])
+
+    assert not report.ok
+    assert any(issue.code == "historical_duplicate" for issue in report.issues)
+
+
 def test_batch_gate_allows_daily_ai_digests_with_different_source_items():
     current = Post(
         title="每日AI讯息",

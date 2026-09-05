@@ -6,7 +6,7 @@ import os
 import re
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass
 from dataclasses import replace
 from datetime import datetime
@@ -22,6 +22,7 @@ from src.ai_digest.generate import (
     generate_ai_digest_brief_with_llm,
     is_ai_digest_source_label_title,
     render_ai_digest_body,
+    validate_ai_digest_concrete_content,
 )
 from src.ai_digest.models import AIDigestBrief, AIUpdateItem
 from src.ai_digest.rank import (
@@ -48,7 +49,9 @@ from src.images.auto_image import (
     is_auto_image_enabled,
 )
 from src.llm.generate import generate_draft, generate_json
-from src.workflow.model_queues import ModelWorkQueues
+from src.workflow.model_queues import ModelWorkQueues, infer_llm_provider
+from src.workflow.performance import PerformancePolicy
+from src.sources.request_budget import RequestBudget
 from src.news.daily_news import (
     _cjk_story_event_signature,
     _is_china_item,
@@ -69,6 +72,19 @@ from src.news.daily_news import (
 from src.storage.files import copy_assets_into_post, list_posts, post_dir, save_post, save_revision
 from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSource, now_iso
 from src.validation.rules import MAX_IMAGE_BODY, MAX_IMAGE_TITLE
+
+
+DEFAULT_DAILY_NEWS_COORDINATOR_WORKERS = 4
+
+
+def _daily_news_coordinator_workers() -> int:
+    """Keep enough coordinators to overlap the two bounded model queues."""
+    raw = (os.getenv("DAILY_NEWS_COORDINATOR_WORKERS") or "").strip()
+    try:
+        requested = int(raw) if raw else DEFAULT_DAILY_NEWS_COORDINATOR_WORKERS
+    except ValueError:
+        requested = DEFAULT_DAILY_NEWS_COORDINATOR_WORKERS
+    return max(2, min(6, requested))
 
 
 _URL_RE = re.compile(r"(?:https?://|www\.|//)[^\s，。；;、）)】\]]+", flags=re.IGNORECASE)
@@ -512,9 +528,10 @@ def _source_lookup_max_chars() -> int:
 
 
 def _daily_news_context_is_incomplete(picked) -> bool:
+    title = _strip_urls(getattr(picked, "title", "") or "")
     description = _strip_urls(getattr(picked, "description", "") or "")
     content = _strip_urls(getattr(picked, "content", "") or "")
-    text = re.sub(r"\s+", " ", f"{description} {content}").strip()
+    text = re.sub(r"\s+", " ", f"{title} {description} {content}").strip()
     if len(text) < _source_lookup_min_chars():
         return True
     # NewsAPI frequently returns truncated snippets such as "[+123 chars]".
@@ -568,6 +585,25 @@ def _strip_news_column_prefix(text: str) -> str:
         "",
         text or "",
     ).strip()
+
+
+def _strip_short_news_column_prefix(text: str) -> str:
+    """Remove an LLM-added short column label while keeping the event title.
+
+    Models sometimes return titles such as ``国际｜具体事件`` or
+    ``新闻速递 | 具体事件``.  These are not incomplete titles, but the label
+    is still unsuitable as part of the post title and triggers the column
+    prefix quality gate.  Only remove a short left segment when the right
+    segment contains enough Chinese text to stand on its own.
+    """
+    value = (text or "").strip()
+    parts = re.split(r"[｜|]", value, maxsplit=1)
+    if len(parts) != 2:
+        return value
+    head, tail = (part.strip() for part in parts)
+    if not (2 <= len(head) <= 10 and _cjk_count(tail) >= 6):
+        return value
+    return tail.strip(" \t\r\n:：|｜-—–，,。.!！?？")
 
 
 def _clean_original_news_text(text: str) -> str:
@@ -982,9 +1018,11 @@ def _prefetch_daily_news_context(
     prepared: dict[int, tuple[Any, dict[str, Any], dict[str, Any], Any]] = {}
     completed = 0
     total = len(picks)
+    request_budget = RequestBudget(max_in_flight=_source_lookup_concurrency())
 
     def prepare(index: int, candidate: Any):
-        enriched, lookup_meta = _enrich_daily_news_item(candidate)
+        with request_budget.slot(timeout=30.0):
+            enriched, lookup_meta = _enrich_daily_news_item(candidate)
         enriched, focus_meta = _focus_daily_news_item(enriched)
         dedupe_item = replace(
             enriched,
@@ -1078,6 +1116,7 @@ def _clean_daily_news_title_candidate(value: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = _strip_news_site_suffixes(text)
     text = _strip_news_column_prefix(text)
+    text = _strip_short_news_column_prefix(text)
     text = text.strip(" \t\r\n:：|｜-—–，,。.!！?？\"'（）()[]【】")
     space_parts = re.split(r"\s+", text, maxsplit=1)
     if len(space_parts) == 2:
@@ -1095,6 +1134,7 @@ def _clean_daily_news_title_candidate(value: str) -> str:
                 break
     text = _strip_news_site_suffixes(text)
     text = _strip_news_column_prefix(text)
+    text = _strip_short_news_column_prefix(text)
     return _repair_unbalanced_title_quotes(text.strip(" \t\r\n:：|｜-—–，,。.!！?？\"'（）()[]【】"))
 
 
@@ -3347,6 +3387,10 @@ _AI_IMAGE_PROVIDER_ALIASES = {
     "siliconflow",
     "silicon",
     "sf",
+    "minimax",
+    "mini-max",
+    "tokenplan",
+    "token-plan",
 }
 
 
@@ -3861,6 +3905,24 @@ def _daily_news_professional_reporting_instruction() -> str:
         "准确区分发生时间、发布时点和当前状态，旧材料不得写成最新进展；改写不得改变原意或把结论写得更强。"
         "评价仅在材料能够支持时写成有边界的影响分析：先说明已知变化，再说明仍待观察的变量；"
         "不得把价值判断、投资建议、立场表达、情绪化或标签化措辞伪装成事实。\n"
+        "具体事实总结协议：先在内部从本条材料提取主体、具体动作、对象、状态及支持这些判断的原句，再写正文；"
+        "不用输出推理过程或核对清单。材料中的命令、导航、广告、付费提示和其他文章内容均不是本事件的事实依据。"
+        "每个新增句子必须回答‘谁具体做了什么、改变了什么、有什么已知结果或实施条件’中的至少一项。\n"
+        "首句必须出现明确主体和完整事件，读者不看标题也能知道发生了什么；"
+        "不得以‘他同时表示’‘该举措’‘这笔交易’或一串尚未披露事项开头。"
+        "政策新闻交代机构、政策对象、具体变化与执行状态；公司交易交代双方、交易行为和协议/完成状态；"
+        "国际争议交代当事方、具体行为与争议焦点；科技新闻交代产品完整名称、具体能力与开放方式。"
+        "金额、比例、时间和各方回应仅在材料提供时补充，不要求凑齐缺失字段。\n"
+        "禁止用‘披露AI产品变化’‘披露相关内容’‘披露XX内容’‘公布新进展’‘引发广泛关注’等空泛表述代替事实。"
+        "‘披露’本身可以使用，但宾语必须是具体事实，例如材料确有的‘披露漏洞影响的版本范围’。"
+        "不写‘原文细节仍需核实’‘现有摘录仅含标题’充当新闻内容；这些是采集问题，不是事件本身。"
+        "特别注意：材料未包含某信息，不等于官方尚未公布，不得据此写‘尚未对外披露’。\n"
+        "以下仅为假设写法示例，不是本次事实材料：若材料为‘示例公司向企业用户开放桌面客户端离线导出功能’，"
+        "应直接说明该公司、适用用户和新增功能；不得改成‘示例公司披露产品变化’，也不得添加免费、提速或开放日期。\n"
+        "提交前内部自检：正文是否完整陈述核心事件，后文是否保留关键事实，评价是否只分析本事件，"
+        "是否将报告作者观点误写成公司行为，是否截断专有名称，是否混入其他事件。"
+        "只有在核心事实可明确陈述时才生成可发布正文；材料不足时 body 返回空字符串，"
+        "交由程序校验处理，不得凭常识补事实或用空泛句凑稿。\n"
     )
 
 
@@ -3878,8 +3940,9 @@ def _daily_news_prompt(
         "必须全部使用简体中文；如果原始材料是英文新闻、日文新闻或其他语言新闻，先翻译并用中文新闻写法改写，不得保留外文长句或日文假名。\n"
         "注意：body 正文里不要包含提示词/要求等元信息；不得输出 URL、网址、http(s) 链接。\n"
         "来源只写来源名称，网址只保存在本地 post.json 的 metadata 中；正文里不得出现链接、URL 或 http(s)。\n"
-        "只允许使用下列已提供的新闻信息，不得新增事实或编造细节；内容不完整时，必须先查阅原新闻/原文摘录后再评价。\n"
-        "如果原文摘录仍不足，不得推测数字、因果、人物关系或后续结果；评价须明确现有事实边界，不要硬凑结论。\n\n"
+        "只允许使用下列已提供的新闻信息，不得新增事实或编造细节；先阅读摘要和原文摘录，再依据其中的具体事实写作。"
+        "本次调用不具备浏览工具，不得声称已经访问链接或用常识补全文。\n"
+        "内容不完整时，先查阅原新闻/原文摘录后再写作；如果原文摘录仍不足，不得推测数字、因果、人物关系或后续结果；评价须明确现有事实边界，不要硬凑结论。\n\n"
         f"{_daily_news_professional_reporting_instruction()}\n"
         "输出为严格 JSON（仅包含 keys: title, body, topics；可选 key: image_event），不要 Markdown/代码块。\n"
         "注意：外层 JSON 的 body 必须是字符串；body 字符串必须是可直接发布的正文，不要把 body 写成 JSON 对象文本。\n\n"
@@ -3896,14 +3959,14 @@ def _daily_news_prompt(
         "title：标题必须是12-18字的简体中文总结标题，理想约15字；必须由你基于新闻标题/摘要/原文摘录重新概括，不得直接照抄新闻原始标题；不得机械截断长标题；必须包含具体事件关键词；不要加“每日新闻｜”前缀，不得仅为“每日新闻”，不得出现日文假名；不得以“如/如果/若/一旦”等条件词开头，不能只写半句条件，必须写清新闻动作或结果。\n"
         "body：正文必须通顺，必须严格使用下面 4 个中文字段标签，不得增加字段，不得使用旧标签“原文标题/要点摘要/新闻内容/点评/发布时间”：\n"
         "内容：\n"
-        "<材料事实充分时建议220-350字；材料较短时可以少于220字，但必须尽可能完整交代事件，不得为了凑字补写事实。内容字段必须脱离评价也能独立成立，优先覆盖材料已有的主体、时间、地点、核心行为、关键数据、原因或背景、当前结果；按事件因果或时间顺序自然衔接，不堆砌网页导航、栏目名、浏览器升级提示、来源页噪声；不得写站内推荐/相关阅读/下一篇文章标题，例如“权威数读”“新华视点”“记者手记”“特色产业赋能”“中国摩托加速”；不写未经证实的细节，不写“目前可以确认的信息主要来自”等模板句>\n\n"
+        "<材料事实充分时建议220-350字；材料较短时可以少于220字，但必须完整说明材料支持的核心事件，不得为了凑字补写事实。先用完整导语写清主体、动作和对象，再补材料已有的时间、地点、关键数据、原因或背景、当前结果；不能仅剩评论、背景或尾段，不能要求读者看标题才能理解。按事件因果或时间顺序自然衔接，不堆砌网页导航、栏目名、浏览器升级提示、来源页噪声；不得写站内推荐/相关阅读/下一篇文章标题，例如“权威数读”“新华视点”“记者手记”“特色产业赋能”“中国摩托加速”；不写未经证实的细节，不写“目前可以确认的信息主要来自”等模板句>\n\n"
         "评价：\n"
         "<评价限制为1句且不超过60字，放在完整事实叙述之后；只概括该事件最直接的意义、影响或待确认变量，不写个人感受、口号、建议和泛泛而谈；评价不得替代、压缩或重复事实叙述；信息不足时说明判断边界，不得留空；不得套用与新闻主题无关的 AI/版权/经贸/供应链等模板>\n\n"
         "日期：YYYY-MM-DD\n\n"
         "来源：来源名称（不要写网址）\n"
         "长度约束：body 总长度（含换行）务必 <= 900 字符，避免写太长导致发布失败。\n"
         f"{_daily_news_evaluation_viewpoint_instruction(evaluation_viewpoint)}"
-        "先查阅并基于已给事实/原文摘录再给判断，不得推测，不煽动对立、不使用攻击性语言、不做情绪化带节奏表述。\n"
+        "先阅读并基于已给事实/原文摘录再给判断，不得推测，不煽动对立、不使用攻击性语言、不做情绪化带节奏表述。\n"
         "可提示风险与影响，但不得夸大、不得杜撰未提供事实；不得写“这类新闻适合先看事实，再看影响”、"
         "“接下来可以重点关注权威更新、执行细节和各方反馈”等空泛方法论句式。\n"
         "topics（数组，3-8个话题词）：必须包含“每日新闻”。不要把 topics 写进 body。\n"
@@ -5509,6 +5572,40 @@ def _ai_digest_post_title(
     subject = subject.replace("加密算法中的弱点", "加密弱点")
     subject = subject.replace("加密算法弱点", "加密弱点")
     subject = subject.strip("，,。；;：:、-—| ") or fallback
+    # A truncated model response can look like an arbitrary ASCII fragment
+    # (for example ``to5MacIt``). Never expose that fragment as the cover
+    # title; recover a fact-grounded Chinese subject or use the neutral title.
+    if featured is not None:
+        complete_model_token = re.search(
+            r"(?i)(?:gpt|glm|qwen|claude|codex|gemini|gemma|doubao|seedream|"
+            r"deepseek|kimi|minimax|ernie|llama|mistral|astra|fable|hy)[-_. ]*"
+            r"(?:v)?\d+(?:\.\d+)?",
+            subject,
+        )
+        if len(_CJK_CHAR_RE.findall(subject)) < 2 and not complete_model_token:
+            from src.ai_digest.generate import _fallback_chinese_title
+
+            recovery_candidates = [
+                str(featured.summary or ""),
+                str(featured.raw_excerpt or ""),
+                _fallback_chinese_title(featured),
+            ]
+            recovered = ""
+            for candidate in recovery_candidates:
+                candidate = re.split(r"[，。！？；;｜|]", candidate, maxsplit=1)[0]
+                candidate = re.sub(r"\s+", "", candidate).strip("，,。；;：:、-—| ")
+                if not candidate or is_ai_digest_source_label_title(candidate, featured):
+                    continue
+                candidate_model_token = re.search(
+                    r"(?i)(?:gpt|glm|qwen|claude|codex|gemini|gemma|doubao|seedream|"
+                    r"deepseek|kimi|minimax|ernie|llama|mistral|astra|fable|hy)[-_. ]*"
+                    r"(?:v)?\d+(?:\.\d+)?",
+                    candidate,
+                )
+                if len(_CJK_CHAR_RE.findall(candidate)) >= 2 or candidate_model_token:
+                    recovered = candidate
+                    break
+            subject = recovered or fallback
     # The body and cover already communicate the digest item count. Keeping
     # it out of the title leaves room for the complete featured product name.
     suffix = ""
@@ -5558,7 +5655,13 @@ def create_daily_ai_digest_posts(
     prompt_hint: str = "",
     evaluation_viewpoint: str = DEFAULT_EVALUATION_VIEWPOINT,
     lookback_days: object = None,
+    performance_mode: str | None = None,
 ) -> list[Post]:
+    performance_policy = (
+        PerformancePolicy.from_value(performance_mode)
+        if performance_mode is not None
+        else PerformancePolicy.from_environment()
+    )
     minimum_count = _ai_digest_min_items()
     max_items = _ai_digest_adaptive_max_items()
     legacy_target_count = _env_int(
@@ -5625,10 +5728,14 @@ def create_daily_ai_digest_posts(
             min_foreign_ai_count=min_foreign_ai_count,
             include_pool_items=True,
             force_search_backfill=bool(prompt_search_queries),
-            force_aggregator_backfill=bool(historical_keys),
+            # History dedupe is local and must not force low-priority
+            # aggregators into every run. Use them only when the official pool
+            # actually has a coverage gap.
+            force_aggregator_backfill=False,
             exclude_history_keys=historical_keys,
             search_backfill_queries=prompt_search_queries or None,
             progress=progress,
+            performance_mode=performance_policy.mode,
             source_health_path=Path("data") / "source_health" / "ai_digest.json",
             persist_source_health=True,
         )
@@ -5668,10 +5775,11 @@ def create_daily_ai_digest_posts(
                 min_foreign_ai_count=min_foreign_ai_count,
                 include_pool_items=True,
                 force_search_backfill=bool(prompt_search_queries),
-                force_aggregator_backfill=bool(historical_keys),
+                force_aggregator_backfill=False,
                 exclude_history_keys=historical_keys,
                 search_backfill_queries=prompt_search_queries or None,
                 progress=progress,
+                performance_mode=performance_policy.mode,
                 source_health_path=Path("data") / "source_health" / "ai_digest.json",
                 persist_source_health=True,
             )
@@ -5953,6 +6061,7 @@ def create_daily_ai_digest_posts(
                 exclude_history_keys=historical_keys,
                 search_backfill_queries=prompt_search_queries or None,
                 progress=progress,
+                performance_mode=performance_policy.mode,
                 source_health_path=Path("data") / "source_health" / "ai_digest.json",
                 persist_source_health=True,
             )
@@ -6345,6 +6454,10 @@ def create_daily_ai_digest_posts(
         body_fit_error = source_cap_error
     if body_fit_error:
         raise RuntimeError(body_fit_error)
+    try:
+        validate_ai_digest_concrete_content(brief)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     source_meta["selected_before_body_fit"] = selected_before_body_fit
     source_meta["body_fit_dropped"] = max(0, selected_before_body_fit - len(brief.items))
     source_meta["selected_quota_counts"] = ai_digest_quota_counts(list(brief.items or []))
@@ -7253,11 +7366,14 @@ def _run_parallel_daily_news_candidates(
     post_quality_callback: DailyNewsPostQualityCallback | None,
     required_china_count: int,
     required_international_conflict_count: int,
+    performance_policy: PerformancePolicy | None = None,
 ) -> list[Post]:
     """Run candidate preparation in two lanes and accept results in order."""
     # Re-assert the protected editorial lane after any LLM reordering. This
     # keeps conflict candidates from waiting behind ordinary stories and
     # avoids spending image calls before the required lane is filled.
+    performance_policy = performance_policy or PerformancePolicy.from_environment()
+    speed_first = performance_policy.is_speed_first
     picks = (
         _prioritize_all_daily_news_conflicts(list(picks))
         if required_international_conflict_count
@@ -7288,17 +7404,31 @@ def _run_parallel_daily_news_candidates(
         for index in range(1, len(picks) + 1)
     }
     prefiltered_duplicates = 0
+    prefiltered_incomplete_context = 0
     prefilter_signatures: list[Any] = []
     if not single_material_mode:
         for candidate_index in sorted(prepared_by_index):
             enriched, lookup_meta, focus_meta, dedupe_item = prepared_by_index[candidate_index]
+            if _daily_news_context_is_incomplete(enriched):
+                prefiltered_incomplete_context += 1
+                prepared_by_index.pop(candidate_index, None)
+                _emit_daily_news_progress(
+                    progress_callback,
+                    "原文核验",
+                    "skipped",
+                    candidate_index=candidate_index,
+                    completed=0,
+                    target=target_count,
+                    reason="source_context_insufficient",
+                )
+                continue
             signature = _cjk_story_event_signature(dedupe_item)
             if any(_same_cjk_story_event(signature, seen) for seen in prefilter_signatures):
                 prefiltered_duplicates += 1
                 prepared_by_index.pop(candidate_index, None)
                 continue
             prefilter_signatures.append(signature)
-    skipped_quality_count = prefiltered_duplicates
+    skipped_quality_count = prefiltered_duplicates + prefiltered_incomplete_context
 
     pending_indices = sorted(prepared_by_index)
     conflict_by_index = {
@@ -7309,57 +7439,113 @@ def _run_parallel_daily_news_candidates(
         for index in pending_indices
     }
 
-    # Two candidate workers feed two independent model queues. The workers
-    # only prepare local objects; XHS upload happens later in apps.cli's
-    # existing serial loop.
-    with ModelWorkQueues(llm_workers=2, image_workers=2) as model_queues:
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="redbook-candidate") as workers:
-            while pending_indices:
+    # Candidate workers feed independent model queues. MiniMax may use five
+    # LLM agents; other providers stay at two. XHS upload happens later in
+    # apps.cli's existing serial loop.
+    llm_provider = infer_llm_provider(cfgs)
+    llm_workers = performance_policy.llm_workers_for_provider(llm_provider)
+    coordinator_workers = max(_daily_news_coordinator_workers(), llm_workers)
+    with ModelWorkQueues(
+        llm_workers=llm_workers,
+        image_workers=performance_policy.image_workers,
+        llm_provider=llm_provider,
+    ) as model_queues:
+        with ThreadPoolExecutor(
+            max_workers=coordinator_workers,
+            thread_name_prefix="redbook-candidate",
+        ) as workers:
+            in_flight: list[Any] = []
+            while pending_indices or in_flight:
                 if (
                     len(posts) >= target_count
                     and accepted_conflict_count >= required_international_conflict_count
                 ):
                     break
-                batch_indices = _daily_news_candidate_batch_indices(
-                    pending_indices,
-                    accepted_conflict_count=accepted_conflict_count,
-                    required_international_conflict_count=required_international_conflict_count,
-                    conflict_by_index=conflict_by_index,
-                )
-                if not batch_indices:
-                    break
-                pending_indices = [
-                    index for index in pending_indices if index not in batch_indices
-                ]
-                batch = [
-                    (index, picks[index - 1])
-                    for index in batch_indices
-                    if index in prepared_by_index
-                ]
-                if not batch:
-                    continue
-                futures = [
-                    workers.submit(
-                        _prepare_daily_news_candidate,
-                        candidate_index=index,
-                        picked=picked,
-                        cfgs=cfgs,
-                        asset_paths=asset_paths,
-                        copy_assets=copy_assets,
-                        auto_image_enabled=auto_image_enabled,
-                        prompt_norm=prompt_norm,
-                        viewpoint_norm=viewpoint_norm,
-                        target_count=target_count,
-                        single_material_mode=single_material_mode,
-                        base_meta=base_meta,
-                        progress_callback=progress_callback,
-                        model_queues=model_queues,
-                        post_quality_callback=post_quality_callback,
-                        prepared=prepared_by_index.get(index),
-                        original_is_conflict=original_conflict_by_index.get(index),
+                if speed_first:
+                    # Keep the coordinator window full. The two model queues
+                    # remain the actual provider-level concurrency boundary.
+                    coordinator_limit = coordinator_workers
+                    while pending_indices and len(in_flight) < coordinator_limit:
+                        batch_indices = _daily_news_candidate_batch_indices(
+                            pending_indices,
+                            accepted_conflict_count=accepted_conflict_count,
+                            required_international_conflict_count=required_international_conflict_count,
+                            conflict_by_index=conflict_by_index,
+                            batch_size=1,
+                        )
+                        if not batch_indices:
+                            break
+                        index = batch_indices[0]
+                        pending_indices.remove(index)
+                        if index not in prepared_by_index:
+                            continue
+                        in_flight.append(
+                            workers.submit(
+                                _prepare_daily_news_candidate,
+                                candidate_index=index,
+                                picked=picks[index - 1],
+                                cfgs=cfgs,
+                                asset_paths=asset_paths,
+                                copy_assets=copy_assets,
+                                auto_image_enabled=auto_image_enabled,
+                                prompt_norm=prompt_norm,
+                                viewpoint_norm=viewpoint_norm,
+                                target_count=target_count,
+                                single_material_mode=single_material_mode,
+                                base_meta=base_meta,
+                                progress_callback=progress_callback,
+                                model_queues=model_queues,
+                                post_quality_callback=post_quality_callback,
+                                prepared=prepared_by_index.get(index),
+                                original_is_conflict=original_conflict_by_index.get(index),
+                            )
+                        )
+                    if not in_flight:
+                        break
+                    done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                    futures = list(done)
+                    in_flight = [future for future in in_flight if future not in done]
+                else:
+                    batch_indices = _daily_news_candidate_batch_indices(
+                        pending_indices,
+                        accepted_conflict_count=accepted_conflict_count,
+                        required_international_conflict_count=required_international_conflict_count,
+                        conflict_by_index=conflict_by_index,
                     )
-                    for index, picked in batch
-                ]
+                    if not batch_indices:
+                        break
+                    pending_indices = [
+                        index for index in pending_indices if index not in batch_indices
+                    ]
+                    batch = [
+                        (index, picks[index - 1])
+                        for index in batch_indices
+                        if index in prepared_by_index
+                    ]
+                    if not batch:
+                        continue
+                    futures = [
+                        workers.submit(
+                            _prepare_daily_news_candidate,
+                            candidate_index=index,
+                            picked=picked,
+                            cfgs=cfgs,
+                            asset_paths=asset_paths,
+                            copy_assets=copy_assets,
+                            auto_image_enabled=auto_image_enabled,
+                            prompt_norm=prompt_norm,
+                            viewpoint_norm=viewpoint_norm,
+                            target_count=target_count,
+                            single_material_mode=single_material_mode,
+                            base_meta=base_meta,
+                            progress_callback=progress_callback,
+                            model_queues=model_queues,
+                            post_quality_callback=post_quality_callback,
+                            prepared=prepared_by_index.get(index),
+                            original_is_conflict=original_conflict_by_index.get(index),
+                        )
+                        for index, picked in batch
+                    ]
                 results: list[_DailyNewsCandidateResult] = []
                 for future in futures:
                     try:
@@ -7570,6 +7756,7 @@ def create_daily_news_posts(
     material_time: str = "",
     progress_callback: DailyNewsProgressCallback | None = None,
     post_quality_callback: DailyNewsPostQualityCallback | None = None,
+    performance_mode: str | None = None,
 ) -> list[Post]:
     """
     Special workflow for title="每日新闻".
@@ -7577,6 +7764,11 @@ def create_daily_news_posts(
     - Use `prompt_hint` to rank candidates, then pick up to `count` items.
     - When `count` is 1, behavior is equivalent to a single best match.
     """
+    performance_policy = (
+        PerformancePolicy.from_value(performance_mode)
+        if performance_mode is not None
+        else PerformancePolicy.from_environment()
+    )
     cfgs = load_llm_configs()
     single_material_mode = bool(str(single_news_material_file or "").strip())
     prompt_norm = "" if single_material_mode else (prompt_hint or "").strip()
@@ -7696,4 +7888,5 @@ def create_daily_news_posts(
         post_quality_callback=post_quality_callback,
         required_china_count=required_china_count,
         required_international_conflict_count=required_international_conflict_count,
+        performance_policy=performance_policy,
     )

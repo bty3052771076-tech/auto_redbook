@@ -10,6 +10,12 @@ from typing import Any
 COOLDOWN_STATUSES = frozenset(
     {"timeout", "transport_error", "http_error", "error", "empty", "missing_date", "stale"}
 )
+# A source that repeatedly fails in any of these ways should be replaced or
+# demoted.  Replacement used to count only literal timeouts, which left a
+# source returning HTTP errors or empty payloads in the hot path.
+REPLACEMENT_FAILURE_STATUSES = frozenset(
+    {"timeout", "transport_error", "http_error", "error", "empty", "missing_date", "stale"}
+)
 
 
 def _parse_datetime(value: str) -> datetime | None:
@@ -157,13 +163,18 @@ def should_replace_source(
     min_samples: int = 5,
     timeout_ratio: float = 0.6,
 ) -> bool:
-    """Return whether repeated timeouts warrant source replacement."""
+    """Return whether repeated source failures warrant replacement.
+
+    ``timeout_ratio`` is retained as the public argument name for backwards
+    compatibility.  It now represents the ratio of all known failure statuses,
+    not only literal timeout results.
+    """
     if attempt is None:
         return False
     statuses = tuple(attempt.recent_statuses or ((attempt.status,) if attempt.status else ()))
     if len(statuses) < max(1, int(min_samples)):
         return False
-    ratio = sum(status == "timeout" for status in statuses) / len(statuses)
+    ratio = sum(status in REPLACEMENT_FAILURE_STATUSES for status in statuses) / len(statuses)
     return ratio >= max(0.0, min(1.0, float(timeout_ratio)))
 
 

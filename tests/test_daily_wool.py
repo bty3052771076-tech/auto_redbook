@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from src.ai_digest.fetchers import parse_benefit_html
+from src.ai_digest.fetchers import parse_benefit_html, parse_codex_reset_html
 from src.ai_digest.models import AIUpdateItem
 from src.storage.files import list_posts
 from src.wool.collect import extract_wool_offers
@@ -51,6 +51,52 @@ def test_extract_wool_offers_accepts_concrete_free_quota_notice():
     assert len(offers) == 1
     assert "免费" in offers[0].benefit or "领取" in offers[0].benefit
     assert offers[0].url == items[0].url
+
+
+def test_parse_codex_reset_tracker_keeps_today_reset_and_x_evidence():
+    html = (
+        '<script>\\"resetAt\\":\\"2026-09-04T03:34:46.386Z\\",'
+        '\\"note\\":\\"A BANKED Reset was distributed to paid ChatGPT users who still do not have access to GPT-6 Astra.\\",'
+        '\\"source\\":\\"https://x.com/thsottiaux/status/2095651088502591861\\"</script>'
+    )
+
+    items = parse_codex_reset_html(
+        html,
+        source_name="Codex Reset Observatory",
+        vendor="Codex Reset Observatory",
+        base_url="https://codex.gussuriworks.com/en",
+    )
+
+    assert len(items) == 1
+    assert items[0].published_at.startswith("2026-09-04T03:34")
+    assert items[0].evidence_urls == [
+        "https://x.com/thsottiaux/status/2095651088502591861",
+        "https://codex.gussuriworks.com/en",
+    ]
+
+
+def test_extract_wool_offers_accepts_current_codex_reset_signal():
+    now = datetime(2026, 9, 4, 12, tzinfo=timezone(timedelta(hours=8)))
+    item = AIUpdateItem(
+        title="OpenAI Codex向符合条件的付费用户发放银行重置",
+        summary=(
+            "公开重置追踪页记录：OpenAI Codex向部分付费ChatGPT用户发放银行重置；"
+            "重置可由符合条件的用户自行使用，最终以账户页面为准。"
+        ),
+        source_name="Codex Reset Observatory",
+        source_type="aggregator",
+        url="https://codex.gussuriworks.com/en",
+        published_at="2026-09-04T03:34:46.386Z",
+        vendor="Codex Reset Observatory",
+        product="Codex banked reset",
+        raw_excerpt="公开重置追踪页记录，最终以账户页面为准。",
+    )
+
+    offers = extract_wool_offers([item], now=now, max_age_days=3)
+
+    assert len(offers) == 1
+    assert offers[0].provider == "OpenAI"
+    assert offers[0].published_at.startswith("2026-09-04T11:34")
 
 
 def test_extract_wool_offers_accepts_zcode_weekend_token_wording():
