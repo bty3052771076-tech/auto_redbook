@@ -38,4 +38,3 @@ def build_search_plan(
         queries=tuple(unique),
         max_concurrency=policy.ai_backfill_concurrency if policy.is_speed_first else 1,
     )
-

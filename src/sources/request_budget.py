@@ -87,4 +87,3 @@ class TTLRequestCache(Generic[T]):
             value = loader()
             self.set(key, value, ttl_s=ttl_s)
             return value
-
