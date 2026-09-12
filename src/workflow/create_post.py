@@ -4,12 +4,13 @@ import json
 import hashlib
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional
@@ -51,6 +52,10 @@ from src.images.auto_image import (
 from src.llm.generate import generate_draft, generate_json
 from src.workflow.model_queues import ModelWorkQueues, infer_llm_provider
 from src.workflow.performance import PerformancePolicy
+from src.workflow.news_discovery import (
+    DailyNewsDiscovery, NEWS_LOOKBACK_MAX, feasible_news_batch,
+    news_key, news_domain, resolve_news_windows,
+)
 from src.sources.request_budget import RequestBudget
 from src.news.daily_news import (
     _cjk_story_event_signature,
@@ -129,7 +134,7 @@ AI_DIGEST_MIN_ITEMS = 1
 AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS = 3
 AI_DIGEST_MIN_FOREIGN_AI_ITEMS = 3
 DEFAULT_CANDIDATE_LOOKBACK_WINDOWS = (3, 7, 14)
-DAILY_NEWS_MAX_LOOKBACK_DAYS = 2
+DAILY_NEWS_MAX_LOOKBACK_DAYS = NEWS_LOOKBACK_MAX
 _DAILY_NEWS_TITLE_MIN_LEN = 10
 _NEWS_TITLE_PROMPT_STRONG_MARKERS = (
     "选择一条",
@@ -531,7 +536,18 @@ def _daily_news_context_is_incomplete(picked) -> bool:
     title = _strip_urls(getattr(picked, "title", "") or "")
     description = _strip_urls(getattr(picked, "description", "") or "")
     content = _strip_urls(getattr(picked, "content", "") or "")
-    text = re.sub(r"\s+", " ", f"{title} {description} {content}").strip()
+    # Count distinct reporting, not repeated headlines and aggregator labels.
+    text = " ".join(dict.fromkeys(part.strip() for part in (description, content) if part.strip()))
+    headline = re.sub(r"\s*[-|｜]\s*[^-|｜]+$", "", title).strip()
+    for repeated in sorted({title, headline}, key=len, reverse=True):
+        if repeated:
+            text = re.sub(re.escape(repeated), " ", text, flags=re.IGNORECASE)
+    for label in (str(getattr(picked, "source", "") or ""), "Google News", "原文摘录："):
+        if label:
+            text = re.sub(re.escape(label), " ", text, flags=re.IGNORECASE)
+    sentences = [re.sub(r"\s+", " ", part).strip()
+                 for part in re.split(r"[。！？\n]|(?<=[.!?])\s+", text)]
+    text = " ".join(dict.fromkeys(part for part in sentences if part))
     if len(text) < _source_lookup_min_chars():
         return True
     # NewsAPI frequently returns truncated snippets such as "[+123 chars]".
@@ -1021,9 +1037,16 @@ def _prefetch_daily_news_context(
     request_budget = RequestBudget(max_in_flight=_source_lookup_concurrency())
 
     def prepare(index: int, candidate: Any):
-        with request_budget.slot(timeout=30.0):
-            enriched, lookup_meta = _enrich_daily_news_item(candidate)
+        lookup_started = time.perf_counter()
+        if _daily_news_context_is_incomplete(candidate):
+            with request_budget.slot(timeout=30.0):
+                enriched, lookup_meta = _enrich_daily_news_item(candidate)
+        else:
+            enriched = candidate
+            lookup_meta = {"source_lookup": {"needed": False, "ok": False,
+                           "skipped": "sufficient_api_context", "chars": 0}}
         enriched, focus_meta = _focus_daily_news_item(enriched)
+        lookup_meta.setdefault("source_lookup", {})["elapsed_seconds"] = round(time.perf_counter() - lookup_started, 3)
         dedupe_item = replace(
             enriched,
             description=_compact_daily_news_context(enriched, max_chars=700),
@@ -1065,6 +1088,9 @@ def _prefetch_daily_news_context(
                     candidate_index=index,
                     candidate_total=total,
                     completed=completed,
+                    title=enriched.title,
+                    elapsed_seconds=lookup_meta.get("source_lookup", {}).get("elapsed_seconds", 0),
+                    context_sufficient=not _daily_news_context_is_incomplete(enriched),
                 )
     return prepared
 
@@ -3540,6 +3566,10 @@ def regenerate_daily_news_post_image(
         post.platform["image"] = image_metas[0]
     if image_fallback:
         post.platform["image_fallback"] = image_fallback
+    else:
+        # A successful AI regeneration replaces the prior fallback assets;
+        # do not leave stale fallback metadata in the post or GUI.
+        post.platform.pop("image_fallback", None)
     save_post(post)
     return True
 
@@ -3553,9 +3583,11 @@ def _fetch_daily_news_candidates_for_upload(
     single_news_material_file: str | Path | None = None,
     material_time: str = "",
     progress_callback: DailyNewsProgressCallback | None = None,
+    discovery_holder: dict[str, Any] | None = None,
+    performance_policy: PerformancePolicy | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
-    multi_material_path = str(news_materials_file or "").strip()
     single_material_path = str(single_news_material_file or "").strip()
+    multi_material_path = str(news_materials_file or ("" if single_material_path else os.getenv("NEWS_MATERIALS_FILE")) or "").strip()
     if single_material_path and multi_material_path:
         raise RuntimeError("single_news_material_file and news_materials_file are mutually exclusive")
     if single_material_path:
@@ -3621,75 +3653,68 @@ def _fetch_daily_news_candidates_for_upload(
         }
         return [item], meta
 
+    if not multi_material_path:
+        windows, window_meta = _daily_news_lookback_window(
+            lookback_days, env_names=("NEWS_LOOKBACK_DAYS", "CONTENT_LOOKBACK_DAYS"))
+        target_count = max(1, int(count or 1))
+        preferred = _daily_news_candidate_fetch_limit(target_count)
+        # The raw target is independent of the minimum generation threshold.
+        raw_target = max(target_count * 20, _daily_news_raw_candidate_fetch_limit(preferred))
+        policy = performance_policy or PerformancePolicy.from_environment()
+        history_signatures = []
+        from src.news.daily_news import NewsItem
+        from src.news.history import news_history_dedupe_enabled
+        if news_history_dedupe_enabled():
+            for historical_post in list_posts():
+                # A failed/incomplete batch is persisted locally as a draft,
+                # but it was never uploaded and must not poison the next
+                # batch's cross-run story dedupe history.
+                if not (
+                    historical_post.uploaded
+                    or historical_post.status in {PostStatus.saved_draft, PostStatus.published}
+                ):
+                    continue
+                news_meta = historical_post.platform.get("news")
+                if not isinstance(news_meta, dict):
+                    continue
+                picked = news_meta.get("picked")
+                if isinstance(picked, dict) and picked.get("title"):
+                    historical_item = NewsItem(**{"url": "", **{
+                        key: value for key, value in picked.items() if key in NewsItem.__dataclass_fields__
+                    }})
+                    history_signatures.append(_cjk_story_event_signature(historical_item))
+        discovery = DailyNewsDiscovery(
+            prompt=prompt_norm, count=target_count, windows=windows, window_meta=window_meta,
+            raw_target=raw_target, preferred_target=preferred,
+            budget_seconds=180.0 if policy.is_speed_first else policy.news_candidate_deadline_s,
+            fetch=fetch_daily_news_candidates, prepare=_prefetch_daily_news_context,
+            incomplete=_daily_news_context_is_incomplete, progress=progress_callback,
+            history_signatures=history_signatures,
+        )
+        _emit_daily_news_progress(progress_callback, "准备候选池", "in_progress",
+                                 requested_count=target_count, raw_target=raw_target,
+                                 preferred_target=preferred, min_qualified=target_count,
+                                 reserve_target=discovery.reserve_target)
+        candidates = discovery.take(initial=True)
+        if discovery_holder is not None:
+            discovery_holder["session"] = discovery
+        return candidates, discovery.meta
+
     target_fetch_count = _daily_news_candidate_fetch_limit(count)
     raw_fetch_count = _daily_news_raw_candidate_fetch_limit(target_fetch_count)
-    lookback_windows, lookback_meta = _daily_news_lookback_window(
-        lookback_days,
-        env_names=("NEWS_LOOKBACK_DAYS", "CONTENT_LOOKBACK_DAYS"),
-    )
-    search_days = max(lookback_windows)
-    required_conflict_count = daily_news_international_conflict_quota(max(1, int(count or 1)))
-    conflict_queries = (
-        [
-            "国际冲突 停火 制裁 争端 争议事件",
-            "international conflict ceasefire sanctions military dispute",
-        ]
-        if required_conflict_count
-        else []
-    )
-    _emit_daily_news_progress(
-        progress_callback,
-        "准备候选池",
-        "in_progress",
-        requested_count=max(1, int(count or 1)),
-        min_qualified=target_fetch_count,
-        raw_target=raw_fetch_count,
-        lookback_days=search_days,
-    )
-
     def _source_progress(stage: str, status: str, detail: dict[str, Any]) -> None:
         _emit_daily_news_progress(progress_callback, stage, status, **detail)
-
-    def _qualified_candidate_count(pool: list[Any]) -> int:
-        best_count = 0
-        for days in lookback_windows:
-            recent_pool, _ = filter_recent_news_items(
-                list(pool),
-                tz_name=os.getenv("NEWS_TZ") or "Asia/Shanghai",
-                max_age_days=days,
-            )
-            relevant_pool, _ = filter_prompt_relevant_news_items(recent_pool, prompt_norm)
-            if required_conflict_count:
-                relevant_keys = {item.url or item.title for item in relevant_pool}
-                relevant_pool.extend(
-                    item
-                    for item in recent_pool
-                    if is_international_conflict_news(item)
-                    and (item.url or item.title) not in relevant_keys
-                )
-            ranked_pool = rank_news_candidate_pool(relevant_pool, prompt_norm)
-            conflict_count = sum(1 for item in ranked_pool if is_international_conflict_news(item))
-            qualified_count = len(ranked_pool)
-            if required_conflict_count and conflict_count < required_conflict_count:
-                # Keep the provider loop alive until the required editorial
-                # lane is represented, even when the ordinary pool is large.
-                qualified_count = min(qualified_count, max(0, target_fetch_count - 1))
-            best_count = max(best_count, qualified_count)
-        return best_count
 
     try:
         candidates, meta = fetch_daily_news_candidates(
             prompt_norm,
             max_records=raw_fetch_count,
-            search_days=search_days,
-            materials_file=news_materials_file,
+            search_days=1,
+            materials_file=multi_material_path,
             source_health_path=Path("data") / "source_health" / "daily_news.json",
             persist_source_health=True,
             exhaustive_sources=True,
             progress_callback=_source_progress,
-            minimum_qualified_records=target_fetch_count,
-            qualified_count_callback=_qualified_candidate_count,
-            additional_queries=conflict_queries,
         )
     except TypeError as exc:
         if "unexpected keyword" not in str(exc) and "positional" not in str(exc):
@@ -3750,129 +3775,7 @@ def _fetch_daily_news_candidates_for_upload(
             "source_domain_max_ratio": None,
         }
         return selected_candidates, meta
-    attempts: list[dict[str, Any]] = []
-    selected_candidates: list[Any] = []
-    selected_recent_candidates: list[Any] = []
-    selected_prompt_candidates: list[Any] = []
-    selected_date_window_meta: dict[str, Any] = {}
-    selected_prompt_relevance_meta: dict[str, Any] = {}
-    for days in lookback_windows:
-        recent_candidates, date_window_meta = filter_recent_news_items(
-            list(candidates),
-            tz_name=tz_name,
-            max_age_days=days,
-        )
-        prompt_candidates, prompt_relevance_meta = filter_prompt_relevant_news_items(
-            recent_candidates,
-            prompt_norm,
-        )
-        if required_conflict_count:
-            prompt_keys = {item.url or item.title for item in prompt_candidates}
-            prompt_candidates.extend(
-                item
-                for item in recent_candidates
-                if is_international_conflict_news(item)
-                and (item.url or item.title) not in prompt_keys
-            )
-        ranked_candidates = rank_news_candidate_pool(prompt_candidates, prompt_norm)
-        ranked_candidates = prioritize_international_conflict_news(
-            ranked_candidates,
-            required_count=required_conflict_count,
-        )[:raw_fetch_count]
-        attempt = {
-            "max_age_days": days,
-            "recent_candidate_count": len(recent_candidates),
-            "prompt_relevant_candidate_count": len(prompt_candidates),
-            "actual_candidate_count": len(ranked_candidates),
-            "international_conflict_candidate_count": sum(
-                1 for item in ranked_candidates if is_international_conflict_news(item)
-            ),
-            "date_window": date_window_meta,
-            "prompt_relevance": prompt_relevance_meta,
-        }
-        attempts.append(attempt)
-        _emit_daily_news_progress(
-            progress_callback,
-            "候选筛选",
-            "in_progress",
-            window_days=days,
-            recent=len(recent_candidates),
-            relevant=len(prompt_candidates),
-            qualified=len(ranked_candidates),
-            min_qualified=target_fetch_count,
-        )
-        if len(ranked_candidates) > len(selected_candidates):
-            selected_candidates = ranked_candidates
-            selected_recent_candidates = recent_candidates
-            selected_prompt_candidates = prompt_candidates
-            selected_date_window_meta = date_window_meta
-            selected_prompt_relevance_meta = prompt_relevance_meta
-        if len(ranked_candidates) >= target_fetch_count:
-            selected_candidates = ranked_candidates
-            selected_recent_candidates = recent_candidates
-            selected_prompt_candidates = prompt_candidates
-            selected_date_window_meta = date_window_meta
-            selected_prompt_relevance_meta = prompt_relevance_meta
-            break
-
-    candidates = selected_candidates
-    if len(candidates) < target_fetch_count:
-        last_window = attempts[-1]["date_window"] if attempts else {}
-        attempt_summary = "; ".join(
-            f"{a['max_age_days']}d recent={a['recent_candidate_count']} "
-            f"relevant={a['prompt_relevant_candidate_count']} selected={a['actual_candidate_count']}"
-            for a in attempts
-        )
-        window_label = f"严格回溯 {lookback_windows[-1]} 个北京时间自然日"
-        message = (
-            "daily news material insufficient in strict two-day window | 候选池不足："
-            f"本次要生成 {max(1, int(count or 1))} 条，需要至少 {target_fetch_count} 条相关且有日期的候选，"
-            f"当前仅得到 {len(candidates)} 条。{window_label}（北京时间 "
-            f"{last_window.get('start_date')}..{last_window.get('end_date')}）。"
-            f"筛选结果：{attempt_summary}。为防止旧闻混入，程序不会扩大到两天之外；"
-            "请放宽关键词、补充近期信源或检查新闻 API 状态。"
-        )
-        _emit_daily_news_progress(
-            progress_callback,
-            "候选筛选",
-            "failed",
-            qualified=len(candidates),
-            min_qualified=target_fetch_count,
-            reason="candidate_pool_insufficient",
-        )
-        raise RuntimeError(message)
-    meta["selection_pool"] = {
-        "requested_count": max(1, int(count or 1)),
-        "target_fetch_count": target_fetch_count,
-        "raw_fetch_count": raw_fetch_count,
-        "raw_candidate_count": raw_candidate_count,
-        "recent_candidate_count": len(selected_recent_candidates),
-        "prompt_relevance": selected_prompt_relevance_meta,
-        "prompt_relevant_candidate_count": len(selected_prompt_candidates),
-        "actual_candidate_count": len(candidates),
-        "international_conflict_candidate_count": sum(
-            1 for item in candidates if is_international_conflict_news(item)
-        ),
-        "dropped_out_of_window_count": raw_candidate_count - len(selected_recent_candidates),
-        "date_window": selected_date_window_meta,
-        "lookback": {
-            **lookback_meta,
-            "selected_max_age_days": selected_date_window_meta.get("max_age_days"),
-            "attempts": attempts,
-        },
-        "selection_policy": "prompt_relevance_attention_recency_source_diversity_conflict_quota",
-        "international_conflict_quota": required_conflict_count,
-        "source_domain_max_ratio": os.getenv("NEWS_SOURCE_DOMAIN_MAX_RATIO") or "0.5",
-    }
-    _emit_daily_news_progress(
-        progress_callback,
-        "候选筛选",
-        "success",
-        qualified=len(candidates),
-        min_qualified=target_fetch_count,
-        raw=raw_candidate_count,
-    )
-    return candidates, meta
+    raise RuntimeError("材料模式未返回候选，请检查材料文件配置。")
 
 
 def _daily_news_evaluation_viewpoint_instruction(value: str | None) -> str:
@@ -4667,28 +4570,7 @@ def _daily_news_lookback_window(
     *,
     env_names: tuple[str, ...] = (),
 ) -> tuple[list[int], dict[str, Any]]:
-    """Resolve the non-negotiable freshness window for ordinary daily news."""
-    fixed = _positive_int_or_none(explicit_days)
-    source = "argument" if fixed is not None else ""
-    if fixed is None:
-        for name in env_names:
-            fixed = _positive_int_or_none(os.getenv(name))
-            if fixed is not None:
-                source = name
-                break
-
-    days = fixed if fixed is not None else DAILY_NEWS_MAX_LOOKBACK_DAYS
-    if days > DAILY_NEWS_MAX_LOOKBACK_DAYS:
-        raise RuntimeError(
-            "每日新闻最多只能回溯 2 个北京时间自然日（发帖当天和前一天）；"
-            f"当前 {source or 'argument'}={days}，请留空或填写 1/2。"
-        )
-    return [days], {
-        "mode": "strict_freshness",
-        "source": source or "default",
-        "windows": [days],
-        "max_allowed_days": DAILY_NEWS_MAX_LOOKBACK_DAYS,
-    }
+    return resolve_news_windows(explicit_days, env_names=env_names)
 
 
 def _ai_digest_candidate_pool_target(target_count: int) -> tuple[int, int]:
@@ -5166,11 +5048,10 @@ def _select_adaptive_ai_digest_items(
         and (is_high(item) or is_protected(item))
     ]
     impact_rescue_count = 0
-    if len(strict_available) < minimum:
-        # The LLM reviewer can miss a clear official release when a source
-        # uses a compact card or an unfamiliar product name. Rescue only
-        # recent, deterministic high-impact items, and only to reach the
-        # configured minimum; stale and generic items remain ineligible.
+    if len(strict_available) < maximum:
+        # Keep concrete model releases and official technical updates even
+        # when the reviewer prefers another story. Minimum count is not an
+        # early-stop condition for finding missed releases.
         strict_keys = {item.dedupe_key for item in strict_available}
         deterministic_rescue = [
             item
@@ -5178,12 +5059,17 @@ def _select_adaptive_ai_digest_items(
             if item.dedupe_key in recent_keys[3]
             and item.dedupe_key not in strict_keys
             and ai_update_is_high_impact(item, threshold=impact_threshold)
+            and (
+                len(strict_available) < minimum
+                or ai_update_category(item) == "model_release"
+                or item.source_type in {"official", "github"}
+            )
         ]
         for item in deterministic_rescue:
             strict_available.append(item)
             strict_keys.add(item.dedupe_key)
             impact_rescue_count += 1
-            if len(strict_available) >= minimum:
+            if len(strict_available) >= maximum:
                 break
     strict_ranked = rank_ai_updates(
         strict_available,
@@ -5245,6 +5131,12 @@ def _select_adaptive_ai_digest_items(
 
     requested_official_min = min(max(0, int(min_official_count or 0)), target)
     eligible_official_count = ai_digest_official_count(eligible_items)
+    if requested_official_min > 0 and eligible_official_count == 0:
+        raise RuntimeError(
+            "daily ai digest official material insufficient: "
+            "去重后没有近期合格的官方资讯；请检查官方源连接或补充可核验的官方发布，"
+            "不会自动上传仅有媒体体验文章的简报"
+        )
     effective_official_min = (
         min(requested_official_min, eligible_official_count)
         if allow_official_relaxation
@@ -6432,6 +6324,10 @@ def create_daily_ai_digest_posts(
             final_error = ""
     if final_error:
         raise RuntimeError(final_error)
+    # The issue date belongs to the run, not to an LLM or a source article.
+    brief = brief.model_copy(update={
+        "date": datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date().isoformat(),
+    })
     selected_before_body_fit = len(brief.items)
     brief = _fit_ai_digest_brief_to_body_limit(
         brief,
@@ -7367,6 +7263,7 @@ def _run_parallel_daily_news_candidates(
     required_china_count: int,
     required_international_conflict_count: int,
     performance_policy: PerformancePolicy | None = None,
+    discovery: DailyNewsDiscovery | None = None,
 ) -> list[Post]:
     """Run candidate preparation in two lanes and accept results in order."""
     # Re-assert the protected editorial lane after any LLM reordering. This
@@ -7382,6 +7279,8 @@ def _run_parallel_daily_news_candidates(
     posts: list[Post] = []
     accepted_china_count = 0
     accepted_conflict_count = 0
+    accepted_items: list[Any] = []
+    retired_indices: set[int] = set()
     accepted_story_signatures: list[Any] = []
     accepted_body_fact_keys: list[tuple[str, Any]] = []
     used_title_keys: set[str] = set()
@@ -7395,9 +7294,10 @@ def _run_parallel_daily_news_candidates(
     # and lets us discard mirrored stories before spending model capacity.
     # Source pages are fetched with bounded concurrency so a large candidate
     # pool cannot spend several minutes waiting on serial 8-second lookups.
-    prepared_by_index = _prefetch_daily_news_context(
-        picks,
-        progress_callback=progress_callback,
+    prepared_by_index = (
+        {index: discovery.prepared[news_key(item)] for index, item in enumerate(picks, 1)}
+        if discovery is not None else
+        _prefetch_daily_news_context(picks, progress_callback=progress_callback)
     )
     original_conflict_by_index = {
         index: _daily_news_conflict_signal(picks[index - 1])
@@ -7455,12 +7355,44 @@ def _run_parallel_daily_news_candidates(
             thread_name_prefix="redbook-candidate",
         ) as workers:
             in_flight: list[Any] = []
-            while pending_indices or in_flight:
+            while True:
                 if (
                     len(posts) >= target_count
                     and accepted_conflict_count >= required_international_conflict_count
+                    and accepted_china_count >= required_china_count
                 ):
                     break
+                protected_lane_empty = (
+                    accepted_conflict_count < required_international_conflict_count
+                    and not any(conflict_by_index.get(index, False) for index in pending_indices)
+                )
+                if not in_flight and (not pending_indices or protected_lane_empty):
+                    if discovery is None:
+                        break
+                    _emit_daily_news_progress(progress_callback, "生成补位", "in_progress",
+                                              completed=len(posts), target=target_count,
+                                              reason="reserve_exhausted")
+                    try:
+                        extra = discovery.take(accepted=accepted_items,
+                                               carry=[prepared_by_index[index][0] for index in pending_indices])
+                    except Exception as exc:
+                        _emit_daily_news_progress(progress_callback, "候选不足", "failed",
+                            reason=f"补充候选失败，已完成的{len(posts)}条保留在本地：{exc}")
+                        break
+                    base_meta.update(discovery.meta)
+                    if not extra:
+                        break
+                    existing_keys = {news_key(item) for item in picks}
+                    for item in extra:
+                        if news_key(item) in existing_keys:
+                            continue
+                        existing_keys.add(news_key(item))
+                        picks.append(item)
+                        index = len(picks)
+                        prepared_by_index[index] = discovery.prepared[news_key(item)]
+                        original_conflict_by_index[index] = _daily_news_conflict_signal(item)
+                        conflict_by_index[index] = original_conflict_by_index[index]
+                        pending_indices.append(index)
                 if speed_first:
                     # Keep the coordinator window full. The two model queues
                     # remain the actual provider-level concurrency boundary.
@@ -7551,7 +7483,6 @@ def _run_parallel_daily_news_candidates(
                     try:
                         results.append(future.result())
                     except Exception as exc:
-                        failed_count += 1
                         results.append(
                             _DailyNewsCandidateResult(
                                 candidate_index=0,
@@ -7562,9 +7493,11 @@ def _run_parallel_daily_news_candidates(
                         )
 
                 for result in results:
+                    retired_indices.add(result.candidate_index)
                     if (
                         len(posts) >= target_count
                         and accepted_conflict_count >= required_international_conflict_count
+                        and accepted_china_count >= required_china_count
                     ):
                         break
                     if result.status != "success" or result.post is None or result.picked is None:
@@ -7635,8 +7568,8 @@ def _run_parallel_daily_news_candidates(
                         result.picked_is_conflict or is_international_conflict_news(picked)
                     )
                     if (
-                        required_international_conflict_count > accepted_conflict_count
-                        and not picked_is_conflict
+                        required_international_conflict_count - accepted_conflict_count - int(picked_is_conflict)
+                        > target_count - len(posts) - 1
                     ):
                         skipped_quota_count += 1
                         _emit_daily_news_progress(
@@ -7650,8 +7583,7 @@ def _run_parallel_daily_news_candidates(
                         )
                         continue
                     if required_china_count > 0 and not picked_is_china:
-                        prospective_required_china = _required_china_count_for_daily_news(len(posts) + 1)
-                        if accepted_china_count < prospective_required_china:
+                        if required_china_count - accepted_china_count > target_count - len(posts) - 1:
                             skipped_quota_count += 1
                             _emit_daily_news_progress(
                                 progress_callback,
@@ -7662,6 +7594,35 @@ def _run_parallel_daily_news_candidates(
                                 target=target_count,
                                 reason="china_quota_reserved",
                             )
+                            continue
+
+                    if discovery is not None:
+                        # Recheck the final selection against domain and both
+                        # quotas after enrichment, including failed replacements.
+                        proposed = [*accepted_items, picked]
+                        slots_left = target_count - len(proposed)
+                        remaining_pool = [prepared[0] for index, prepared in prepared_by_index.items()
+                                          if index not in retired_indices]
+                        if slots_left and len(remaining_pool) >= slots_left and not feasible_news_batch(
+                            remaining_pool, slots_left,
+                            china=max(0, required_china_count - accepted_china_count - int(picked_is_china)),
+                            conflict=max(0, required_international_conflict_count - accepted_conflict_count - int(picked_is_conflict)),
+                            total=target_count, accepted=proposed,
+                        ):
+                            skipped_quota_count += 1
+                            _emit_daily_news_progress(progress_callback, "候选配额", "skipped",
+                                reason="combined_editorial_quota_reserved", candidate_index=result.candidate_index)
+                            continue
+                        # Domain caps are based on the requested batch, never on
+                        # the temporary number of completed results.
+                        from src.news.daily_news import _source_domain_max_ratio
+                        import math
+                        domains = {news_domain(item) for item in picks}
+                        cap = max(1, math.ceil(target_count * _source_domain_max_ratio()))
+                        if len(domains) > 1 and sum(news_domain(item) == news_domain(picked) for item in proposed) > cap:
+                            skipped_quota_count += 1
+                            _emit_daily_news_progress(progress_callback, "候选配额", "skipped",
+                                reason="source_domain_quota_reserved", candidate_index=result.candidate_index)
                             continue
 
                     result.asset_paths = list(result.asset_paths or [])
@@ -7681,6 +7642,7 @@ def _run_parallel_daily_news_candidates(
                         )
                     )
                     posts.append(post)
+                    accepted_items.append(picked)
                     if title_key:
                         used_title_keys.add(title_key)
                     if signature is not None:
@@ -7704,15 +7666,24 @@ def _run_parallel_daily_news_candidates(
                         candidate_index=result.candidate_index,
                     )
 
+    if discovery is not None:
+        complete = (len(posts) == target_count and accepted_china_count >= required_china_count
+                    and accepted_conflict_count >= required_international_conflict_count)
+        discovery.save_record(status="generation_complete" if complete else "generation_partial",
+                              post_ids=[post.id for post in posts])
+        for post in posts:
+            post.platform.setdefault("news", {})["discovery_record"] = str(discovery.record_path)
+            save_post(post)
     if (
         len(posts) < target_count
         or accepted_conflict_count < required_international_conflict_count
+        or accepted_china_count < required_china_count
     ):
         message = (
             f"daily news created only {len(posts)}/{target_count} | 批次生成未完成："
-            f"已完成 {len(posts)}/{target_count}，已尝试候选 {len(picks)}/{len(picks)}，"
+            f"已完成 {len(posts)}/{target_count}，已处理候选 {len(retired_indices - {0})}/{len(picks)}，"
             f"文案或生图失败 {failed_count}，质量/去重跳过 {skipped_quality_count}，"
-            f"国内新闻配额预留跳过 {skipped_quota_count}，国内稿件 {accepted_china_count}/{required_china_count}。"
+            f"类别/来源配额预留跳过 {skipped_quota_count}，国内稿件 {accepted_china_count}/{required_china_count}。"
             f"国际冲突稿件 {accepted_conflict_count}/{required_international_conflict_count}。"
             "本次默认不会上传不完整批次；请查看上方具体步骤，调整关键词、回溯天数或模型额度后重试。"
         )
@@ -7794,6 +7765,7 @@ def create_daily_news_posts(
             or "enable_interleave" in joined
         )
 
+    discovery_holder: dict[str, Any] = {}
     candidates, base_meta = _fetch_daily_news_candidates_for_upload(
         prompt_norm,
         count=count,
@@ -7802,6 +7774,8 @@ def create_daily_news_posts(
         single_news_material_file=single_news_material_file,
         material_time=material_time,
         progress_callback=progress_callback,
+        discovery_holder=discovery_holder,
+        performance_policy=performance_policy,
     )
     target_count = count
     required_china_count = (
@@ -7873,6 +7847,21 @@ def create_daily_news_posts(
             if len(picks) >= pick_limit:
                 break
 
+    discovery = discovery_holder.get("session")
+    if discovery is not None:
+        # Preserve fresh-first order; a model may rank within a day, but must
+        # not promote older reserve material over today's viable main set.
+        from src.news.daily_news import _parse_seendate_utc
+        from zoneinfo import ZoneInfo
+        from src.news.daily_news import _resolve_tz
+        picks.sort(key=lambda item: _parse_seendate_utc(item.seendate).astimezone(_resolve_tz("Asia/Shanghai")).date(), reverse=True)
+        main = feasible_news_batch(picks, target_count, china=required_china_count,
+                                   conflict=required_international_conflict_count)
+        if not main:
+            raise RuntimeError("模型排序后无法同时满足新闻数量、类别与来源要求，未开始生图。")
+        main_keys = {news_key(item) for item in main}
+        picks = main + [item for item in picks if news_key(item) not in main_keys]
+
     return _run_parallel_daily_news_candidates(
         picks=picks,
         cfgs=cfgs,
@@ -7889,4 +7878,5 @@ def create_daily_news_posts(
         required_china_count=required_china_count,
         required_international_conflict_count=required_international_conflict_count,
         performance_policy=performance_policy,
+        discovery=discovery,
     )

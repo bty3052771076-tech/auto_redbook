@@ -306,6 +306,120 @@ def test_ensure_chinese_item_turns_fal_h3_max_notice_into_a_concrete_fact():
     assert "披露AI产品变化" not in result.summary
 
 
+def test_ensure_chinese_item_translates_unmapped_official_release_with_concrete_facts():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="Daybreak for Frontline Defenders: $1B to protect essential services",
+        summary=(
+            "OpenAI introduces Daybreak for Frontline Defenders. A $1 billion commitment "
+            "expands access to frontier cyber AI, training, and support for essential services."
+        ),
+        source_name="OpenAI",
+        source_type="official",
+        url="https://openai.com/index/daybreak-for-frontline-defenders",
+        published_at="2026-09-03T13:15:00Z",
+        vendor="OpenAI",
+        product="Daybreak",
+        raw_excerpt="OpenAI introduces Daybreak for Frontline Defenders with a $1 billion commitment.",
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "OpenAI推出Daybreak计划"
+    assert "10亿美元" in result.summary
+    assert "网络安全AI" in result.summary
+    assert "关键服务" in result.summary
+    assert "披露AI产品变化" not in result.title
+    assert "披露AI产品变化" not in result.summary
+
+
+def test_ensure_chinese_item_translates_unmapped_model_safety_notice():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="Anthropic发布Claude Fable 5.1",
+        summary="Improving Fable 5’s biology safeguards",
+        source_name="Anthropic",
+        source_type="official",
+        url="https://www.anthropic.com/news/fable-5-biology-safeguards",
+        published_at="2026-09-01",
+        vendor="Anthropic",
+        product="Claude Fable 5.1",
+        raw_excerpt="Anthropic发布Claude Fable 5.1，并说明Fable 5生物安全防护改进。",
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "Anthropic发布Claude Fable 5.1"
+    assert "生物安全防护" in result.summary
+    assert len(result.summary) >= 12
+
+
+def test_ensure_chinese_item_translates_unmapped_enterprise_ai_offer():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    item = AIUpdateItem(
+        title="Sep 3, 2026 Grok Bot for Enterprise",
+        summary=(
+            "Grok Bot is now available for enterprises. Grok and Cursor Enterprise customers "
+            "have free usage for the next two weeks, and can invite their whole organization."
+        ),
+        source_name="xAI",
+        source_type="official",
+        url="https://x.ai/news/grok-bot-for-enterprise",
+        published_at="2026-09-03T12:00:00Z",
+        vendor="xAI",
+        raw_excerpt=(
+            "Grok Bot is now available for enterprises. Grok and Cursor Enterprise customers "
+            "have free usage for the next two weeks, and can invite their whole organization."
+        ),
+    )
+
+    result = _ensure_chinese_item(item)
+
+    assert result.title == "xAI推出企业版Grok Bot"
+    assert "未来两周" in result.summary
+    assert "整个组织" in result.summary
+
+
+def test_ensure_chinese_item_translates_github_status_service_incidents():
+    from src.ai_digest.generate import _ensure_chinese_item
+
+    cases = [
+        (
+            "Disruption with Copilot Code Review",
+            "GitHub Status marks the Copilot Code Review incident as resolved.",
+            "GitHub Copilot代码审查故障已恢复",
+            "Copilot Code Review",
+        ),
+        (
+            "Degradation in repos contents API",
+            "GitHub Status marks the repos contents API incident as resolved.",
+            "GitHub仓库内容API故障已恢复",
+            "repos contents API",
+        ),
+    ]
+
+    for title, summary, expected_title, expected_service in cases:
+        item = AIUpdateItem(
+            title=title,
+            summary=summary,
+            source_name="GitHub Status",
+            source_type="official",
+            url=f"https://www.githubstatus.com/incidents/{title.replace(' ', '-').lower()}",
+            published_at="2026-09-04T22:26:00Z",
+            vendor="GitHub Status",
+            raw_excerpt=summary,
+        )
+
+        result = _ensure_chinese_item(item)
+
+        assert result.title == expected_title
+        assert expected_service in result.summary
+        assert "已恢复" in result.summary
+
+
 def test_build_ai_digest_prompt_requires_chinese_translation_for_foreign_updates():
     item = AIUpdateItem(
         title="OpenAI launches new developer tools",
@@ -632,7 +746,7 @@ def test_generate_ai_digest_brief_with_llm_returns_chinese_items(monkeypatch):
                     {
                       "title": "每日AI讯息",
                       "subtitle": "AI平台与工具更新",
-                      "date": "2026-06-30",
+                      "date": "2026-06-29",
                       "items": [
                         {
                           "title": "OpenAI发布开发者工具更新",
@@ -664,6 +778,7 @@ def test_generate_ai_digest_brief_with_llm_returns_chinese_items(monkeypatch):
     )
 
     assert "翻译" in captured["messages"]
+    assert brief.date == "2026-06-30"
     assert brief.items[0].title == "OpenAI发布开发者工具更新"
     assert "开发者工具" in brief.items[0].summary
 

@@ -84,6 +84,16 @@ def collect_used_news_url_keys(*, data_root: Path | str = Path("data")) -> set[s
             continue
         if not isinstance(data, dict):
             continue
+        # Incomplete generation batches are persisted as local drafts, but
+        # they were never delivered to a platform and must not block a later
+        # retry. Only platform-delivered or platform-saved posts belong to
+        # cross-run URL history. Older records predate these delivery fields;
+        # when neither field exists, preserve the legacy behavior and treat
+        # the record as historical rather than silently losing dedupe data.
+        status = str(data.get("status") or "").strip().lower()
+        has_delivery_fields = "status" in data or "uploaded" in data
+        if has_delivery_fields and not bool(data.get("uploaded")) and status not in {"saved_as_draft", "published"}:
+            continue
         for url in _news_urls_from_post_data(data):
             key = normalize_news_url_key(url)
             if key:
@@ -111,4 +121,3 @@ def filter_used_news_items(items: list[Any], used_url_keys: set[str]) -> tuple[l
             continue
         kept.append(item)
     return kept, skipped
-

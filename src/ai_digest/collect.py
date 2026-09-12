@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 import re
@@ -53,19 +54,16 @@ from src.ai_digest.search_plan import build_search_plan
 FetchSource = Callable[[AIDigestSource], list[AIUpdateItem]]
 ProgressCallback = Callable[[str, str], None]
 DEFAULT_SEARCH_BACKFILL_QUERIES = (
-    "国内 AI 模型 发布 GLM Qwen 豆包 DeepSeek Kimi MiniMax",
-    "AI model release OpenAI Anthropic Claude Gemini GPT Llama Mistral",
-    "AI API developer tools model release open source",
-    "HY4 preview model release",
-    "HY4 preview 发布 模型",
-    "OpenAI Cursor contract wind down official",
-    "MiniMax H3 Max fal video release official",
-    "ZCode 周末送额度 3亿 Token",
-    "ZCode GLM-5.3-Flash 免费额度 8月31日",
+    "DeepSeek 新模型 发布 内测 官方",
+    "Qwen GLM 豆包 Kimi MiniMax 新模型 发布 官方",
+    "OpenAI new model release official",
+    "Anthropic Claude new model release official",
+    "Google Gemini DeepMind new model release official",
+    "Mistral Meta Llama xAI model release open weights official",
 )
 BEIJING_TZ = timezone(timedelta(hours=8))
 DEFAULT_MODEL_RELEASE_SEARCH_QUERIES = (
-    "Claude Fable 5.1 release Anthropic official",
+    "Claude model release Anthropic official",
     "OpenAI model release official",
     "Google Gemini model release official",
     "Meta Llama model release official",
@@ -297,6 +295,22 @@ def _matches_vendor_official_host(item: AIUpdateItem, url: str) -> bool:
     vendor = (item.vendor or "").strip().lower()
     expected_hosts = _VENDOR_OFFICIAL_HOSTS.get(vendor, ())
     return any(host == expected or host.endswith(f".{expected}") for expected in expected_hosts)
+
+
+def load_ai_digest_research_items(path: Path) -> list[AIUpdateItem]:
+    """Load an explicitly supplied, locally reviewed evidence supplement."""
+    raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(raw, list) or len(raw) > 200:
+        raise ValueError("AI digest research materials must be a list of at most 200 items")
+    items = [AIUpdateItem.model_validate(row) for row in raw]
+    for item in items:
+        if not item.published_at or not item.raw_excerpt or not item.evidence_urls:
+            raise ValueError("AI digest research material requires date, excerpt and evidence URLs")
+        if urlsplit(item.url).scheme not in {"https", "http"}:
+            raise ValueError("AI digest research material requires a public HTTP source URL")
+        if item.source_type in {"official", "github"} and not _matches_vendor_official_host(item, item.url):
+            raise ValueError("AI digest research material official host does not match vendor")
+    return [item.model_copy(update={"tags": [*item.tags, "reviewed_research_material"]}) for item in items]
 
 
 def resolve_aihot_detail_source(item: AIUpdateItem, *, timeout_s: float = 8.0) -> AIUpdateItem:
@@ -1030,9 +1044,16 @@ def collect_ai_digest_updates(
                 and previous_attempt.source_url == source.url
                 and should_replace_source(previous_attempt)
             ):
-                replacement_skipped.append(source.name)
-                _emit_progress(progress, "fetch_source", f"skipped_replacement name={source.name}")
-                continue
+                # A replacement recommendation must not permanently disable
+                # official release discovery. Re-probe after a bounded cooldown.
+                recovery_due = source.kind == "official" and not is_source_in_cooldown(
+                    previous_attempt, now=health_now, cooldown_seconds=6 * 3600,
+                )
+                if not recovery_due:
+                    replacement_skipped.append(source.name)
+                    _emit_progress(progress, "fetch_source", f"skipped_replacement name={source.name}")
+                    continue
+                _emit_progress(progress, "fetch_source", f"recovery_probe name={source.name}")
             if is_source_in_cooldown(
                 previous_attempt,
                 now=health_now,
@@ -1098,6 +1119,12 @@ def collect_ai_digest_updates(
             checked_at, elapsed, source_items, error = result
             _record_source_result(source, checked_at, elapsed, source_items, error)
 
+    research_path = (os.getenv("AI_DIGEST_RESEARCH_ITEMS_FILE") or "").strip()
+    research_items = load_ai_digest_research_items(Path(research_path)) if research_path else []
+    research_kept = _exclude_history_items(research_items, "reviewed_research_material")
+    fetched.extend(research_kept)
+    if research_path:
+        _emit_progress(progress, "research_materials", f"loaded={len(research_items)} retained={len(research_kept)}")
     _fetch_stage(official_stream_sources)
     stream_ranked = rank_ai_updates(
         fetched,
@@ -1358,6 +1385,7 @@ def collect_ai_digest_updates(
         "social_backfill_forced": bool(force_social_backfill),
         "detail_source_resolution": detail_source_resolution,
         "search_backfill": search_backfill_meta,
+        "research_materials": {"path": research_path, "loaded": len(research_items), "retained": len(research_kept)},
         "quota_counts": ai_digest_quota_counts(ranked),
         "sources": [source.name for source in resolved],
         "errors": errors,

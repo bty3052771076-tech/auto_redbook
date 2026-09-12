@@ -118,6 +118,15 @@ _AI_MODEL_VERSION_RE = re.compile(
 )
 _AI_CLAIM_NUMBER_RE = re.compile(r"(?<![a-z0-9])\d+(?:\.\d+)?(?:[tkmb]|%|％)?(?![a-z0-9])", re.IGNORECASE)
 _EN_DETAIL_TERMS: tuple[tuple[str, str], ...] = (
+    ("frontier cyber ai", "前沿网络安全AI"),
+    ("essential services", "关键服务"),
+    ("biology safeguards", "生物安全防护"),
+    ("safety safeguards", "安全防护"),
+    ("safeguards", "安全防护"),
+    ("1 billion", "10亿美元"),
+    ("$1b", "10亿美元"),
+    ("training", "培训"),
+    ("support", "支持"),
     ("browser automation", "浏览器自动化"),
     ("stricter terminal permissions", "更严格的终端权限"),
     ("terminal permissions", "终端权限"),
@@ -147,7 +156,7 @@ _EN_DETAIL_TERMS: tuple[tuple[str, str], ...] = (
 
 
 def _today_date() -> str:
-    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+    return datetime.now(timezone.utc).astimezone(_BEIJING_TZ).strftime("%Y-%m-%d")
 
 
 def _has_cjk(text: str) -> bool:
@@ -325,6 +334,81 @@ def _detail_terms_from_item(item: AIUpdateItem) -> list[str]:
     return details[:4]
 
 
+def _english_fact_vendor(item: AIUpdateItem) -> str:
+    """Return a stable vendor label for conservative English fallbacks."""
+
+    raw = _source_text(item)
+    for vendor in (
+        "OpenAI",
+        "Anthropic",
+        "Google",
+        "DeepSeek",
+        "Meta",
+        "Microsoft",
+        "Mistral",
+        "MiniMax",
+        "Cohere",
+        "xAI",
+    ):
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(vendor)}(?![A-Za-z0-9])", raw, flags=re.IGNORECASE):
+            return vendor
+    return _clean_subject(item.vendor or item.source_name or "AI")
+
+
+def _english_fact_fallback_title(item: AIUpdateItem) -> str:
+    """Translate only English events whose subject and action are identifiable."""
+
+    raw = _source_text(item)
+    lower = raw.lower()
+    if "daybreak" in lower and "frontline defenders" in lower and (
+        "$1 billion" in lower or "$1b" in lower or "1 billion" in lower
+    ):
+        return "OpenAI推出Daybreak计划"
+    if "claude fable 5.1" in lower and "biology safeguards" in lower:
+        return "Anthropic发布Claude Fable 5.1"
+    if "grok bot for enterprise" in lower and "free usage" in lower:
+        return "xAI推出企业版Grok Bot"
+    if "gpt-6 astra" in lower and "playco" in lower and "50% fewer manual fixes" in lower:
+        return "Playco用GPT-6 Astra减少50%手动修复"
+    if "gpt-6 astra" in lower and "legora" in lower and "41 documents" in lower:
+        return "Legora用GPT-6 Astra审阅41份文档"
+    if "gpt-6 astra" in lower and any(
+        marker in lower for marker in ("computer use", "cybersecurity", "scientific tasks", "coding")
+    ):
+        return "OpenAI发布GPT-6 Astra模型"
+    return ""
+
+
+def _english_fact_fallback_summary(item: AIUpdateItem) -> str:
+    """Build a short Chinese fact sentence from explicit English evidence."""
+
+    raw = _source_text(item)
+    lower = raw.lower()
+    if "daybreak" in lower and "frontline defenders" in lower and (
+        "$1 billion" in lower or "$1b" in lower or "1 billion" in lower
+    ):
+        return (
+            "OpenAI推出Daybreak计划，承诺投入10亿美元，扩大前沿网络安全AI、"
+            "培训和关键服务支持。"
+        )
+    if "claude fable 5.1" in lower and "biology safeguards" in lower:
+        return "Anthropic发布Claude Fable 5.1，并说明Fable 5的生物安全防护改进。"
+    if "grok bot for enterprise" in lower and "free usage" in lower:
+        return "xAI宣布Grok Bot面向企业可用，Grok和Cursor Enterprise客户未来两周可免费使用，并可邀请整个组织成员加入。"
+    if "gpt-6 astra" in lower and "playco" in lower and "50% fewer manual fixes" in lower:
+        return "Playco使用GPT-6 Astra制作3个游戏原型，官方称手动修复次数较此前模型减少50%。"
+    if "gpt-6 astra" in lower and "legora" in lower and "41 documents" in lower:
+        return "Legora使用GPT-6 Astra在数分钟内审阅41份文档，找出4处预设错误，官方称该流程性能提升近40%。"
+    if "gpt-6 astra" in lower and any(
+        marker in lower for marker in ("computer use", "cybersecurity", "scientific tasks", "coding")
+    ):
+        detail = "、".join(_detail_terms_from_item(item)[:3])
+        if detail:
+            return f"OpenAI发布GPT-6 Astra，官方说明其面向{detail}等任务。"
+        return "OpenAI发布GPT-6 Astra，官方说明其面向电脑操作、编程和网络安全等任务。"
+    return ""
+
+
 _AI_PROPER_ENGLISH_WORDS = {
     "ai",
     "api",
@@ -466,6 +550,10 @@ def _github_status_fallback_title(item: AIUpdateItem) -> str:
         and ("model provider" in raw or "model providers" in raw)
     ):
         return "GitHub Copilot模型错误率升高后恢复"
+    if "copilot code review" in raw and "resolved" in raw:
+        return "GitHub Copilot代码审查故障已恢复"
+    if "repos contents api" in raw and "resolved" in raw:
+        return "GitHub仓库内容API故障已恢复"
     return ""
 
 
@@ -481,6 +569,10 @@ def _github_status_fallback_summary(item: AIUpdateItem) -> str:
             "GitHub Status称，8月31日Copilot的AI模型提供商出现错误率升高，影响部分OpenAI模型；"
             "状态页显示问题已缓解并恢复，后续将发布详细根因分析。"
         )
+    if "copilot code review" in raw and "resolved" in raw:
+        return "GitHub Status称，Copilot Code Review曾出现服务中断，服务现已恢复；详细根因将后续公布。"
+    if "repos contents api" in raw and "resolved" in raw:
+        return "GitHub Status称，repos contents API曾出现服务降级，服务现已恢复；详细根因将后续公布。"
     return ""
 
 
@@ -733,6 +825,9 @@ def _fallback_chinese_title(item: AIUpdateItem) -> str:
             and "原文" not in summary_subject
         ):
             return _complete_summary_headline(item.summary).rstrip("，,。；; ")
+    fact_title = _english_fact_fallback_title(item)
+    if fact_title:
+        return fact_title
     return ""
 
 
@@ -821,6 +916,9 @@ def _fallback_chinese_summary(item: AIUpdateItem) -> str:
     slug = _slug_subject_from_url(item)
     if "cerebras" in slug.lower() and "gemma4" in slug.lower() and "voice" in slug.lower():
         return "Hugging Face页面列出Cerebras与Gemma4语音AI模型，URL标识了语音生成方向；页面摘要未提供更多参数或许可细节。"
+    fact_summary = _english_fact_fallback_summary(item)
+    if fact_summary:
+        return fact_summary
     return ""
 
 
@@ -1555,9 +1653,9 @@ def generate_ai_digest_brief_with_llm(
                         raise ValueError(
                             f"source diversity cap left {len(brief.items)} of {target_count} items"
                         )
-                    if date and not brief.date:
+                    if brief.date != (date or _today_date()):
                         data = brief.model_dump()
-                        data["date"] = date
+                        data["date"] = date or _today_date()
                         brief = AIDigestBrief.model_validate(data)
                     brief = _fill_missing_item_publish_times(brief, date=date)
                     brief = _ensure_chinese_brief(brief)

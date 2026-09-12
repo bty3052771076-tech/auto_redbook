@@ -7,6 +7,9 @@ __pycache__/
 .npm-cache/
 .pip-cache/
 .playwright-browsers/
+node_modules/
+frontend/dist/
+*.tsbuildinfo
 
 # Local data
 data/
@@ -15,6 +18,21 @@ exports/
 .agents/
 AGENT.md
 CODING_PROGRESS.md
+.tmp_*/
+*.log
+*.trace
+
+# Local credentials and browser/session state
+secrets/
+credentials/
+**/cookies*
+**/storage-state*
+**/*api-key*
+**/*apikey*
+**/*secret*
+**/*credential*
+**/*access-token*
+**/*refresh-token*
 
 # Local development records and images
 docs/

@@ -1026,6 +1026,9 @@ def ai_update_is_non_model_infrastructure_notice(item: AIUpdateItem) -> bool:
 def ai_update_category(item: AIUpdateItem) -> str:
     blob = _text_blob(item).lower()
     headline_blob = f"{item.title} {_url_topic_text(item.url)} {item.product}".lower()
+    # Background model mentions must not turn opinion pieces into releases.
+    if re.search(r"观点|探讨|行业观察|到底强在哪|品类.*(?:爆发|难题)|\b(?:opinion|editorial)\b", item.title, re.I):
+        return "discussion"
     financial_model_context = any(marker in blob for marker in _FINANCIAL_MODEL_MARKERS)
     explicit_ai_context = bool(_MODEL_TOPIC_RE.search(blob)) or bool(
         re.search(r"(?:^|[^a-z])ai(?:[^a-z]|$)|artificial intelligence|人工智能|大模型|智能体", blob)

@@ -31,6 +31,7 @@ from src.sources.health import (
     save_source_health_snapshot,
 )
 from src.workflow import create_post
+from src.workflow import news_discovery
 from src.workflow.create_post import (
     _append_news_source_line,
     _daily_news_body_has_prompt_leak,
@@ -810,6 +811,8 @@ def test_create_daily_news_falls_back_when_llm_echoes_prompt(monkeypatch, tmp_pa
         "fetch_daily_news_candidates",
         lambda _prompt, **_kwargs: ([picked], {"provider": "fake-news", "picked": {"title": picked.title}}),
     )
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
 
     def fake_generate_draft(*_args, **_kwargs):
         return {
@@ -1157,7 +1160,7 @@ def test_create_daily_news_posts_dedupes_same_event_after_source_enrichment(monk
 
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", fake_enrich)
     monkeypatch.setattr(create_post, "_focus_daily_news_item", lambda item: (item, {}))
-    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda item: not bool(item.content))
     monkeypatch.setattr(create_post, "_daily_news_quality_issue", lambda *_args: "")
     calls = {"count": 0}
 
@@ -2897,6 +2900,8 @@ def test_create_daily_news_posts_keeps_normal_multi_paragraph_source(monkeypatch
             "长鑫存储披露一季度盈利改善，产线利用率继续回升。\n"
             "公司称产品结构调整带动毛利率改善。\n"
             "业内人士认为国产存储供应链仍需观察需求周期。"
+            "公司在季度经营说明中介绍了产线利用率、产品组合及客户订单的变化，表示将根据订单安排生产。"
+            "经营说明同时列明了原材料采购、设备维护与研发投入对成本的影响，未给出下一季度的利润预测。"
         ),
     )
     monkeypatch.setattr(
@@ -3029,13 +3034,13 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
     )
 
     picked_domains = [post.platform["news"]["picked"]["domain"] for post in posts]
-    assert fetch_kwargs["max_records"] == 20
+    assert fetch_kwargs["max_records"] == 40
     assert len(posts) == 2
     assert picked_domains.count("36kr.com") <= 1
     assert len(set(picked_domains)) == 2
     for post in posts:
         assert post.platform["news"]["selection_pool"]["target_fetch_count"] == 2
-        assert post.platform["news"]["selection_pool"]["raw_fetch_count"] == 20
+        assert post.platform["news"]["selection_pool"]["raw_fetch_count"] == 40
         assert post.platform["news"]["selection_pool"]["requested_count"] == 2
 
 
@@ -3048,15 +3053,16 @@ def test_daily_news_uses_two_independent_model_queues(monkeypatch, tmp_path):
         "load_llm_configs",
         lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
     )
+    subjects = ["智能芯片", "医疗设备", "工业机器人", "能源管理"]
     candidates = [
         NewsItem(
-            title=f"模型公司发布第{index}项技术更新",
+            title=f"模型公司发布{subjects[index - 1]}技术更新",
             url=f"https://example.com/news/{index}",
             source="Example",
             domain="example.com",
             seendate=_recent_news_seendate(0, hour=10 - index),
-            description=f"模型公司发布第{index}项技术更新，披露具体技术变化。",
-            content=f"模型公司发布第{index}项技术更新，披露具体技术变化。",
+            description=f"模型公司发布{subjects[index - 1]}技术更新，披露具体技术变化和实施主体。",
+            content=f"模型公司发布{subjects[index - 1]}技术更新，披露具体技术变化和实施主体。",
             sourcecountry="cn",
         )
         for index in range(1, 5)
@@ -3069,6 +3075,8 @@ def test_daily_news_uses_two_independent_model_queues(monkeypatch, tmp_path):
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
     monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
     monkeypatch.setattr(create_post, "_same_cjk_story_event", lambda *_args: False)
+    monkeypatch.setattr(news_discovery, "_same_cjk_story_event", lambda *_args: False)
+    monkeypatch.setattr(news_discovery, "_dedupe_by_story", lambda items, max_count: items[:max_count])
 
     active = {"llm": 0, "image": 0}
     peak = {"llm": 0, "image": 0}
@@ -3278,7 +3286,7 @@ def test_daily_news_batch_uses_successful_supervisor_order_for_drafts(monkeypatc
     ]
 
 
-def test_daily_news_upload_filters_candidates_to_strict_beijing_two_day_window(monkeypatch):
+def test_daily_news_upload_adapts_beijing_window_and_keeps_reserve(monkeypatch):
     monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
@@ -3324,26 +3332,32 @@ def test_daily_news_upload_filters_candidates_to_strict_beijing_two_day_window(m
         return candidates, {"provider": "fake-news", "tz": "Asia/Shanghai"}
 
     monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(news_discovery, "_same_cjk_story_event", lambda *_args: False)
+    monkeypatch.setattr(news_discovery, "_dedupe_by_story", lambda items, max_count: items[:max_count])
 
     filtered, meta = create_post._fetch_daily_news_candidates_for_upload("新闻", count=2)
 
-    assert fetch_kwargs["max_records"] == 20
+    assert fetch_kwargs["max_records"] == 40
     assert [item.url for item in filtered] == [
         "https://example.com/today",
         "https://example.com/yesterday",
+        "https://example.com/before-yesterday",
     ]
     pool = meta["selection_pool"]
     assert pool["requested_count"] == 2
     assert pool["target_fetch_count"] == 2
-    assert pool["raw_fetch_count"] == 20
+    assert pool["raw_fetch_count"] == 40
     assert pool["raw_candidate_count"] == 5
-    assert pool["recent_candidate_count"] == 2
-    assert pool["actual_candidate_count"] == 2
-    assert pool["dropped_out_of_window_count"] == 3
-    assert pool["date_window"]["max_age_days"] == 2
+    assert pool["recent_candidate_count"] == 3
+    assert pool["actual_candidate_count"] == 3
+    assert pool["dropped_out_of_window_count"] == 2
+    assert pool["date_window"]["max_age_days"] == 3
     assert pool["date_window"]["tz"] == "Asia/Shanghai"
-    assert pool["lookback"]["mode"] == "strict_freshness"
-    assert pool["lookback"]["windows"] == [2]
+    assert pool["lookback"]["mode"] == "auto"
+    assert pool["lookback"]["windows"] == [1, 2, 3, 5]
+    assert pool["lookback"]["selected_max_age_days"] == 3
 
 
 def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(monkeypatch):
@@ -3393,27 +3407,32 @@ def test_daily_news_upload_fetches_twenty_times_and_filters_to_prompt_relevance(
         return candidates, {"provider": "fake-news", "tz": "Asia/Shanghai"}
 
     monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(news_discovery, "_same_cjk_story_event", lambda *_args: False)
+    monkeypatch.setattr(news_discovery, "_dedupe_by_story", lambda items, max_count: items[:max_count])
 
     selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
 
-    assert fetch_kwargs["max_records"] == 20
-    assert fetch_kwargs["search_days"] == 2
+    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["search_days"] == 5
     assert [item.url for item in selected] == [
-        "https://example.org/world-cup-sponsors",
         "https://example.com/world-cup-rules",
+        "https://example.org/world-cup-sponsors",
+        "https://example.net/old-world-cup",
     ]
     pool = meta["selection_pool"]
     assert pool["requested_count"] == 2
     assert pool["target_fetch_count"] == 2
-    assert pool["raw_fetch_count"] == 20
-    assert pool["recent_candidate_count"] == 3
-    assert pool["prompt_relevant_candidate_count"] == 2
-    assert pool["actual_candidate_count"] == 2
-    assert pool["lookback"]["mode"] == "strict_freshness"
-    assert pool["lookback"]["selected_max_age_days"] == 2
+    assert pool["raw_fetch_count"] == 40
+    assert pool["recent_candidate_count"] == 4
+    assert pool["prompt_relevant_candidate_count"] == 3
+    assert pool["actual_candidate_count"] == 3
+    assert pool["lookback"]["mode"] == "auto"
+    assert pool["lookback"]["selected_max_age_days"] == 5
 
 
-def test_daily_news_upload_never_expands_beyond_two_day_window(monkeypatch):
+def test_daily_news_upload_expands_to_five_day_window_when_needed(monkeypatch):
     monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
@@ -3451,15 +3470,23 @@ def test_daily_news_upload_never_expands_beyond_two_day_window(monkeypatch):
         return candidates, {"provider": "fake-news", "tz": "Asia/Shanghai"}
 
     monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
+    monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
+    monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(news_discovery, "_same_cjk_story_event", lambda *_args: False)
+    monkeypatch.setattr(news_discovery, "_dedupe_by_story", lambda items, max_count: items[:max_count])
 
-    with pytest.raises(RuntimeError, match="strict two-day window"):
-        create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
+    selected, meta = create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2)
 
-    assert fetch_kwargs["max_records"] == 20
-    assert fetch_kwargs["search_days"] == 2
+    assert [item.url for item in selected] == [
+        "https://example.com/world-cup-today",
+        "https://example.org/world-cup-rights",
+    ]
+    assert fetch_kwargs["max_records"] == 40
+    assert fetch_kwargs["search_days"] == 5
+    assert meta["selection_pool"]["lookback"]["selected_max_age_days"] == 5
 
 
-def test_daily_news_upload_rejects_explicit_lookback_beyond_two_days(monkeypatch):
+def test_daily_news_upload_rejects_explicit_lookback_beyond_five_days(monkeypatch):
     monkeypatch.setenv("NEWS_UPLOAD_QUALIFIED_POOL_MULTIPLIER", "1")
     candidates = [
         NewsItem(
@@ -3489,8 +3516,8 @@ def test_daily_news_upload_rejects_explicit_lookback_beyond_two_days(monkeypatch
 
     monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
 
-    with pytest.raises(RuntimeError, match="最多只能回溯 2 个北京时间自然日"):
-        create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2, lookback_days=3)
+    with pytest.raises(ValueError, match="请选择 auto.*整数1至5"):
+        create_post._fetch_daily_news_candidates_for_upload("World Cup sports", count=2, lookback_days=6)
 
     assert fetch_kwargs == {}
 
@@ -3629,6 +3656,8 @@ def test_create_daily_news_posts_uses_backup_candidates_after_quality_skips(monk
     # This case covers fallback candidates after render-quality rejection; the
     # separate source-context gate is covered by its own tests.
     monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(news_discovery, "_same_cjk_story_event", lambda *_args: False)
+    monkeypatch.setattr(news_discovery, "_dedupe_by_story", lambda items, max_count: items[:max_count])
     pick_args: dict[str, int] = {}
 
     def fake_pick_news_items(items, _prompt, *, count=1):
@@ -3790,13 +3819,14 @@ def test_create_daily_news_posts_raises_instead_of_returning_partial_posts(monke
     )
     candidates = [
         NewsItem(
-            title=f"\u5019\u9009\u65b0\u95fb{i}",
+            title=f"\u5019\u9009\u65b0\u95fb{i}\u9879\u76ee\u516c\u5e03\u8fdb\u5c55",
             url=f"https://example.com/partial/{i}",
             source="Example News",
             domain="example.com",
             seendate=_recent_news_seendate(0),
-            description="\u6d4b\u8bd5\u5019\u9009\u63cf\u8ff0\u3002",
-            content="\u6d4b\u8bd5\u5019\u9009\u6b63\u6587\u3002",
+            description=f"\u6d4b\u8bd5\u5019\u9009{i}\u9879\u76ee\u516c\u5e03\u4e86\u660e\u786e\u8fdb\u5c55\u3001\u8d1f\u8d23\u4e3b\u4f53\u548c\u5b9e\u65bd\u5730\u70b9\u3002",
+            content=f"\u6d4b\u8bd5\u5019\u9009{i}\u9879\u76ee\u5df2\u516c\u5e03\u5b9e\u65bd\u65f6\u95f4\u8868\u548c\u76ee\u6807\uff0c\u53ef\u7528\u4e8e\u9a8c\u8bc1\u540e\u7eed\u8d28\u91cf\u95e8\u69db\u3002",
+            sourcecountry="cn",
         )
         for i in range(6)
     ]
@@ -3807,6 +3837,8 @@ def test_create_daily_news_posts_raises_instead_of_returning_partial_posts(monke
     )
     monkeypatch.setattr(create_post, "_enrich_daily_news_item", lambda item: (item, {}))
     monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
+    monkeypatch.setattr(news_discovery, "_same_cjk_story_event", lambda *_args: False)
+    monkeypatch.setattr(news_discovery, "_dedupe_by_story", lambda items, max_count: items[:max_count])
     monkeypatch.setattr(create_post, "pick_news_items", lambda items, _prompt, *, count=1: items[:count])
     calls = {"count": 0}
 

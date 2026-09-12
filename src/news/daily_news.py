@@ -13,7 +13,7 @@ from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Optional
 from xml.etree import ElementTree
@@ -64,6 +64,9 @@ _INTERNATIONAL_CONTEXT_MARKERS = (
     "israel", "iran", "palestine", "nato", "united nations", "europe",
     "us", "america", "美国", "俄罗斯", "乌克兰", "以色列", "伊朗", "巴勒斯坦",
     "中东", "欧洲", "北约", "联合国", "国际", "海外", "全球",
+    "iranian", "palestinian", "palestinians", "west bank", "gaza",
+    "lebanon", "lebanese", "israeli", "ukrainian", "russian", "hormuz",
+    "黎巴嫩", "加沙", "约旦河西岸", "霍尔木兹",
 )
 # Automatic collection intentionally visits multiple sources. Keep each source
 # bounded so a slow fallback cannot make the whole candidate-pool stage look
@@ -693,14 +696,11 @@ def is_international_conflict_news(item: NewsItem) -> bool:
         for part in (
             item.title,
             item.description,
-            item.source,
-            item.domain,
-            item.url,
             # A distant mention in the body (for example, a market article
             # saying that geopolitical tension may affect prices) must not
             # turn an ordinary story into a conflict event. Keep the event
             # classifier anchored to the headline/lead context.
-            (item.content or "")[:600],
+            (item.content or "")[:600] if not (item.title or item.description) else "",
         )
     ).lower()
     def contains_marker(marker: str) -> bool:
@@ -712,10 +712,29 @@ def is_international_conflict_news(item: NewsItem) -> bool:
             ) is not None
         return marker in text
 
-    return (
-        any(contains_marker(marker) for marker in _INTERNATIONAL_CONFLICT_MARKERS)
-        and any(contains_marker(marker) for marker in _INTERNATIONAL_CONTEXT_MARKERS)
-    )
+    international = any(contains_marker(marker) for marker in _INTERNATIONAL_CONTEXT_MARKERS)
+    if not international:
+        return False
+    # Match actions rather than isolated words such as fire, force or peace.
+    action = bool(re.search(
+        r"\b(?:wars?|sanctions?|airstrikes?|attacks?|clashes|disputes|tariffs)\b"
+        r"|\b(?:fire|fires|fired|firing)\s+(?:at|on|upon)\b"
+        r"|\b(?:settler|settlers|border|sectarian)\s+violence\b"
+        r"|\b(?:peace|ceasefire)\s+(?:talks|negotiations|deal|agreement)\b"
+        r"|\b(?:discuss|discusses|discussing|negotiate|negotiating)\b[^.!?\n]{0,60}\bpeace\b",
+        text,
+    ))
+    event = action or any(contains_marker(marker) for marker in _INTERNATIONAL_CONFLICT_MARKERS)
+    if not event:
+        return False
+    headline = str(item.title or "").lower()
+    market_headline = bool(re.search(
+        r"\b(?:stocks?|shares?|prices?|inflation|earnings|yields?|investors?|funds?)\b"
+        r"|油价|股价|通胀|股市|基金|财报", headline))
+    direct_headline = bool(re.search(
+        r"\b(?:imposes?|sanctions?|tariffs?|ceasefire|talks|attacks?|strikes?|displaced)\b"
+        r"|\b(?:fire|fires|fired)\s+(?:at|on)\b|制裁|关税|停火|谈判|袭击|交火", headline))
+    return not (market_headline and not direct_headline)
 
 
 def prioritize_international_conflict_news(
@@ -2715,13 +2734,16 @@ def _google_rss_fetch_articles(
 
 def _bbc_rss_feed_keys(prompt_hint: str) -> tuple[str, ...]:
     hint = (prompt_hint or "").lower()
+    keys = []
+    if re.search(r"国际|全球|冲突|争议|停火|制裁|international|world|global|conflict|war|sanction|ceasefire", hint):
+        keys.append("world")
     if re.search(r"(世界杯|世界盃|体育|體育|足球|篮球|籃球|sport|football|soccer|basketball|league|match)", hint):
-        return ("sport",)
+        keys.append("sport")
     if re.search(r"(财经|財經|经济|經濟|金融|市场|市場|公司|企业|企業|产业|產業|business|economy|finance|market|stock)", hint):
-        return ("business",)
+        keys.append("business")
     if re.search(r"(科技|技术|技術|人工智能|ai|芯片|晶片|technology|tech|software|semiconductor)", hint):
-        return ("technology",)
-    return ("world",)
+        keys.append("technology")
+    return tuple(keys) or ("world",)
 
 
 def _bbc_rss_fetch_articles(
@@ -2736,21 +2758,21 @@ def _bbc_rss_fetch_articles(
         "technology": "BBC Technology",
         "sport": "BBC Sport",
     }
-    items: list[NewsItem] = []
+    buckets: list[list[NewsItem]] = []
     errors: list[str] = []
-    for key in _bbc_rss_feed_keys(prompt_hint):
-        try:
-            items.extend(
-                _rss_fetch_articles(
-                    feed_url=BBC_RSS_FEEDS[key],
-                    source_name=labels[key],
-                    fallback_language="en",
-                    max_records=max_records,
-                    timeout_s=timeout_s,
-                )
-            )
-        except RuntimeError as exc:
-            errors.append(str(exc))
+    keys = _bbc_rss_feed_keys(prompt_hint)
+    with ThreadPoolExecutor(max_workers=len(keys), thread_name_prefix="redbook-bbc") as workers:
+        futures = [workers.submit(
+            _rss_fetch_articles, feed_url=BBC_RSS_FEEDS[key], source_name=labels[key],
+            fallback_language="en", max_records=max_records, timeout_s=timeout_s,
+        ) for key in keys]
+        for future in futures:
+            try:
+                buckets.append(future.result())
+            except (RuntimeError, OSError) as exc:
+                errors.append(str(exc))
+    items = [bucket[index] for index in range(max(map(len, buckets), default=0))
+             for bucket in buckets if index < len(bucket)]
     if not items and errors:
         raise RuntimeError("; ".join(errors))
     return _dedupe_candidates(items)[: max(1, int(max_records))]
@@ -3150,12 +3172,32 @@ class _NewsProviderFetchResult:
     error: Exception | None = None
 
 
+@dataclass
+class NewsFetchSession:
+    """Task-local raw responses and one cumulative discovery budget."""
+
+    now: datetime
+    remaining_seconds: float
+    cache: dict[tuple[Any, ...], _NewsProviderFetchResult] = field(default_factory=dict)
+    blocked: set[str] = field(default_factory=set)
+    previous_days: int = 0
+    budget_incomplete: bool = False
+    queries: list[str] | None = None
+
+
+_HISTORICAL_NEWS_PROVIDERS = {"newsapi", "gnews", "alphavantage", "thenewsapi"}
+
+
 def _news_provider_query_plan(
     provider: str,
     queries: list[str],
     *,
     exhaustive_sources: bool,
+    required_queries: Iterable[str] = (),
 ) -> list[str]:
+    required = list(dict.fromkeys(q.strip() for q in required_queries if q.strip()))
+    if provider == "bbc_rss" and required:
+        return [" ".join([*required, *queries[:1]])]
     provider_queries = (
         queries[:1]
         if provider in ("file", "manual", "hotnews", "bbc_rss", "alphavantage", "finnhub")
@@ -3166,6 +3208,8 @@ def _news_provider_query_plan(
             "NEWS_EXHAUSTIVE_PROVIDER_QUERY_LIMIT",
             DEFAULT_EXHAUSTIVE_PROVIDER_QUERY_LIMIT,
         )]
+    if provider not in ("file", "manual", "hotnews", "bbc_rss", "alphavantage", "finnhub"):
+        provider_queries = list(dict.fromkeys([*required, *provider_queries]))
     if provider == "google_rss_cn" and exhaustive_sources:
         official_queries = [
             f"{query} site:{domain}"
@@ -3195,6 +3239,9 @@ def _fetch_news_provider(
     exhaustive_sources: bool,
     auto_provider_selection: bool,
     manual_materials_file: str,
+    deadline: float | None = None,
+    retain_raw_dates: bool = False,
+    required_queries: Iterable[str] = (),
 ) -> _NewsProviderFetchResult:
     """Fetch one provider without mutating the aggregate collection state."""
     started = time.perf_counter()
@@ -3204,10 +3251,12 @@ def _fetch_news_provider(
     queries_used: list[str] = []
     used_time_range = False
     provider_error: Exception | None = None
+    required_queries = tuple(required_queries)
     provider_queries = _news_provider_query_plan(
         provider,
         queries,
         exhaustive_sources=exhaustive_sources,
+        required_queries=required_queries,
     )
     provider_timeout_s = _provider_request_timeout_s(
         provider,
@@ -3215,8 +3264,17 @@ def _fetch_news_provider(
         exhaustive_sources=exhaustive_sources,
     )
 
-    for query in provider_queries:
-        if hint_query and query in default_queries and provider_candidates:
+    protected_queries = {str(query).strip() for query in required_queries}
+    for query_index, query in enumerate(provider_queries):
+        required_pending = bool(protected_queries.intersection(provider_queries[query_index + 1:]))
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                provider_error = TimeoutError("discovery_budget_exhausted")
+                break
+            provider_timeout_s = min(provider_timeout_s, max(0.1, remaining))
+        if (hint_query and query in default_queries and provider_candidates
+                and query not in protected_queries and not required_pending):
             break
         chosen_query = query
         try:
@@ -3426,14 +3484,18 @@ def _fetch_news_provider(
                 chosen_source_api = {"provider": "file", "file_path": file_path}
                 candidates = _file_fetch_articles(path=file_path, max_records=max_records)
 
+            # Latest-only endpoints must retain yesterday's raw rows for the
+            # next local window, even when today's response was nonempty.
+            if retain_raw_dates and provider in {"juhe", "newsdata", "finnhub"}:
+                candidates = raw
             candidates = [replace(item, provider=provider) for item in candidates]
             if candidates:
                 provider_candidates.extend(_dedupe_candidates(candidates))
                 provider_candidates = _dedupe_candidates(provider_candidates)
                 queries_used.append(query)
-                if not (aggregate_empty_prompt or (hint_query and query not in default_queries)):
+                if not required_pending and not (aggregate_empty_prompt or (hint_query and query not in default_queries)):
                     break
-                if len(provider_candidates) >= max_records and provider != "google_rss_cn":
+                if not required_pending and len(provider_candidates) >= max_records and provider != "google_rss_cn":
                     break
         except Exception as exc:
             provider_error = exc
@@ -3471,6 +3533,7 @@ def fetch_daily_news_candidates(
     minimum_qualified_records: int | None = None,
     qualified_count_callback: Callable[[list[NewsItem]], int] | None = None,
     additional_queries: Iterable[str] | None = None,
+    session: NewsFetchSession | None = None,
 ) -> tuple[list[NewsItem], dict[str, Any]]:
     """
     Fetch today's news via an external API.
@@ -3523,7 +3586,17 @@ def fetch_daily_news_candidates(
         )
         return str(save_source_health_snapshot(snapshot, health_path))
 
+    call_started = time.monotonic()
+    deadline = call_started + session.remaining_seconds if session is not None else None
     startdatetime, enddatetime = _recent_range_utc(tz_name, days=search_days)
+    if session is not None:
+        local_now = session.now.astimezone(_resolve_tz(tz_name))
+        start = local_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=search_days - 1)
+        end = session.now
+        if session.previous_days:
+            end = local_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=session.previous_days - 1, seconds=1)
+        startdatetime = start.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
+        enddatetime = end.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
     start_dt = datetime.strptime(startdatetime, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     end_dt = datetime.strptime(enddatetime, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     from_iso = start_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -3631,6 +3704,13 @@ def fetch_daily_news_candidates(
             else _build_prompt_news_queries("")
         )
         default_queries = []
+    if session is not None:
+        # Empty-prompt defaults are shuffled only once per batch; otherwise a
+        # window expansion would change cache keys and refetch latest feeds.
+        if session.queries is None:
+            session.queries = list(queries)
+        else:
+            queries = list(session.queries)
     aggregate_empty_prompt = not bool(hint_query)
     history_dedupe_is_enabled = news_history_dedupe_enabled()
     used_news_url_keys = collect_used_news_url_keys() if history_dedupe_is_enabled else set()
@@ -3661,14 +3741,33 @@ def fetch_daily_news_candidates(
     # existing replacement/cooldown checks, then merge their results below in
     # provider-plan order so ranking and metadata remain deterministic.
     prefetched_provider_results: dict[str, _NewsProviderFetchResult] = {}
+    cached_providers: set[str] = set()
+    budget_skipped: set[str] = set()
     provider_collection_concurrency = 1
-    if auto_provider_selection and exhaustive_sources and len(provider_plan) > 1:
+    if session is not None or (auto_provider_selection and exhaustive_sources and len(provider_plan) > 1):
         provider_collection_concurrency = min(
             len(provider_plan),
             _positive_env_int("NEWS_PROVIDER_CONCURRENCY", 4),
         )
         prefetch_providers: list[str] = []
+        def cache_key(provider: str) -> tuple[Any, ...]:
+            return (provider, tuple(queries), max_records,
+                    startdatetime if provider in _HISTORICAL_NEWS_PROVIDERS else "latest",
+                    enddatetime if provider in _HISTORICAL_NEWS_PROVIDERS else "latest")
+
         for provider in provider_plan:
+            if session is not None:
+                cached = session.cache.get(cache_key(provider))
+                if cached is not None:
+                    prefetched_provider_results[provider] = cached
+                    cached_providers.add(provider)
+                    continue
+                if provider in session.blocked:
+                    continue
+                if time.monotonic() >= deadline:
+                    budget_skipped.add(provider)
+                    session.budget_incomplete = True
+                    continue
             previous_attempt = persisted_health_attempts.get(provider)
             if (
                 previous_attempt is not None
@@ -3707,6 +3806,8 @@ def fetch_daily_news_candidates(
                 exhaustive_sources=exhaustive_sources,
                 auto_provider_selection=auto_provider_selection,
                 manual_materials_file=manual_materials_file,
+                required_queries=required_queries,
+                **({"deadline": deadline, "retain_raw_dates": True} if session is not None else {}),
             )
 
         with ThreadPoolExecutor(
@@ -3728,8 +3829,24 @@ def fetch_daily_news_candidates(
                         elapsed_seconds=0.0,
                         error=exc,
                     )
+                if session is not None:
+                    result = prefetched_provider_results[provider]
+                    session.cache[cache_key(provider)] = result
+                    if result.error is not None:
+                        # Do not spend another window retrying a failing API.
+                        session.blocked.add(provider)
+                        if "discovery_budget_exhausted" in str(result.error):
+                            session.budget_incomplete = True
 
     for provider_index, provider in enumerate(provider_plan, start=1):
+        if session is not None and provider not in prefetched_provider_results:
+            if progress_callback is not None:
+                progress_callback("信源采集", "skipped", {
+                    "provider": provider, "source_index": provider_index,
+                    "source_total": provider_total,
+                    "reason": "discovery_budget_exhausted" if provider in budget_skipped else "source_unavailable_this_run",
+                })
+            continue
         if progress_callback is not None:
             progress_callback(
                 "信源采集",
@@ -3745,6 +3862,7 @@ def fetch_daily_news_candidates(
         previous_attempt = persisted_health_attempts.get(provider)
         if (
             auto_provider_selection
+            and provider not in cached_providers
             and previous_attempt is not None
             and previous_attempt.source_url == _news_provider_health_url(provider)
             and should_replace_source(previous_attempt)
@@ -3762,7 +3880,7 @@ def fetch_daily_news_candidates(
                     },
                 )
             continue
-        if auto_provider_selection and is_source_in_cooldown(
+        if auto_provider_selection and provider not in cached_providers and is_source_in_cooldown(
             previous_attempt,
             cooldown_seconds=cooldown_seconds,
         ):
@@ -3806,8 +3924,9 @@ def fetch_daily_news_candidates(
         if prefetched is not None:
             provider_started = time.perf_counter() - max(0.0, prefetched.elapsed_seconds)
             provider_error = prefetched.error
-            provider_candidates = list(prefetched.candidates)
-            candidates = list(prefetched.candidates)
+            provider_candidates, skipped_used = filter_used_news_items(list(prefetched.candidates), used_news_url_keys)
+            history_skipped.extend(skipped_used)
+            candidates = list(provider_candidates)
             provider_item_count = prefetched.item_count
             provider_dated_count = prefetched.dated_count
             provider_url_count = prefetched.url_count
@@ -3821,14 +3940,18 @@ def fetch_daily_news_candidates(
                 provider,
                 queries,
                 exhaustive_sources=exhaustive_sources,
+                required_queries=required_queries,
             )
         provider_timeout_s = _provider_request_timeout_s(
             provider,
             requested_timeout_s=timeout_s,
             exhaustive_sources=exhaustive_sources,
         )
-        for q in provider_queries:
-            if hint_query and q in default_queries and provider_candidates:
+        protected_queries = {str(query).strip() for query in required_queries}
+        for query_index, q in enumerate(provider_queries):
+            required_pending = bool(protected_queries.intersection(provider_queries[query_index + 1:]))
+            if (hint_query and q in default_queries and provider_candidates
+                    and q not in protected_queries and not required_pending):
                 break
             chosen_provider = provider
             chosen_query = q
@@ -4071,12 +4194,13 @@ def fetch_daily_news_candidates(
                             last_err = "all candidates filtered by history URL dedupe"
                     if not candidates:
                         continue
-                    aggregate_query = aggregate_empty_prompt or (bool(hint_query) and q not in default_queries)
+                    aggregate_query = (required_pending or q in protected_queries or aggregate_empty_prompt
+                                       or (bool(hint_query) and q not in default_queries))
                     if aggregate_query:
                         provider_candidates.extend(candidates)
                         queries_used.append(q)
                         provider_candidates = _dedupe_candidates(provider_candidates)
-                        if len(provider_candidates) >= max_records and not (
+                        if not required_pending and len(provider_candidates) >= max_records and not (
                             exhaustive_sources and provider == "google_rss_cn"
                         ):
                             break
@@ -4127,9 +4251,16 @@ def fetch_daily_news_candidates(
                 dated_count=provider_dated_count,
                 url_count=provider_url_count,
             )
-        health_attempt = append_source_status(health_attempt, previous_attempt)
-        health_attempts.append(health_attempt)
-        persisted_health_attempts[provider] = health_attempt
+        if session is not None and provider in _HISTORICAL_NEWS_PROVIDERS and provider_error is None and provider_item_count == 0:
+            # An empty date slice is not an endpoint failure: tomorrow's
+            # expansion still needs to query the adjacent historical slice.
+            health_attempt = replace(health_attempt, status="empty_window")
+        if session is not None and provider_error is not None and "discovery_budget_exhausted" in str(provider_error):
+            health_attempt = replace(health_attempt, status="budget_exhausted")
+        if provider not in cached_providers:
+            health_attempt = append_source_status(health_attempt, previous_attempt)
+            health_attempts.append(health_attempt)
+            persisted_health_attempts[provider] = health_attempt
         if progress_callback is not None:
             progress_callback(
                 "信源采集",
@@ -4141,6 +4272,7 @@ def fetch_daily_news_candidates(
                     "items": provider_item_count,
                     "dated": provider_dated_count,
                     "elapsed_seconds": round(elapsed_seconds, 1),
+                    "cached": provider in cached_providers,
                     "error": str(provider_error)[:180] if provider_error is not None else "",
                 },
             )
@@ -4167,6 +4299,7 @@ def fetch_daily_news_candidates(
                 qualified_target_met = qualified_count_at_stop >= minimum_qualified
             if (
                 raw_target_met
+                and session is None
                 and (not (auto_provider_selection and exhaustive_sources) or enough_diversity)
                 and qualified_target_met
             ):
@@ -4218,7 +4351,10 @@ def fetch_daily_news_candidates(
                 continue
             break
 
-    if not candidates:
+    if session is not None:
+        session.remaining_seconds = max(0.0, session.remaining_seconds - (time.monotonic() - call_started))
+        session.previous_days = search_days
+    if not candidates and session is None:
         _persist_health_snapshot()
         raise RuntimeError(
             f"no news returned (providers={','.join(provider_attempts)}, query={chosen_query}, err={last_err})"
@@ -4243,6 +4379,11 @@ def fetch_daily_news_candidates(
         "provider_attempts": provider_attempts,
         "provider_errors": provider_errors[-10:],
         "collection_stop_reason": collection_stop_reason,
+        "cached_providers": sorted(cached_providers),
+        "unavailable_providers": [provider for provider in provider_plan if session is not None and provider not in prefetched_provider_results],
+        "history_range_capable_providers": sorted(set(provider_plan) & _HISTORICAL_NEWS_PROVIDERS),
+        "budget_incomplete": session.budget_incomplete if session is not None else False,
+        "discovery_remaining_seconds": session.remaining_seconds if session is not None else None,
         "qualified_count_at_stop": qualified_count_at_stop,
         "minimum_qualified_records": minimum_qualified or None,
         "successful_providers": successful_providers,

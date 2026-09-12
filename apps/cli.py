@@ -1254,21 +1254,54 @@ def _daily_news_generation_progress(stage: str, status: str, detail: dict[str, o
                 f"信源 {index}/{total}：{source} 完成，获得 {detail.get('items', 0)} 条，"
                 f"含日期 {detail.get('dated', 0)} 条，耗时 {detail.get('elapsed_seconds', 0)} 秒"
             )
+            if detail.get("cached"):
+                message = f"信源 {index}/{total}：{source} 复用本轮已抓取结果 {detail.get('items', 0)} 条，未重新请求"
         elif status == "skipped":
-            message = f"信源 {index}/{total}：{source} 暂跳过（近期请求异常，冷却中）"
+            reason = {"discovery_budget_exhausted": "本批检索预算已用完，历史覆盖未完成",
+                      "source_unavailable_this_run": "本轮不可用或仍在冷却，不重复请求",
+                      "timeout_ratio_reached_replacement_threshold": "超时比例达到替换阈值"}.get(
+                          detail.get("reason"), "近期请求异常，冷却中")
+            message = f"信源 {index}/{total}：{source} 暂跳过（{reason}）"
         else:
             message = f"信源 {index}/{total}：{source} 失败，已继续检查其他信源：{detail.get('error', '')}"
+    elif stage == "材料审核":
+        message = (f"第{detail.get('batch')}批：审核{detail.get('count')}条材料，"
+                   f"累计检查{detail.get('checked')}条；{detail.get('reason', '')}")
+    elif stage == "source_context":
+        if status == "failed":
+            message = (f"本批候选{detail.get('candidate_index')}/{detail.get('candidate_total')}原文处理失败；"
+                       "请检查来源页面是否可访问，或使用另一原文来源")
+        else:
+            result = "正文信息量通过，待查重及配额检查" if detail.get('context_sufficient') else "正文不足，不能据此成稿"
+            message = (f"本批{detail.get('completed')}/{detail.get('candidate_total')}，"
+                       f"耗时{detail.get('elapsed_seconds', 0)}秒；{result}；{detail.get('title', '')}")
+    elif stage == "配额预筛":
+        message = (f"{detail.get('window_days')}天窗口：国内缺{detail.get('china_missing')}，"
+                   f"国际争议缺{detail.get('conflict_missing')}；{detail.get('reason', '')}，"
+                   f"延后{detail.get('deferred')}条材料")
     elif stage == "准备候选池":
         message = (
-            f"计划生成 {detail.get('requested_count')} 条；先收集约 {detail.get('raw_target')} 条原始材料，"
-            f"至少保留 {detail.get('min_qualified')} 条合格候选"
+            f"计划生成 {detail.get('requested_count')} 条；原始材料优选目标 {detail.get('raw_target')} 条，"
+            f"初筛优选目标 {detail.get('preferred_target', detail.get('min_qualified'))} 条（非硬门槛）；"
+            f"需要 {detail.get('min_qualified')} 条可成稿材料，替补目标 {detail.get('reserve_target', 0)} 条"
         )
     elif stage == "候选筛选":
         message = (
             f"{detail.get('window_days', '当前')}天窗口：近期 {detail.get('recent', detail.get('raw', 0))} 条，"
             f"相关 {detail.get('relevant', detail.get('qualified', 0))} 条，"
-            f"合格 {detail.get('qualified', 0)}/{detail.get('min_qualified', 0)} 条"
+            f"材料合格 {detail.get('qualified', 0)} 条，主候选 {detail.get('main', 0)}/{detail.get('min_qualified', 0)} 条，"
+            f"替补 {detail.get('reserve', 0)} 条；国内缺 {detail.get('china_missing', 0)}，国际争议缺 {detail.get('conflict_missing', 0)}"
         )
+    elif stage == "扩展检索":
+        message = (f"检查 {detail.get('window_days')} 天窗口；复用本轮已采材料，仅历史接口补查新增日期；"
+                   f"剩余采集预算 {detail.get('remaining_seconds')} 秒")
+    elif stage == "候选就绪":
+        message = (f"{detail.get('window_days')}天窗口：主候选 {detail.get('main')}/{detail.get('target')}，"
+                   f"替补 {detail.get('reserve')}/{detail.get('reserve_target')}；允许进入生成，图文仍需逐条审查")
+    elif stage == "生成补位":
+        message = f"已保留 {detail.get('completed')}/{detail.get('target')} 条成稿；替补耗尽，检查未审核材料和剩余日期窗口"
+    elif stage == "候选不足":
+        message = str(detail.get("reason") or "材料不足，请检查日期、类别和新闻源状态")
     elif stage == "模型审校候选":
         message = (
             f"模型正在审校 {detail.get('candidates', detail.get('reviewed', 0))} 条候选，"
@@ -1299,6 +1332,19 @@ def _daily_news_generation_progress(stage: str, status: str, detail: dict[str, o
     else:
         message = "；".join(f"{key}={value}" for key, value in detail.items())
     _emit_progress_event("auto", stage, status, message)
+
+
+def _validate_cli_lookback(value: object, *, title: str, material_mode: bool) -> None:
+    if material_mode:
+        return
+    try:
+        if title == "每日新闻":
+            from src.workflow.news_discovery import resolve_news_windows
+            resolve_news_windows(value, env_names=("NEWS_LOOKBACK_DAYS", "CONTENT_LOOKBACK_DAYS"))
+        elif value is not None:
+            int(str(value))
+    except (ValueError, TypeError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--lookback-days") from exc
 
 
 def _env_first(*names: str) -> str:
@@ -1580,10 +1626,10 @@ def create(
         "--evaluation-viewpoint",
         help="每日新闻评价视角；默认无视角评价",
     ),
-    lookback_days: Optional[int] = typer.Option(
+    lookback_days: Optional[str] = typer.Option(
         None,
         "--lookback-days",
-        help="每日新闻只允许 1/2 天且默认 2 天；每日AI讯息留空按 3/7/14 天自动扩展",
+        help="每日新闻：auto或留空按1/2/3/5个北京时间自然日扩展，整数1至5固定窗口；auto覆盖环境固定值。每日AI讯息原有回溯规则不变",
     ),
     news_materials_file: str = typer.Option(
         "",
@@ -1620,6 +1666,8 @@ def create(
         prompt_norm = ""
         lookback_days = None
         count = 1
+    _validate_cli_lookback(lookback_days, title=title_norm,
+                          material_mode=bool(single_news_material_file_norm or news_materials_file_norm or os.getenv("NEWS_MATERIALS_FILE")))
     asset_paths = _initial_asset_paths(assets_glob)
     if not asset_paths:
         _emit_missing_assets_hint(title_norm)
@@ -2061,10 +2109,10 @@ def auto(
         "--evaluation-viewpoint",
         help="每日新闻评价视角；默认无视角评价",
     ),
-    lookback_days: Optional[int] = typer.Option(
+    lookback_days: Optional[str] = typer.Option(
         None,
         "--lookback-days",
-        help="每日新闻只允许 1/2 天且默认 2 天；每日AI讯息留空按 3/7/14 天自动扩展",
+        help="每日新闻：auto或留空按1/2/3/5个北京时间自然日扩展，整数1至5固定窗口；auto覆盖环境固定值。每日AI讯息原有回溯规则不变",
     ),
     news_materials_file: str = typer.Option(
         "",
@@ -2160,6 +2208,8 @@ def auto(
         prompt_norm = ""
         lookback_days = None
         count = 1
+    _validate_cli_lookback(lookback_days, title=title_norm,
+                          material_mode=bool(single_news_material_file_norm or news_materials_file_norm or os.getenv("NEWS_MATERIALS_FILE")))
     asset_paths = _initial_asset_paths(assets_glob)
     if not asset_paths:
         _emit_missing_assets_hint(title_norm, dry_run=dry_run)

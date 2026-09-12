@@ -52,7 +52,7 @@ def test_daily_news_context_accepts_title_plus_rss_summary_but_not_title_only():
     with_summary = NewsItem(
         title="国际冲突双方就停火安排继续谈判并公布最新进展",
         url="https://news.google.com/rss/articles/example",
-        description="双方代表在最新会谈后分别说明当前立场，相关安排仍需进一步确认，后续将继续磋商。双方表示将通过正式渠道发布后续信息，并继续就停火执行、人员安全和地区局势展开沟通。会谈涉及停火安排、人员安全、地区局势和后续信息发布等具体事项。",
+        description="双方代表在最新会谈后分别说明当前立场，相关安排仍需进一步确认，后续将继续磋商。双方表示将通过正式渠道发布后续信息，并继续就停火执行、人员安全和地区局势展开沟通。会谈涉及停火安排、人员安全、地区局势和后续信息发布等具体事项。双方尚未签署执行文件，下一轮磋商地点与日期也未公布。",
     )
     title_only = NewsItem(
         title="国际冲突双方就停火安排继续谈判并公布最新进展",

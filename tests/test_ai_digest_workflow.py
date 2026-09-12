@@ -129,6 +129,10 @@ def test_select_adaptive_ai_digest_items_uses_all_strict_candidates_up_to_twenty
 
 def test_select_adaptive_ai_digest_items_does_not_backfill_low_impact_items():
     items = _distinct_updates(8)
+    items[-1] = items[-1].model_copy(update={
+        "title": "AI industry opinion", "product": "AI", "summary": "Opinion on industry trends.",
+        "raw_excerpt": "Opinion on industry trends.",
+    })
     scores = {
         item.dedupe_key: {
             "impact_score": 90.0 if index < 7 else 62.0,
@@ -206,6 +210,10 @@ def test_select_adaptive_ai_digest_items_excludes_older_and_normal_items():
         for index, item in enumerate(_distinct_updates(8))
     ]
     high_indexes = {0, 1, 3, 4, 5, 6}
+    items[-1] = items[-1].model_copy(update={
+        "title": "AI industry opinion", "product": "AI", "summary": "Opinion on industry trends.",
+        "raw_excerpt": "Opinion on industry trends.",
+    })
     scores = {
         item.dedupe_key: {
             "impact_score": 90.0 if index in high_indexes else 60.0,
@@ -446,6 +454,10 @@ def test_create_daily_ai_digest_posts_publishes_only_the_seven_high_impact_items
 ):
     monkeypatch.chdir(tmp_path)
     pool = _distinct_updates(8)
+    pool[-1] = pool[-1].model_copy(update={
+        "title": "AI industry opinion", "product": "AI", "summary": "Opinion on industry trends.",
+        "raw_excerpt": "Opinion on industry trends.",
+    })
     monkeypatch.setattr(
         create_post,
         "collect_ai_digest_updates",
@@ -1947,6 +1959,10 @@ def test_ai_digest_default_count_is_quality_driven_without_low_impact_backfill(m
     monkeypatch.delenv("AI_DIGEST_MIN_ITEMS", raising=False)
     monkeypatch.delenv("AI_DIGEST_ALLOW_MIN_ITEMS_DEGRADE", raising=False)
     items = _distinct_updates(6)
+    items[4:] = [item.model_copy(update={
+        "title": "AI industry opinion", "product": "AI", "summary": "Opinion on industry trends.",
+        "raw_excerpt": "Opinion on industry trends.",
+    }) for item in items[4:]]
     scores = {
         item.dedupe_key: {
             "impact_score": 90.0 if index < 4 else 60.0,

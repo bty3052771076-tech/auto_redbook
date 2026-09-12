@@ -143,7 +143,7 @@ def test_default_sources_use_current_official_pages_when_legacy_rss_endpoints_ar
 def test_default_sources_include_precision_model_release_search_queries():
     queries = collect_mod._search_backfill_queries()
 
-    assert "Claude Fable 5.1 release Anthropic official" in queries
+    assert "Claude model release Anthropic official" in queries
 
 
 def test_parse_fable_official_page_as_concrete_model_release(monkeypatch):

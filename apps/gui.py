@@ -1789,6 +1789,14 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             keywords = ""
             lookback_days = ""
             count = 1
+        if title == "每日新闻" and not (single_news_material_file or news_materials_file):
+            from src.workflow.news_discovery import resolve_news_windows
+            raw_days = params.get("lookback_days")
+            raw_days = "auto" if params.get("lookback_mode") == "auto" else raw_days
+            if params.get("lookback_mode") == "fixed" and not str(raw_days or "").strip():
+                raise ValueError("固定回溯天数不能为空，请填写1至5或选择自动。")
+            windows, policy = resolve_news_windows(raw_days)
+            lookback_days = "auto" if policy["mode"] == "auto" else str(windows[0])
         no_copy = bool(params.get("no_copy") or False)
         platform = normalize_publish_platform(str(params.get("platform") or "xhs"))
 
@@ -3322,6 +3330,7 @@ def main() -> None:
     assets_var = tk.StringVar(value=DEFAULT_ASSETS_GLOB)
     count_var = tk.IntVar(value=1)
     lookback_days_var = tk.StringVar(value="")
+    lookback_mode_var = tk.StringVar(value="auto")
     performance_mode_var = tk.StringVar(
         value=_env_default("WORKFLOW_PERFORMANCE_MODE", "balanced") or "balanced"
     )
@@ -3396,16 +3405,26 @@ def main() -> None:
         row=6, column=2, sticky="w", padx=(10, 0)
     )
 
-    ttk.Label(auto_grid, text="回溯天数（新闻1-2）").grid(row=7, column=0, sticky="w", pady=5)
-    ttk.Entry(auto_grid, textvariable=lookback_days_var, width=8).grid(
-        row=7, column=1, sticky="w", pady=5, padx=(10, 0)
-    )
-    ttk.Label(
-        auto_grid,
-        text="留空：先用 3 天内候选，不足自动扩至 7/14 天；填写数字：固定只使用发帖日 N 天内候选。",
-        style="Muted.TLabel",
-        wraplength=620,
-    ).grid(row=7, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=5)
+    ttk.Label(auto_grid, text="回溯窗口").grid(row=7, column=0, sticky="w", pady=5)
+    lookback_controls = ttk.Frame(auto_grid)
+    lookback_controls.grid(row=7, column=1, columnspan=3, sticky="w", pady=5, padx=(10, 0))
+    ttk.Radiobutton(lookback_controls, text="自动", value="auto", variable=lookback_mode_var).pack(side="left")
+    ttk.Radiobutton(lookback_controls, text="固定", value="fixed", variable=lookback_mode_var).pack(side="left", padx=(12, 6))
+    lookback_input = ttk.Spinbox(lookback_controls, from_=1, to=5, textvariable=lookback_days_var, width=5)
+    lookback_input.pack(side="left")
+    lookback_label = ttk.Label(lookback_controls, style="Muted.TLabel")
+    lookback_label.pack(side="left", padx=(10, 0))
+
+    def _refresh_lookback_controls(*_args):
+        daily_news = title_var.get().strip() == "每日新闻"
+        automatic = lookback_mode_var.get() == "auto"
+        lookback_input.configure(state="disabled" if automatic else "normal", to=5 if daily_news else 14)
+        lookback_label.configure(text=("1 / 2 / 3 / 5 天" if automatic else "天，范围 1 至 5")
+                                 if daily_news else ("默认日期策略" if automatic else "天"))
+
+    lookback_mode_var.trace_add("write", _refresh_lookback_controls)
+    title_var.trace_add("write", _refresh_lookback_controls)
+    _refresh_lookback_controls()
 
     ttk.Label(auto_grid, text="运行模式").grid(row=8, column=0, sticky="w", pady=5)
     ttk.Combobox(
@@ -3674,7 +3693,8 @@ def main() -> None:
             "assets_glob": assets_var.get(),
             "image_source": image_provider_var.get(),
             "count": count_var.get(),
-            "lookback_days": lookback_days_var.get(),
+            "lookback_days": lookback_days_var.get() if lookback_mode_var.get() == "fixed" else "",
+            "lookback_mode": lookback_mode_var.get(),
             "no_copy": no_copy_var.get(),
             "dry_run": dry_run_var.get(),
             "headless": headless_var.get(),
@@ -3726,7 +3746,9 @@ def main() -> None:
         )
         assets_var.set(os.getenv("AUTO_REDBOOK_GUI_ASSETS_GLOB") or AUTO_IMAGE_ASSETS_GLOB)
         count_var.set(env_int_value(os.getenv("AUTO_REDBOOK_GUI_COUNT"), count_var.get(), min_value=1))
-        lookback_days_var.set(normalize_optional_day_count(os.getenv("AUTO_REDBOOK_GUI_LOOKBACK_DAYS")))
+        configured_days = (os.getenv("AUTO_REDBOOK_GUI_LOOKBACK_DAYS") or "").strip()
+        lookback_mode_var.set("auto" if configured_days.lower() in {"", "auto"} else "fixed")
+        lookback_days_var.set("" if lookback_mode_var.get() == "auto" else configured_days)
         dry_run_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_DRY_RUN")))
         headless_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_HEADLESS")))
         force_var.set(env_flag_enabled(os.getenv("AUTO_REDBOOK_GUI_FORCE")))
@@ -3947,7 +3969,7 @@ def main() -> None:
     )
     ttk.Label(
         material_grid,
-        text="必填；只验证格式，不判断材料新旧，也不会套用每日新闻的2/3/7/14天窗口。",
+        text="必填；只验证格式，不判断材料新旧，也不会套用每日新闻的自动或固定日期窗口。",
         style="PanelMuted.TLabel",
         wraplength=760,
     ).grid(row=5, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
