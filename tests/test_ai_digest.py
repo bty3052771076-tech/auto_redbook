@@ -58,6 +58,26 @@ def test_ai_update_item_normalizes_url_key_and_source_type():
     assert item.verification_status == "official_only"
 
 
+def test_ai_update_quality_rejects_disclosure_title_without_concrete_object():
+    item = _item(
+        "Anthropic披露AI产品变化",
+        summary="Anthropic披露AI产品变化。",
+        raw_excerpt="Anthropic披露AI产品变化。",
+    )
+
+    assert "generic_title" in ai_update_quality_issues(item)
+
+
+def test_ai_update_quality_rejects_disclosure_related_content_title():
+    item = _item(
+        "Anthropic\u62ab\u9732AI\u76f8\u5173\u5185\u5bb9",
+        summary="Anthropic\u62ab\u9732AI\u76f8\u5173\u5185\u5bb9",
+        raw_excerpt="Anthropic\u62ab\u9732AI\u76f8\u5173\u5185\u5bb9",
+    )
+
+    assert "generic_title" in ai_update_quality_issues(item)
+
+
 def test_hy4_preview_is_classified_as_a_model_release():
     item = _item(
         "HY4 preview",

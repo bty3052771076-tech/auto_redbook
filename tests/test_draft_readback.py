@@ -62,6 +62,22 @@ def test_readback_rejects_partial_body_or_missing_image():
     assert not result.image_ok
 
 
+def test_readback_rejects_extra_image_that_does_not_belong_to_this_revision():
+    post = _post()
+
+    result = _verify_draft_readback_snapshot(
+        {
+            "actual_title": post.title,
+            "actual_body": post.body,
+        },
+        post,
+        actual_image_count=3,
+    )
+
+    assert not result.ok
+    assert not result.image_ok
+
+
 def test_readback_normalizes_html_entities_in_source_urls():
     post = Post(
         title="AI source",

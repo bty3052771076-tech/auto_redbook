@@ -2514,11 +2514,9 @@ def _verify_draft_readback_snapshot(
         for asset in post.assets or []
         if (asset.kind or "image").strip().lower() == "image"
     )
-    image_ok = (
-        actual_image_count >= expected_image_count
-        if expected_image_count > 0
-        else actual_image_count == 0
-    )
+    # Extra images are just as much a delivery mismatch as missing images: the
+    # remote draft may contain leftovers from a previous revision.
+    image_ok = actual_image_count == expected_image_count
     return DraftReadbackResult(
         ok=title_ok and body_ok and image_ok,
         title_ok=title_ok,

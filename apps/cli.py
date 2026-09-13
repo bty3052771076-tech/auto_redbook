@@ -56,6 +56,7 @@ from src.publish.draft_inventory import (
     match_draft_inventory,
     platform_records_from_items,
 )
+from src.publish.draft_delivery import content_revision_fingerprint, has_current_draft_receipt
 from src.publish.targets import normalize_publish_platform, publish_targets
 from src.publish.toutiao_steps import adapt_post_for_toutiao, run_save_toutiao_draft_sync
 from src.storage.files import (
@@ -896,10 +897,17 @@ def _run_auto_quality_gate(
                 max_repairs=repair_limit,
                 review_fn=review_post_image,
                 regenerate_fn=regenerate_daily_news_post_image,
-                fallback_regenerate_fn=lambda post, prompt: regenerate_daily_news_post_image(
-                    post,
-                    prompt,
-                    provider="pexels",
+                fallback_regenerate_fn=(
+                    None
+                    if str((post.platform.get("news") or {}).get("image_policy") or "")
+                    .strip()
+                    .lower()
+                    == "ai_required"
+                    else lambda post, prompt: regenerate_daily_news_post_image(
+                        post,
+                        prompt,
+                        provider="pexels",
+                    )
                 ),
                 progress_fn=lambda attempt, limit, _prompt, index=index: _emit_progress_event(
                     "auto",
@@ -1935,7 +1943,10 @@ def run(
     _emit_progress_event("run", "校验草稿", "in_progress", f"post_id={post.id}")
     result = validate_post(post)
     _emit_validation(result)
-    if result.errors and not force:
+    # --force may bypass workflow status checks, but never bypasses content or
+    # asset validation. Uploading a known-corrupted draft creates a remote
+    # artifact that the user cannot reliably repair afterward.
+    if result.errors:
         _emit_progress_event("run", "校验草稿", "failed", f"post_id={post.id} errors={len(result.errors)}")
         raise typer.Exit(code=1)
     _emit_progress_event("run", "校验草稿", "success", f"post_id={post.id}")
@@ -1952,6 +1963,11 @@ def run(
     for target in target_platforms:
         target_label = "小红书" if target == "xhs" else "今日头条"
         stage = f"上传{target_label}草稿"
+        if not dry_run and has_current_draft_receipt(post, platform=target):
+            saved_targets.append(target)
+            typer.echo(f"platform={target} result: already_current (no duplicate upload)")
+            _emit_progress_event("run", stage, "success", f"post_id={post.id} already_current")
+            continue
         attempt = _next_attempt(post_id)
         exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
         _emit_progress_event("run", stage, "in_progress", f"post_id={post.id}")
@@ -1983,6 +1999,7 @@ def run(
                     "title": post.title,
                     "saved_at": post.updated_at,
                     "execution_id": exec_rec.id,
+                    "revision_fingerprint": content_revision_fingerprint(post),
                 }
             else:
                 article = adapt_post_for_toutiao(post)
@@ -1990,6 +2007,7 @@ def run(
                     "title": article.title,
                     "saved_at": post.updated_at,
                     "execution_id": exec_rec.id,
+                    "revision_fingerprint": content_revision_fingerprint(post),
                 }
             _emit_progress_event("run", stage, "success", f"post_id={post.id}")
         elif dry_run and exec_rec.result == "pending" and not exec_rec.error:
@@ -2089,6 +2107,7 @@ def update_draft(
         "title": post.title,
         "saved_at": post.updated_at,
         "execution_id": exec_rec.id,
+        "revision_fingerprint": content_revision_fingerprint(post),
     }
     save_post(post)
     _emit_progress_event("update-draft", "更新平台草稿", "success", f"post_id={post.id}")
@@ -2504,7 +2523,7 @@ def auto(
             if fingerprint:
                 preflight_fingerprints[fingerprint] = str(idx)
             validation = validate_post(post)
-            if validation.errors and not force:
+            if validation.errors:
                 preflight_errors.append(f"第 {idx} 条草稿校验失败：{'；'.join(validation.errors)}")
         if preflight_errors:
             run_errors.extend(preflight_errors)
@@ -2550,7 +2569,7 @@ def auto(
             continue
         result = validate_post(post)
         _emit_validation(result)
-        if result.errors and not force:
+        if result.errors:
             if not continue_on_invalid:
                 skipped_invalid += 1
                 post.status = PostStatus.failed
@@ -2608,6 +2627,11 @@ def auto(
         for target in target_platforms:
             target_label = "小红书" if target == "xhs" else "今日头条"
             stage = f"上传{target_label}草稿"
+            if not dry_run and has_current_draft_receipt(post, platform=target):
+                saved_targets.append(target)
+                typer.echo(f"post_id={post.id} platform={target} result: already_current (no duplicate upload)")
+                _emit_progress_event("auto", stage, "success", f"post_id={post.id} already_current")
+                continue
             attempt = _next_attempt(post.id)
             exec_rec = Execution(post_id=post.id, attempt=attempt, result="pending")
             try:
@@ -2655,6 +2679,7 @@ def auto(
                         "title": post.title,
                         "saved_at": post.updated_at,
                         "execution_id": exec_rec.id,
+                        "revision_fingerprint": content_revision_fingerprint(post),
                     }
                 else:
                     article = adapt_post_for_toutiao(post)
@@ -2662,6 +2687,7 @@ def auto(
                         "title": article.title,
                         "saved_at": post.updated_at,
                         "execution_id": exec_rec.id,
+                        "revision_fingerprint": content_revision_fingerprint(post),
                     }
                 _emit_progress_event("auto", stage, "success", f"post_id={post.id}")
             elif not dry_run and not exec_rec.error:

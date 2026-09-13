@@ -52,6 +52,7 @@ from src.images.auto_image import (
 from src.llm.generate import generate_draft, generate_json
 from src.workflow.model_queues import ModelWorkQueues, infer_llm_provider
 from src.workflow.performance import PerformancePolicy
+from src.workflow.content_evidence import BEIJING_TZ, ai_digest_items_in_beijing_window
 from src.workflow.news_discovery import (
     DailyNewsDiscovery, NEWS_LOOKBACK_MAX, feasible_news_batch,
     news_key, news_domain, resolve_news_windows,
@@ -123,6 +124,16 @@ _DAILY_NEWS_INSUFFICIENT_CONTENT_MARKERS = (
     "\u539f\u59cb\u6750\u6599\u63d0\u5230",
     "\u672a\u63d0\u4f9b\u8db3\u591f\u7ec6\u8282",
     "\u76f8\u5173\u6280\u672f\u4e89\u8bae\u51fa\u73b0\u5347\u7ea7",
+)
+_DAILY_NEWS_INCOMPLETE_CONTENT_PATTERNS = (
+    # A model can be cut off in the middle of a Chinese compound word and the
+    # normalizer may then append a full stop. Keep these patterns explicit so
+    # a grammatical-looking fragment cannot pass the publish gate.
+    re.compile(r"(?:人工智能|技术|软件|平台|业务|产业)应用生$"),
+)
+_DAILY_NEWS_VAGUE_CONTENT_MARKERS = (
+    "从已公布信息看，本次动态属于",
+    "本次动态属于监管框架层面的方向性更新",
 )
 _DAILY_NEWS_PREFIX_RE = re.compile(r"^(?:每日新闻)(?:[｜|:：\-—–\s]+)?")
 _SOURCE_LOOKUP_MIN_CHARS = 120
@@ -1922,6 +1933,13 @@ def _daily_news_content_has_malformed_field_artifact(content: str) -> bool:
     )
 
 
+def _daily_news_content_has_incomplete_tail(content: str) -> bool:
+    """Reject a normalized sentence that still ends inside a known phrase."""
+    text = _clean_daily_news_text_value(content)
+    compact = re.sub(r"\s+", "", text).rstrip("。！？!?。")
+    return any(pattern.search(compact) for pattern in _DAILY_NEWS_INCOMPLETE_CONTENT_PATTERNS)
+
+
 def _daily_news_content_is_unsupported(content: str, picked) -> bool:
     text = content or ""
     if not text.strip():
@@ -2082,7 +2100,13 @@ def _daily_news_body_is_too_generic(body: str) -> bool:
     text = body or ""
     if not text.strip():
         return True
-    return any(marker in text for marker in _NEWS_GENERIC_BODY_MARKERS) or _daily_news_comment_is_generic(text)
+    fields = _daily_news_body_quality_fields(text)
+    content = fields.get("内容", "")
+    return (
+        any(marker in text for marker in _NEWS_GENERIC_BODY_MARKERS)
+        or any(marker in content for marker in _DAILY_NEWS_VAGUE_CONTENT_MARKERS)
+        or _daily_news_comment_is_generic(text)
+    )
 
 
 def _daily_news_body_quality_fields(body: str) -> dict[str, str]:
@@ -2144,7 +2168,11 @@ def _daily_news_body_has_site_noise(body: str) -> bool:
 
 def _daily_news_body_has_malformed_content(body: str) -> bool:
     fields = _daily_news_body_quality_fields(body)
-    return _daily_news_content_has_malformed_field_artifact(fields.get("内容", ""))
+    content = fields.get("内容", "")
+    return (
+        _daily_news_content_has_malformed_field_artifact(content)
+        or _daily_news_content_has_incomplete_tail(content)
+    )
 
 
 def _daily_news_body_has_multiple_story_content(body: str) -> bool:
@@ -2239,6 +2267,8 @@ def _daily_news_quality_issue(title: str, body: str, prompt_norm: str = "") -> s
         return "body_html_artifacts"
     if _daily_news_body_has_site_noise(body):
         return "body_site_noise"
+    if _daily_news_content_has_incomplete_tail(_daily_news_body_quality_fields(body).get("内容", "")):
+        return "incomplete_content"
     if _daily_news_body_has_malformed_content(body):
         return "malformed_body_content"
     if _daily_news_body_has_multiple_story_content(body):
@@ -3442,6 +3472,7 @@ def _fetch_daily_news_related_images(
     exclude_ids: Optional[set[str]] = None,
     ai_first: bool = False,
     provider: Optional[str] = None,
+    image_policy: str = "ai_preferred",
 ) -> tuple[list[Path], list[dict[str, Any]], dict[str, Any] | None]:
     if not ai_first:
         paths, metas = fetch_and_download_related_images(
@@ -3455,7 +3486,10 @@ def _fetch_daily_news_related_images(
         return paths, metas, None
 
     primary_provider = (provider or _daily_news_ai_first_provider()).strip().lower()
+    required_ai = str(image_policy or "").strip().lower() == "ai_required"
     if primary_provider == "pexels":
+        if required_ai:
+            raise RuntimeError("AI image required, but the selected image provider is Pexels")
         paths, metas = fetch_and_download_related_images(
             title=title,
             body=body,
@@ -3478,6 +3512,10 @@ def _fetch_daily_news_related_images(
         )
         return paths, metas, None
     except Exception as exc:
+        if required_ai:
+            raise RuntimeError(
+                f"AI image required; provider={primary_provider} failed: {str(exc)[:240]}"
+            ) from exc
         fallback_meta: dict[str, Any] = {
             "from_provider": primary_provider,
             "to_provider": "pexels",
@@ -3556,6 +3594,7 @@ def regenerate_daily_news_post_image(
         exclude_ids=existing_ids,
         ai_first=True,
         provider=provider,
+        image_policy=str(news_meta.get("image_policy") or "ai_required"),
     )
     if not image_paths:
         return False
@@ -4598,6 +4637,42 @@ def _ai_digest_min_items() -> int:
     quantity gate that makes the workflow publish low-impact filler.
     """
     return AI_DIGEST_MIN_ITEMS
+
+
+def _enforce_ai_digest_publish_policy(
+    brief: AIDigestBrief,
+) -> tuple[AIDigestBrief, dict[str, int | str]]:
+    """Apply the final two-day Beijing gate after every generation path."""
+
+    publication_date = datetime.now(timezone.utc).astimezone(BEIJING_TZ).date().isoformat()
+    selected, meta = ai_digest_items_in_beijing_window(
+        brief.items,
+        publication_date=publication_date,
+        now=datetime.now(timezone.utc),
+    )
+    source_counts: dict[str, int] = {}
+    source_capped: list[AIUpdateItem] = []
+    source_cap_removed = 0
+    for item in selected:
+        source_key = ai_update_source_key(item)
+        if source_counts.get(source_key, 0) >= AI_DIGEST_MAX_ITEMS_PER_SOURCE:
+            source_cap_removed += 1
+            continue
+        source_counts[source_key] = source_counts.get(source_key, 0) + 1
+        source_capped.append(item)
+    selected = source_capped
+    meta["source_cap_removed"] = source_cap_removed
+    if not selected:
+        raise RuntimeError(
+            "daily ai digest material insufficient: strict Beijing two-day window "
+            f"{meta['earliest_date']}..{meta['publication_date']} has no eligible item; "
+            "older or undated items were discarded"
+        )
+    data = brief.model_dump()
+    data["date"] = publication_date
+    data["items"] = [item.model_dump() for item in selected]
+    meta["selected_count"] = len(selected)
+    return AIDigestBrief.model_validate(data), meta
 
 
 def _ai_digest_prompt_search_queries(prompt_hint: str) -> list[str]:
@@ -6188,6 +6263,42 @@ def create_daily_ai_digest_posts(
                 adaptive_selection_meta["final_target_items"] = target_count
                 source_meta["body_capacity"] = body_capacity_meta
 
+    # Apply the non-negotiable publication window and event dedupe before the
+    # LLM sees the pool. This avoids spending a generation request on stale or
+    # mirrored items, while the post-LLM gate below still protects rewritten
+    # output that accidentally reintroduces a duplicate.
+    items, strict_pre_llm_meta = ai_digest_items_in_beijing_window(
+        items,
+        publication_date=datetime.now(timezone.utc).astimezone(BEIJING_TZ).date().isoformat(),
+        now=datetime.now(timezone.utc),
+    )
+    source_meta["strict_pre_llm_policy"] = strict_pre_llm_meta
+    if not items:
+        raise RuntimeError(
+            "daily ai digest material insufficient: strict Beijing two-day window "
+            f"{strict_pre_llm_meta['earliest_date']}..{strict_pre_llm_meta['publication_date']} "
+            "has no eligible item before LLM generation"
+        )
+    target_count = len(items)
+    if not adaptive_mode:
+        target_count = min(legacy_target_count, target_count)
+        items = items[:target_count]
+    max_age_days = 2
+    effective_min_official_count = min(
+        effective_min_official_count,
+        ai_digest_official_count(list(items or [])),
+        target_count,
+    )
+    effective_min_domestic_model_count = min(
+        effective_min_domestic_model_count,
+        ai_digest_quota_counts(list(items or []))["domestic_model"],
+        target_count,
+    )
+    effective_min_foreign_ai_count = min(
+        effective_min_foreign_ai_count,
+        ai_digest_quota_counts(list(items or []))["foreign_ai"],
+        target_count,
+    )
     generation_target = target_count
     # Adaptive mode may intentionally publish fewer than the historical
     # quota targets when only a small set of fresh, high-impact items remains.
@@ -6268,6 +6379,22 @@ def create_daily_ai_digest_posts(
                 generation_target,
             )
         adaptive_selection_meta["final_prompt_topic_coverage"] = final_prompt_topic_meta
+    brief, strict_publish_meta = _enforce_ai_digest_publish_policy(brief)
+    source_meta["strict_publish_policy"] = strict_publish_meta
+    max_age_days = 2
+    generation_target = len(brief.items)
+    effective_min_official_count = min(
+        effective_min_official_count,
+        ai_digest_official_count(list(brief.items or [])),
+    )
+    effective_min_domestic_model_count = min(
+        effective_min_domestic_model_count,
+        ai_digest_quota_counts(list(brief.items or []))["domestic_model"],
+    )
+    effective_min_foreign_ai_count = min(
+        effective_min_foreign_ai_count,
+        ai_digest_quota_counts(list(brief.items or []))["foreign_ai"],
+    )
     final_error = _ai_digest_selection_error(
         brief.items,
         target_count=generation_target,
@@ -6322,6 +6449,37 @@ def create_daily_ai_digest_posts(
             generation_mode = "llm_quota_fallback"
             llm_error = final_error
             final_error = ""
+            brief, strict_publish_meta = _enforce_ai_digest_publish_policy(brief)
+            source_meta["strict_publish_policy"] = strict_publish_meta
+            generation_target = len(brief.items)
+            max_age_days = 2
+            strict_quota_counts = ai_digest_quota_counts(list(brief.items or []))
+            effective_min_official_count = min(
+                effective_min_official_count,
+                ai_digest_official_count(list(brief.items or [])),
+            )
+            effective_min_domestic_model_count = min(
+                effective_min_domestic_model_count,
+                strict_quota_counts["domestic_model"],
+            )
+            effective_min_foreign_ai_count = min(
+                effective_min_foreign_ai_count,
+                strict_quota_counts["foreign_ai"],
+            )
+            final_error = _ai_digest_selection_error(
+                brief.items,
+                target_count=generation_target,
+                min_official_count=effective_min_official_count,
+                min_domestic_model_count=effective_min_domestic_model_count,
+                min_foreign_ai_count=effective_min_foreign_ai_count,
+                max_age_days=max_age_days,
+            )
+            source_cap_error = _ai_digest_source_cap_error(
+                brief.items,
+                target_count=generation_target,
+            )
+            if source_cap_error:
+                final_error = source_cap_error
     if final_error:
         raise RuntimeError(final_error)
     # The issue date belongs to the run, not to an LLM or a source article.
@@ -6488,6 +6646,11 @@ def create_post_with_draft(
                 "picked": asdict(picked),
                 "source_url": picked.url,
                 "mode": "daily_news_single_material" if str(single_news_material_file or "").strip() else "daily_news",
+                "image_policy": (
+                    "ai_required"
+                    if not asset_paths and not str(single_news_material_file or "").strip()
+                    else ("ai_preferred" if str(single_news_material_file or "").strip() else "provided")
+                ),
                 "prompt_hint": prompt_norm,
                 "evaluation_viewpoint": viewpoint_norm,
             }
@@ -6649,6 +6812,7 @@ def create_post_with_draft(
             # fails, including for online candidates rather than just manual
             # single-news materials.
             ai_first=True,
+            image_policy=str((post.platform.get("news") or {}).get("image_policy") or "ai_required"),
         )
         if image_fallback:
             post.platform["image_fallback"] = image_fallback
@@ -7095,6 +7259,11 @@ def _prepare_daily_news_candidate(
                 "picked": asdict(picked),
                 "source_url": picked.url,
                 "mode": "daily_news_single_material" if single_material_mode else ("daily_news_multi" if target_count > 1 else "daily_news"),
+                "image_policy": (
+                    "ai_required"
+                    if not asset_paths and not single_material_mode
+                    else ("ai_preferred" if single_material_mode else "provided")
+                ),
                 "prompt_hint": prompt_norm,
                 "evaluation_viewpoint": viewpoint_norm,
                 "pick_index": candidate_index,
@@ -7127,6 +7296,7 @@ def _prepare_daily_news_candidate(
                 dest_dir=dest_dir,
                 exclude_ids=set(),
                 ai_first=True,
+                image_policy="ai_preferred" if single_material_mode else "ai_required",
             ).result()
             if image_fallback:
                 post.platform["image_fallback"] = image_fallback

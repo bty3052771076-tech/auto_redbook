@@ -558,7 +558,9 @@ def generate_draft(
     if not raw_title:
         raw_title = title_hint
     if not raw_body:
-        raw_body = prompt_hint
+        # Never turn private instructions into publishable content. An empty
+        # model body is a failed generation and must be rejected by callers.
+        data["_fallback_error"] = str(data.get("_fallback_error") or "LLM returned an empty body")
 
     data["title"] = _truncate(repair_utf8_as_gbk_mojibake(raw_title), max_title)
     data["body"] = _truncate(repair_utf8_as_gbk_mojibake(raw_body), max_body)

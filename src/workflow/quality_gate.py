@@ -13,6 +13,7 @@ from PIL import Image, ImageStat, UnidentifiedImageError
 from src.ai_digest.models import AIUpdateItem
 from src.ai_digest.rank import ai_update_history_key, ai_update_quality_issues
 from src.storage.models import Post, PostStatus
+from src.workflow.content_evidence import text_integrity_issues
 
 
 _BODY_DATE_RE = re.compile(r"(?:日期|发布时间)\s*[:：]\s*(\d{4}-\d{1,2}-\d{1,2})")
@@ -268,8 +269,10 @@ def _same_event(left: Post, right: Post) -> bool:
         right_keys = _ai_digest_item_keys(right)
         if not left_keys or not right_keys:
             return False
-        overlap_ratio = len(left_keys & right_keys) / min(len(left_keys), len(right_keys))
-        return overlap_ratio >= 0.75
+        # A single repeated AI event is still a duplicate. Comparing whole
+        # digest overlap allowed yesterday's one repeated item to hide inside
+        # an otherwise different brief.
+        return bool(left_keys & right_keys)
 
     left_url = _source_url(left)
     right_url = _source_url(right)
@@ -298,6 +301,12 @@ def _has_traditional_marker(text: str) -> bool:
 
 def _post_issues(post: Post) -> list[QualityIssue]:
     issues: list[QualityIssue] = []
+    for code in text_integrity_issues(post.title, post.body):
+        message = {
+            "replacement_character": "标题或正文包含Unicode替代字符，无法安全恢复。",
+            "question_mark_corruption": "标题或正文出现连续问号，疑似编码损坏，已阻止上传。",
+        }.get(code, "标题或正文完整性检查失败。")
+        issues.append(QualityIssue(code, message, post.id))
     text_fields = [post.title or "", post.body or "", *(post.topics or [])]
     if any(_has_traditional_marker(text) for text in text_fields):
         issues.append(
@@ -317,6 +326,26 @@ def _post_issues(post: Post) -> list[QualityIssue]:
         )
     news = _news_metadata(post)
     if news:
+        image_policy = str(news.get("image_policy") or "").strip().lower()
+        if image_policy == "ai_required":
+            image_meta = (post.platform or {}).get("images")
+            if not isinstance(image_meta, list):
+                image_meta = [(post.platform or {}).get("image")]
+            providers = {
+                str(item.get("provider") or "").strip().lower()
+                for item in image_meta
+                if isinstance(item, Mapping)
+            }
+            if not providers or not providers.issubset(
+                {"aliyun", "volcengine", "minimax", "siliconflow", "qwen", "doubao"}
+            ):
+                issues.append(
+                    QualityIssue(
+                        "ai_image_required",
+                        "当前草稿要求AI配图，但图片来源包含图库或来源未知，已阻止上传。",
+                        post.id,
+                    )
+                )
         source_url = _source_url(post)
         if not source_url.startswith(("http://", "https://")):
             issues.append(

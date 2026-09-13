@@ -913,6 +913,16 @@ _GENERIC_CHANGE_TITLE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+# Treat a headline that only says a vendor "disclosed related content" (or a
+# similarly empty label) as non-actionable until the source facts can supply a
+# concrete model, feature, release, price, benchmark, or policy change.
+_GENERIC_CHANGE_TITLE_RE = re.compile(
+    r"(?:\u62ab\u9732|\u516c\u5f00|\u516c\u5e03|\u5ba3\u5e03|\u53d1\u5e03|\u63a8\u51fa|\u4e0a\u7ebf)"
+    r"[^\u3002\uff01\uff1f\uff1b;\n]{0,80}"
+    r"(?:AI\u4ea7\u54c1\u53d8\u5316|\u4ea7\u54c1\u53d8\u5316|AI\u76f8\u5173\u5185\u5bb9|\u76f8\u5173\u5185\u5bb9|AI\u52a8\u6001|\u76f8\u5173\u52a8\u6001|AI\u8fdb\u5c55|\u76f8\u5173\u8fdb\u5c55|AI\u4fe1\u606f|\u76f8\u5173\u4fe1\u606f|XX\u5185\u5bb9|XX\u53d8\u5316)$",
+    flags=re.IGNORECASE,
+)
+
 
 def ai_update_quality_issues(item: AIUpdateItem) -> tuple[str, ...]:
     """Return deterministic quality issues before an item reaches the LLM.

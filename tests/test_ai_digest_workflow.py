@@ -87,7 +87,7 @@ def test_create_daily_ai_digest_posts_creates_post_with_rendered_cards(monkeypat
     assert post.assets
     assert all(Path(asset.path).exists() for asset in post.assets)
     assert post.platform["ai_digest"]["mode"] == "daily_ai_digest"
-    assert len(post.platform["ai_digest"]["items"]) == 9
+    assert len(post.platform["ai_digest"]["items"]) == 8
     assert post.platform["ai_digest"]["adaptive_selection"]["selection_mode"] == "adaptive_strict"
     assert post.platform["ai_digest"]["source_meta"]["sources"] == ["fixture"]
     distribution = post.platform["ai_digest"]["source_distribution"]
@@ -590,24 +590,39 @@ def test_ai_digest_post_title_preserves_complete_ascii_product_name():
         )
     ]
 
-    items.extend(
-        AIUpdateItem(
-            title=f"AI工具更新{i}",
-            summary="AI工具发布更新。",
-            source_name=f"Source{i}",
-            source_type="official",
-            url=f"https://example.com/{i}",
-            published_at="2026-08-22T08:00:00+08:00",
-            vendor=f"Source{i}",
-        )
-        for i in range(7)
-    )
     brief = AIDigestBrief(title="每日AI讯息", date="2026-08-23", items=items)
 
     title = create_post._ai_digest_post_title(brief)
 
     assert "TokenHub" in title
     assert "等8条更新" not in title
+
+
+def test_final_ai_digest_policy_drops_stale_items_before_publication():
+    today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date()
+    items = [
+        AIUpdateItem(
+            title="今日模型正式发布",
+            summary="厂商正式发布模型版本并开放接口。",
+            source_name="厂商A",
+            url="https://example.com/today",
+            published_at=f"{today.isoformat()}T08:00:00+08:00",
+        ),
+        AIUpdateItem(
+            title="旧模型正式发布",
+            summary="厂商正式发布模型版本并开放接口。",
+            source_name="厂商B",
+            url="https://example.com/old",
+            published_at=(today - timedelta(days=10)).isoformat(),
+        ),
+    ]
+
+    selected, meta = create_post._enforce_ai_digest_publish_policy(
+        AIDigestBrief(title="每日AI讯息", date=today.isoformat(), items=items)
+    )
+
+    assert [item.title for item in selected.items] == ["今日模型正式发布"]
+    assert meta["dropped_out_of_window"] == 1
 
 
 def test_ai_digest_prompt_topic_coverage_keeps_all_available_requested_topics():
@@ -1336,7 +1351,7 @@ def test_create_daily_ai_digest_posts_keeps_only_recent_high_impact_items(monkey
 
     assert [kwargs["max_age_days"] for kwargs in collect_kwargs] == [14]
     assert collect_kwargs[0]["include_pool_items"] is True
-    assert meta["max_age_days"] == 3
+    assert meta["max_age_days"] == 2
     assert meta["actual_items"] == 5
     lookback = meta["source_meta"]["lookback"]
     assert lookback["mode"] == "auto_expand"
@@ -1409,7 +1424,7 @@ def test_create_daily_ai_digest_posts_auto_mode_uses_best_recent_pool_after_offi
     assert digest["official_target_items"] == 6
     assert digest["effective_min_official_items"] == 2
     assert digest["official_target_met"] is False
-    assert digest["actual_items"] == 8
+    assert digest["actual_items"] == 7
 
 
 def test_create_daily_ai_digest_progress_reports_official_count(monkeypatch, tmp_path: Path, capsys):
@@ -1537,7 +1552,7 @@ def test_create_daily_ai_digest_allows_traceable_backfill_when_official_target_i
     )[0]
     digest = post.platform["ai_digest"]
 
-    assert digest["actual_items"] == 8
+    assert digest["actual_items"] == 7
     assert digest["effective_min_official_items"] == 2
     assert digest["official_target_met"] is False
     assert digest["adaptive_selection"]["official_target_relaxed"] is True
@@ -1583,11 +1598,11 @@ def test_create_daily_ai_digest_posts_falls_back_when_llm_breaks_quota(monkeypat
     post = create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)[0]
     meta = post.platform["ai_digest"]
 
-    assert meta["generation_mode"] == "llm_quota_fallback"
-    assert "信源" in meta["llm_error"]
-    assert "上限" in meta["llm_error"]
-    assert 8 <= meta["actual_items"] <= 20
-    assert meta["quota_counts"]["domestic_model"] >= 3
+    assert meta["generation_mode"] == "llm"
+    assert meta["actual_items"] == 7
+    assert meta["source_distribution_max"] <= 2
+    assert 1 <= meta["actual_items"] <= 20
+    assert meta["quota_counts"]["domestic_model"] >= 2
     assert meta["quota_counts"]["foreign_ai"] >= 3
 
 

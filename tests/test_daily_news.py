@@ -5616,7 +5616,7 @@ def test_single_news_material_repairs_generic_final_body_from_source(monkeypatch
     assert calls >= 2
 
 
-def test_online_daily_news_falls_back_to_pexels_when_ai_image_fails(monkeypatch, tmp_path):
+def test_online_daily_news_fails_without_stock_fallback_when_ai_image_fails(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("IMAGE_PROVIDER", "volcengine")
     monkeypatch.setattr(
@@ -5673,17 +5673,18 @@ def test_online_daily_news_falls_back_to_pexels_when_ai_image_fails(monkeypatch,
     monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
     monkeypatch.setattr(create_post, "fetch_and_download_related_images", fake_images)
 
-    posts = create_post.create_daily_news_posts(
+    try:
+        posts = create_post.create_daily_news_posts(
         prompt_hint="工业算力",
         asset_paths=[],
         count=1,
         auto_image=True,
     )
 
-    assert len(posts) == 1
-    assert providers == ["volcengine", "pexels"]
-    assert posts[0].platform["images"][0]["provider"] == "pexels"
-    assert posts[0].platform["image_fallback"]["from_provider"] == "volcengine"
+    except RuntimeError as exc:
+        assert "daily news created only 0/1" in str(exc)
+        posts = []
+    assert providers == ["volcengine"]
 
 
 def test_online_daily_news_skips_headline_only_candidate_after_source_lookup(monkeypatch, tmp_path):
@@ -6210,6 +6211,30 @@ def test_daily_news_quality_rejects_raw_html_artifacts():
     )
 
     assert _daily_news_quality_issue("昆山农商银行员工画像系统上线", body, "") == "body_html_artifacts"
+
+
+def test_daily_news_quality_rejects_content_cut_off_before_a_word_is_finished():
+    body = (
+        "原文标题：工信部发布软件业AI融合行动计划\n\n"
+        "内容：\n工信部发布软件和信息技术服务业人工智能融合行动计划，推动智能体软件在重点场景应用并培育开源项目，加快构建软件领域人工智能应用生。\n\n"
+        "评价：\n计划的执行细则仍待后续明确。\n\n"
+        "日期：2026-09-11\n\n"
+        "来源：国务院新闻办公室英文网"
+    )
+
+    assert _daily_news_quality_issue("工信部发布软件业AI融合行动计划", body, "") == "incomplete_content"
+
+
+def test_daily_news_quality_rejects_directional_placeholder_content():
+    body = (
+        "原文标题：市场监管总局公布智能驾驶安全监管动态\n\n"
+        "内容：\n从已公布信息看，本次动态属于监管框架层面的方向性更新，具体执行细则有待后续官方文件进一步明确。\n\n"
+        "评价：\n规则细则与执行安排仍待后续文件明确。\n\n"
+        "日期：2026-09-10\n\n"
+        "来源：国家市场监督管理总局"
+    )
+
+    assert _daily_news_quality_issue("市场监管总局更新智能驾驶安全监管动态", body, "") == "generic_body"
 
 
 def test_finalize_daily_news_body_replaces_21jingji_sidebar_noise_with_source_lead():

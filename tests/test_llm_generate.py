@@ -94,6 +94,24 @@ def test_generate_draft_uses_safe_effective_max_tokens(monkeypatch):
     assert captured["kwargs"]["timeout"] == 240
 
 
+def test_generate_draft_does_not_publish_prompt_when_model_returns_empty_body(monkeypatch):
+    class FakeModel:
+        def invoke(self, _messages):
+            return type("FakeResponse", (), {"content": '{"title":"A title","body":"","topics":[]}'} )()
+
+    monkeypatch.setattr(generate_mod, "init_chat_model", lambda *_args, **_kwargs: FakeModel())
+
+    out = generate_mod.generate_draft(
+        LLMConfig(model="fake-model", api_key="fake-key", base_url="https://example.invalid/v1"),
+        title_hint="A title",
+        prompt_hint="private generation instructions",
+        asset_paths=[],
+    )
+
+    assert out["body"] == ""
+    assert "_fallback_error" in out
+
+
 def test_generate_draft_caps_effective_tokens_for_long_prompt(monkeypatch):
     captured = {}
 

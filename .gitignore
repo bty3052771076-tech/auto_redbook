@@ -27,12 +27,19 @@ secrets/
 credentials/
 **/cookies*
 **/storage-state*
+**/browser-profile/
+**/*session*
 **/*api-key*
 **/*apikey*
+**/*api_key*
 **/*secret*
 **/*credential*
 **/*access-token*
 **/*refresh-token*
+*.token
+*.tokens
+*.secret
+*.secrets
 
 # Local development records and images
 docs/
@@ -62,6 +69,14 @@ docs/aliyun_image_api-key.md
 *.p12
 *.pfx
 *.key
+
+# Local runtime config and credential exports
+config.local.*
+settings.local.*
+*.credentials.json
+*.secrets.json
+*.quota.json
+*.snapshot.json
 
 # OS
 .DS_Store

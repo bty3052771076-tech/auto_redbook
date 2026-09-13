@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from src.storage.models import Post, PostType
 from src.text_integrity import contains_recoverable_utf8_as_gbk_mojibake
+from src.workflow.content_evidence import text_integrity_issues
 
 MAX_IMAGE_TITLE = 20
 MAX_IMAGE_BODY = 1000
@@ -51,6 +52,8 @@ def validate_post(post: Post) -> ValidationResult:
     for field_name, value in (("title", title), ("body", body)):
         if contains_recoverable_utf8_as_gbk_mojibake(value):
             errors.append(f"{field_name} contains UTF-8/GBK mojibake")
+    for code in text_integrity_issues(title, body):
+        errors.append(f"title/body contains text integrity issue: {code}")
     if body in {"（生成失败，请稍后重试）", "(生成失败，请稍后重试)"}:
         errors.append("body is a generation-failure placeholder")
 
