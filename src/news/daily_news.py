@@ -120,6 +120,16 @@ BBC_RSS_FEEDS = {
     "sport": "https://feeds.bbci.co.uk/sport/rss.xml",
 }
 
+# Keyless feeds whose editorial beat is unusual/human-interest news.  The
+# "每日我去" column needs this kind of supply; ordinary world/business feeds
+# rarely carry reportable-but-absurd stories.
+ODD_NEWS_RSS_FEEDS = {
+    "cbc_offbeat": "https://www.cbc.ca/webfeed/rss/rss-offbeat",
+    "npr_strange": "https://feeds.npr.org/1032/rss.xml",
+    "mirror_weird": "https://www.mirror.co.uk/news/weird-news/?service=rss",
+    "odditycentral": "https://www.odditycentral.com/feed",
+}
+
 # Public Chinese mainland newsrooms. These are used as Google News RSS
 # domain filters, so the workflow only reads publicly exposed headlines and
 # links and does not bypass access controls.
@@ -160,7 +170,13 @@ def _provider_request_timeout_s(
 ) -> float:
     if not exhaustive_sources:
         return requested_timeout_s
-    is_rss_like = provider in {"google_rss", "google_rss_cn", "bbc_rss", "hotnews"}
+    is_rss_like = provider in {
+        "google_rss",
+        "google_rss_cn",
+        "bbc_rss",
+        "odd_news_rss",
+        "hotnews",
+    }
     env_name = "NEWS_EXHAUSTIVE_RSS_TIMEOUT_S" if is_rss_like else "NEWS_EXHAUSTIVE_PROVIDER_TIMEOUT_S"
     default = DEFAULT_EXHAUSTIVE_RSS_TIMEOUT_S if is_rss_like else DEFAULT_EXHAUSTIVE_PROVIDER_TIMEOUT_S
     return min(requested_timeout_s, _positive_env_float(env_name, default))
@@ -202,6 +218,8 @@ def _news_provider_health_url(provider: str) -> str:
         return _google_news_rss_base_url()
     if provider == "bbc_rss":
         return "https://feeds.bbci.co.uk/"
+    if provider == "odd_news_rss":
+        return "https://www.cbc.ca/webfeed/rss/"
     if provider == "hotnews":
         return _hotnews_base_url()
     return ""
@@ -218,7 +236,7 @@ def _news_provider_health_tier(provider: str) -> str:
         "finnhub",
     }:
         return "keyed_api"
-    if provider in {"google_rss", "google_rss_cn", "bbc_rss"}:
+    if provider in {"google_rss", "google_rss_cn", "bbc_rss", "odd_news_rss"}:
         return "dated_rss"
     if provider == "hotnews":
         return "heat_backfill"
@@ -301,6 +319,55 @@ _ENTITY_STOPWORDS = {
     "were",
     "will",
     "with",
+    # Narrative/reporting verbs and generic qualifiers are not entities. If
+    # they remain here, unrelated English headlines can share two tokens and
+    # be incorrectly treated as the same story.
+    "about",
+    "added",
+    "admits",
+    "after",
+    "ahead",
+    "been",
+    "but",
+    "called",
+    "could",
+    "describes",
+    "does",
+    "ends",
+    "error",
+    "explains",
+    "following",
+    "gives",
+    "had",
+    "has",
+    "how",
+    "launch",
+    "launched",
+    "make",
+    "made",
+    "more",
+    "near",
+    "over",
+    "possible",
+    "reported",
+    "result",
+    "said",
+    "says",
+    "some",
+    "than",
+    "those",
+    "use",
+    "using",
+    "who",
+    "would",
+    # Broad geography and conflict labels are useful for ranking, but are too
+    # weak to establish that two English reports describe the same event.
+    "east",
+    "middle",
+    "regional",
+    "region",
+    "war",
+    "conflict",
     # News boilerplate / generic terms
     "analysis",
     "ap",
@@ -456,9 +523,11 @@ def _entity_similar(tokens_a: set[str], tokens_b: set[str]) -> bool:
     if not tokens_a or not tokens_b:
         return False
     inter = tokens_a & tokens_b
+    # Two overlapping words are common in unrelated English summaries (for
+    # example, ``ship`` + ``death``). Require three surviving entity tokens so
+    # cross-language dedupe remains conservative; Chinese event signatures
+    # continue to handle the stronger same-event cases.
     if len(inter) >= 3:
-        return True
-    if len(inter) >= 2 and any(not t.isdigit() for t in inter):
         return True
     return False
 
@@ -2782,6 +2851,50 @@ def _hotnews_base_url() -> str:
     return (os.getenv("HOTNEWS_BASE_URL") or HOTNEWS_BASE_URL).strip().rstrip("/")
 
 
+def _odd_news_rss_fetch_articles(
+    *,
+    max_records: int,
+    timeout_s: float,
+    limit_sources: int | None = None,
+) -> list[NewsItem]:
+    """Fetch keyless odd-news feeds for the "每日我去" column.
+
+    These feeds are the column's primary supply of genuinely absurd but
+    reportable stories.  A failing feed must not hide a healthy one.
+    """
+    names = list(ODD_NEWS_RSS_FEEDS)
+    if limit_sources is not None:
+        names = names[: max(1, int(limit_sources))]
+    buckets: list[list[NewsItem]] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=max(1, len(names)), thread_name_prefix="redbook-odd") as workers:
+        futures = [
+            workers.submit(
+                _rss_fetch_articles,
+                feed_url=ODD_NEWS_RSS_FEEDS[name],
+                source_name=name,
+                fallback_language="en",
+                max_records=max_records,
+                timeout_s=timeout_s,
+            )
+            for name in names
+        ]
+        for future in futures:
+            try:
+                buckets.append(future.result())
+            except (RuntimeError, OSError) as exc:
+                errors.append(str(exc))
+    items = [
+        bucket[index]
+        for index in range(max(map(len, buckets), default=0))
+        for bucket in buckets
+        if index < len(bucket)
+    ]
+    if not items and errors:
+        raise RuntimeError("; ".join(errors))
+    return _dedupe_candidates(items)[: max(1, int(max_records))]
+
+
 def _hotnews_platforms(value: Optional[str] = None) -> list[str]:
     raw = os.getenv("HOTNEWS_PLATFORMS") if value is None else value
     platforms = _split_news_queries(raw)
@@ -3453,6 +3566,15 @@ def _fetch_news_provider(
                     max_records=max_records,
                     timeout_s=provider_timeout_s,
                 )
+            elif provider == "odd_news_rss":
+                chosen_source_api = {
+                    "provider": "odd_news_rss",
+                    "feeds": list(ODD_NEWS_RSS_FEEDS.values()),
+                }
+                candidates = _odd_news_rss_fetch_articles(
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                )
             elif provider == "hotnews":
                 base_url = _hotnews_base_url()
                 platforms = _hotnews_platforms()
@@ -3534,6 +3656,7 @@ def fetch_daily_news_candidates(
     qualified_count_callback: Callable[[list[NewsItem]], int] | None = None,
     additional_queries: Iterable[str] | None = None,
     session: NewsFetchSession | None = None,
+    preferred_providers: Iterable[str] | None = None,
 ) -> tuple[list[NewsItem], dict[str, Any]]:
     """
     Fetch today's news via an external API.
@@ -3654,6 +3777,15 @@ def fetch_daily_news_candidates(
             provider_plan.extend(["google_rss_cn", "google_rss", "bbc_rss"])
             provider_plan.append("hotnews")
     provider_plan = list(dict.fromkeys(provider_plan))
+    # A column may require a specific supply (for example the odd-news feeds)
+    # before the generic sources, without disabling the automatic plan.
+    preferred = [
+        re.sub(r"\s+", "", str(item or "")).strip()
+        for item in (preferred_providers or [])
+        if str(item or "").strip()
+    ]
+    if preferred and not provider_env and not manual_materials_file:
+        provider_plan = list(dict.fromkeys([*preferred, *provider_plan]))
 
     supported_providers = (
         "newsapi",
@@ -3666,6 +3798,7 @@ def fetch_daily_news_candidates(
         "google_rss",
         "google_rss_cn",
         "bbc_rss",
+        "odd_news_rss",
         "hotnews",
         "file",
         "manual",
@@ -4143,6 +4276,16 @@ def fetch_daily_news_candidates(
                     }
                     candidates = _bbc_rss_fetch_articles(
                         prompt_hint=q,
+                        max_records=max_records,
+                        timeout_s=provider_timeout_s,
+                    )
+                    used_time_range = False
+                elif provider == "odd_news_rss":
+                    chosen_source_api = {
+                        "provider": "odd_news_rss",
+                        "feeds": list(ODD_NEWS_RSS_FEEDS.values()),
+                    }
+                    candidates = _odd_news_rss_fetch_articles(
                         max_records=max_records,
                         timeout_s=provider_timeout_s,
                     )

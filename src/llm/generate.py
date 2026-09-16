@@ -48,6 +48,87 @@ def _extract_json_block(text: str) -> str | None:
     return None
 
 
+def _iter_balanced_json_objects(text: str) -> list[str]:
+    """Return every top-level ``{...}`` span, ignoring braces inside strings.
+
+    Some providers (MiniMax-M3 was observed) print their reasoning before the
+    final JSON answer.  A greedy first-open-to-last-close match then swallows
+    that prose into the parsed fields, so callers need the individual objects.
+    """
+    objects: list[str] = []
+    depth = 0
+    start: int | None = None
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text or ""):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start : index + 1])
+                start = None
+    return objects
+
+
+def _escape_raw_controls_in_strings(text: str) -> str:
+    """Escape literal newlines/tabs inside JSON strings so they parse.
+
+    Models frequently emit a multi-line body with a real newline inside the
+    JSON string (``"body":"内容：<newline>正文"``).  Strict JSON rejects that,
+    and the regex recovery that follows mangles every field.  Escaping only the
+    control characters that appear inside string literals keeps the structure
+    intact while making the payload valid.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    replacements = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    for char in text or "":
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if in_string and char == "\\":
+            out.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            out.append(char)
+            continue
+        if in_string and char in replacements:
+            out.append(replacements[char])
+            continue
+        out.append(char)
+    return "".join(out)
+
+
+def _loads_json_object(candidate: str) -> Dict[str, Any] | None:
+    """Parse one JSON object, repairing raw control characters if needed."""
+    for attempt in (candidate, _escape_raw_controls_in_strings(candidate)):
+        try:
+            data = json.loads(attempt)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
 def _looks_like_jsonish_payload(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
@@ -256,6 +337,18 @@ def _parse_json_text(text: Any) -> Dict[str, Any] | None:
     text = (text or "").strip()
     if not text:
         return None
+    # Prefer an individual balanced object.  Providers that narrate before the
+    # JSON would otherwise have their prose merged into the first and last
+    # brace, corrupting every field.  The last complete object is the answer;
+    # intermediate ones are quoted text inside the reasoning.
+    balanced = _iter_balanced_json_objects(text)
+    for candidate in reversed(balanced):
+        data = _loads_json_object(candidate)
+        if data is not None:
+            return data
+        recovered = _recover_jsonish_object(candidate)
+        if recovered:
+            return recovered
     json_text = _extract_json_block(text)
     if json_text:
         try:
@@ -534,6 +627,13 @@ def generate_draft(
     data = _parse_json_text(text)
     if data is None:
         data = {"title": title_hint, "body": text, "topics": [], "image_event": ""}
+    # Snapshot the model's optional column extras before they are normalised
+    # away, so the caller can persist them when a column prompt asks for them.
+    parsed_extras = {
+        key: data.get(key)
+        for key in ("status", "reason", "verified_contrast", "visual_plan")
+        if key in data
+    }
 
     raw_title = _coerce_text(data.get("title", title_hint)).strip()
     raw_body = _coerce_text(data.get("body", "")).strip()
@@ -571,6 +671,15 @@ def generate_draft(
     data["image_event"] = repair_utf8_as_gbk_mojibake(
         _coerce_text(data.get("image_event", ""))
     )
+    # Column prompts may request a few structured extras (for example the
+    # illustration plan or an explicit status). Carry them through unchanged so
+    # the caller can persist and validate them; unknown keys stay dropped.
+    for extra_key in ("status", "reason", "verified_contrast", "visual_plan"):
+        if extra_key in data:
+            continue
+        value = parsed_extras.get(extra_key) if isinstance(parsed_extras, dict) else None
+        if value not in (None, "", [], {}):
+            data[extra_key] = value
     return data
 
 

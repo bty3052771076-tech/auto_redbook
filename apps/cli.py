@@ -101,6 +101,7 @@ app = typer.Typer(
 )
 DAILY_AI_DIGEST_TITLE = "每日AI讯息"
 DAILY_WOOL_TITLE = "每日羊毛"
+DAILY_WOW_TITLE = "每日我去"
 
 
 def _jsonable_quota_result(provider: str, result: dict) -> dict:
@@ -1205,6 +1206,15 @@ def _is_daily_wool_title(title: str) -> bool:
     return (title or "").strip().replace(" ", "") == DAILY_WOOL_TITLE
 
 
+def _is_daily_wow_title(title: str) -> bool:
+    return (title or "").strip().replace(" ", "") == DAILY_WOW_TITLE
+
+
+def _is_news_column_title(title: str) -> bool:
+    """Titles that use the news retrieval/generation pipeline."""
+    return (title or "").strip() == "每日新闻" or _is_daily_wow_title(title)
+
+
 def _emit_missing_assets_hint(title: str, *, dry_run: bool = False) -> None:
     if _is_daily_ai_digest_title(title):
         typer.echo("note: 每日AI讯息会自动渲染本地简报图，无需本地素材或 AI 生图。")
@@ -1222,6 +1232,8 @@ def _generation_stage_for_title(title: str) -> str:
         return "生成每日AI讯息"
     if _is_daily_wool_title(title_norm):
         return "生成每日羊毛"
+    if _is_daily_wow_title(title_norm):
+        return "生成每日我去"
     if title_norm == "每日新闻":
         return "生成每日新闻"
     return "生成草稿"
@@ -1346,7 +1358,7 @@ def _validate_cli_lookback(value: object, *, title: str, material_mode: bool) ->
     if material_mode:
         return
     try:
-        if title == "每日新闻":
+        if title == "每日新闻" or _is_daily_wow_title(title):
             from src.workflow.news_discovery import resolve_news_windows
             resolve_news_windows(value, env_names=("NEWS_LOOKBACK_DAYS", "CONTENT_LOOKBACK_DAYS"))
         elif value is not None:
@@ -1703,6 +1715,10 @@ def create(
     _emit_progress_event("create", generation_stage, "in_progress", f"count={requested_count}")
 
     if _is_daily_ai_digest_title(title_norm):
+        from src.ai_digest.rsshub_local import start_rsshub_if_needed
+
+        if start_rsshub_if_needed():
+            typer.echo("[rsshub] local RSSHub ready at http://127.0.0.1:1200 (on-demand)")
         try:
             posts = create_daily_ai_digest_posts(
                 prompt_hint=prompt_norm,
@@ -1731,7 +1747,7 @@ def create(
             posts = []
             generation_failed_count = requested_count
             run_errors.append(str(exc))
-    elif title_norm == "每日新闻":
+    elif title_norm == "每日新闻" or _is_daily_wow_title(title_norm):
         try:
             posts = create_daily_news_posts(
                 prompt_hint=prompt_norm,
@@ -1744,6 +1760,12 @@ def create(
                 news_materials_file=news_materials_file_norm,
                 single_news_material_file=single_news_material_file_norm,
                 material_time=material_time_norm,
+                column=(
+                    "daily_wow"
+                    if _is_daily_wow_title(title_norm)
+                    and not (single_news_material_file_norm or news_materials_file_norm)
+                    else "daily_news"
+                ),
             )
         except PartialDailyNewsError as exc:
             typer.echo(f"partial daily news: generated={len(exc.posts)}/{exc.requested_count}; {exc}")
@@ -2266,7 +2288,13 @@ def auto(
                 wait_timeout=wait_timeout,
                 metrics_max_age_hours=metrics_max_age_hours,
                 quota_max_age_hours=quota_max_age_hours,
-                require_image=not (_is_daily_ai_digest_title(title_norm) or _is_daily_wool_title(title_norm)),
+                # A validated local asset fulfills the image requirement; do not
+                # block local-image runs on an unrelated image-quota snapshot.
+                require_image=not (
+                    _is_daily_ai_digest_title(title_norm)
+                    or _is_daily_wool_title(title_norm)
+                    or bool(asset_paths)
+                ),
                 refresh_quotas=refresh_quotas,
             )
         except FreeQuotaUnavailableError as exc:
@@ -2294,6 +2322,10 @@ def auto(
     _emit_progress_event("auto", "准备生成", "in_progress", f"title={title_norm} count={requested_count}")
     _emit_progress_event("auto", generation_stage, "in_progress", f"count={requested_count}")
     if _is_daily_ai_digest_title(title_norm):
+        from src.ai_digest.rsshub_local import start_rsshub_if_needed
+
+        if start_rsshub_if_needed():
+            typer.echo("[rsshub] local RSSHub ready at http://127.0.0.1:1200 (on-demand)")
         try:
             posts = create_daily_ai_digest_posts(
                 prompt_hint=prompt_norm,
@@ -2325,7 +2357,7 @@ def auto(
             posts = []
             generation_failed_count = requested_count
             run_errors.append(str(exc))
-    elif title_norm == "每日新闻":
+    elif title_norm == "每日新闻" or _is_daily_wow_title(title_norm):
         try:
             daily_news_inline_quality = bool(
                 preflight
@@ -2377,6 +2409,12 @@ def auto(
                 progress_callback=_daily_news_generation_progress,
                 post_quality_callback=post_quality_callback,
                 performance_mode=performance_policy.mode,
+                column=(
+                    "daily_wow"
+                    if _is_daily_wow_title(title_norm)
+                    and not (single_news_material_file_norm or news_materials_file_norm)
+                    else "daily_news"
+                ),
             )
         except PartialDailyNewsError as exc:
             typer.echo(f"partial daily news: generated={len(exc.posts)}/{exc.requested_count}; {exc}")
@@ -2453,7 +2491,7 @@ def auto(
             require_vision=True,
             reuse_vision_results=daily_news_inline_quality,
         )
-        if title_norm == "每日新闻" and len(posts) > requested_count:
+        if _is_news_column_title(title_norm) and len(posts) > requested_count:
             selected_posts, failed_quality_posts, unused_spares = _select_visual_ready_daily_news_posts(
                 posts,
                 requested_count=requested_count,
@@ -2509,7 +2547,7 @@ def auto(
             raise typer.Exit(code=1)
 
     _emit_progress_event("auto", generation_stage, "success", f"posts={len(posts)}")
-    atomic_daily_batch = title_norm == "每日新闻" and not allow_partial
+    atomic_daily_batch = _is_news_column_title(title_norm) and not allow_partial
     if atomic_daily_batch:
         preflight_errors: list[str] = []
         preflight_fingerprints: dict[str, str] = {}

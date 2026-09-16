@@ -60,7 +60,12 @@ BJT = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 def _recent_news_seendate(days_ago: int, *, hour: int = 10) -> str:
-    dt = datetime.now(BJT).replace(hour=hour, minute=0, second=0, microsecond=0) - timedelta(days=days_ago)
+    now = datetime.now(BJT)
+    dt = now.replace(hour=hour, minute=0, second=0, microsecond=0) - timedelta(days=days_ago)
+    if dt > now:
+        # Tests can run before the nominal publication hour; a fixture must
+        # never carry a future timestamp or the freshness gate drops it.
+        dt = now - timedelta(minutes=1)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
@@ -5684,7 +5689,7 @@ def test_online_daily_news_fails_without_stock_fallback_when_ai_image_fails(monk
     except RuntimeError as exc:
         assert "daily news created only 0/1" in str(exc)
         posts = []
-    assert providers == ["volcengine"]
+    assert providers == ["volcengine", "volcengine"]
 
 
 def test_online_daily_news_skips_headline_only_candidate_after_source_lookup(monkeypatch, tmp_path):

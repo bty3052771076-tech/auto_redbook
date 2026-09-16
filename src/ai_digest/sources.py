@@ -50,17 +50,6 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
             topics=("model", "platform", "policy"),
             priority=20,
         ),
-        AIDigestSource(
-            "github-status",
-            "official",
-            "https://www.githubstatus.com/history.rss",
-            "GitHub Status",
-            "rss",
-            tier="official_stream",
-            region="global",
-            topics=("incident", "outage", "platform", "service"),
-            priority=5,
-        ),
         AIDigestSource("anthropic", "official", "https://www.anthropic.com/news", "Anthropic", "html"),
         AIDigestSource(
             "anthropic-fable-5-1",
@@ -250,6 +239,47 @@ def default_ai_digest_sources() -> list[AIDigestSource]:
         ),
         AIDigestSource("aihot-daily", "aggregator", "https://aihot.virxact.com/daily", "AI HOT", "aihot_daily"),
         AIDigestSource("huggingface", "aggregator", "https://huggingface.co/blog/feed.xml", "Hugging Face", "rss"),
+        # RSSHub-backed routes (DIYgod/RSSHub). URLs use a custom scheme and
+        # are expanded to the configured public/self-hosted base at resolve
+        # time; without a base they stay disabled instead of failing fetches.
+        AIDigestSource(
+            "rsshub-jiqizhixin",
+            "aggregator",
+            "rsshub://zhihu/zhuanlan/jiqizhixin",
+            "机器之心",
+            "rss",
+            region="domestic",
+        ),
+        AIDigestSource(
+            "rsshub-qbitai",
+            "aggregator",
+            "rsshub://qbitai/category/ebandeng",
+            "量子位",
+            "rss",
+            region="domestic",
+        ),
+        AIDigestSource(
+            "rsshub-hf-daily-papers",
+            "aggregator",
+            "rsshub://huggingface/daily-papers",
+            "Hugging Face Papers",
+            "rss",
+        ),
+        AIDigestSource(
+            "rsshub-github-trending",
+            "aggregator",
+            "rsshub://github/trending/daily/any",
+            "GitHub Trending",
+            "rss",
+        ),
+        # arXiv publishes its own RSS; no RSSHub dependency.
+        AIDigestSource(
+            "arxiv-cs-ai",
+            "aggregator",
+            "https://export.arxiv.org/rss/cs.AI",
+            "arXiv cs.AI",
+            "rss",
+        ),
         AIDigestSource(
             "github-ai",
             "aggregator",
@@ -313,10 +343,26 @@ def _split_env_names(value: str) -> list[str]:
 
 def resolve_ai_digest_sources(env: dict[str, str] | None = None) -> list[AIDigestSource]:
     env = env if env is not None else os.environ
+    rsshub_base = (env.get("AI_DIGEST_RSSHUB_BASE_URL") or "").strip().rstrip("/")
     primary_names = _split_env_names(env.get("AI_DIGEST_PRIMARY_SOURCES", ""))
     social_names = _split_env_names(env.get("AI_DIGEST_SOCIAL_SOURCES", ""))
     aggregator_names = _split_env_names(env.get("AI_DIGEST_AGGREGATOR_SOURCES", ""))
     sources = default_ai_digest_sources()
+    expanded: list[AIDigestSource] = []
+    for source in sources:
+        if source.url.startswith("rsshub://"):
+            if rsshub_base:
+                expanded.append(
+                    replace(
+                        source,
+                        url=f"{rsshub_base}/{source.url.removeprefix('rsshub://').lstrip('/')}",
+                    )
+                )
+            else:
+                expanded.append(replace(source, enabled=False))
+        else:
+            expanded.append(source)
+    sources = expanded
     by_name = {source.name: source for source in sources}
 
     if not primary_names:

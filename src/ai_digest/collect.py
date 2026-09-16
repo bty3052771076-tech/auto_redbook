@@ -27,7 +27,7 @@ from .fetchers import (
     parse_social_search_html,
     parse_x_profile_html,
 )
-from .models import AIUpdateItem
+from .models import AIUpdateItem, strip_html_artifacts
 from .rank import (
     ai_digest_quota_counts,
     ai_update_history_key,
@@ -192,8 +192,44 @@ def _curl_executable() -> str:
 
 
 def _curl_get_text(url: str, *, timeout_s: float, executable: str) -> str:
+    """Fetch a URL with curl, retrying transient TLS/connect handshake errors.
+
+    ``schannel`` (the Windows TLS backend) intermittently fails the handshake
+    for vendor CDNs such as anthropic.com or githubstatus.com on the first
+    attempt. A single bounded retry recovers those sources without masking
+    genuine HTTP errors or permanent DNS/connection failures.
+    """
+
+    # Parallel fetches make the Windows TLS handshake fail more often, so
+    # allow a few bounded retries with a short backoff before giving up.
+    attempts = 4
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return _curl_get_text_once(url, timeout_s=timeout_s, executable=executable)
+        except (URLError, TimeoutError) as exc:
+            last_exc = exc
+            message = str(exc).lower()
+            transient = any(
+                marker in message
+                for marker in ("handshake", "ssl/tls", "connection timed out", "timed out", "ssl connect")
+            )
+            if not transient or attempt == attempts - 1:
+                raise
+            # A failing TLS handshake often succeeds immediately afterwards;
+            # a short pause also stops parallel attempts from colliding.
+            time.sleep(0.6 * (attempt + 1))
+    raise last_exc if last_exc is not None else URLError(f"failed to fetch {url}")
+
+
+def _curl_get_text_once(url: str, *, timeout_s: float, executable: str) -> str:
     total_timeout = max(1.0, float(timeout_s))
-    connect_timeout = min(5.0, total_timeout)
+    # Some vendor CDNs (openai.com, anthropic.com) need 4-6s just for the TLS
+    # handshake. A hard 5s connect cap made them fail intermittently with
+    # ``SSL/TLS connection timeout`` even though ``curl`` succeeds when given
+    # a slightly larger budget, which starved the digest of official material.
+    # Keep the connect phase bounded by the overall request budget.
+    connect_timeout = min(total_timeout, max(10.0, total_timeout * 0.6))
     args = [
         executable,
         "--location",
@@ -350,6 +386,12 @@ def fetch_ai_digest_source(
     timeout_s: float = 12.0,
     max_age_days: int | None = None,
 ) -> list[AIUpdateItem]:
+    if source.url.startswith("rsshub://"):
+        # Resolve without a configured base: disabled sources never reach the
+        # fetch stage, so this guard only fires for direct fetch calls.
+        raise RuntimeError(
+            f"RSSHub base URL is not configured; set AI_DIGEST_RSSHUB_BASE_URL for {source.name}"
+        )
     if source.parser == "aihot_daily":
         return fetch_aihot_daily_source(source, days=max_age_days)
     text = _http_get_text(source.url, timeout_s=timeout_s)
@@ -583,7 +625,7 @@ def _is_known_official_discovery_url(url: str) -> bool:
 
 def _news_item_to_ai_update(item, *, query: str) -> AIUpdateItem:
     source_name = (getattr(item, "source", "") or getattr(item, "domain", "") or "新闻搜索").strip()
-    body = " ".join(
+    raw_body = " ".join(
         part.strip()
         for part in (
             getattr(item, "description", "") or "",
@@ -591,6 +633,9 @@ def _news_item_to_ai_update(item, *, query: str) -> AIUpdateItem:
         )
         if part and part.strip()
     )
+    # Search providers echo the publisher's raw HTML. Strip it before the
+    # 220-char summary budget is spent on markup instead of facts.
+    body = strip_html_artifacts(raw_body)
     body = re.sub(
         r"\bONLY\s+AVAILABLE\s+IN\s+PAID\s+PLANS\b",
         " ",
@@ -600,7 +645,7 @@ def _news_item_to_ai_update(item, *, query: str) -> AIUpdateItem:
     body = re.sub(r"\s+", " ", body).strip(" -|")
     direct_official = _is_known_official_discovery_url(str(getattr(item, "url", "") or ""))
     return AIUpdateItem(
-        title=str(getattr(item, "title", "") or "").strip(),
+        title=strip_html_artifacts(str(getattr(item, "title", "") or "")),
         summary=body[:220],
         source_name=source_name,
         source_type="official" if direct_official else "search",

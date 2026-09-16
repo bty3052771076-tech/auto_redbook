@@ -23,6 +23,13 @@ from src.news.daily_news import (
     is_international_conflict_news, rank_news_candidate_pool,
 )
 from src.news.history import normalize_news_url_key
+from src.news.daily_wow import (
+    DAILY_WOW_CONTENT_TYPE,
+    daily_wow_candidate_pool,
+    daily_wow_contrast_signal,
+    daily_wow_queries,
+    daily_wow_score,
+)
 
 
 AUTO_NEWS_WINDOWS = (1, 2, 3, 5)
@@ -114,13 +121,24 @@ class DailyNewsDiscovery:
     def __init__(self, *, prompt: str, count: int, windows: list[int], window_meta: dict,
                  raw_target: int, preferred_target: int, budget_seconds: float,
                  fetch: Callable, prepare: Callable, incomplete: Callable,
-                 progress: Callable | None = None, history_signatures: list | None = None):
+                 progress: Callable | None = None, history_signatures: list | None = None,
+                 column: str = "daily_news"):
         self.prompt, self.count = prompt, count
+        self.column = str(column or "daily_news").strip().lower() or "daily_news"
+        self.wow_column = self.column == DAILY_WOW_CONTENT_TYPE
         self.windows, self.window_meta = windows, window_meta
         self.raw_target, self.preferred_target = raw_target, preferred_target
-        self.reserve_target = min(5, max(1, math.ceil(count * 0.3)))
-        self.china = _required_china_count_for_daily_news(count)
-        self.conflict = daily_news_international_conflict_quota(count)
+        if self.wow_column:
+            # Genuine absurd news is scarce, and the column judge can only
+            # choose from what was material-reviewed.  Build a wider reviewed
+            # pool before allowing the batch to stop, so ordinary headlines in
+            # the freshest window cannot exhaust the review quota.
+            self.reserve_target = min(12, max(6, count * 4))
+        else:
+            self.reserve_target = min(5, max(1, math.ceil(count * 0.3)))
+        # 本栏目不设国内/国际冲突配额，按栏目适配选稿。
+        self.china = 0 if self.wow_column else _required_china_count_for_daily_news(count)
+        self.conflict = 0 if self.wow_column else daily_news_international_conflict_quota(count)
         if max(self.china, self.conflict) > count:
             raise ValueError("新闻数量与国内/国际争议配额矛盾，请调整数量。")
         self.fetch, self.prepare, self.incomplete, self.progress = fetch, prepare, incomplete, progress
@@ -169,6 +187,25 @@ class DailyNewsDiscovery:
         recent, dates = filter_recent_news_items(
             list(self.raw.values()), tz_name="Asia/Shanghai", max_age_days=days, now=self.session.now)
         recent = [item for item in recent if self._valid_time(item)]
+        if self.wow_column:
+            # 栏目复用采集与日期窗口，但按反差信号做本地兜底筛选，
+            # 且不使用国内/国际冲突配额。
+            eligible, wow_meta = daily_wow_candidate_pool(recent, self.prompt)
+            self.meta.setdefault("selection_pool", {})["column_filter"] = wow_meta
+            # Contrast leads inside the window.  Supply for this column is
+            # scarce, so an older-but-absurd story must outrank today's
+            # ordinary headline; the date filter still enforces freshness.
+            ordered = eligible
+            ordered.sort(
+                key=lambda item: (
+                    daily_wow_score(item, self.prompt),
+                    _parse_seendate_utc(item.seendate)
+                    .astimezone(_resolve_tz("Asia/Shanghai"))
+                    .date(),
+                ),
+                reverse=True,
+            )
+            return ordered, dates, wow_meta, len(recent)
         relevant, relevance = filter_prompt_relevant_news_items(recent, self.prompt)
         keys = {news_key(item) for item in relevant}
         if self.conflict:
@@ -195,7 +232,9 @@ class DailyNewsDiscovery:
         self.emit("扩展检索", window_days=days, remaining_seconds=round(self.session.remaining_seconds, 1),
                   reason="initial_window" if self.index == 0 else "candidate_or_reserve_shortfall")
         queries = []
-        if self.china:
+        if self.wow_column:
+            queries += daily_wow_queries(self.prompt)
+        elif self.china:
             queries.append("中国 国内 政策 产业 民生")
         if self.conflict:
             queries += ["国际冲突 停火 制裁 争端 争议事件", "international conflict ceasefire sanctions military dispute"]
@@ -204,7 +243,8 @@ class DailyNewsDiscovery:
                 self.prompt, tz_name="Asia/Shanghai", max_records=self.raw_target, search_days=days,
                 source_health_path="data/source_health/daily_news.json", persist_source_health=True,
                 exhaustive_sources=True, progress_callback=self.progress,
-                additional_queries=queries, session=self.session)
+                additional_queries=queries, session=self.session,
+                **self._column_fetch_kwargs())
         except TypeError as exc:
             # Keep local test doubles and third-party integrations with the
             # historical one-argument callable contract usable.
@@ -219,6 +259,14 @@ class DailyNewsDiscovery:
             if key not in self.raw:
                 self.raw[key] = item
         return True
+
+    def _column_fetch_kwargs(self) -> dict[str, Any]:
+        """Extra fetch options a column needs (none for ordinary news)."""
+        if not self.wow_column:
+            return {}
+        # Seed the odd-news feed as an explicit provider because it is this
+        # column's primary supply of genuinely absurd stories.
+        return {"preferred_providers": ("odd_news_rss",)}
 
     def _available(self, ordered):
         available = []
@@ -330,7 +378,14 @@ class DailyNewsDiscovery:
                     not (conflict_gap and is_international_conflict_news(item)),
                     not (china_gap and _is_china_item(item)),
                 ))
-                size = min(8, max(1, needed + self.reserve_target - len(available)))
+                if self.wow_column:
+                    # The column judge can only accept what was material-reviewed,
+                    # and its supply is scarce.  Cover the design's ~10x qualified
+                    # target inside the current window before allowing a stop, so
+                    # a genuinely absurd story is not skipped by the reserve rule.
+                    size = min(20, max(needed + self.reserve_target - len(available), 10))
+                else:
+                    size = min(8, max(1, needed + self.reserve_target - len(available)))
                 if china_gap or conflict_gap:
                     size = min(8, max(2, china_gap + conflict_gap))
                 shortlist = prioritized[:size]
@@ -353,6 +408,23 @@ class DailyNewsDiscovery:
                       preferred_target=self.preferred_target, main=len(main), reserve=reserve,
                       china_missing=attempt["china_missing"], conflict_missing=attempt["conflict_missing"])
             if main and reserve >= self.reserve_target:
+                if self.wow_column:
+                    # Absurd-but-reportable news is sparse and often a day or two
+                    # older than the freshest ordinary headlines.  Do not stop in
+                    # a window that holds no locally-detected contrast signal;
+                    # advance and top up instead.
+                    contrast_ready = sum(
+                        1 for item in available if daily_wow_contrast_signal(item)
+                    )
+                    if contrast_ready < needed:
+                        self.emit(
+                            "扩展检索",
+                            window_days=self.windows[self.index],
+                            contrast_ready=contrast_ready,
+                            reason="no_contrast_signal_in_window",
+                        )
+                        if self._next_window():
+                            continue
                 self.stop_reason = "ready_with_reserve"
                 break
             if not self._next_window():
@@ -380,12 +452,30 @@ class DailyNewsDiscovery:
         }
         if not main:
             self.save_record()
-            message = (f"每日新闻材料不足：需要补齐{needed}条，材料合格{len(available)}条；"
-                       f"国内缺{attempt['china_missing']}条、国际争议缺{attempt['conflict_missing']}条。"
-                       f"已检查窗口{[row['max_age_days'] for row in self.attempts]}，状态={self.stop_reason}。"
-                       "请补充近期信源、检查新闻API配额或调整提示词；数量够但无法组成主候选时请检查同源集中度。")
-            message += (f"原始国际争议候选{attempt['raw_conflict_count']}条，审核合格"
-                        f"{attempt['material_conflict_count']}条；延后审核{len(unchecked)}条普通/其他候选。")
+            if self.wow_column:
+                # Name the column and its actual gap: this is about reportable
+                # contrast, not domestic or conflict quotas.
+                review_status = str(
+                    (self.meta.get("selection_pool") or {}).get("wow_review_status") or ""
+                )
+                message = (
+                    f"每日我去材料不足：需要补齐{needed}条真实反差事件，材料合格{len(available)}条。"
+                    f"已检查窗口{[row['max_age_days'] for row in self.attempts]}，状态={self.stop_reason}。"
+                )
+                if review_status == "offline_strict_after_review_failure":
+                    message += (
+                        "反差筛选没有通过任何候选，已按栏目规则停止，未用普通热点凑稿。"
+                        "可追加更具体的奇闻关键词、补充信源或稍后重试。"
+                    )
+                else:
+                    message += "请补充近期信源、检查新闻API配额或调整关键词。"
+            else:
+                message = (f"每日新闻材料不足：需要补齐{needed}条，材料合格{len(available)}条；"
+                           f"国内缺{attempt['china_missing']}条、国际争议缺{attempt['conflict_missing']}条。"
+                           f"已检查窗口{[row['max_age_days'] for row in self.attempts]}，状态={self.stop_reason}。"
+                           "请补充近期信源、检查新闻API配额或调整提示词；数量够但无法组成主候选时请检查同源集中度。")
+                message += (f"原始国际争议候选{attempt['raw_conflict_count']}条，审核合格"
+                            f"{attempt['material_conflict_count']}条；延后审核{len(unchecked)}条普通/其他候选。")
             if self.session.budget_incomplete:
                 message += "采集预算内未完成所有历史请求，不能据此断言这些日期没有新闻。"
             self.emit("候选不足", "failed", reason=message)

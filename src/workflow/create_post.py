@@ -18,9 +18,11 @@ from typing import Any, Callable, Iterable, List, Optional
 from src.config import load_llm_configs
 from src.ai_digest.collect import collect_ai_digest_updates
 from src.ai_digest.generate import (
+    _concrete_action_in_text,
     build_fallback_brief,
     evaluate_ai_digest_impact_with_llm,
     generate_ai_digest_brief_with_llm,
+    is_vague_collective_title,
     is_ai_digest_source_label_title,
     render_ai_digest_body,
     validate_ai_digest_concrete_content,
@@ -58,6 +60,23 @@ from src.workflow.news_discovery import (
     news_key, news_domain, resolve_news_windows,
 )
 from src.sources.request_budget import RequestBudget
+from src.news.daily_wow import (
+    DAILY_WOW_CONTENT_TYPE,
+    DAILY_WOW_TOPIC,
+    daily_wow_comment_instruction,
+    daily_wow_comment_is_valid,
+    daily_wow_clean_image_event,
+    daily_wow_fallback_comment,
+    daily_wow_image_prompt,
+    daily_wow_is_schema_echo,
+    daily_wow_title_max_len,
+    normalize_column as daily_wow_normalize_column,
+    daily_wow_review_instruction,
+    daily_wow_selection_payload,
+    daily_wow_selection_system_prompt,
+    daily_wow_strict_candidates,
+    daily_wow_write_instruction,
+)
 from src.news.daily_news import (
     _cjk_story_event_signature,
     _is_china_item,
@@ -187,6 +206,63 @@ class PartialDailyNewsError(RuntimeError):
         self.requested_count = requested_count
         self.failed_count = failed_count
         self.skipped_quality_count = skipped_quality_count
+
+
+def _daily_news_candidate_retry_limit() -> int:
+    raw = os.getenv("DAILY_NEWS_CANDIDATE_RETRY_LIMIT", "1")
+    try:
+        return max(0, min(3, int(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _daily_news_candidate_retryable(result: "_DailyNewsCandidateResult") -> bool:
+    """Retry only transient model failures, never permanent or editorial rejects."""
+    if result.status != "failed" or result.candidate_index <= 0:
+        return False
+    if result.reason not in {
+        "llm_request_failed",
+        "image_generation_failed",
+        "image_generation_abandoned",
+    }:
+        return False
+    message = str(result.error or "").lower()
+    permanent_markers = (
+        "api_key missing",
+        "401",
+        "403",
+        "invalid model",
+        "not found",
+        "permission",
+        "forbidden",
+        "quota",
+        "balance",
+        "allocation",
+        "content policy",
+        "content_policy",
+        "data_inspection_failed",
+        "context length",
+        "max_tokens",
+    )
+    return not any(marker in message for marker in permanent_markers)
+
+
+def _schedule_daily_news_candidate_retry(
+    result: "_DailyNewsCandidateResult",
+    retry_counts: dict[int, int],
+    pending_indices: list[int],
+) -> bool:
+    """Requeue one transiently failed candidate without duplicating queue entries."""
+    if not _daily_news_candidate_retryable(result):
+        return False
+    index = int(result.candidate_index)
+    used = int(retry_counts.get(index, 0))
+    if used >= _daily_news_candidate_retry_limit():
+        return False
+    retry_counts[index] = used + 1
+    if index not in pending_indices:
+        pending_indices.append(index)
+    return True
 
 
 DailyNewsProgressCallback = Callable[[str, str, dict[str, Any]], None]
@@ -2282,6 +2358,73 @@ def _daily_news_quality_issue(title: str, body: str, prompt_norm: str = "") -> s
     return ""
 
 
+def _daily_wow_quality_issue(title: str, body: str, prompt_norm: str = "") -> str:
+    """Column gate: the shared news checks plus a usable playful comment.
+
+    The shared gate rejects bodies that only contain a structure without facts.
+    The column adds one requirement: the evaluation must be a single concrete,
+    non-fabricated line.  Tone and humour are deliberately not gated here, so a
+    mild profanity or a dry one-liner cannot fail a factually sound draft.
+    """
+    shared = _daily_news_quality_issue(title, body, prompt_norm)
+    if shared:
+        return shared
+    comment = _daily_news_body_quality_fields(body).get("评价", "")
+    if not daily_wow_comment_is_valid(comment):
+        return "wow_comment_unusable"
+    return ""
+
+
+def _daily_wow_repair_comment(body: str, picked, prompt_norm: str) -> str:
+    """Replace an unusable column comment while keeping the verified facts."""
+    fields = _daily_news_body_quality_fields(body)
+    comment = fields.get("评价", "")
+    if daily_wow_comment_is_valid(comment):
+        return body
+    fallback = daily_wow_fallback_comment(picked, fields.get("内容", ""))
+    if not daily_wow_comment_is_valid(fallback):
+        fallback = "这事本身就够说明问题了。"
+    return _render_daily_news_body_fields({**fields, "评价": fallback})
+
+
+def _daily_wow_topics(topics, prompt_norm: str, context: str) -> list[str]:
+    normalized = _normalize_daily_news_topics(topics, prompt_norm, context)
+    kept = [topic for topic in normalized if topic != "每日新闻"]
+    if DAILY_WOW_TOPIC not in kept:
+        kept.insert(0, DAILY_WOW_TOPIC)
+    return kept[:8]
+
+
+def _daily_wow_visual_plan_text(plan: Any) -> str:
+    """Flatten the model's visual_plan object into one short scene line."""
+    if isinstance(plan, dict):
+        ordered = ("subject", "props", "composition", "contrast")
+        pieces = [str(plan.get(key) or "").strip() for key in ordered]
+        joined = "；".join(piece for piece in pieces if piece)
+        return _clip_text(joined, limit=300) if joined else ""
+    text = str(plan or "").strip()
+    return _clip_text(text, limit=300) if text else ""
+
+
+def _daily_wow_image_prompt_for_post(post: Post) -> str:
+    """Build the column illustration prompt from saved, verified post facts.
+
+    The scene comes from the model's event description; the contrast and style
+    come from reviewed fields.  Nothing here adds facts beyond the draft.
+    """
+    news_meta = (post.platform or {}).get("news") or {}
+    if not isinstance(news_meta, dict):
+        news_meta = {}
+    image_event = str(news_meta.get("image_event") or "").strip() or post.title
+    comment = _daily_news_body_quality_fields(post.body).get("评价", "")
+    return daily_wow_image_prompt(
+        image_event=image_event,
+        contrast=str(news_meta.get("verified_contrast") or ""),
+        visual_plan=str(news_meta.get("visual_plan") or ""),
+        comment=comment,
+    )
+
+
 def _looks_like_jsonish_body(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
@@ -3473,6 +3616,7 @@ def _fetch_daily_news_related_images(
     ai_first: bool = False,
     provider: Optional[str] = None,
     image_policy: str = "ai_preferred",
+    prompt_override: Optional[str] = None,
 ) -> tuple[list[Path], list[dict[str, Any]], dict[str, Any] | None]:
     if not ai_first:
         paths, metas = fetch_and_download_related_images(
@@ -3482,6 +3626,7 @@ def _fetch_daily_news_related_images(
             prompt_hint=prompt_hint,
             dest_dir=dest_dir,
             exclude_ids=exclude_ids,
+            prompt_override=prompt_override,
         )
         return paths, metas, None
 
@@ -3509,6 +3654,7 @@ def _fetch_daily_news_related_images(
             dest_dir=dest_dir,
             exclude_ids=exclude_ids,
             provider=primary_provider,
+            prompt_override=prompt_override,
         )
         return paths, metas, None
     except Exception as exc:
@@ -3624,6 +3770,7 @@ def _fetch_daily_news_candidates_for_upload(
     progress_callback: DailyNewsProgressCallback | None = None,
     discovery_holder: dict[str, Any] | None = None,
     performance_policy: PerformancePolicy | None = None,
+    column: str = "daily_news",
 ) -> tuple[list[Any], dict[str, Any]]:
     single_material_path = str(single_news_material_file or "").strip()
     multi_material_path = str(news_materials_file or ("" if single_material_path else os.getenv("NEWS_MATERIALS_FILE")) or "").strip()
@@ -3729,6 +3876,7 @@ def _fetch_daily_news_candidates_for_upload(
             fetch=fetch_daily_news_candidates, prepare=_prefetch_daily_news_context,
             incomplete=_daily_news_context_is_incomplete, progress=progress_callback,
             history_signatures=history_signatures,
+            column=column,
         )
         _emit_daily_news_progress(progress_callback, "准备候选池", "in_progress",
                                  requested_count=target_count, raw_target=raw_target,
@@ -3872,11 +4020,12 @@ def _daily_news_prompt(
     picked,
     prompt_norm: str,
     evaluation_viewpoint: str | None = DEFAULT_EVALUATION_VIEWPOINT,
+    column: str = "daily_news",
 ) -> str:
     """
     Prompt for LLM to write publishable body ONLY (no metadata/requirements echoed).
     """
-    return (
+    base = (
         "你正在为小红书图文笔记写《每日新闻》栏目。\n"
         "请依据下面提供的新闻信息，生成一份可直接发布的草稿。\n"
         "必须全部使用简体中文；如果原始材料是英文新闻、日文新闻或其他语言新闻，先翻译并用中文新闻写法改写，不得保留外文长句或日文假名。\n"
@@ -3915,6 +4064,19 @@ def _daily_news_prompt(
         "image_event（字符串，可选，20-40字）：仅用于配图的事件描述，只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
         "不要出现“新闻/报道/采访/记者/媒体/来源/链接/时间”等词。不要把 image_event 写进 body。\n"
     )
+    if column == DAILY_WOW_CONTENT_TYPE:
+        base = base.replace(
+            "你正在为小红书图文笔记写《每日新闻》栏目。",
+            "你正在为小红书图文笔记写《每日我去》栏目。",
+        )
+        # 栏目专属写法与评价风格覆盖通用总结语气，但事实与来源约束继续沿用。
+        base += (
+            "\n栏目专属要求（优先于上面的通用语气）：\n"
+            f"{daily_wow_write_instruction()}"
+            f"{daily_wow_comment_instruction(evaluation_viewpoint)}\n"
+            "topics（数组，3-5个话题词）：必须包含“每日我去”。不要把 topics 写进 body。\n"
+        )
+    return base
 
 
 def _daily_news_fallback_subject(picked, prompt_norm: str) -> str:
@@ -5028,9 +5190,39 @@ def _ai_digest_source_cap_error(
 
 
 def _uploaded_ai_digest_history_keys() -> set[str]:
+    def created_on_beijing_date(post: Post, target_date: str) -> bool:
+        # ``updated_at`` is excluded so re-saving an older digest does not
+        # make it count as a same-day regeneration.
+        for raw in (post.created_at, post.uploaded_at):
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if parsed.astimezone(BEIJING_TZ).strftime("%Y-%m-%d") == target_date:
+                return True
+        return False
+
+    # ``AI_DIGEST_HISTORY_SKIP_TODAY=1`` regenerates the same day's digest
+    # without deduplicating against digests already saved earlier today. That
+    # matches a repair/regeneration request while keeping cross-day dedupe.
+    skip_today = (os.getenv("AI_DIGEST_HISTORY_SKIP_TODAY") or "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    today = datetime.now(timezone.utc).astimezone(BEIJING_TZ).strftime("%Y-%m-%d")
     keys: set[str] = set()
     for post in list_posts():
         if not (post.uploaded or post.status in {PostStatus.saved_draft, PostStatus.published}):
+            continue
+        if skip_today and created_on_beijing_date(post, today):
             continue
         digest = (post.platform or {}).get("ai_digest")
         if not isinstance(digest, dict):
@@ -5454,6 +5646,105 @@ def _fit_ai_digest_items_to_body_capacity(
     )
 
 
+def _compact_ai_digest_subject(
+    subject: str,
+    *,
+    featured: AIUpdateItem | None,
+    max_subject_length: int,
+    fallback: str,
+) -> str:
+    """Compress an over-long headline subject without losing the event.
+
+    A bare ASCII word is rarely a good subject (``PullRequests``, ``GitHub``),
+    so prefer a readable CJK-led prefix and only fall back to a complete
+    model/version token when nothing else fits.
+    """
+
+    clean = re.sub(r"\s+", "", subject or "").strip()
+    if not clean:
+        return fallback
+    if len(clean) <= max_subject_length:
+        return clean
+
+    source_text = ""
+    if featured is not None:
+        source_text = f"{featured.title} {featured.summary} {featured.raw_excerpt}"
+
+    def _norm_label(value: str) -> str:
+        return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or ""), flags=re.IGNORECASE).lower()
+
+    vendor_labels = set()
+    if featured is not None:
+        vendor_labels = {_norm_label(featured.vendor), _norm_label(featured.source_name)}
+        vendor_labels.discard("")
+
+    def _is_meaningful(candidate: str) -> bool:
+        value = re.sub(r"\s+", "", candidate or "")
+        if not value:
+            return False
+        if _CJK_CHAR_RE.search(value):
+            return True
+        return bool(re.search(r"(?i)(?:gpt|glm|qwen|claude|codex|gemini|gemma|doubao|seedream|deepseek|kimi|minimax|ernie|llama|mistral|cosmos|tokenhub)[-_. ]*(?:v)?\d*", value))
+
+    # 1) Keep a complete model/version token when the source names one.
+    model_match = re.search(
+        r"(?i)(?:gpt|glm|qwen|claude|codex|gemini|gemma|doubao|seedream|"
+        r"deepseek|kimi|minimax|ernie|llama|mistral|cosmos)[-_. ]*(?:v)?\d+(?:\.\d+)?",
+        clean,
+    )
+    if model_match and len(model_match.group(0)) <= max_subject_length:
+        return model_match.group(0)
+
+    # 2) Prefer the longest readable prefix that ends on a word boundary.
+    words = re.findall(r"[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|[\u4e00-\u9fff]", clean)
+    compact = ""
+    for word in words:
+        if len(compact) + len(word) > max_subject_length:
+            break
+        compact += word
+    if _is_meaningful(compact):
+        return _trim_dangling_ai_digest_tail(compact)
+
+    # 3) Fall back to a named product token, then to the vendor plus the
+    #    concrete action so the headline still states what happened.
+    for token in sorted(
+        (t for t in re.findall(r"[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*", clean) if len(t) <= max_subject_length),
+        key=len,
+        reverse=True,
+    ):
+        normalized = _norm_label(token)
+        if normalized and any(normalized in label for label in vendor_labels):
+            continue
+        if _is_meaningful(token):
+            return token
+
+    action = _concrete_action_in_text(source_text)
+    vendor = ""
+    if featured is not None:
+        vendor = re.sub(r"(?i)\s*(?:blog|官网|official|status)$", "", str(featured.vendor or "")).strip()
+    candidate = f"{vendor}{action}" if vendor and action else ""
+    if candidate and len(candidate) <= max_subject_length:
+        return candidate
+    return compact or fallback
+
+
+_DANGLING_TITLE_TAIL_RE = re.compile(
+    r"(?:波及|导致|引起|影响|发生|出现|涉及|包含|包括|以及|并且|已经|正在|已经|已|将|在|与|和|或|及|并|正|被|把|向|对|为|是|等|的|了)+$"
+)
+
+
+def _trim_dangling_ai_digest_tail(subject: str) -> str:
+    """Drop trailing connectors so a compacted headline ends cleanly."""
+
+    value = subject or ""
+    for _ in range(4):
+        trimmed = _DANGLING_TITLE_TAIL_RE.sub("", value)
+        if trimmed == value or len(trimmed) < 4:
+            break
+        value = trimmed
+    return value.rstrip("，,。；;：:、-—| ")
+
+
 def _ai_digest_post_title(
     brief: AIDigestBrief,
     *,
@@ -5485,6 +5776,19 @@ def _ai_digest_post_title(
 
         featured_title = _fallback_chinese_title(featured)
         generic_title = True
+    if featured is not None and is_vague_collective_title(featured_title):
+        # “三位AI大佬” names nobody. Rebuild the headline from the concrete
+        # entities in the source text before it reaches the cover and draft.
+        from src.ai_digest.generate import _concrete_subject_from_item, _fallback_chinese_title
+
+        # Respect the image-title budget here so the concrete action survives
+        # the later length guard instead of being trimmed to a bare name.
+        concrete_title = _concrete_subject_from_item(
+            featured, max_chars=max(1, MAX_IMAGE_TITLE - len(prefix))
+        ) or _fallback_chinese_title(featured)
+        if concrete_title and not is_vague_collective_title(concrete_title):
+            featured_title = concrete_title
+            generic_title = False
     if generic_title and featured is not None:
         raw_subject = str(featured.raw_excerpt or featured.summary or "").strip()
         vendor = re.sub(r"(?i)\s*(?:blog|官网|official)$", "", str(featured.vendor or "").strip())
@@ -5592,23 +5896,12 @@ def _ai_digest_post_title(
             subject = subject.strip("，,。；;：:、-—| ") or fallback
     max_subject_length = max(1, MAX_IMAGE_TITLE - len(prefix) - len(suffix))
     if len(subject) > max_subject_length:
-        # Keep a complete model/product token before applying the final
-        # length fallback. This prevents names such as TokenHub from being
-        # cut into TokenHu when the multi-item suffix is added.
-        tokens = re.findall(r"[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*", subject)
-        complete_tokens = [token for token in tokens if len(token) <= max_subject_length]
-        if complete_tokens:
-            subject = max(complete_tokens, key=len)
-        else:
-            # Keep a complete model/version token when the vendor's product
-            # name is longer than the legacy title budget. Never expose a
-            # partial token such as ``Gemini3.5Transc`` to readers.
-            model_match = re.search(
-                r"(?i)(?:gpt|glm|qwen|claude|codex|gemini|gemma|doubao|seedream|"
-                r"deepseek|kimi|minimax|ernie|llama|mistral)[-_. ]*(?:v)?\d+(?:\.\d+)?",
-                subject,
-            )
-            subject = model_match.group(0) if model_match else fallback
+        subject = _compact_ai_digest_subject(
+            subject,
+            featured=featured,
+            max_subject_length=max_subject_length,
+            fallback=fallback,
+        )
     subject = subject.rstrip("，,。；;：:、-—| ")
     return f"{prefix}{subject or fallback[:max_subject_length]}{suffix}"
 
@@ -6842,9 +7135,18 @@ def create_post_with_draft(
     return post
 
 
-def _daily_news_llm_supervisor_enabled(cfgs: list[Any], *, target_count: int) -> bool:
+def _daily_news_llm_supervisor_enabled(
+    cfgs: list[Any],
+    *,
+    target_count: int,
+    column: str = "daily_news",
+) -> bool:
     raw = (os.getenv("NEWS_LLM_SUPERVISOR_ENABLED") or "1").strip().lower()
-    if raw in {"0", "false", "off", "no"} or target_count <= 1:
+    if raw in {"0", "false", "off", "no"}:
+        return False
+    # The column must validate contrast and evidence even for a single draft;
+    # ordinary daily news only needs the review when it has to pick a batch.
+    if target_count <= 1 and column != DAILY_WOW_CONTENT_TYPE:
         return False
     # Test and offline configurations conventionally use a fake model. Avoid
     # making a network call in that mode while retaining local ranking.
@@ -6860,6 +7162,79 @@ def _daily_news_supervisor_pool_limit(target_count: int) -> int:
     return max(target_count * 10, configured or 0, 60)
 
 
+_WOW_ACCEPT_DECISIONS = {"accept", "accepted", "yes", "true", "keep"}
+_WOW_REJECT_DECISIONS = {"reject", "rejected", "no", "false", "drop", "needs_evidence"}
+# Design 5.2: a story needs contrast >= 3 to enter the column.  The judge
+# reported "荒诞性一般" (score 2) on an item it still accepted, so an accept is
+# only honoured when its own score clears the floor.
+_WOW_MIN_CONTRAST_SCORE = 3.0
+
+
+def _wow_score_value(value: object) -> float | None:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _daily_wow_decisions_from_result(
+    result: dict[str, Any], *, pool_size: int
+) -> tuple[list[int], list[int], list[dict[str, Any]]]:
+    """Split the column model's per-id decisions into accepted and rejected.
+
+    Only ids present in the input pool are honoured, and a decision that is
+    missing or unrecognised stays undecided so it can be reported rather than
+    silently promoted into generation.
+    """
+    accepted: list[int] = []
+    rejected: list[int] = []
+    decisions: list[dict[str, Any]] = []
+    rows = result.get("decisions") if isinstance(result, dict) else None
+    if not isinstance(rows, list):
+        return accepted, rejected, decisions
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            index = int(row.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= index <= pool_size:
+            continue
+        decision = str(row.get("decision") or "").strip().lower()
+        decisions.append(
+            {
+                "id": index,
+                "decision": decision,
+                "contrast": _clip_text(str(row.get("contrast") or ""), limit=120),
+                "score": row.get("score"),
+                "reason": _clip_text(str(row.get("reason") or ""), limit=120),
+            }
+        )
+        if decision in _WOW_ACCEPT_DECISIONS and index not in accepted:
+            score = _wow_score_value(row.get("score"))
+            contrast = str(row.get("contrast") or "").strip()
+            if daily_wow_is_schema_echo(contrast):
+                # The model repeated the prompt's example rather than judging
+                # this story, so there is no verified contrast to accept.
+                if index not in rejected:
+                    rejected.append(index)
+                decisions[-1]["schema_echo"] = True
+                continue
+            # An accept below the contrast floor is treated as a soft reject so
+            # an ordinary story cannot be published just because the model
+            # called it acceptable.
+            if score is not None and score < _WOW_MIN_CONTRAST_SCORE:
+                if index not in rejected:
+                    rejected.append(index)
+                decisions[-1]["below_contrast_floor"] = True
+            else:
+                accepted.append(index)
+        elif decision in _WOW_REJECT_DECISIONS and index not in rejected:
+            rejected.append(index)
+    return accepted, rejected, decisions
+
+
 def _supervise_daily_news_candidates(
     candidates: list[Any],
     *,
@@ -6869,9 +7244,33 @@ def _supervise_daily_news_candidates(
     required_china_count: int,
     required_international_conflict_count: int = 0,
     progress_callback: DailyNewsProgressCallback | None,
+    column: str = "daily_news",
 ) -> tuple[list[Any], dict[str, Any]]:
     """Use one optional LLM call to reorder the already validated candidate pool."""
-    if not _daily_news_llm_supervisor_enabled(cfgs, target_count=target_count):
+    wow_column = column == DAILY_WOW_CONTENT_TYPE
+    if wow_column and not _daily_news_llm_supervisor_enabled(
+        cfgs, target_count=target_count, column=column
+    ):
+        # No column judge is available, so require a local contrast signal
+        # instead of quietly publishing ordinary headlines.
+        strict, strict_meta = daily_wow_strict_candidates(candidates, prompt_hint)
+        _emit_daily_news_progress(
+            progress_callback,
+            "反差筛选",
+            "warning" if strict else "skipped",
+            mode="offline_strict",
+            checked=strict_meta["input_count"],
+            matched=strict_meta["strict_count"],
+        )
+        return strict, {
+            "enabled": False,
+            "status": "offline_strict_fallback",
+            "column": DAILY_WOW_CONTENT_TYPE,
+            **strict_meta,
+        }
+    if not _daily_news_llm_supervisor_enabled(
+        cfgs, target_count=target_count, column=column
+    ):
         return candidates, {"enabled": False, "status": "not_requested"}
 
     pool = candidates[: min(len(candidates), _daily_news_supervisor_pool_limit(target_count))]
@@ -6900,32 +7299,43 @@ def _supervise_daily_news_candidates(
         china_required=required_china_count,
         international_conflict_required=required_international_conflict_count,
     )
-    system_prompt = (
-        "你是严格的新闻选题审校员。只基于给定候选信息工作，不补充事实。"
-        "选择与用户关键词直接相关、时间新、可核验、事件明确且彼此不重复的候选；"
-        "优先保留有具体主体、动作、时间或数据的新闻，排除泛泛评论、旧闻、重复报道和信息不足项。"
-        "必须仅返回 JSON 对象，不得输出 Markdown 或解释文字。"
-        "JSON 格式：{\"ranked_ids\":[正整数...],\"rejected_ids\":[正整数...],\"reason\":\"不超过80字\"}。"
-        "ranked_ids 必须是候选 id 的去重排序；未列出的 id 会保留在本地排序末尾。"
-    )
-    system_prompt += (
-        f" Return at least {minimum_ranked_count} unique ranked_ids. "
-        "Do not return fewer ranked_ids when the candidate pool contains enough items. "
-        f"The final batch must include at least {required_international_conflict_count} "
-        "international conflict or geopolitical stories when marked true; rank those "
-        "traceable items before ordinary business stories."
-    )
-    user_prompt = json.dumps(
-        {
-            "task": "为小红书每日新闻生成任务进行候选重排",
-            "keywords": prompt_hint or "综合当日重要新闻",
-            "requested_drafts": target_count,
-            "minimum_china_mainland_items": required_china_count,
-            "minimum_international_conflict_items": required_international_conflict_count,
-            "candidates": payload,
-        },
-        ensure_ascii=False,
-    )
+    if wow_column:
+        system_prompt = daily_wow_selection_system_prompt(minimum_ranked_count)
+        user_prompt = json.dumps(
+            daily_wow_selection_payload(
+                candidates=payload,
+                prompt_hint=prompt_hint,
+                requested_drafts=target_count,
+            ),
+            ensure_ascii=False,
+        )
+    else:
+        system_prompt = (
+            "你是严格的新闻选题审校员。只基于给定候选信息工作，不补充事实。"
+            "选择与用户关键词直接相关、时间新、可核验、事件明确且彼此不重复的候选；"
+            "优先保留有具体主体、动作、时间或数据的新闻，排除泛泛评论、旧闻、重复报道和信息不足项。"
+            "必须仅返回 JSON 对象，不得输出 Markdown 或解释文字。"
+            "JSON 格式：{\"ranked_ids\":[正整数...],\"rejected_ids\":[正整数...],\"reason\":\"不超过80字\"}。"
+            "ranked_ids 必须是候选 id 的去重排序；未列出的 id 会保留在本地排序末尾。"
+        )
+        system_prompt += (
+            f" Return at least {minimum_ranked_count} unique ranked_ids. "
+            "Do not return fewer ranked_ids when the candidate pool contains enough items. "
+            f"The final batch must include at least {required_international_conflict_count} "
+            "international conflict or geopolitical stories when marked true; rank those "
+            "traceable items before ordinary business stories."
+        )
+        user_prompt = json.dumps(
+            {
+                "task": "为小红书每日新闻生成任务进行候选重排",
+                "keywords": prompt_hint or "综合当日重要新闻",
+                "requested_drafts": target_count,
+                "minimum_china_mainland_items": required_china_count,
+                "minimum_international_conflict_items": required_international_conflict_count,
+                "candidates": payload,
+            },
+            ensure_ascii=False,
+        )
     try:
         result = generate_json(
             cfgs,
@@ -6933,6 +7343,50 @@ def _supervise_daily_news_candidates(
             user_prompt=user_prompt,
             max_tokens=6000,
         )
+        if wow_column:
+            accepted_ids, rejected_ids, decisions = _daily_wow_decisions_from_result(
+                result, pool_size=len(pool)
+            )
+            if not accepted_ids:
+                raise RuntimeError("column supervisor accepted no usable candidate")
+            chosen = [pool[index - 1] for index in accepted_ids]
+            chosen_keys = {item.url or item.title for item in chosen}
+            # Rejected candidates stay rejected: they were checked against the
+            # column's fact and contrast rules and must not re-enter generation.
+            undecided = [
+                item
+                for index, item in enumerate(pool, start=1)
+                if index not in accepted_ids
+                and index not in rejected_ids
+                and (item.url or item.title) not in chosen_keys
+            ]
+            reviewed_ids = set(accepted_ids) | set(rejected_ids)
+            tail = [
+                item
+                for index, item in enumerate(candidates, start=1)
+                if index > len(pool)
+                and (item.url or item.title) not in chosen_keys
+            ]
+            meta = {
+                "enabled": True,
+                "status": "success",
+                "column": DAILY_WOW_CONTENT_TYPE,
+                "reviewed_candidate_count": len(pool),
+                "accepted_candidate_count": len(chosen),
+                "rejected_candidate_count": len(rejected_ids),
+                "undecided_candidate_count": len(undecided),
+                "decisions": decisions,
+                "reason": _clip_text(str(result.get("reason") or ""), limit=160),
+            }
+            _emit_daily_news_progress(
+                progress_callback,
+                "反差筛选",
+                "success",
+                reviewed=len(pool) if reviewed_ids else len(pool),
+                accepted=len(chosen),
+                rejected=len(rejected_ids),
+            )
+            return [*chosen, *undecided, *tail], meta
         raw_ids = result.get("ranked_ids")
         ranked_indices: list[int] = []
         if isinstance(raw_ids, list):
@@ -6969,6 +7423,30 @@ def _supervise_daily_news_candidates(
         )
         return chosen, meta
     except Exception as exc:
+        if wow_column:
+            # The judge ran but produced no usable decision (for example every
+            # candidate was rejected, or the response was unusable). Falling
+            # back to ordinary ranking here would publish non-column stories,
+            # so require a local contrast signal instead and let the caller
+            # report the shortfall.
+            message = _clip_text(str(exc), limit=180)
+            strict, strict_meta = daily_wow_strict_candidates(candidates, prompt_hint)
+            _emit_daily_news_progress(
+                progress_callback,
+                "反差筛选",
+                "warning" if strict else "skipped",
+                mode="offline_strict_after_review_failure",
+                reason=message,
+                checked=strict_meta["input_count"],
+                matched=strict_meta["strict_count"],
+            )
+            return strict, {
+                "enabled": True,
+                "status": "offline_strict_after_review_failure",
+                "column": DAILY_WOW_CONTENT_TYPE,
+                "error": message,
+                **strict_meta,
+            }
         # Local ranking is deterministic and remains a valid fallback. The
         # user sees the degraded mode instead of waiting for a silent retry.
         message = _clip_text(str(exc), limit=180)
@@ -7025,6 +7503,7 @@ def _prepare_daily_news_candidate(
     post_quality_callback: DailyNewsPostQualityCallback | None,
     prepared: tuple[Any, dict[str, Any], dict[str, Any], Any] | None = None,
     original_is_conflict: bool | None = None,
+    column: str = "daily_news",
 ) -> _DailyNewsCandidateResult:
     """Prepare one candidate without touching shared acceptance state.
 
@@ -7032,6 +7511,7 @@ def _prepare_daily_news_candidate(
     It may run in parallel, while dedupe and domestic-source quotas remain
     deterministic in the caller.
     """
+    wow_column = column == DAILY_WOW_CONTENT_TYPE
     original_is_conflict = (
         _daily_news_conflict_signal(picked)
         if original_is_conflict is None
@@ -7088,7 +7568,7 @@ def _prepare_daily_news_candidate(
         {**base_meta, **(lookup_meta or {}), **(focus_meta or {})},
         picked,
     )
-    news_prompt = _daily_news_prompt(picked, prompt_norm, viewpoint_norm)
+    news_prompt = _daily_news_prompt(picked, prompt_norm, viewpoint_norm, column=column)
     if target_count > 1:
         news_prompt = f"（候选 {candidate_index}）\n{news_prompt}"
 
@@ -7175,21 +7655,27 @@ def _prepare_daily_news_candidate(
     if _daily_news_body_has_prompt_leak(draft.get("body", "")) or _daily_news_body_is_too_generic(draft.get("body", "")):
         draft["title"] = _normalize_daily_news_title(picked.title, picked, prompt_norm)
         draft["body"] = _daily_news_offline_body(picked, prompt_norm)
-        draft["topics"] = ["每日新闻"]
+        draft["topics"] = [DAILY_WOW_TOPIC if wow_column else "每日新闻"]
     if _is_generic_daily_news_title(draft.get("title", "")):
         draft["title"] = _normalize_daily_news_title(
             picked.title or picked.description or prompt_norm,
             picked,
             prompt_norm,
         )
-    draft["title"] = _normalize_daily_news_title(draft.get("title", ""), picked, prompt_norm)
+    draft["title"] = _normalize_daily_news_title(
+        draft.get("title", ""),
+        picked,
+        prompt_norm,
+        max_len=daily_wow_title_max_len() if wow_column else 18,
+    )
     topics = draft.get("topics") or []
     if not isinstance(topics, list):
         topics = [str(topics)]
-    draft["topics"] = _normalize_daily_news_topics(
-        topics,
-        prompt_norm,
-        context=f"{draft.get('title', '')} {draft.get('body', '')}",
+    topics_context = f"{draft.get('title', '')} {draft.get('body', '')}"
+    draft["topics"] = (
+        _daily_wow_topics(topics, prompt_norm, topics_context)
+        if wow_column
+        else _normalize_daily_news_topics(topics, prompt_norm, topics_context)
     )
     draft["body"] = _finalize_daily_news_body(
         draft.get("body", ""),
@@ -7203,8 +7689,14 @@ def _prepare_daily_news_candidate(
         prompt_norm,
         title_hint=str(draft.get("title") or ""),
     )
+    if wow_column:
+        draft["body"] = _daily_wow_repair_comment(draft["body"], picked, prompt_norm)
     draft = _simplify_daily_news_draft(draft)
-    quality_issue = _daily_news_quality_issue(draft.get("title", ""), draft.get("body", ""), prompt_norm)
+    quality_issue = (
+        _daily_wow_quality_issue(draft.get("title", ""), draft.get("body", ""), prompt_norm)
+        if wow_column
+        else _daily_news_quality_issue(draft.get("title", ""), draft.get("body", ""), prompt_norm)
+    )
     if quality_issue == "generic_body" and single_material_mode:
         # A user-supplied single material is the source of truth.  If the model
         # turns it into generic copy, rebuild from that material before rejecting it.
@@ -7238,7 +7730,11 @@ def _prepare_daily_news_candidate(
         )
 
     image_event = _to_simplified_common(
-        _normalize_daily_news_image_event(
+        # The column strips narration/JSON leakage first; a truncated model
+        # response must not store prose in an event field.
+        daily_wow_clean_image_event(draft.get("image_event"))
+        if wow_column
+        else _normalize_daily_news_image_event(
             str(draft.get("image_event") or ""),
             picked=picked,
             title=str(draft.get("title") or ""),
@@ -7246,6 +7742,10 @@ def _prepare_daily_news_candidate(
             prompt_norm=prompt_norm,
         )
     )
+    if wow_column and not image_event:
+        image_event = _to_simplified_common(
+            _daily_news_fallback_subject(picked, prompt_norm)
+        )
     draft["image_event"] = image_event
     post = Post(
         type="image",
@@ -7273,6 +7773,18 @@ def _prepare_daily_news_candidate(
             }
         },
     )
+    if wow_column:
+        wow_contrast = daily_wow_clean_image_event(draft.get("verified_contrast"))
+        wow_visual_plan = _daily_wow_visual_plan_text(draft.get("visual_plan"))
+        post.platform["news"].update(
+            {
+                "column": DAILY_WOW_CONTENT_TYPE,
+                "content_type": DAILY_WOW_CONTENT_TYPE,
+                "image_style": "daily_wow",
+                "verified_contrast": wow_contrast,
+                "visual_plan": wow_visual_plan,
+            }
+        )
 
     resolved_assets = [Path(p) for p in asset_paths]
     effective_copy_assets = copy_assets
@@ -7297,6 +7809,11 @@ def _prepare_daily_news_candidate(
                 exclude_ids=set(),
                 ai_first=True,
                 image_policy="ai_preferred" if single_material_mode else "ai_required",
+                prompt_override=(
+                    _daily_wow_image_prompt_for_post(post)
+                    if wow_column
+                    else None
+                ),
             ).result()
             if image_fallback:
                 post.platform["image_fallback"] = image_fallback
@@ -7434,6 +7951,7 @@ def _run_parallel_daily_news_candidates(
     required_international_conflict_count: int,
     performance_policy: PerformancePolicy | None = None,
     discovery: DailyNewsDiscovery | None = None,
+    column: str = "daily_news",
 ) -> list[Post]:
     """Run candidate preparation in two lanes and accept results in order."""
     # Re-assert the protected editorial lane after any LLM reordering. This
@@ -7441,6 +7959,12 @@ def _run_parallel_daily_news_candidates(
     # avoids spending image calls before the required lane is filled.
     performance_policy = performance_policy or PerformancePolicy.from_environment()
     speed_first = performance_policy.is_speed_first
+    wow_column = column == DAILY_WOW_CONTENT_TYPE
+    if wow_column:
+        # The column has no domestic or conflict lane; contrast selection already
+        # happened before generation.
+        required_china_count = 0
+        required_international_conflict_count = 0
     picks = (
         _prioritize_all_daily_news_conflicts(list(picks))
         if required_international_conflict_count
@@ -7459,6 +7983,7 @@ def _run_parallel_daily_news_candidates(
     skipped_quality_count = 0
     skipped_quota_count = 0
     llm_unavailable_reasons: list[str] = []
+    candidate_retry_counts: dict[int, int] = {}
 
     # Enrich once before submitting work. This avoids duplicate source requests
     # and lets us discard mirrored stories before spending model capacity.
@@ -7600,6 +8125,7 @@ def _run_parallel_daily_news_candidates(
                                 post_quality_callback=post_quality_callback,
                                 prepared=prepared_by_index.get(index),
                                 original_is_conflict=original_conflict_by_index.get(index),
+                                column=column,
                             )
                         )
                     if not in_flight:
@@ -7645,6 +8171,7 @@ def _run_parallel_daily_news_candidates(
                             post_quality_callback=post_quality_callback,
                             prepared=prepared_by_index.get(index),
                             original_is_conflict=original_conflict_by_index.get(index),
+                            column=column,
                         )
                         for index, picked in batch
                     ]
@@ -7663,7 +8190,6 @@ def _run_parallel_daily_news_candidates(
                         )
 
                 for result in results:
-                    retired_indices.add(result.candidate_index)
                     if (
                         len(posts) >= target_count
                         and accepted_conflict_count >= required_international_conflict_count
@@ -7671,6 +8197,25 @@ def _run_parallel_daily_news_candidates(
                     ):
                         break
                     if result.status != "success" or result.post is None or result.picked is None:
+                        if _schedule_daily_news_candidate_retry(
+                            result,
+                            candidate_retry_counts,
+                            pending_indices,
+                        ):
+                            retry_count = candidate_retry_counts[result.candidate_index]
+                            _emit_daily_news_progress(
+                                progress_callback,
+                                "候选重试",
+                                "retrying",
+                                candidate_index=result.candidate_index,
+                                completed=len(posts),
+                                target=target_count,
+                                retry_count=retry_count,
+                                retry_limit=_daily_news_candidate_retry_limit(),
+                                reason=result.reason,
+                            )
+                            continue
+                        retired_indices.add(result.candidate_index)
                         if result.status == "skipped":
                             if not result.failed_post_saved:
                                 skipped_quality_count += 1
@@ -7681,6 +8226,8 @@ def _run_parallel_daily_news_candidates(
                                     _daily_news_llm_unavailable_reason(result.error)
                                 )
                         continue
+
+                    retired_indices.add(result.candidate_index)
 
                     picked = result.picked
                     post = result.post
@@ -7898,13 +8445,21 @@ def create_daily_news_posts(
     progress_callback: DailyNewsProgressCallback | None = None,
     post_quality_callback: DailyNewsPostQualityCallback | None = None,
     performance_mode: str | None = None,
+    column: str = "daily_news",
 ) -> list[Post]:
     """
     Special workflow for title="每日新闻".
 
     - Use `prompt_hint` to rank candidates, then pick up to `count` items.
     - When `count` is 1, behavior is equivalent to a single best match.
+
+    `column` selects the editorial strategy.  The default keeps ordinary daily
+    news unchanged; `daily_wow` reuses retrieval, dates, dedupe, generation and
+    delivery with the 反差 selection, playful comment and clean-illustration
+    rules from the column design.
     """
+    column_norm = daily_wow_normalize_column(column)
+    wow_column = column_norm == DAILY_WOW_CONTENT_TYPE
     performance_policy = (
         PerformancePolicy.from_value(performance_mode)
         if performance_mode is not None
@@ -7946,16 +8501,17 @@ def create_daily_news_posts(
         progress_callback=progress_callback,
         discovery_holder=discovery_holder,
         performance_policy=performance_policy,
+        column=column_norm,
     )
     target_count = count
     required_china_count = (
         0
-        if single_material_mode
+        if single_material_mode or wow_column
         else _required_china_count_for_daily_news(target_count)
     )
     required_international_conflict_count = (
         0
-        if single_material_mode
+        if single_material_mode or wow_column
         else daily_news_international_conflict_quota(target_count)
     )
     available_conflict_count = sum(
@@ -7985,13 +8541,21 @@ def create_daily_news_posts(
         required_china_count=required_china_count,
         required_international_conflict_count=required_international_conflict_count,
         progress_callback=progress_callback,
+        column=column_norm,
     )
     base_meta = dict(base_meta)
     selection_pool = base_meta.get("selection_pool")
     if isinstance(selection_pool, dict):
         selection_pool = dict(selection_pool)
         selection_pool["llm_supervisor"] = supervisor_meta
+        if wow_column:
+            selection_pool["wow_review_status"] = supervisor_meta.get("status")
         base_meta["selection_pool"] = selection_pool
+    elif wow_column:
+        base_meta["selection_pool"] = {
+            "llm_supervisor": supervisor_meta,
+            "wow_review_status": supervisor_meta.get("status"),
+        }
     # Pick the first pass with the true target count so source diversity quotas
     # are based on the number of drafts the user asked for. Keep extra ranked
     # candidates after that because strict quality gates can reject snippets.
@@ -8028,6 +8592,12 @@ def create_daily_news_posts(
         main = feasible_news_batch(picks, target_count, china=required_china_count,
                                    conflict=required_international_conflict_count)
         if not main:
+            if wow_column:
+                raise RuntimeError(
+                    "每日我去没有通过反差筛选的候选：本次候选都缺少可检查的真实反差，"
+                    "未开始生图，也没有用普通热点凑稿。可补充更具体的奇闻关键词、"
+                    "增加信源或稍后重试。"
+                )
             raise RuntimeError("模型排序后无法同时满足新闻数量、类别与来源要求，未开始生图。")
         main_keys = {news_key(item) for item in main}
         picks = main + [item for item in picks if news_key(item) not in main_keys]
@@ -8049,4 +8619,5 @@ def create_daily_news_posts(
         required_international_conflict_count=required_international_conflict_count,
         performance_policy=performance_policy,
         discovery=discovery,
+        column=column_norm,
     )

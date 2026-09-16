@@ -59,6 +59,93 @@ _GENERIC_CHANGE_TITLE_RE = re.compile(
     r"(?=$|[，,。！？；;：:])",
     flags=re.IGNORECASE,
 )
+# A headline such as “三位AI大佬” names nobody. Reject the collective phrase
+# so the title has to fall back to the concrete entities in the source text.
+_VAGUE_COLLECTIVE_TITLE_RE = re.compile(
+    r"(?:[一二两三四五六七八九十百千\d]+(?:位|名|个|家|批|众)?"
+    r"(?:AI|大模型|科技|互联网|行业|业界)?"
+    r"(?:大佬|巨头|大厂|巨头们|专家|学者|高管|分析师|业内人士|行业人士|相关人士|人士|厂商|公司|企业)"
+    r"|(?:业内人士|行业人士|相关人士|业内人士称|知情人|多位(?:专家|大佬|人士)))"
+)
+_CONCRETE_ACTION_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("呼吁",), "呼吁AI减速"),
+    (("断供", "停止提供", "stop providing"), "停止供应"),
+    (("暴涨", "暴跌"), "市场波动"),
+    (("涨价", "降价", "调价", "定价", "计费", "pricing"), "调整定价"),
+    (("宕机", "故障", "中断", "outage", "incident"), "服务故障"),
+    (("开源", "open-sourc", "open weights", "open weight", "开放权重"), "开源模型"),
+    (("泄露", "漏洞", "vulnerab"), "安全漏洞"),
+    (("融资", "funding", "round"), "融资"),
+    (("起诉", "诉讼", "lawsuit", "sue"), "诉讼"),
+    (("招聘", "hiring", "hiring spree"), "招聘"),
+    (("重置", "reset"), "额度重置"),
+    (("发布", "推出", "上线", "release", "released", "launch", "introduc"), "发布"),
+)
+_NAMED_ENTITY_RULES: tuple[tuple[str, str], ...] = (
+    ("anthropic", "Anthropic"),
+    ("openai", "OpenAI"),
+    ("deepmind", "Google DeepMind"),
+    ("gemini", "Google"),
+    ("google", "Google"),
+    ("hugging face", "Hugging Face"),
+    ("microsoft", "微软"),
+    ("nvidia", "英伟达"),
+    ("meta", "Meta"),
+    ("llama", "Meta"),
+    ("mistral", "Mistral"),
+    ("perplexity", "Perplexity"),
+    ("cerebras", "Cerebras"),
+    ("stability", "Stability AI"),
+    ("runway", "Runway"),
+    ("suno", "Suno"),
+    ("cursor", "Cursor"),
+    ("github", "GitHub"),
+    ("amazon", "亚马逊"),
+    ("apple", "苹果"),
+    ("samsung", "三星"),
+    ("deepseek", "DeepSeek"),
+    ("qwen", "阿里Qwen"),
+    ("通义", "阿里Qwen"),
+    ("glm", "智谱GLM"),
+    ("智谱", "智谱GLM"),
+    ("zhipu", "智谱GLM"),
+    ("minimax", "MiniMax"),
+    ("kimi", "月之暗面"),
+    ("moonshot", "月之暗面"),
+    ("月之暗面", "月之暗面"),
+    ("doubao", "字节豆包"),
+    ("seedream", "字节豆包"),
+    ("豆包", "字节豆包"),
+    ("bytedance", "字节跳动"),
+    ("字节", "字节跳动"),
+    ("hunyuan", "腾讯混元"),
+    ("混元", "腾讯混元"),
+    ("tencent", "腾讯"),
+    ("腾讯", "腾讯"),
+    ("ernie", "百度文心"),
+    ("文心", "百度文心"),
+    ("百度", "百度"),
+    ("pangu", "华为"),
+    ("华为", "华为"),
+    ("sensetime", "商汤"),
+    ("商汤", "商汤"),
+    ("iflytek", "科大讯飞"),
+    ("讯飞", "科大讯飞"),
+    ("stepfun", "阶跃星辰"),
+    ("阶跃", "阶跃星辰"),
+    ("马斯克", "马斯克"),
+    ("musk", "马斯克"),
+    ("奥特曼", "奥特曼"),
+    ("altman", "奥特曼"),
+    ("阿莫代伊", "阿莫代伊"),
+    ("amodei", "阿莫代伊"),
+    ("黄仁勋", "黄仁勋"),
+    ("扎克伯格", "扎克伯格"),
+    ("梁文锋", "梁文锋"),
+    ("李彦宏", "李彦宏"),
+    ("zuckerberg", "扎克伯格"),
+    ("jensen", "黄仁勋"),
+)
 
 
 def cap_ai_digest_items_by_source(
@@ -691,6 +778,66 @@ def _title_with_action(subject: str, action: str, *, limit: int = 28) -> str:
     return f"{clean_subject}{clean_action}"[:limit]
 
 
+def _named_entities_in_text(text: str) -> list[str]:
+    """Return concrete vendor/person names present in the source text.
+
+    The result is ordered by the rule table so well-known AI vendors and
+    protagonists surface before incidental product words.
+    """
+
+    value = text or ""
+    if not value:
+        return []
+    lower = value.lower()
+    found: list[str] = []
+    for marker, label in _NAMED_ENTITY_RULES:
+        if label in found:
+            continue
+        if marker.isascii():
+            if re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", lower):
+                found.append(label)
+        elif marker in value:
+            found.append(label)
+    return found
+
+
+def _concrete_action_in_text(text: str) -> str:
+    lower = (text or "").lower()
+    for markers, label in _CONCRETE_ACTION_RULES:
+        if any(marker.lower() in lower for marker in markers):
+            return label
+    return ""
+
+
+def _concrete_subject_from_item(item: AIUpdateItem, *, max_chars: int = 28) -> str:
+    """Build a named-subject headline from the concrete entities in an item."""
+
+    text = _source_text(item)
+    entities = _named_entities_in_text(text)
+    if not entities:
+        return ""
+    action = _concrete_action_in_text(text)
+    separators = ("与", "、", "与")
+    for count in (3, 2, 1):
+        subject = ""
+        for index, entity in enumerate(entities[:count]):
+            subject = entity if not subject else f"{subject}{separators[min(index - 1, len(separators) - 1)]}{entity}"
+        for candidate_action in (action, ""):
+            candidate = f"{subject}{candidate_action}" if candidate_action else subject
+            if candidate and len(candidate) <= max_chars:
+                return candidate
+    return entities[0][:max_chars]
+
+
+def is_vague_collective_title(text: str) -> bool:
+    """Reject a headline naming an unnamed group instead of real entities."""
+
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact or not _VAGUE_COLLECTIVE_TITLE_RE.search(compact):
+        return False
+    return not _named_entities_in_text(text)
+
+
 def _specific_chinese_excerpt_title(item: AIUpdateItem, *, subject: str) -> str:
     excerpt = re.sub(r"\s+", " ", item.raw_excerpt or "").strip()
     if not excerpt or not _has_cjk(excerpt):
@@ -1005,12 +1152,18 @@ def _repair_title_cut_inside_summary_lead(title: str, summary: str, *, limit: in
 
 def _ensure_chinese_item(item: AIUpdateItem) -> AIUpdateItem:
     data = item.model_dump()
+    # Reject an unnamed-group headline (for example, “三位AI大佬”) and rebuild
+    # the subject from the concrete entities present in the source text.
+    if is_vague_collective_title(data.get("title", "")):
+        data["title"] = _concrete_subject_from_item(item) or data.get("title", "")
     data["title"] = simplify_common_chinese(data.get("title", ""))
     data["summary"] = simplify_common_chinese(data.get("summary", ""))
     repaired_title = _repair_title_cut_inside_summary_lead(item.title, item.summary)
     title_repaired = repaired_title != item.title
     data["title"] = repaired_title
-    if not title_repaired and (
+    if (not title_repaired and is_vague_collective_title(data.get("title", ""))) or (
+        not title_repaired
+        and (
         not _has_cjk(data.get("title", ""))
         or _is_low_information_ai_digest_text(data.get("title", ""))
         or is_ai_digest_source_label_title(data.get("title", ""), item)
@@ -1018,20 +1171,36 @@ def _ensure_chinese_item(item: AIUpdateItem) -> AIUpdateItem:
             _has_untranslated_english_phrase(data.get("title", ""))
             and not _has_chinese_title_context(data.get("title", ""))
         )
+        )
     ):
-        data["title"] = _fallback_chinese_title(item)
+        fallback_title = _fallback_chinese_title(item)
+        # Never let a missing fallback erase text that was already present;
+        # blanking here removed valid source titles and made the whole digest
+        # look like a material shortage downstream.
+        if fallback_title:
+            data["title"] = fallback_title
     if (
         not _has_cjk(data.get("summary", ""))
         or _is_low_information_ai_digest_text(data.get("summary", ""))
         or _has_untranslated_english_phrase(data.get("summary", ""))
     ):
-        data["summary"] = _fallback_chinese_summary(item)
+        fallback_summary = _fallback_chinese_summary(item)
+        if fallback_summary:
+            data["summary"] = fallback_summary
     data["title"] = _repair_title_cut_inside_summary_lead(data.get("title", ""), data.get("summary", ""))
     data["title"] = simplify_common_chinese(data.get("title", ""))
-    if is_ai_digest_source_label_title(data["title"], item) or _is_low_information_ai_digest_text(data["title"]):
+    if (
+        is_ai_digest_source_label_title(data["title"], item)
+        or _is_low_information_ai_digest_text(data["title"])
+        or is_vague_collective_title(data["title"])
+    ):
         fallback_title = _fallback_chinese_title(item)
         if fallback_title and not is_ai_digest_source_label_title(fallback_title, item):
             data["title"] = fallback_title
+        if is_vague_collective_title(data["title"]):
+            concrete = _concrete_subject_from_item(item)
+            if concrete:
+                data["title"] = concrete
     data["summary"] = simplify_common_chinese(data.get("summary", ""))
     tags = []
     for tag in item.tags or []:
@@ -1051,6 +1220,8 @@ def _ai_digest_item_content_issue(item: AIUpdateItem) -> str:
         return "标题或摘要未完成中文改写"
     if is_ai_digest_source_label_title(title, item):
         return "标题只有来源名或动态占位词"
+    if is_vague_collective_title(title):
+        return "标题只写了未具名群体，没有说明具体主体"
     if _is_low_information_ai_digest_text(title) or _is_low_information_ai_digest_text(summary):
         return "标题或摘要使用了空泛变化表述"
     if len(summary) < 12:
@@ -1202,19 +1373,29 @@ def _restore_traceable_ai_digest_items(brief: AIDigestBrief, source_items: list[
                     evidence.append(url)
             data["evidence_urls"] = evidence
             grounded = _generated_item_is_grounded(item, match)
+            title_text = str(data.get("title") or "")
+            summary_text = str(data.get("summary") or "")
             if (
                 not grounded
-                or _is_low_information_ai_digest_text(str(data.get("title") or ""))
-                or is_ai_digest_source_label_title(str(data.get("title") or ""), match)
-                or not _has_cjk(str(data.get("title") or ""))
+                or _is_low_information_ai_digest_text(title_text)
+                or is_ai_digest_source_label_title(title_text, match)
+                or is_vague_collective_title(title_text)
+                or not _has_cjk(title_text)
             ):
-                data["title"] = _fallback_chinese_title(match)
+                # A missing fallback must not erase a valid model-written
+                # title; that blanking produced empty items and a misleading
+                # material-shortage error.
+                fallback_title = _fallback_chinese_title(match)
+                if fallback_title:
+                    data["title"] = fallback_title
             if (
                 not grounded
-                or _looks_generic_ai_digest_text(str(data.get("summary") or ""))
-                or not _has_cjk(str(data.get("summary") or ""))
+                or _looks_generic_ai_digest_text(summary_text)
+                or not _has_cjk(summary_text)
             ):
-                data["summary"] = _fallback_chinese_summary(match)
+                fallback_summary = _fallback_chinese_summary(match)
+                if fallback_summary:
+                    data["summary"] = fallback_summary
         restored.append(_ensure_chinese_item(AIUpdateItem.model_validate(data)))
     unique_restored = []
     seen_keys = set()
@@ -1346,27 +1527,54 @@ def build_ai_digest_prompt(
     )
 
 
-def _extract_json_object(text: str) -> str:
+def _extract_json_object(text: str, *, required_key: str = "") -> str:
     raw = (text or "").strip()
+    # Reasoning models (for example MiniMax-M3) may emit a ``<think>`` block
+    # before the answer. That prose often contains brace fragments, so drop it
+    # rather than letting the scanner lock onto the wrong object.
+    raw = re.sub(r"(?is)<think\b[^>]*>.*?</think\s*>", " ", raw)
+    raw = re.sub(r"(?is)<(?:thinking|reasoning)\b[^>]*>.*?</(?:thinking|reasoning)\s*>", " ", raw)
+    # An unterminated think block means the answer was cut before the JSON.
+    open_think = re.search(r"(?is)<think\b[^>]*>", raw)
+    if open_think and not re.search(r"(?is)</think\s*>", raw[open_think.end():]):
+        raw = raw[: open_think.start()]
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?", "", raw, flags=re.IGNORECASE).strip()
         raw = re.sub(r"```$", "", raw).strip()
+    fences = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
     decoder = json.JSONDecoder()
+
+    def _decode_candidates(source: str) -> list[str]:
+        found: list[str] = []
+        for match in re.finditer(r"\{", source):
+            start = match.start()
+            try:
+                _, end = decoder.raw_decode(source[start:])
+            except json.JSONDecodeError:
+                continue
+            found.append(source[start : start + end])
+        return found
+
+    # Prefer a fenced block, then any object that carries the expected key.
     # Some OpenAI-compatible endpoints append a second JSON object after a
-    # valid response. Decode one complete object instead of joining through
-    # the last closing brace, which produces ``Extra data``.
-    for match in re.finditer(r"\{", raw):
-        start = match.start()
-        try:
-            _, end = decoder.raw_decode(raw[start:])
-        except json.JSONDecodeError:
-            continue
-        return raw[start : start + end]
+    # valid response; decode one complete object instead of joining through the
+    # last closing brace, which produces ``Extra data``.
+    ordered = [*_decode_candidates(f"\n".join(fences)), *_decode_candidates(raw)]
+    if required_key:
+        for candidate in ordered:
+            try:
+                data = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and required_key in data:
+                return candidate
+    if ordered:
+        return ordered[0]
     return raw
 
 
 def parse_ai_digest_impact_json(text: str, *, candidate_count: int) -> dict[int, dict[str, object]]:
-    data = json.loads(_extract_json_object(text))
+    data = json.loads(_extract_json_object(text, required_key="scores"))
     raw_rows = data.get("scores") if isinstance(data, dict) else None
     if not isinstance(raw_rows, list):
         raise ValueError("impact supervisor response must contain a scores list")
@@ -1525,7 +1733,7 @@ def evaluate_ai_digest_impact_with_llm(
 
 
 def parse_ai_digest_brief_json(text: str) -> AIDigestBrief:
-    data = json.loads(_extract_json_object(text))
+    data = json.loads(_extract_json_object(text, required_key="items"))
     items = [AIUpdateItem.model_validate(item) for item in data.get("items", []) if isinstance(item, dict)]
     for idx, item in enumerate(items):
         if item.source_type not in {"official", "github"} or not item.evidence_urls:

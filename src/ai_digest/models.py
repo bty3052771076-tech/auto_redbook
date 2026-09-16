@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from html import unescape
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -18,6 +19,72 @@ VerificationStatus = Literal[
     "search_only",
     "rejected",
 ]
+
+
+_VOID_HTML_TAGS = (
+    "script",
+    "style",
+    "noscript",
+    "img",
+    "br",
+    "hr",
+    "source",
+    "iframe",
+    "video",
+    "audio",
+    "embed",
+    "input",
+    "meta",
+    "link",
+)
+_HTML_TAG_RE = re.compile(r"(?is)<\s*/?\s*[a-zA-Z][a-zA-Z0-9:-]*(?:\s[^<>]*)?>")
+_DANGLING_HTML_TAG_RE = re.compile(r"(?is)<\s*/?\s*[a-zA-Z][a-zA-Z0-9:-]*\b[^<>]*$")
+_HTML_ATTR_RE = re.compile(
+    r"(?i)\b(?:referrerpolicy|src|width|height|alt|class|style|id|data-[a-z0-9-]+)"
+    r"\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s，。！？；;，]+)"
+)
+_BARE_HTML_ATTR_RE = re.compile(r"(?i)\b(?:referrerpolicy|src|width|height)\b(?=\s|$)")
+_HTML_ARTIFACT_RE = re.compile(
+    r"(?is)<\s*/?\s*(?:p|div|img|span|a|br|table|tr|td|ul|ol|li|h[1-6]|html|body|section|article|font|strong|em|figure)\b"
+)
+
+
+def strip_html_artifacts(text: str) -> str:
+    """Remove HTML markup and leftover attributes from source text.
+
+    Search providers frequently return NetEase-style fragments such as
+    ``<p id="x">...</p><img referrerpolicy='no-referrer' src='...'>``. Those
+    must never reach a card image or a saved draft, so every ingestion path
+    funnels through here before the text is stored on an item.
+    """
+
+    cleaned = unescape(str(text or ""))
+    if not cleaned:
+        return ""
+    for tag in _VOID_HTML_TAGS:
+        cleaned = re.sub(rf"(?is)<{tag}\b[^<>]*>?", " ", cleaned)
+    cleaned = re.sub(r"(?is)<br\s*/?>", " ", cleaned)
+    cleaned = _HTML_TAG_RE.sub(" ", cleaned)
+    # A payload cut off mid-tag leaves a bare ``<img referrerpolicy=...`` tail.
+    cleaned = _DANGLING_HTML_TAG_RE.sub(" ", cleaned)
+    cleaned = _HTML_ATTR_RE.sub(" ", cleaned)
+    cleaned = _BARE_HTML_ATTR_RE.sub(" ", cleaned)
+    cleaned = cleaned.replace("<", " ").replace(">", " ")
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def has_html_artifacts(text: str) -> bool:
+    """Return True when source text still looks like raw HTML or attributes."""
+
+    value = str(text or "")
+    if not value:
+        return False
+    if _HTML_ARTIFACT_RE.search(value):
+        return True
+    if _DANGLING_HTML_TAG_RE.search(value):
+        return True
+    return bool(_BARE_HTML_ATTR_RE.search(value) or _HTML_ATTR_RE.search(value))
 
 
 def _normalize_url(value: str) -> str:
@@ -66,9 +133,21 @@ class AIUpdateItem(BaseModel):
     evidence_urls: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 
-    @field_validator("title", "summary", "source_name", "url", "published_at", "vendor", "product", "raw_excerpt", mode="before")
+    @field_validator("title", "summary", "source_name", "vendor", "product", "raw_excerpt", mode="before")
     @classmethod
     def _strip_text(cls, value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        # Source payloads (especially search-provider results) can embed raw
+        # HTML fragments. Strip them on construction so no downstream caller
+        # can render or store markup as reader-facing text.
+        return strip_html_artifacts(text)
+
+    @field_validator("url", "published_at", mode="before")
+    @classmethod
+    def _strip_url_text(cls, value):
+        # URLs and timestamps must survive verbatim; only trim whitespace.
         return str(value or "").strip()
 
     @field_validator("evidence_urls", "tags", mode="before")

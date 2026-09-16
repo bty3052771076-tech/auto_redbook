@@ -1950,3 +1950,44 @@ def test_restore_traceable_items_dedupes_same_event_across_social_urls():
     assert len(restored.items) == 2
     assert len({generate_mod.ai_update_history_key(item) for item in restored.items}) == 2
     assert sum("Hacker-Opus" in item.title for item in restored.items) == 1
+
+
+def test_restore_traceable_items_keeps_valid_model_title_when_fallback_is_empty():
+    """An empty fallback must not blank a good model-written title or summary."""
+
+    source = AIUpdateItem(
+        title="Incident with several GitHub Services",
+        summary="Database replication delay increased authorization error rates; incident resolved.",
+        source_name="GitHub Status",
+        source_type="official",
+        url="https://www.githubstatus.com/incidents/0rn90wk115q9",
+        published_at="2026-09-13T10:44:55Z",
+        vendor="GitHub Status",
+        raw_excerpt=(
+            "Database replication delay increased authorization error rates; "
+            "Actions and Pull Requests saw degraded performance; incident resolved."
+        ),
+    )
+    brief = AIDigestBrief(
+        title="每日AI讯息",
+        date="2026-09-13",
+        items=[
+            source.model_copy(
+                update={
+                    "title": "GitHub多项服务出现故障后已恢复",
+                    "summary": (
+                        "2026年9月13日，GitHub的Actions与Pull Requests等服务出现性能下降，"
+                        "因数据库复制延迟导致授权接口错误率升高，事件随后已解决。"
+                    ),
+                }
+            )
+        ],
+    )
+
+    restored = generate_mod._restore_traceable_ai_digest_items(brief, [source])
+
+    assert restored.items
+    item = restored.items[0]
+    assert item.title, "valid model title must survive provenance restoration"
+    assert "GitHub" in item.title
+    assert item.summary, "valid model summary must survive provenance restoration"

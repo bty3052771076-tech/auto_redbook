@@ -280,6 +280,45 @@ def test_batch_gate_rejects_daily_ai_digest_with_mostly_same_source_items():
     assert any(issue.code == "historical_duplicate" for issue in report.issues)
 
 
+def test_batch_gate_allows_same_day_digest_regeneration_when_requested(monkeypatch):
+    from datetime import datetime, timezone
+
+    shared = [f"https://example.com/update-{index}" for index in range(3)]
+    current = Post(
+        title="每日AI讯息",
+        platform={"ai_digest": {"items": [{"url": url} for url in shared]}},
+    )
+    same_day = Post(
+        title="每日AI讯息",
+        status=PostStatus.saved_draft,
+        uploaded=True,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        platform={"ai_digest": {"items": [{"url": url} for url in shared]}},
+    )
+    older = Post(
+        title="每日AI讯息",
+        status=PostStatus.published,
+        uploaded=True,
+        created_at="2026-01-01T00:00:00+00:00",
+        platform={"ai_digest": {"items": [{"url": url} for url in shared]}},
+    )
+
+    # Default behaviour still blocks the duplicate.
+    monkeypatch.delenv("AI_DIGEST_HISTORY_SKIP_TODAY", raising=False)
+    assert not validate_post_batch(
+        [current], expected_count=1, historical_posts=[same_day]
+    ).ok
+
+    # The explicit regeneration flag exempts today's digest but not older days.
+    monkeypatch.setenv("AI_DIGEST_HISTORY_SKIP_TODAY", "1")
+    assert validate_post_batch(
+        [current], expected_count=1, historical_posts=[same_day]
+    ).ok
+    assert not validate_post_batch(
+        [current], expected_count=1, historical_posts=[older]
+    ).ok
+
+
 def test_batch_gate_ignores_generic_historical_digest_item_but_keeps_concrete_event_check():
     current = Post(
         title="每日AI讯息",

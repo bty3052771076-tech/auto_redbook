@@ -576,6 +576,31 @@ def test_ai_digest_post_title_focuses_featured_topic_without_forced_count_suffix
     assert "等8条更新" not in title
 
 
+def test_ai_digest_post_title_keeps_event_instead_of_bare_ascii_fragment():
+    """A long incident title must not compact down to a meaningless token."""
+
+    items = [
+        AIUpdateItem(
+            title="GitHub 协作集群故障波及 Pull Requests 与 Actions，现已恢复",
+            summary="GitHub 协作集群故障波及 Pull Requests 与 Actions，现已恢复。",
+            source_name="GitHub Status",
+            source_type="official",
+            url="https://www.githubstatus.com/incidents/0rn90wk115q9",
+            published_at="2026-09-13T10:44:55Z",
+            vendor="GitHub Status",
+            raw_excerpt="Database replication delay increased authorization error rates; incident resolved.",
+        )
+    ]
+    brief = AIDigestBrief(title="每日AI讯息", date="2026-09-13", items=items)
+
+    title = create_post._ai_digest_post_title(brief)
+
+    assert title.startswith("每日AI|")
+    assert title != "每日AI|PullRequests"
+    assert "故障" in title
+    assert len(title) <= len("每日AI|") + 20
+
+
 def test_ai_digest_post_title_preserves_complete_ascii_product_name():
     items = [
         AIUpdateItem(
@@ -1877,6 +1902,38 @@ def test_uploaded_ai_digest_history_ignores_generic_previous_item(monkeypatch, t
 
     assert create_post.ai_update_history_key(valid) in keys
     assert create_post.ai_update_history_key(generic) not in keys
+
+
+def test_uploaded_ai_digest_history_can_skip_same_day_regeneration(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    item = AIUpdateItem(
+        title="OpenAI发布开发者工具",
+        summary="OpenAI发布开发者工具并说明了具体使用范围。",
+        source_name="OpenAI",
+        source_type="official",
+        url="https://openai.com/news/tool",
+        published_at="2026-09-01T00:00:00Z",
+        vendor="OpenAI",
+        raw_excerpt="OpenAI发布开发者工具并说明了具体使用范围。",
+    )
+    today_post = create_post.Post(
+        title="每日AI讯息",
+        status=PostStatus.saved_draft,
+        uploaded=True,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        platform={"ai_digest": {"mode": "daily_ai_digest", "items": [item.model_dump()]}},
+    )
+    monkeypatch.setattr(create_post, "list_posts", lambda: [today_post], raising=False)
+    key = create_post.ai_update_history_key(item)
+
+    # Default behaviour keeps cross-run dedupe, including today's digest.
+    monkeypatch.delenv("AI_DIGEST_HISTORY_SKIP_TODAY", raising=False)
+    assert key in create_post._uploaded_ai_digest_history_keys()
+
+    # The explicit flag exempts drafts created today so the same day can be
+    # regenerated without colliding with itself, while older days still dedupe.
+    monkeypatch.setenv("AI_DIGEST_HISTORY_SKIP_TODAY", "1")
+    assert key not in create_post._uploaded_ai_digest_history_keys()
 
 
 def test_create_daily_ai_digest_fails_when_history_blocks_quota(

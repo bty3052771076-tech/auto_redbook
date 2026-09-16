@@ -31,6 +31,8 @@ import {
   ExternalLink,
   Trash2,
   Activity,
+  CircleHelp,
+  Sparkles,
 } from "lucide-react";
 import { DeleteDrafts, SourceHealth, AnalysisReport, LocalConfiguration } from "./WorkbenchTools";
 import {
@@ -107,6 +109,275 @@ function IconButton({
     </button>
   );
 }
+const QUICKSTART_SEEN_KEY = "auto-redbook.quickstart.seen";
+type TourStep = {
+  id: string;
+  anchor: string;
+  page: Page;
+  title: string;
+  path: string;
+  body: string;
+};
+type TourChapter = {
+  id: string;
+  label: string;
+  icon: string;
+  hint?: string;
+  page: Page;
+  steps: TourStep[];
+};
+const tourChapters: TourChapter[] = [
+  {
+    id: "setup",
+    label: "首次准备",
+    icon: "settings",
+    hint: "推荐",
+    page: "settings",
+    steps: [
+      { id: "settings.profile", anchor: "settings.profile", page: "settings", title: "确认专用浏览器", path: "账号与设置 › 专用浏览器", body: "先确认这里显示的是项目专用 profile。它和日常浏览器的登录状态彼此独立。" },
+      { id: "settings.login", anchor: "settings.login", page: "settings", title: "需要登录时从这里开始", path: "账号与设置 › 打开专用登录窗口", body: "需要登录平台时使用这个按钮。引导不会替你打开窗口；结束引导后再按页面完成验证。" },
+      { id: "settings.credentials", anchor: "settings.credentials", page: "settings", title: "配置自己的密钥", path: "账号与设置 › 本机配置 › 模型与信源密钥", body: "展开后填写本机密钥并保存。已有密钥留空会保留，不要把密钥写进新闻材料或公开仓库。" },
+      { id: "settings.defaults", anchor: "settings.defaults", page: "settings", title: "保存运行默认值", path: "账号与设置 › 运行默认值", body: "选择常用运行模式和目标平台并保存。之后到模型与额度确认实际可用的模型。" },
+    ],
+  },
+  {
+    id: "auto",
+    label: "自动发帖",
+    icon: "sparkles",
+    hint: "当前页",
+    page: "auto",
+    steps: [
+      { id: "auto.type", anchor: "auto.type", page: "auto", title: "先选择内容类型", path: "自动发帖 › 内容类型", body: "每日新闻按事件成稿；每日我去只挑选真实但反差离谱的事件，配图是恶搞但不恶心的插画；每日AI讯息汇总AI动态；每日羊毛和其他类型会显示不同的策略提示。" },
+      { id: "auto.prompts", anchor: "auto.prompts", page: "auto", title: "每个框写一个选题方向", path: "自动发帖 › 选题与范围 › 提示词", body: "例如第一框填“国际争议事件”，第二框填“中国产业政策”。要增加方向，使用下方“添加提示词”。" },
+      { id: "auto.range", anchor: "auto.range", page: "auto", title: "设定数量和回溯范围", path: "自动发帖 › 稿件数量 / 新闻回溯", body: "稿件数量是本次需要的草稿数。回溯选择自动时按界面列出的窗口逐级筛选，候选不足会给出明确原因。" },
+      { id: "auto.llm", anchor: "auto.llm", page: "auto", title: "选择写稿模型", path: "自动发帖 › 模型与生成 › 语言模型", body: "这里选择写正文和评价的语言模型。展开后可以按平台筛选和搜索，并结合能力、额度与费用类型选择。" },
+      { id: "auto.image", anchor: "auto.image", page: "auto", title: "决定图片来源", path: "自动发帖 › 模型与生成 › 图片方式", body: "要使用AI配图就选择生图模型；使用本地图片时填写工作区路径。引导不会改变你的选择。" },
+      { id: "auto.options", anchor: "auto.options", page: "auto", title: "核对评价与速度策略", path: "自动发帖 › 评价视角 / 运行模式", body: "评价视角决定成稿采用的观察方式，运行模式决定速度策略，不会降低事实核验要求。" },
+      { id: "auto.platform", anchor: "auto.platform", page: "auto", title: "选择保存平台", path: "自动发帖 › 保存位置 › 目标平台", body: "选择小红书、今日头条或两个平台。上传使用项目专用浏览器的登录状态。" },
+      { id: "auto.submit", anchor: "auto.submit", page: "auto", title: "最后再生成并保存", path: "自动发帖 › 生成并保存草稿", body: "核对配置后再点击。它会调用模型并保存草稿，可能消耗额度，但不等于公开发布。" },
+    ],
+  },
+  {
+    id: "material",
+    label: "材料发帖",
+    icon: "file-text",
+    page: "material",
+    steps: [
+      { id: "material.mode", anchor: "material.mode", page: "material", title: "选择材料数量模式", path: "材料发帖 › 材料类型", body: "单条材料对应一件事；多条材料适合批量成稿并设置生成数量。这一页使用你提供的事实材料。" },
+      { id: "material.input-mode", anchor: "material.input-mode", page: "material", title: "输入文字或上传文件", path: "材料发帖 › 输入文字 / 上传文件", body: "可以直接粘贴，也可以上传界面列出的文字文件。选择文件后先检查读出的正文，避免编码或内容遗漏。" },
+      { id: "material.content", anchor: "material.content", page: "material", title: "提供完整材料", path: "材料发帖 › 新闻材料 › 材料正文", body: "填写完整事件经过和事实，不要只写一句选题。文件模式会把读出的内容放入同一个正文区域。" },
+      { id: "material.time", anchor: "material.time", page: "material", title: "填写材料本身的时间", path: "材料发帖 › 新闻材料 › 材料时间（北京时间）", body: "按北京时间填写这份材料的时间，不是运行软件的时间。材料模式不套用自动抓新闻的回溯筛选，请自行核实日期。" },
+      { id: "material.models", anchor: "material.models", page: "material", title: "选择写稿与配图方式", path: "材料发帖 › 模型与生成", body: "语言模型用于成稿；要AI配图时选择生图模型，也可以选择工作区已有图片并核对图文一致。" },
+      { id: "material.options", anchor: "material.options", page: "material", title: "核对评价、模式和平台", path: "材料发帖 › 评价视角 / 运行模式 / 保存位置", body: "依次确认评价方式、速度策略与目标平台，不会沿用自动发帖页的提示词去重新搜索新闻。" },
+      { id: "material.submit", anchor: "material.submit", page: "material", title: "生成并保存材料草稿", path: "材料发帖 › 生成并保存草稿", body: "确认材料与时间后再提交。成功与否以任务结果和平台读回为准，不以本地文件出现为准。" },
+    ],
+  },
+  { id: "jobs", label: "任务进度", icon: "activity", page: "jobs", steps: [
+    { id: "jobs.list", anchor: "jobs.list", page: "jobs", title: "找到本次任务", path: "任务中心 › 任务列表", body: "按任务名称和时间找到本次操作，不要把上一次成功结果当成本次成功。" },
+    { id: "jobs.stage", anchor: "jobs.stage", page: "jobs", title: "查看当前阶段", path: "任务中心 › 当前阶段与状态", body: "先看当前执行到哪一步。失败时按错误原因处理；显示运行中不代表已经上传成功。" },
+    { id: "jobs.logs", anchor: "jobs.logs", page: "jobs", title: "打开执行日志", path: "任务中心 › 执行日志", body: "在这里查看具体报错、处理数量和验证结果。需要排查时下载本次日志，不要反复提交同一任务。" },
+  ] },
+  { id: "local", label: "本地草稿", icon: "folder", page: "local", steps: [
+    { id: "local.filters", anchor: "local.filters", page: "local", title: "先筛选本地草稿", path: "本地草稿处理 › 搜索 / 状态 / 刷新", body: "这里只显示本机保存的草稿。用标题和状态找稿件，刷新本地列表不会重新读取平台草稿。" },
+    { id: "local.review", anchor: "local.review", page: "local", title: "审查真实草稿", path: "本地草稿处理 › 审查", body: "打开真实草稿后核对标题、正文、图片和来源证据。没有草稿时不会高亮不存在的列表行。" },
+    { id: "local.upload", anchor: "local.upload", page: "local", title: "选择上传目标", path: "本地草稿处理 › 上传目标平台 / 上传", body: "上传的是这一份本地草稿。已上传或已发布的项目可能禁用操作，应先查看状态。" },
+    { id: "local.evidence", anchor: "local.evidence", page: "local", title: "查看来源和执行证据", path: "草稿审查 › 来源与执行证据", body: "切换到证据页检查来源和执行步骤；引导不会替你保存、审核、重试或更新平台草稿。" },
+  ] },
+  { id: "remote", label: "平台草稿", icon: "cloud", page: "remote", steps: [
+    { id: "remote.scan", anchor: "remote.scan", page: "remote", title: "读取平台未发布草稿", path: "平台草稿 › 读取平台未发布草稿", body: "先执行读取，再查看平台当前未发布的草稿；这和刷新本地列表不是一回事。" },
+    { id: "remote.snapshot", anchor: "remote.snapshot", page: "remote", title: "确认扫描时间", path: "平台草稿 › 列表快照", body: "确认这是最近一次读取结果。列表有标题不等于正文和图片已经核验。" },
+    { id: "remote.review", anchor: "remote.review", page: "remote", title: "核对对应草稿", path: "平台草稿 › 审查", body: "打开可关联的真实草稿核对内容和图片。无法关联本地记录的项目不能假定具备更新能力。" },
+    { id: "remote.publish", anchor: "remote.publish", page: "remote", title: "公开发布需要单独确认", path: "平台草稿 › 发布已选", body: "这里是公开发布操作，不是再次保存草稿。引导不会勾选草稿或填写确认发布。" },
+  ] },
+  { id: "metrics", label: "已发布数据", icon: "chart-no-axes-combined", page: "metrics", steps: [
+    { id: "metrics.sync", anchor: "metrics.sync", page: "metrics", title: "全量同步已发布数据", path: "已发布数据 › 全量同步", body: "从创作者中心重新获取已发布帖子数据。需要项目专用浏览器的登录状态。" },
+    { id: "metrics.scope", anchor: "metrics.scope", page: "metrics", title: "先确认完整性和范围", path: "已发布数据 › 时间范围 / 完整性", body: "先确认数据是否完整、统计的是哪段时间。缺失数据不应当被当成零曝光。" },
+    { id: "metrics.table", anchor: "metrics.table", page: "metrics", title: "比较内容表现", path: "已发布数据 › 阅读表现 / 数据表", body: "比较阅读、互动等数据并排序查看，不只看单个爆款；需要时可以导出留档。" },
+    { id: "metrics.analysis", anchor: "metrics.analysis", page: "metrics", title: "生成选题建议", path: "已发布数据 › 选题分析", body: "基于当前同步结果生成建议。历史表现是参考，不代表下一篇一定获得同样表现。" },
+  ] },
+  { id: "models", label: "模型与额度", icon: "layers", page: "models", steps: [
+    { id: "models.quota.sync", anchor: "models.quota.sync", page: "models", title: "按需同步额度", path: "模型与额度 › 同步免费额度", body: "需要刷新时使用这里。刚完成同步可以直接查看时间与结果，引导不会自动再次同步。" },
+    { id: "models.quota.providers", anchor: "models.quota.providers", page: "models", title: "按平台查看", path: "模型与额度 › 额度平台", body: "按平台查看语言和生图模型，不把不同平台的用量或计费方式混在一起。" },
+    { id: "models.quota.filter", anchor: "models.quota.filter", page: "models", title: "搜索和排序模型", path: "模型与额度 › 搜索 / 排序 / 可用", body: "输入完整或部分模型名，再按剩余额度等选项排序。“可用”基于当前返回的可选状态。" },
+    { id: "models.quota.rows", anchor: "models.quota.rows", page: "models", title: "看懂一行额度", path: "模型与额度 › 模型行", body: "看清剩余量、单位、费用类型、更新时间和禁用原因。余额或代金券不等于免费额度。" },
+  ] },
+  { id: "sources", label: "信源健康", icon: "rss", page: "sources", steps: [
+    { id: "sources.scope", anchor: "sources.scope", page: "sources", title: "指定检查范围", path: "信源健康 › 检查范围 / 关键词 / 回溯天数", body: "指定每日新闻还是AI讯息的来源，以及本次检索条件。" },
+    { id: "sources.check", anchor: "sources.check", page: "sources", title: "开始检查信源", path: "信源健康 › 检查信源", body: "检查信源会实际请求来源；刷新状态只查看已有结果。引导不会消耗新闻接口次数。" },
+    { id: "sources.results", anchor: "sources.results", page: "sources", title: "从结果定位问题", path: "信源健康 › 状态 / 条数 / 耗时 / 错误", body: "候选不足时先看是否限流、超时或缺日期；有返回数据不代表每条都能成稿。" },
+  ] },
+  { id: "delete", label: "删除平台草稿", icon: "trash-2", page: "delete", steps: [
+    { id: "delete.filters", anchor: "delete.filters", page: "delete", title: "先缩小删除范围", path: "删除平台草稿 › 类型 / 标题 / 数量", body: "这是平台侧删除。检查筛选条件；“0为全部”不是“不删除”。" },
+    { id: "delete.preview", anchor: "delete.preview", page: "delete", title: "先预览命中草稿", path: "删除平台草稿 › 预览平台草稿", body: "预览会列出命中的平台草稿，逐条核对后再决定。过期预览不能直接确认删除。" },
+    { id: "delete.confirm", anchor: "delete.confirm", page: "delete", title: "最后才输入确认文字", path: "删除平台草稿 › 确认删除", body: "确认后会删除平台草稿，但保留本地记录。引导只解释位置，不填写确认文字，也不调用删除接口。" },
+  ] },
+];
+function QuickStart({
+  askOpen,
+  helpOpen,
+  page,
+  onOpen,
+  onClose,
+  onAskChoice,
+  onNavigate,
+}: {
+  askOpen: boolean;
+  helpOpen: boolean;
+  page: Page;
+  onOpen: () => void;
+  onClose: () => void;
+  onAskChoice: (open: boolean) => void;
+  onNavigate: (page: Page) => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [chapterId, setChapterId] = useState("");
+  const [stepIndex, setStepIndex] = useState(0);
+  const [target, setTarget] = useState<DOMRect | null>(null);
+  const chapter = tourChapters.find((item) => item.id === chapterId);
+  const step = chapter?.steps[stepIndex];
+  useEffect(() => {
+    const element = dialog.current;
+    if (!helpOpen || !element) return;
+    if (!element.open) element.showModal();
+    setChapterId("");
+    setStepIndex(0);
+    setTarget(null);
+    return () => {
+      if (element.open) element.close();
+    };
+  }, [helpOpen]);
+  useEffect(() => {
+    if (!helpOpen || !step) return;
+    onNavigate(step.page);
+    setTarget(null);
+    let disposed = false;
+    const locate = () => {
+      const nodes = Array.from(
+        document.querySelectorAll<HTMLElement>(`[data-tour="${step.anchor}"]`),
+      );
+      const element = nodes.find((node) => {
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      });
+      if (!element) {
+        if (!disposed) setTarget(null);
+        return;
+      }
+      element.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
+      requestAnimationFrame(() => {
+        if (!disposed) setTarget(element.getBoundingClientRect());
+      });
+    };
+    const first = window.requestAnimationFrame(locate);
+    const delayed = window.setTimeout(locate, 120);
+    const refresh = () => locate();
+    window.addEventListener("resize", refresh);
+    window.addEventListener("scroll", refresh, true);
+    return () => {
+      disposed = true;
+      window.cancelAnimationFrame(first);
+      window.clearTimeout(delayed);
+      window.removeEventListener("resize", refresh);
+      window.removeEventListener("scroll", refresh, true);
+    };
+  }, [helpOpen, step?.id]);
+  const closeDialog = () => {
+    if (dialog.current?.open) dialog.current.close();
+    onClose();
+  };
+  const startChapter = (id: string) => {
+    setChapterId(id);
+    setStepIndex(0);
+  };
+  const moveStep = (offset: number) => {
+    if (!chapter) return;
+    const next = Math.max(0, Math.min(chapter.steps.length - 1, stepIndex + offset));
+    setStepIndex(next);
+  };
+  const targetStyle = target
+    ? { left: target.left - 6, top: target.top - 6, width: target.width + 12, height: target.height + 12 }
+    : undefined;
+  return (
+    <>
+      {askOpen && (
+        <aside className="quickstart-ask" role="dialog" aria-label="快速上手提示">
+          <div className="quickstart-ask-head">
+            <Sparkles size={18} />
+            <strong>跟着界面操作一遍？</strong>
+          </div>
+          <p>逐步指出在哪里填材料、选模型和检查草稿。</p>
+          <div className="quickstart-ask-actions">
+            <button className="primary" type="button" onClick={() => onAskChoice(true)}>
+              开始引导
+            </button>
+            <button type="button" onClick={() => onAskChoice(false)}>
+              暂时不用
+            </button>
+          </div>
+        </aside>
+      )}
+      <button
+        className="quickstart-fab"
+        type="button"
+        title="快速上手"
+        aria-label="打开快速上手"
+        onClick={onOpen}
+      >
+        <CircleHelp size={19} />
+      </button>
+      {helpOpen && (
+        <dialog
+          className="quickstart-dialog guided-tour-dialog"
+          ref={dialog}
+          aria-labelledby="guided-tour-title"
+          onCancel={(event) => {
+            event.preventDefault();
+            closeDialog();
+          }}
+        >
+          <div className="guided-tour-stage">
+            {chapter && step && target && <div className="tour-spotlight" style={targetStyle} aria-hidden="true" />}
+            <section className={chapter && step ? `tour-coachmark ${target && target.left > window.innerWidth / 2 ? "side-left" : "side-right"}` : "tour-chooser"}>
+              <div className="tour-card-header">
+                <div>
+                  <span className="eyebrow">{chapter ? `${chapter.label} · ${stepIndex + 1} / ${chapter.steps.length}` : "QUICK START"}</span>
+                  <h2 id="guided-tour-title">{chapter ? "跟着界面操作" : "想从哪里开始？"}</h2>
+                </div>
+                <IconButton label="关闭快速上手" onClick={closeDialog}><X size={18} /></IconButton>
+              </div>
+              {!chapter || !step ? (
+                <>
+                  <p className="tour-card-lead">先看当前页面，或从首次准备开始。查看引导不会生成、同步、发布或删除。</p>
+                  <div className="tour-chapter-list">
+                    {tourChapters.map((item) => {
+                      const Icon = item.icon === "settings" ? Settings : item.icon === "sparkles" ? Sparkles : item.icon === "file-text" ? FileText : item.icon === "activity" ? Activity : item.icon === "folder" ? Folder : item.icon === "cloud" ? Cloud : item.icon === "layers" ? Layers : item.icon === "trash-2" ? Trash2 : item.icon === "chart-no-axes-combined" ? BarChart3 : Activity;
+                      return <button type="button" className={item.page === page ? "tour-chapter current" : "tour-chapter"} key={item.id} onClick={() => startChapter(item.id)}><Icon size={17} /><strong>{item.label}</strong>{item.hint && <small>{item.hint}</small>}<ChevronRight size={16} /></button>;
+                    })}
+                  </div>
+                </>
+              ) : (
+                <>
+                  {!target && <p className="tour-unavailable" role="status">正在定位“{step.path}”。如果当前页面正在刷新，请稍后重试或跳过这一步。</p>}
+                  <h3 className="tour-step-title">{step.title}</h3>
+                  <p className="tour-step-path">{step.path}</p>
+                  <p className="tour-step-body">{step.body}</p>
+                  <div className="tour-card-divider" />
+                  <div className="tour-step-actions">
+                    <button type="button" onClick={() => setChapterId("")}><ListChecks size={16} />章节</button>
+                    <button type="button" disabled={stepIndex === 0} onClick={() => moveStep(-1)}><ChevronLeft size={16} />上一步</button>
+                    <button type="button" className="primary" disabled={stepIndex === chapter.steps.length - 1} onClick={() => moveStep(1)}>下一步<ChevronRight size={16} /></button>
+                  </div>
+                  <button type="button" className="tour-finish" onClick={closeDialog}>结束引导并操作</button>
+                </>
+              )}
+            </section>
+          </div>
+        </dialog>
+      )}
+    </>
+  );
+}
 function Field({
   label,
   children,
@@ -157,11 +428,13 @@ function ModelPicker({
   value,
   onChange,
   models,
+  tourAnchor,
 }: {
   kind: string;
   value: string;
   onChange: (id: string) => void;
   models: Model[];
+  tourAnchor?: string;
 }) {
   const [open, setOpen] = useState(false),
     [query, setQuery] = useState(""),
@@ -174,7 +447,7 @@ function ModelPicker({
       m.model.toLowerCase().includes(query.toLowerCase()),
   );
   return (
-    <div className="model-picker">
+    <div className="model-picker" data-tour={tourAnchor}>
       <span className="field-label">
         {kind === "llm" ? "语言模型" : "生图模型"}
       </span>
@@ -256,11 +529,13 @@ function QuotaPanel({
   sync,
   choose,
   wide = false,
+  tourScope = "models",
 }: {
   data: Models;
   sync: () => void;
   choose?: (m: Model) => void;
   wide?: boolean;
+  tourScope?: string;
 }) {
   const [provider, setProvider] = useState(""),
     [q, setQ] = useState(""),
@@ -283,14 +558,14 @@ function QuotaPanel({
           ) || (b.remaining ?? -1) - (a.remaining ?? -1),
     );
   return (
-    <section className={"quota-panel " + (wide ? "wide" : "")}>
-      <div className="section-heading">
+    <section className={"quota-panel " + (wide ? "wide" : "")} data-tour-page={tourScope}>
+      <div className="section-heading" data-tour={`${tourScope}.quota.sync`}>
         <h2>模型与额度</h2>
         <IconButton label="同步免费额度" onClick={sync}>
           <RefreshCw size={17} />
         </IconButton>
       </div>
-      <div className="platform-tabs" role="group" aria-label="额度平台">
+      <div className="platform-tabs" role="group" aria-label="额度平台" data-tour={`${tourScope}.quota.providers`}>
         <button
           className={!provider ? "selected" : ""}
           onClick={() => setProvider("")}
@@ -307,7 +582,7 @@ function QuotaPanel({
           </button>
         ))}
       </div>
-      <div className="search">
+      <div className="search" data-tour={`${tourScope}.quota.filter`}>
         <Search size={16} />
         <input
           aria-label="搜索额度模型"
@@ -334,7 +609,7 @@ function QuotaPanel({
           可用
         </label>
       </div>
-      <div className="quota-rows">
+      <div className="quota-rows" data-tour={`${tourScope}.quota.rows`}>
         {!rows.length && (
           <Empty text={q || usable ? "没有匹配的模型" : "尚未取得额度快照"} />
         )}{" "}
@@ -408,6 +683,7 @@ function Creation({
   sync: () => void;
   onError: (s: string) => void;
 }) {
+  const tourPrefix = material ? "material" : "auto";
   const [title, setTitle] = useState("每日新闻"),
     [prompts, setPrompts] = useState(["国际争议事件", "中国产业与公司政策"]),
     [count, setCount] = useState(10),
@@ -426,9 +702,10 @@ function Creation({
     [fileName, setFileName] = useState(""),
     [materialMode, setMaterialMode] = useState("single"),
     [localImages, setLocalImages] = useState(false),
+    [materialUrl, setMaterialUrl] = useState(""),
     [assetsGlob, setAssetsGlob] = useState("assets/*"),
     [sending, setSending] = useState(false);
-  const isNews = material || title === "每日新闻" || title === "每日假新闻";
+  const isNews = material || title === "每日新闻" || title === "每日我去" || title === "每日假新闻";
   const choose = (m: Model) => (m.kind === "llm" ? setLLM(m.id) : setImg(m.id));
   async function run(e: React.FormEvent) {
     e.preventDefault();
@@ -452,6 +729,7 @@ function Creation({
         material_time: time,
         material_text: inputMode === "file" ? fileText : text,
         material_source: materialMode === "multiple" ? "" : source,
+        material_url: materialMode === "multiple" ? "" : materialUrl,
       });
     } catch (e) {
       onError(String(e));
@@ -477,15 +755,15 @@ function Creation({
     }
   }
   return (
-    <div className="creation-grid">
+    <div className="creation-grid" data-tour-page={tourPrefix}>
       <form className="creation-form" onSubmit={run}>
         {material && <div className="form-grid">
-          <Field label="材料类型"><select value={materialMode} onChange={e=>setMaterialMode(e.target.value)}><option value="single">单条材料</option><option value="multiple">多条材料</option></select></Field>
+          <Field label="材料类型"><select data-tour="material.mode" value={materialMode} onChange={e=>setMaterialMode(e.target.value)}><option value="single">单条材料</option><option value="multiple">多条材料</option></select></Field>
           {materialMode === "multiple" && <Field label="材料生成数量"><input type="number" min={1} max={20} value={count} onChange={e=>setCount(Number(e.target.value))}/></Field>}
         </div>}
         {!material ? (
           <>
-            <div className="segmented" aria-label="内容类型">
+            <div className="segmented" aria-label="内容类型" data-tour="auto.type">
               {boot.capabilities.titles.map((t) => (
                 <button
                   type="button"
@@ -505,7 +783,7 @@ function Creation({
                 </span>
               </div>
               <label className="field-label">提示词</label>
-              <div className="prompt-list">
+              <div className="prompt-list" data-tour="auto.prompts">
                 {prompts.map((p, i) => (
                   <div className="prompt-row" key={i}>
                     <input
@@ -538,7 +816,7 @@ function Creation({
                 添加提示词
               </button>
               {isNews ? (
-                <div className="form-grid">
+                <div className="form-grid" data-tour="auto.range">
                   <Field label="稿件数量">
                     <input
                       type="number"
@@ -568,7 +846,9 @@ function Creation({
                   <span>
                     {title === "每日AI讯息"
                       ? `历史查重 · 同源最多 ${boot.capabilities.source_cap} 条 · 模型发布优先`
-                      : "有效期核查 · 官方证据优先"}
+                      : title === "每日我去"
+                        ? "只选真实反差事件 · 事件级查重 · AI 恶搞插画"
+                        : "有效期核查 · 官方证据优先"}
                   </span>
                 </div>
               )}
@@ -576,7 +856,7 @@ function Creation({
           </>
         ) : (
           <>
-            <div className="segmented">
+            <div className="segmented" data-tour="material.input-mode">
               <button
                 type="button"
                 className={inputMode === "text" ? "selected" : ""}
@@ -592,7 +872,7 @@ function Creation({
                 上传文件
               </button>
             </div>
-            <section>
+            <section data-tour="material.content">
               <h2>新闻材料</h2>
               <Field label="材料标题">
                 <input
@@ -626,14 +906,14 @@ function Creation({
                 />
               </Field>
               <div className="form-grid">
-                <Field label="材料时间（北京时间）">
+                <div data-tour="material.time"><Field label="材料时间（北京时间）">
                   <input
                     required
                     type="datetime-local"
                     value={time}
                     onChange={(e) => setTime(e.target.value)}
                   />
-                </Field>
+                </Field></div>
                 <Field label="来源名称（选填）">
                   <input
                     disabled={materialMode === "multiple"}
@@ -641,29 +921,40 @@ function Creation({
                     onChange={(e) => setSource(e.target.value)}
                   />
                 </Field>
+                <Field label="来源链接（选填）">
+                  <input
+                    disabled={materialMode === "multiple"}
+                    type="url"
+                    placeholder="https://..."
+                    value={materialUrl}
+                    onChange={(e) => setMaterialUrl(e.target.value)}
+                  />
+                </Field>
               </div>
             </section>
           </>
         )}
-        <section>
+        <section data-tour={`${tourPrefix}.models`}>
           <h2>模型与生成</h2>
           <ModelPicker
             kind="llm"
+            tourAnchor={`${tourPrefix}.llm`}
             value={llm}
             onChange={setLLM}
             models={boot.models.rows}
           />
-          {isNews && <label className="check-label"><input type="checkbox" checked={localImages} onChange={e=>setLocalImages(e.target.checked)}/>使用本地图片</label>}
+          {isNews && <label className="check-label" data-tour={`${tourPrefix}.image`}><input type="checkbox" checked={localImages} onChange={e=>setLocalImages(e.target.checked)}/>使用本地图片</label>}
           {isNews && localImages && <Field label="工作区图片路径"><input value={assetsGlob} onChange={e=>setAssetsGlob(e.target.value)}/></Field>}
           {isNews && !localImages && (
             <ModelPicker
               kind="image"
+              tourAnchor={`${tourPrefix}.image`}
               value={img}
               onChange={setImg}
               models={boot.models.rows}
             />
           )}
-          <div className="form-grid">
+          <div className="form-grid" data-tour={`${tourPrefix}.options`}>
             <Field label="评价视角">
               <input value={view} onChange={(e) => setView(e.target.value)} />
             </Field>
@@ -675,7 +966,7 @@ function Creation({
             </Field>
           </div>
         </section>
-        <section>
+        <section data-tour={`${tourPrefix}.platform`}>
           <div className="section-heading">
             <h2>保存位置</h2>
             <span className="subtle">仅保存草稿</span>
@@ -690,7 +981,7 @@ function Creation({
               <option value="both">小红书 + 今日头条</option>
             </select>
           </Field>
-          <div className="submit-row">
+          <div className="submit-row" data-tour={`${tourPrefix}.submit`}>
             <button
               className="primary"
               disabled={sending || boot.jobs.some(active)}
@@ -703,7 +994,7 @@ function Creation({
         </section>
       </form>
       <aside className="resource-column">
-        <QuotaPanel data={boot.models} sync={sync} choose={choose} />
+        <QuotaPanel data={boot.models} sync={sync} choose={choose} tourScope={tourPrefix} />
       </aside>
     </div>
   );
@@ -738,8 +1029,8 @@ function Jobs({
   }, [id]);
   if (!jobs.length) return <Empty text="暂无工作台任务" />;
   return (
-    <div className="jobs-layout">
-      <div className="job-list">
+    <div className="jobs-layout" data-tour-page="jobs">
+      <div className="job-list" data-tour="jobs.list">
         {jobs.map((j) => (
           <button
             key={j.id}
@@ -753,7 +1044,7 @@ function Jobs({
         ))}
       </div>
       {detail && (
-        <section className="job-detail">
+        <section className="job-detail" data-tour="jobs.stage">
           <div className="section-heading">
             <h2>{detail.title}</h2>
             <Status value={detail.status} />
@@ -822,7 +1113,7 @@ function Jobs({
               </button>
             )}
           </div>
-          <pre className="logs" aria-label="执行日志">
+          <pre className="logs" aria-label="执行日志" data-tour="jobs.logs">
             {detail.events
               ?.map((e) => `${dateLabel(e.at)}  ${e.message}`)
               .join("\n") || "等待日志"}
@@ -919,7 +1210,7 @@ function DraftDrawer({
       .catch((e) => onError(String(e)));
   }, [id]);
   return (
-    <dialog className="draft-dialog" ref={dialog} onCancel={close}>
+    <dialog className="draft-dialog" ref={dialog} onCancel={close} data-tour-page="local">
       <div className="drawer-header">
         <h2>草稿审查</h2>
         <IconButton label="关闭草稿" onClick={close}>
@@ -933,7 +1224,7 @@ function DraftDrawer({
             <Status value={post.readback} />
             <span>{post.assets.length} 张图片</span>
           </div>
-          <div className="segmented">
+          <div className="segmented" data-tour="local.evidence">
             {[
               ["body", "正文"],
               ["images", "图片"],
@@ -1073,10 +1364,10 @@ function Drafts({
   );
   useEffect(() => setPageIndex(0), [query, status, rows]);
   return (
-    <>
-      <div className="toolbar">
+    <div className="draft-workbench" data-tour-page={remote ? "remote" : "local"}>
+      <div className="toolbar" data-tour={remote ? "remote.publish" : "local.filters"}>
         {!remote && <select aria-label="上传目标平台" value={destination} onChange={e=>setDestination(e.target.value)}><option value="xhs">小红书</option><option value="toutiao">今日头条</option><option value="both">两个平台</option></select>}
-        {remote && <button disabled={!selected.length} onClick={()=>{const confirmation=prompt(`将公开发布已选择的 ${selected.length} 条草稿，请输入确认发布`);if(confirmation === "确认发布")submit({kind:"publish-batch",post_ids:selected,confirmation}).catch(e=>onError(String(e)));}}><Upload size={16}/>发布已选（{selected.length}）</button>}
+        {remote && <button data-tour="remote.publish" disabled={!selected.length} onClick={()=>{const confirmation=prompt(`将公开发布已选择的 ${selected.length} 条草稿，请输入确认发布`);if(confirmation === "确认发布")submit({kind:"publish-batch",post_ids:selected,confirmation}).catch(e=>onError(String(e)));}}><Upload size={16}/>发布已选（{selected.length}）</button>}
         <div className="search">
           <Search size={16} />
           <input
@@ -1098,7 +1389,7 @@ function Drafts({
             <option value="failed">失败</option>
           </select>
         )}
-        <button
+        <button data-tour={remote ? "remote.scan" : "local.filters"}
           onClick={() =>
             remote
               ? submit({ kind: "scan-drafts" }).catch((e) => onError(String(e)))
@@ -1115,12 +1406,12 @@ function Drafts({
         )}
       </div>
       {remote && (
-        <div className="policy-strip">
+        <div className="policy-strip" data-tour="remote.snapshot">
           <Cloud size={17} />
           小红书 · 列表快照：{dateLabel(at)} · 列表存在不代表正文已验证
         </div>
       )}
-      <div className="table-wrap">
+      <div className="table-wrap" data-tour={remote ? "remote.review" : "local.review"}>
         <table>
           <thead>
             <tr>
@@ -1154,6 +1445,7 @@ function Drafts({
                   </td>
                   <td>
                     <div className="row-actions">
+                      <span data-tour={remote ? "remote.review" : "local.review"}>
                       <IconButton
                         label={"审查 " + r.title}
                         disabled={!r.post_id}
@@ -1161,8 +1453,9 @@ function Drafts({
                       >
                         <Eye size={17} />
                       </IconButton>
+                      </span>
                       {remote ? (
-                        <IconButton
+                        <span data-tour="remote.publish"><IconButton
                           label={"发布 " + r.title}
                           disabled={!r.post_id}
                           onClick={() => {
@@ -1178,9 +1471,9 @@ function Drafts({
                           }}
                         >
                           <Upload size={17} />
-                        </IconButton>
+                        </IconButton></span>
                       ) : (
-                        <IconButton
+                        <span data-tour="local.upload"><IconButton
                           label={"上传 " + r.title}
                           disabled={r.uploaded || r.status === "published"}
                           onClick={() =>
@@ -1190,7 +1483,7 @@ function Drafts({
                           }
                         >
                           <Upload size={17} />
-                        </IconButton>
+                        </IconButton></span>
                       )}
                     </div>
                   </td>
@@ -1222,7 +1515,7 @@ function Drafts({
           </button>
         </div>
       )}
-    </>
+    </div>
   );
 }
 function Metrics({
@@ -1259,9 +1552,10 @@ function Metrics({
   const total = (key: string) => rows.reduce((n, r) => n + (r[key] ?? 0), 0);
   return (
     <>
-      <div className="toolbar">
+      <div className="toolbar" data-tour-page="metrics">
         <button
           className="primary"
+          data-tour="metrics.sync"
           onClick={() =>
             submit({ kind: "update-metrics" }).catch((e) => onError(String(e)))
           }
@@ -1294,7 +1588,7 @@ function Metrics({
           <option value={30}>近30天</option>
         </select>
       </div>
-      <div className="policy-strip">
+      <div className="policy-strip" data-tour="metrics.scope">
         <AlertTriangle size={17} />
         完整性{data.complete === true ? "已确认" : "待核对"} · 最近快照{" "}
         {dateLabel(data.captured_at)}
@@ -1312,7 +1606,7 @@ function Metrics({
           </div>
         ))}
       </div>
-      <section className="chart-section">
+      <section className="chart-section" data-tour="metrics.table">
         <h2>阅读表现</h2>
         {rows.slice(0, 5).map((r, i) => (
           <div className="chart-row" key={i}>
@@ -1352,7 +1646,7 @@ function Metrics({
           ))}
         </select>
       </div>
-      <div className="table-wrap">
+      <div className="table-wrap" data-tour="metrics.table">
         <table>
           <thead>
             <tr>
@@ -1427,8 +1721,8 @@ function SettingsPage({
     [platform, setPlatform] = useState(boot.settings.platform),
     [saved, setSaved] = useState("");
   return (
-    <div className="settings-page">
-      <section>
+    <div className="settings-page" data-tour-page="settings">
+      <section data-tour="settings.profile">
         <h2>专用浏览器</h2>
         <div className="setting-row">
           <div>
@@ -1437,7 +1731,7 @@ function SettingsPage({
               {boot.profile} · 登录状态：{boot.login_status}
             </small>
           </div>
-          <button
+          <button data-tour="settings.login"
             onClick={() =>
               submit({ kind: "login" }).catch((e) => onError(String(e)))
             }
@@ -1456,7 +1750,7 @@ function SettingsPage({
           </div>
         ))}
       </section>
-      <section>
+      <section data-tour="settings.defaults">
         <h2>运行默认值</h2>
         <div className="form-grid">
           <Field label="运行模式">
@@ -1510,6 +1804,8 @@ function App() {
     [quotaProvider, setQuotaProvider] = useState("all"),
     [quotaModels, setQuotaModels] = useState(""),
     [visibleOnly, setVisibleOnly] = useState(false),
+    [helpOpen, setHelpOpen] = useState(false),
+    [askOpen, setAskOpen] = useState(false),
     [connected, setConnected] = useState(false);
   const busy = useRef(false);
   const previousJobs = useRef<Job[]>([]);
@@ -1547,6 +1843,30 @@ function App() {
     );
     return () => clearInterval(id);
   }, []);
+  useEffect(() => {
+    try {
+      setAskOpen(window.localStorage.getItem(QUICKSTART_SEEN_KEY) !== "1");
+    } catch {
+      setAskOpen(false);
+    }
+  }, []);
+  function markQuickStartSeen() {
+    try {
+      window.localStorage.setItem(QUICKSTART_SEEN_KEY, "1");
+    } catch {
+      // Private browsing or a blocked storage backend should not block the guide.
+    }
+  }
+  function openQuickStart() {
+    markQuickStartSeen();
+    setAskOpen(false);
+    setHelpOpen(true);
+  }
+  function chooseQuickStart(open: boolean) {
+    markQuickStartSeen();
+    setAskOpen(false);
+    if (open) setHelpOpen(true);
+  }
   async function submit(request: Request) {
     if (busy.current) throw Error("任务正在提交");
     busy.current = true;
@@ -1754,6 +2074,18 @@ function App() {
           )}
         </main>
       </div>
+      <QuickStart
+        askOpen={askOpen}
+        helpOpen={helpOpen}
+        page={page}
+        onOpen={openQuickStart}
+        onClose={() => setHelpOpen(false)}
+        onAskChoice={chooseQuickStart}
+        onNavigate={(nextPage) => {
+          setPage(nextPage);
+          setMenu(false);
+        }}
+      />
       {post && (
         <DraftDrawer
           id={post}

@@ -703,6 +703,7 @@ def fetch_and_download_related_images(
     exclude_ids: Optional[set[str]] = None,
     max_candidates: Optional[int] = None,
     timeout_s: Optional[float] = None,
+    prompt_override: Optional[str] = None,
 ) -> tuple[list[Path], list[dict[str, Any]]]:
     """
     Search related images and download them into `dest_dir`.
@@ -713,6 +714,25 @@ def fetch_and_download_related_images(
     """
     provider_env = (provider or os.getenv("IMAGE_PROVIDER") or "").strip().lower()
     provider_name = provider_env or DEFAULT_PROVIDER
+
+    # A column that requires its own illustration style passes a complete prompt.
+    # It is never truncated: an overlong prompt fails so the caller can shorten
+    # the scene instead of silently dropping style or safety constraints.
+    prompt_override_text = (prompt_override or "").strip()
+    if prompt_override_text:
+        override_limit = int(os.getenv("IMAGE_PROMPT_OVERRIDE_MAX_CHARS") or "1200")
+        if len(prompt_override_text) > override_limit:
+            raise ValueError(
+                f"image prompt override exceeds {override_limit} characters "
+                f"({len(prompt_override_text)}); shorten the scene instead of truncating"
+            )
+
+    def _resolve_image_prompt() -> str:
+        if prompt_override_text:
+            return prompt_override_text
+        return _build_aliyun_image_prompt(
+            title=title, body=body, topics=topics, prompt_hint=prompt_hint
+        )
 
     timeout_s = float(os.getenv("IMAGE_TIMEOUT_S") or (timeout_s or DEFAULT_TIMEOUT_S))
     max_candidates = int(os.getenv("IMAGE_MAX_CANDIDATES") or (max_candidates or DEFAULT_MAX_CANDIDATES))
@@ -750,9 +770,7 @@ def fetch_and_download_related_images(
         if max_attempts <= 0:
             max_attempts = 1
 
-        prompt = _build_aliyun_image_prompt(
-            title=title, body=body, topics=topics, prompt_hint=prompt_hint
-        )
+        prompt = _resolve_image_prompt()
 
         # Best-effort derive post_id from dest_dir.
         post_id = dest_dir.parent.name if dest_dir.name == "assets" else dest_dir.name
@@ -821,9 +839,7 @@ def fetch_and_download_related_images(
         if max_attempts <= 0:
             max_attempts = 1
 
-        prompt = _build_aliyun_image_prompt(
-            title=title, body=body, topics=topics, prompt_hint=prompt_hint
-        )
+        prompt = _resolve_image_prompt()
         post_id = dest_dir.parent.name if dest_dir.name == "assets" else dest_dir.name
 
         paths: list[Path] = []
@@ -890,9 +906,7 @@ def fetch_and_download_related_images(
         if max_attempts <= 0:
             max_attempts = 1
 
-        prompt = _build_aliyun_image_prompt(
-            title=title, body=body, topics=topics, prompt_hint=prompt_hint
-        )
+        prompt = _resolve_image_prompt()
         post_id = dest_dir.parent.name if dest_dir.name == "assets" else dest_dir.name
 
         paths: list[Path] = []
@@ -945,9 +959,7 @@ def fetch_and_download_related_images(
         minimax_download_timeout_s = float(os.getenv("MINIMAX_IMAGE_DOWNLOAD_TIMEOUT_S") or 60.0)
         max_attempts = max(1, int(os.getenv("MINIMAX_IMAGE_MAX_ATTEMPTS") or 1))
         retry_sleep_s = float(os.getenv("MINIMAX_IMAGE_RETRY_SLEEP_S") or 2.0)
-        prompt = _build_aliyun_image_prompt(
-            title=title, body=body, topics=topics, prompt_hint=prompt_hint
-        )
+        prompt = _resolve_image_prompt()
         if len(prompt) > 1500:
             raise ValueError(
                 "MiniMax image prompt exceeds 1500 characters after grounding; "

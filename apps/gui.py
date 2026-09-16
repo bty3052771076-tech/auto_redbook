@@ -80,6 +80,7 @@ ENV_GUI_PATH = PROJECT_ROOT / ".env.gui"
 
 # --- GUI defaults (safe; no secrets) ---
 DEFAULT_TITLE = "每日新闻"
+DAILY_WOW_TITLE = "每日我去"
 DEFAULT_ASSETS_GLOB = "assets/pics/*"
 AUTO_IMAGE_ASSETS_GLOB = "assets/empty/*"
 DEFAULT_LOGIN_HOLD = 600
@@ -1789,7 +1790,9 @@ def build_cli_args(subcommand: str, *, params: dict[str, object]) -> list[str]:
             keywords = ""
             lookback_days = ""
             count = 1
-        if title == "每日新闻" and not (single_news_material_file or news_materials_file):
+        if (title or "").strip() in {DEFAULT_TITLE, DAILY_WOW_TITLE} and not (
+            single_news_material_file or news_materials_file
+        ):
             from src.workflow.news_discovery import resolve_news_windows
             raw_days = params.get("lookback_days")
             raw_days = "auto" if params.get("lookback_mode") == "auto" else raw_days
@@ -2258,7 +2261,9 @@ def ensure_daily_news_candidate_pool_env(
         count_int = int(count or 1)
     except (TypeError, ValueError):
         count_int = 1
-    if (title or "").strip() != DEFAULT_TITLE or count_int <= 1:
+    # The column shares the news candidate-pool sizing, so it must scale the raw
+    # fetch target the same way ordinary daily news does.
+    if (title or "").strip() not in {DEFAULT_TITLE, DAILY_WOW_TITLE} or count_int <= 1:
         return env
 
     env["NEWS_MAX_RECORDS"] = str(max(1, count_int) * 20)
@@ -3347,6 +3352,9 @@ def main() -> None:
     quick_titles = ttk.Frame(auto_grid)
     quick_titles.grid(row=1, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=(0, 5))
     ttk.Button(quick_titles, text="每日新闻", command=lambda: title_var.set("每日新闻")).pack(side="left")
+    ttk.Button(quick_titles, text="每日我去", command=lambda: title_var.set(DAILY_WOW_TITLE)).pack(
+        side="left", padx=(8, 0)
+    )
     ttk.Button(quick_titles, text="每日AI讯息", command=lambda: title_var.set("每日AI讯息")).pack(
         side="left", padx=(8, 0)
     )
@@ -3384,7 +3392,7 @@ def main() -> None:
         )
     ttk.Label(
         prompt_panel,
-        text="每个框填写一个检索关键词；每日新闻只筛选北京时间今天和昨天，再按相关度、热度与同事件去重合并。",
+        text="每个框填写一个检索关键词；每日新闻与每日我去按北京时间 1/2/3/5 天逐级筛选，再按相关度、热度与同事件去重合并。",
         style="Muted.TLabel",
         wraplength=760,
     ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -3416,7 +3424,7 @@ def main() -> None:
     lookback_label.pack(side="left", padx=(10, 0))
 
     def _refresh_lookback_controls(*_args):
-        daily_news = title_var.get().strip() == "每日新闻"
+        daily_news = title_var.get().strip() in {DEFAULT_TITLE, DAILY_WOW_TITLE}
         automatic = lookback_mode_var.get() == "auto"
         lookback_input.configure(state="disabled" if automatic else "normal", to=5 if daily_news else 14)
         lookback_label.configure(text=("1 / 2 / 3 / 5 天" if automatic else "天，范围 1 至 5")

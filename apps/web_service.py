@@ -278,7 +278,7 @@ class Workbench:
 
     def bootstrap(self) -> dict:
         env = gui.load_env_file(self.root / ".env.gui")
-        return {"capabilities": {"titles": ["每日新闻", "每日AI讯息", "每日羊毛", "每日假新闻"], "news_windows": [1, 2, 3, 5],
+        return {"capabilities": {"titles": ["每日新闻", "每日我去", "每日AI讯息", "每日羊毛", "每日假新闻"], "news_windows": [1, 2, 3, 5],
                  "max_count": 20, "source_cap": 2, "platforms": ["xhs", "toutiao", "both"], "readback_platform": "xhs"},
                 "settings": self.settings(), "models": self.models(), "jobs": self.list_jobs(),
                 "accounts": [{"provider": p, "label": label, "configured": any(v for k, v in env.items() if k.startswith(p.upper()) and ("KEY" in k or "TOKEN" in k))} for p, label in PROVIDERS.items()],
@@ -295,7 +295,7 @@ class Workbench:
         args = [sys.executable, "-u", "-m", "apps.cli"]
         if kind in {"auto", "material"}:
             title = "每日新闻" if kind == "material" else request.get("title", "每日新闻")
-            if title not in {"每日新闻", "每日AI讯息", "每日羊毛", "每日假新闻"}:
+            if title not in {"每日新闻", "每日我去", "每日AI讯息", "每日羊毛", "每日假新闻"}:
                 raise ValueError("内容类型无效")
             count = int(request.get("count", 1))
             if not 1 <= count <= 20:
@@ -337,7 +337,9 @@ class Workbench:
                 material_mode = request.get("material_mode", "single")
                 snapshot = prepare_material_text_snapshot(str(request.get("material_text", "")), mode=material_mode, requested_count=count,
                     default_material_time=material_time, title_override=str(request.get("material_title", "")),
-                    source_override=str(request.get("material_source", "")), output_dir=self.directory / "materials" / job_id)
+                    source_override=str(request.get("material_source", "")),
+                    url_override=str(request.get("material_url", "")),
+                    output_dir=self.directory / "materials" / job_id)
                 params.update(material_time=material_time, count=1 if material_mode == "single" else count)
                 params["single_news_material_file" if material_mode == "single" else "news_materials_file"] = str(snapshot.path)
             args = gui.build_cli_args("auto", params=params) + ["--no-refresh-quotas"]

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import urllib.parse
+import os
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -22,6 +23,38 @@ _TRADITIONAL_MARKERS = set(
     "臺灣發佈資訊號網絡軟體數據國際業產經濟場開啟關閉與為後這"
     "應該將會進實現選擇條聞內評價連結點擊瀏覽"
 )
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _created_on_beijing_today(post: Post) -> bool:
+    today = datetime.now(timezone.utc).astimezone(_BEIJING_TZ).strftime("%Y-%m-%d")
+    # Deliberately exclude ``updated_at``: re-saving an older digest today
+    # must not make it look like a same-day regeneration.
+    for raw in (post.created_at, post.uploaded_at):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if parsed.astimezone(_BEIJING_TZ).strftime("%Y-%m-%d") == today:
+            return True
+    return False
+
+
+def _same_day_digest_regeneration() -> bool:
+    """Whether an explicit same-day AI digest regeneration was requested."""
+
+    return (os.getenv("AI_DIGEST_HISTORY_SKIP_TODAY") or "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 @dataclass(frozen=True)
@@ -424,6 +457,14 @@ def validate_post_batch(
         if post.id not in {item.id for item in items}
         and (post.uploaded or post.status in {PostStatus.saved_draft, PostStatus.published})
     ]
+    if _same_day_digest_regeneration():
+        # An explicit same-day regeneration replaces today's digest. Older
+        # digests and non-digest history still dedupe normally.
+        historical = [
+            post
+            for post in historical
+            if not (_ai_digest_metadata(post) and _created_on_beijing_today(post))
+        ]
     for post in items:
         for previous in historical:
             if _same_event(post, previous):

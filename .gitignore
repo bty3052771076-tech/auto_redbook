@@ -18,7 +18,8 @@ exports/
 .agents/
 AGENT.md
 CODING_PROGRESS.md
-.tmp_*/
+.tmp*/
+.tmp*
 *.log
 *.trace
 
@@ -85,6 +86,7 @@ Thumbs.db
 # Debug artifacts
 tmp_*.png
 output/
+.playwright-cli/
 scripts/debug_*.py
 
 # PyInstaller
