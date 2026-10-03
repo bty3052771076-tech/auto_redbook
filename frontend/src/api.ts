@@ -1,6 +1,7 @@
 export type Model = {
   id: string;
   provider: string;
+  provider_name?: string;
   model: string;
   kind: string;
   remaining: number | null;
@@ -18,6 +19,24 @@ export type Model = {
 export type Models = {
   rows: Model[];
   snapshots: { provider: string; at: number; name: string; errors: string[] }[];
+  provider_labels?: Record<string, string>;
+};
+export type ProviderConnection = {
+  id: string;
+  name: string;
+  label: string;
+  builtin: boolean;
+  protocol: string;
+  base_url?: string;
+  billing: string;
+  configured: boolean;
+  verification_status: string;
+  models: { id: string; name: string; kind: string }[];
+};
+export type ProviderCatalog = {
+  connections: ProviderConnection[];
+  bindings: { agent: string; writer: string; image: string };
+  roles: Record<string, string>;
 };
 export type Job = {
   id: string;
@@ -62,6 +81,59 @@ export type Post = {
   steps: { name: string; status: string; detail: string }[];
   platform: Record<string, unknown>;
 };
+export type AgentMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  created_at: number;
+  plan_id?: string;
+};
+export type AgentJobPlan = {
+  id: string;
+  version: number;
+  status: string;
+  executable: boolean;
+  jobs: { kind: string; title: string; count: number; prompt: string }[];
+  plan_kind?: "editorial" | "draft_management";
+  management?: { mode: string; draft_type: string; max_items: number; title_contains?: string; max_age_days?: number };
+  platform: string;
+  delivery: string;
+  model_roles: { agent: string; writer: string; image: string };
+  performance_mode: string;
+  budget_minutes: number;
+  assistant_summary: string;
+};
+export type AgentConversation = {
+  id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  status: string;
+  messages: AgentMessage[];
+  plans: AgentJobPlan[];
+  runs: string[];
+};
+export type AgentContextStatus = {
+  status: string;
+  snapshot_version?: number;
+  through_seq?: number;
+  raw_message_count?: number;
+  active_context_tokens_estimate?: number;
+  context?: { snapshot?: { summary?: string; constraints?: string[]; evidence_refs?: string[] } | null; recent_messages?: AgentMessage[] };
+  reason?: string;
+};
+export type AgentCapabilities = {
+  database: { status: string; documents?: number; index_ready?: boolean; error?: string };
+  mcp: { status: string; tools: { name: string; description: string }[]; error?: string };
+  skills: { status: string; items: { name: string; description: string; version_hash: string }[]; error?: string };
+  compaction: { available: boolean; default_provider: string };
+};
+export type AgentEvent = {
+  id: number;
+  kind: "message" | "job";
+  job_id?: string;
+  message: AgentMessage | { id: number; at: number; message: string };
+};
 export type Bootstrap = {
   capabilities: {
     titles: string[];
@@ -72,6 +144,7 @@ export type Bootstrap = {
   };
   settings: { performance_mode: string; platform: string };
   models: Models;
+  providers: ProviderCatalog;
   jobs: Job[];
   profile: string;
   login_status: string;

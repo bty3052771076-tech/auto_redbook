@@ -52,12 +52,15 @@ from src.images.auto_image import (
     is_auto_image_enabled,
 )
 from src.llm.generate import generate_draft, generate_json
+from src.news.length_policy import (
+    assess_news_length, news_length_instruction, news_length_rewrite_instruction,
+)
 from src.workflow.model_queues import ModelWorkQueues, infer_llm_provider
 from src.workflow.performance import PerformancePolicy
 from src.workflow.content_evidence import BEIJING_TZ, ai_digest_items_in_beijing_window
 from src.workflow.news_discovery import (
     DailyNewsDiscovery, NEWS_LOOKBACK_MAX, feasible_news_batch,
-    news_key, news_domain, resolve_news_windows,
+    news_key, news_domain, news_story_identity_keys, resolve_news_windows, source_domain_cap,
 )
 from src.sources.request_budget import RequestBudget
 from src.news.daily_wow import (
@@ -66,6 +69,7 @@ from src.news.daily_wow import (
     daily_wow_comment_instruction,
     daily_wow_comment_is_valid,
     daily_wow_clean_image_event,
+    daily_wow_display_title,
     daily_wow_fallback_comment,
     daily_wow_image_prompt,
     daily_wow_is_schema_echo,
@@ -93,6 +97,7 @@ from src.news.daily_news import (
     rank_news_candidate_pool,
     read_manual_material_source_info,
     resolve_manual_material_times,
+    daily_news_soft_preferences_enabled,
 )
 from src.storage.files import copy_assets_into_post, list_posts, post_dir, save_post, save_revision
 from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSource, now_iso
@@ -153,6 +158,8 @@ _DAILY_NEWS_INCOMPLETE_CONTENT_PATTERNS = (
 _DAILY_NEWS_VAGUE_CONTENT_MARKERS = (
     "从已公布信息看，本次动态属于",
     "本次动态属于监管框架层面的方向性更新",
+    "摘要未给出",
+    "现有事实以上述摘要为限",
 )
 _DAILY_NEWS_PREFIX_RE = re.compile(r"^(?:每日新闻)(?:[｜|:：\-—–\s]+)?")
 _SOURCE_LOOKUP_MIN_CHARS = 120
@@ -287,6 +294,8 @@ def _emit_daily_news_progress(
 def _daily_news_llm_unavailable_reason(error: object) -> str:
     text = str(error or "").strip()
     lowered = text.lower()
+    if "token plan" in lowered or "用量上限" in text or "套餐用量" in text:
+        return "模型订阅 Token Plan 用量上限已达到，未切换付费模型"
     if (
         "invalidendpointormodel.notfound" in lowered
         or "model or endpoint" in lowered
@@ -304,6 +313,23 @@ def _daily_news_llm_unavailable_reason(error: object) -> str:
     if "403" in lowered or "forbidden" in lowered or "permission" in lowered:
         return "模型没有可用权限"
     return "模型请求失败"
+
+
+def _daily_news_provider_capacity_exhausted(error: object) -> bool:
+    """Identify provider-level capacity failures that make more candidates futile."""
+    text = str(error or "").strip().lower()
+    return any(
+        marker in text
+        for marker in (
+            "token plan",
+            "用量上限",
+            "套餐用量",
+            "quota exhausted",
+            "free quota exhausted",
+            "insufficient balance",
+            "余额不足",
+        )
+    )
 
 
 def _daily_news_content_policy_rejection(error: object) -> bool:
@@ -2281,10 +2307,11 @@ def _repair_daily_news_mismatched_comment(
     picked,
     prompt_norm: str,
     title_hint: str = "",
+    preserve_length: bool = False,
 ) -> str:
     """Replace a final rendered cross-topic comment with a source-grounded one."""
-    fields = _daily_news_body_to_fields(body, picked, prompt_norm, title_hint=title_hint)
-    rendered = _render_daily_news_body_fields(fields)
+    fields = _daily_news_body_to_fields(body, picked, prompt_norm, title_hint=title_hint, preserve_length=preserve_length)
+    rendered = _render_daily_news_body_fields(fields, preserve_length=preserve_length)
     if not _daily_news_body_has_mismatched_comment(rendered):
         return rendered
 
@@ -2301,7 +2328,7 @@ def _repair_daily_news_mismatched_comment(
         fields["评价"] = fallback_comment
     else:
         fields["评价"] = ""
-    return _render_daily_news_body_fields(fields)
+    return _render_daily_news_body_fields(fields, preserve_length=preserve_length)
 
 
 def _daily_news_body_has_bad_language(body: str) -> bool:
@@ -2366,9 +2393,19 @@ def _daily_wow_quality_issue(title: str, body: str, prompt_norm: str = "") -> st
     non-fabricated line.  Tone and humour are deliberately not gated here, so a
     mild profanity or a dry one-liner cannot fail a factually sound draft.
     """
-    shared = _daily_news_quality_issue(title, body, prompt_norm)
+    # The visible column marker is intentional metadata for reviewers.  Strip
+    # only that known prefix before applying the ordinary headline gate so the
+    # marker itself is not mistaken for a generic ``栏目｜标题`` placeholder.
+    review_title = re.sub(r"^每日我去\s*[｜|]\s*", "", str(title or "")).strip()
+    shared = _daily_news_quality_issue(review_title, body, prompt_norm)
     if shared:
         return shared
+    content = _daily_news_body_quality_fields(body).get("内容", "")
+    for chunk in re.findall(r"[\u4e00-\u9fff]{4,}", review_title):
+        bigrams = set(chunk[index:index + 2] for index in range(len(chunk) - 1))
+        required = 1 if len(chunk) <= 6 else (len(bigrams) + 2) // 3
+        if sum(token in content for token in bigrams) < required:
+            return "wow_event_missing_from_body"
     comment = _daily_news_body_quality_fields(body).get("评价", "")
     if not daily_wow_comment_is_valid(comment):
         return "wow_comment_unusable"
@@ -2382,9 +2419,9 @@ def _daily_wow_repair_comment(body: str, picked, prompt_norm: str) -> str:
     if daily_wow_comment_is_valid(comment):
         return body
     fallback = daily_wow_fallback_comment(picked, fields.get("内容", ""))
-    if not daily_wow_comment_is_valid(fallback):
-        fallback = "这事本身就够说明问题了。"
-    return _render_daily_news_body_fields({**fields, "评价": fallback})
+    if daily_wow_comment_is_valid(fallback):
+        return _render_daily_news_body_fields({**fields, "评价": fallback})
+    return body
 
 
 def _daily_wow_topics(topics, prompt_norm: str, context: str) -> list[str]:
@@ -2549,7 +2586,7 @@ def _daily_news_comment_tail_is_incomplete(text: str) -> bool:
     return False
 
 
-def _clean_daily_news_comment_value(value) -> str:
+def _clean_daily_news_comment_value(value, *, preserve_length: bool = False) -> str:
     text = _clean_daily_news_text_value(value)
     if not text:
         return ""
@@ -2558,6 +2595,11 @@ def _clean_daily_news_comment_value(value) -> str:
     text = text.rstrip("，,；;：:、 ")
     if not text:
         return ""
+    if preserve_length:
+        return (
+            text if _daily_news_text_has_sentence_end(text) or _daily_news_comment_tail_is_incomplete(text)
+            else f"{text}。"
+        )
     if _daily_news_text_has_sentence_end(text):
         return text
     last_end = max(text.rfind(mark) for mark in "。！？!?")
@@ -3079,6 +3121,7 @@ def _daily_news_body_to_fields(
     picked,
     prompt_norm: str,
     title_hint: str = "",
+    preserve_length: bool = False,
 ) -> dict[str, str]:
     """
     Normalize daily-news body into stable internal fields.
@@ -3204,8 +3247,11 @@ def _daily_news_body_to_fields(
     source_date = _format_news_seendate(getattr(picked, "seendate", None))
     normalized = {
         "原文标题": final_original_title,
-        "内容": _limit_daily_news_content(str(content or "")),
-        "评价": _clean_daily_news_comment_value(comment),
+        "内容": (
+            _clean_daily_news_text_value(content)
+            if preserve_length else _limit_daily_news_content(str(content or ""))
+        ),
+        "评价": _clean_daily_news_comment_value(comment, preserve_length=preserve_length),
         "日期": source_date if source_date != "未知" else _clean_daily_news_json_value(date),
         "来源": _clean_daily_news_json_value(source) or _daily_news_source_name(picked),
     }
@@ -3217,10 +3263,10 @@ def _daily_news_body_to_json(body: str, picked, prompt_norm: str) -> str:
     return _dump_daily_news_body_json(_daily_news_body_to_fields(body, picked, prompt_norm))
 
 
-def _render_daily_news_body_fields(data: dict[str, str]) -> str:
+def _render_daily_news_body_fields(data: dict[str, str], *, preserve_length: bool = False) -> str:
     normalized = {key: _clean_daily_news_json_value(data.get(key, "")) for key in _NEWS_BODY_JSON_KEYS}
     normalized["内容"] = _clean_daily_news_text_value(data.get("内容", ""))
-    normalized["评价"] = _clean_daily_news_comment_value(data.get("评价", ""))
+    normalized["评价"] = _clean_daily_news_comment_value(data.get("评价", ""), preserve_length=preserve_length)
 
     def render(fields: dict[str, str]) -> str:
         chunks: list[str] = []
@@ -3235,7 +3281,7 @@ def _render_daily_news_body_fields(data: dict[str, str]) -> str:
         return "\n\n".join(chunk for chunk in chunks if chunk).strip()
 
     text = render(normalized)
-    if len(text) <= MAX_IMAGE_BODY:
+    if preserve_length or len(text) <= MAX_IMAGE_BODY:
         return text
 
     for key in ("内容", "评价"):
@@ -3559,6 +3605,11 @@ def _daily_news_candidate_fetch_limit(count: int) -> int:
     return requested * max(1, multiplier)
 
 
+def _daily_news_story_identity(value: Any) -> set[str]:
+    """Return stable URL/title identities for cross-batch story exclusion."""
+    return news_story_identity_keys(value)
+
+
 def _daily_news_raw_candidate_fetch_limit(target_fetch_count: int) -> int:
     raw = (os.getenv("NEWS_UPLOAD_RAW_MAX_RECORDS") or os.getenv("NEWS_RAW_MAX_RECORDS") or "").strip()
     try:
@@ -3574,6 +3625,7 @@ def _daily_news_raw_candidate_fetch_limit(target_fetch_count: int) -> int:
 
 
 _AI_IMAGE_PROVIDER_ALIASES = {
+    "opencodex",
     "aliyun",
     "dashscope",
     "bailian",
@@ -3691,14 +3743,46 @@ def _fetch_daily_news_related_images(
         return paths, metas, fallback_meta
 
 
+def _safe_daily_news_visual_feedback(retry_prompt: str) -> str:
+    """Keep semantic repair hints while dropping unsafe visual prescriptions.
+
+    Vision models sometimes suggest adding flags, badges, logos, or readable
+    labels while explaining why an image failed. Echoing that advice back to
+    the image model reintroduces exactly the artifacts the gate rejects.
+    """
+    text = re.sub(r"\s+", " ", (retry_prompt or "").strip())
+    if not text:
+        return ""
+    clauses = re.split(r"[。；;\n]", text)
+    forbidden = (
+        "文字", "字母", "数字", "logo", "标志", "徽章", "印章", "水印",
+        "旗帜", "国旗", "品牌", "商标", "招牌", "名牌",
+    )
+    kept: list[str] = []
+    for clause in clauses:
+        item = clause.strip(" ：:，,、")
+        if not item or any(word.lower() in item.lower() for word in forbidden):
+            continue
+        kept.append(item)
+        if len("；".join(kept)) >= 100:
+            break
+    return re.sub(r"\s+", " ", "；".join(kept))[:120].strip("； ")
+
+
 def _daily_news_image_repair_hint(retry_prompt: str) -> str:
-    feedback = re.sub(r"\s+", " ", (retry_prompt or "").strip())
+    feedback = _safe_daily_news_visual_feedback(retry_prompt)
     if len(feedback) > 100:
         feedback = f"{feedback[:100].rstrip()}…"
-    prefix = f"VLM 反馈：{feedback}。" if feedback else ""
+    if feedback:
+        prefix = f"VLM 反馈：只根据事件语义纠正上一版构图：{feedback}。"
+    elif (retry_prompt or "").strip():
+        prefix = "VLM 反馈：已过滤不安全的具体视觉处方，只保留事件语义纠偏。"
+    else:
+        prefix = ""
     return (
         f"{prefix}重新构图，只用人物、环境、实体物体和动作表达新闻事件；"
-        "严禁任何品牌名、Logo、屏幕、界面、招牌、海报、文件文字、字母或数字。"
+        "严禁任何品牌名、Logo、徽章、旗帜、屏幕、界面、招牌、海报、文件文字、字母或数字；"
+        "不得采纳视觉模型提出的具体标志、文字或人物肖像建议。"
     ) + (
         " For software news, a text-free abstract performance interface is allowed; "
         "any screen or interface must not contain readable text, branding, logos, letters, or numbers."
@@ -3771,6 +3855,7 @@ def _fetch_daily_news_candidates_for_upload(
     discovery_holder: dict[str, Any] | None = None,
     performance_policy: PerformancePolicy | None = None,
     column: str = "daily_news",
+    exclude_story_keys: set[str] | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
     single_material_path = str(single_news_material_file or "").strip()
     multi_material_path = str(news_materials_file or ("" if single_material_path else os.getenv("NEWS_MATERIALS_FILE")) or "").strip()
@@ -3877,6 +3962,7 @@ def _fetch_daily_news_candidates_for_upload(
             incomplete=_daily_news_context_is_incomplete, progress=progress_callback,
             history_signatures=history_signatures,
             column=column,
+            excluded_story_keys=exclude_story_keys,
         )
         _emit_daily_news_progress(progress_callback, "准备候选池", "in_progress",
                                  requested_count=target_count, raw_target=raw_target,
@@ -4025,6 +4111,22 @@ def _daily_news_prompt(
     """
     Prompt for LLM to write publishable body ONLY (no metadata/requirements echoed).
     """
+    wow_column = column == DAILY_WOW_CONTENT_TYPE
+    content_length = (
+        "材料事实充分时建议220-350字；材料较短时可以少于220字"
+        if wow_column else "按前置篇幅规则组织短消息"
+    )
+    comment_length = "评价限制为1句且不超过60字" if wow_column else "按前置篇幅规则写1个完整句子"
+    length_rules = "" if wow_column else news_length_instruction()
+    body_length = (
+        "长度约束：body 总长度（含换行）务必 <= 900 字符，避免写太长导致发布失败。\n"
+        if wow_column else "内容、评价分别遵守前置篇幅上限；日期、来源另列，不计入两项字数。\n"
+    )
+    output_fields = (
+        "输出为严格 JSON（仅包含 keys: title, body, topics；可选 key: image_event），不要 Markdown/代码块。\n"
+        if wow_column else
+        "输出为严格 JSON，字段为 title, body, topics, image_event, complexity, complexity_reason, complexity_evidence；不要 Markdown/代码块。\n"
+    )
     base = (
         "你正在为小红书图文笔记写《每日新闻》栏目。\n"
         "请依据下面提供的新闻信息，生成一份可直接发布的草稿。\n"
@@ -4035,7 +4137,7 @@ def _daily_news_prompt(
         "本次调用不具备浏览工具，不得声称已经访问链接或用常识补全文。\n"
         "内容不完整时，先查阅原新闻/原文摘录后再写作；如果原文摘录仍不足，不得推测数字、因果、人物关系或后续结果；评价须明确现有事实边界，不要硬凑结论。\n\n"
         f"{_daily_news_professional_reporting_instruction()}\n"
-        "输出为严格 JSON（仅包含 keys: title, body, topics；可选 key: image_event），不要 Markdown/代码块。\n"
+        f"{output_fields}"
         "注意：外层 JSON 的 body 必须是字符串；body 字符串必须是可直接发布的正文，不要把 body 写成 JSON 对象文本。\n\n"
         "可用新闻信息（仅限以下字段，链接仅供参考不要输出）：\n"
         f"- 新闻标题：{picked.title}\n"
@@ -4050,12 +4152,12 @@ def _daily_news_prompt(
         "title：标题必须是12-18字的简体中文总结标题，理想约15字；必须由你基于新闻标题/摘要/原文摘录重新概括，不得直接照抄新闻原始标题；不得机械截断长标题；必须包含具体事件关键词；不要加“每日新闻｜”前缀，不得仅为“每日新闻”，不得出现日文假名；不得以“如/如果/若/一旦”等条件词开头，不能只写半句条件，必须写清新闻动作或结果。\n"
         "body：正文必须通顺，必须严格使用下面 4 个中文字段标签，不得增加字段，不得使用旧标签“原文标题/要点摘要/新闻内容/点评/发布时间”：\n"
         "内容：\n"
-        "<材料事实充分时建议220-350字；材料较短时可以少于220字，但必须完整说明材料支持的核心事件，不得为了凑字补写事实。先用完整导语写清主体、动作和对象，再补材料已有的时间、地点、关键数据、原因或背景、当前结果；不能仅剩评论、背景或尾段，不能要求读者看标题才能理解。按事件因果或时间顺序自然衔接，不堆砌网页导航、栏目名、浏览器升级提示、来源页噪声；不得写站内推荐/相关阅读/下一篇文章标题，例如“权威数读”“新华视点”“记者手记”“特色产业赋能”“中国摩托加速”；不写未经证实的细节，不写“目前可以确认的信息主要来自”等模板句>\n\n"
+        f"<{content_length}，但必须完整说明材料支持的核心事件，不得为了凑字补写事实。先用完整导语写清主体、动作和对象，再补材料已有的时间、地点、关键数据、原因或背景、当前结果；不能仅剩评论、背景或尾段，不能要求读者看标题才能理解。按事件因果或时间顺序自然衔接，不堆砌网页导航、栏目名、浏览器升级提示、来源页噪声；不得写站内推荐/相关阅读/下一篇文章标题，例如“权威数读”“新华视点”“记者手记”“特色产业赋能”“中国摩托加速”；不写未经证实的细节，不写“目前可以确认的信息主要来自”等模板句>\n\n"
         "评价：\n"
-        "<评价限制为1句且不超过60字，放在完整事实叙述之后；只概括该事件最直接的意义、影响或待确认变量，不写个人感受、口号、建议和泛泛而谈；评价不得替代、压缩或重复事实叙述；信息不足时说明判断边界，不得留空；不得套用与新闻主题无关的 AI/版权/经贸/供应链等模板>\n\n"
+        f"<{comment_length}，放在完整事实叙述之后；只概括该事件最直接的意义、影响或待确认变量，不写个人感受、口号、建议和泛泛而谈；评价不得替代、压缩或重复事实叙述；信息不足时说明判断边界，不得留空；不得套用与新闻主题无关的 AI/版权/经贸/供应链等模板>\n\n"
         "日期：YYYY-MM-DD\n\n"
         "来源：来源名称（不要写网址）\n"
-        "长度约束：body 总长度（含换行）务必 <= 900 字符，避免写太长导致发布失败。\n"
+        f"{body_length}"
         f"{_daily_news_evaluation_viewpoint_instruction(evaluation_viewpoint)}"
         "先阅读并基于已给事实/原文摘录再给判断，不得推测，不煽动对立、不使用攻击性语言、不做情绪化带节奏表述。\n"
         "可提示风险与影响，但不得夸大、不得杜撰未提供事实；不得写“这类新闻适合先看事实，再看影响”、"
@@ -4063,6 +4165,7 @@ def _daily_news_prompt(
         "topics（数组，3-8个话题词）：必须包含“每日新闻”。不要把 topics 写进 body。\n"
         "image_event（字符串，可选，20-40字）：仅用于配图的事件描述，只描述发生了什么（主体/动作/对象/场景线索），不含评价；"
         "不要出现“新闻/报道/采访/记者/媒体/来源/链接/时间”等词。不要把 image_event 写进 body。\n"
+        f"{length_rules}"
     )
     if column == DAILY_WOW_CONTENT_TYPE:
         base = base.replace(
@@ -4615,28 +4718,79 @@ def _clamp_daily_news_body(body: str) -> str:
     return f"{main[:room].rstrip()}{tail}".strip()
 
 
-def _finalize_daily_news_body(body: str, picked, prompt_norm: str, title_hint: str = "") -> str:
+def _finalize_daily_news_body(
+    body: str, picked, prompt_norm: str, title_hint: str = "", *, preserve_length: bool = False,
+) -> str:
     raw = body or ""
     if _load_daily_news_body_json(raw):
-        fields = _daily_news_body_to_fields(raw, picked, prompt_norm, title_hint=title_hint)
-        return _render_daily_news_body_fields(fields)
+        fields = _daily_news_body_to_fields(raw, picked, prompt_norm, title_hint=title_hint, preserve_length=preserve_length)
+        return _render_daily_news_body_fields(fields, preserve_length=preserve_length)
     text = _strip_urls(raw)
     if _extract_rendered_daily_news_body_fields(text):
-        fields = _daily_news_body_to_fields(text, picked, prompt_norm, title_hint=title_hint)
-        return _render_daily_news_body_fields(fields)
+        fields = _daily_news_body_to_fields(text, picked, prompt_norm, title_hint=title_hint, preserve_length=preserve_length)
+        return _render_daily_news_body_fields(fields, preserve_length=preserve_length)
     text = _ensure_daily_news_sections(text, prompt_norm)
     text = _ensure_news_publish_date(text, picked.seendate)
     text = _append_news_source_line(text, picked)
-    fields = _daily_news_body_to_fields(text, picked, prompt_norm, title_hint=title_hint)
-    return _render_daily_news_body_fields(fields)
+    fields = _daily_news_body_to_fields(text, picked, prompt_norm, title_hint=title_hint, preserve_length=preserve_length)
+    return _render_daily_news_body_fields(fields, preserve_length=preserve_length)
 
 
-def _source_grounded_single_material_draft(picked, prompt_norm: str) -> dict[str, Any]:
+def _review_daily_news_length(draft: dict[str, Any], picked, *, rewrite_count: int = 0) -> str:
+    fields = _daily_news_body_quality_fields(str(draft.get("body") or ""))
+    comment = _clean_daily_news_comment_value(fields.get("评价", ""), preserve_length=True)
+    review = assess_news_length(fields.get("内容", ""), comment, draft, picked)
+    if not review["issue"] and comment and not _daily_news_text_has_sentence_end(comment):
+        review.update(issue="incomplete_comment", status="needs_resummary")
+    if not review["issue"] and len(re.findall(r"[。！？!?]", comment)) > 1:
+        review.update(issue="comment_multiple_sentences", status="needs_resummary")
+    if not review["issue"] and len(str(draft.get("body") or "")) > MAX_IMAGE_BODY:
+        review.update(issue="body_too_long", status="needs_resummary")
+    review["rewrite_count"] = rewrite_count
+    draft["_length_review"] = review
+    return str(review["issue"])
+
+
+def _resummarize_daily_news_length_once(
+    draft: dict[str, Any], *, cfgs, picked, prompt_norm: str,
+    news_prompt: str, asset_paths: list[str], model_queues=None,
+) -> tuple[dict[str, Any], str]:
+    issue = _review_daily_news_length(draft, picked)
+    if not issue:
+        return draft, ""
+    kwargs = dict(title_hint="每日新闻", prompt_hint=news_prompt + news_length_rewrite_instruction(draft),
+                  asset_paths=asset_paths, preserve_body=True, concise_news=True)
+    rewritten = (
+        model_queues.submit_llm(generate_draft, cfgs, **kwargs).result()
+        if model_queues else generate_draft(cfgs, **kwargs)
+    )
+    if not isinstance(rewritten, dict) or rewritten.get("_fallback_error"):
+        reason = rewritten.get("_fallback_error") if isinstance(rewritten, dict) else "invalid draft"
+        raise RuntimeError(f"daily news resummary failed: {reason}")
+    rewritten["title"] = _normalize_daily_news_title(rewritten.get("title", ""), picked, prompt_norm)
+    rewritten["body"] = _finalize_daily_news_body(
+        rewritten.get("body", ""), picked, prompt_norm,
+        title_hint=rewritten["title"], preserve_length=True,
+    )
+    rewritten["body"] = _repair_daily_news_mismatched_comment(
+        rewritten["body"], picked, prompt_norm, title_hint=rewritten["title"], preserve_length=True,
+    )
+    rewritten["topics"] = _normalize_daily_news_topics(
+        rewritten.get("topics") or [], prompt_norm,
+        context=f"{rewritten['title']} {rewritten['body']}",
+    )
+    rewritten = _simplify_daily_news_draft(rewritten)
+    return rewritten, _review_daily_news_length(rewritten, picked, rewrite_count=1)
+
+
+def _source_grounded_single_material_draft(
+    picked, prompt_norm: str, *, preserve_length: bool = False,
+) -> dict[str, Any]:
     """Rebuild a publishable single-material draft without trusting generic model copy."""
     title = _normalize_daily_news_title(picked.title or picked.description or "", picked, prompt_norm)
     body = _daily_news_offline_body(picked, prompt_norm)
-    body = _finalize_daily_news_body(body, picked, prompt_norm, title_hint=title)
-    body = _repair_daily_news_mismatched_comment(body, picked, prompt_norm, title_hint=title)
+    body = _finalize_daily_news_body(body, picked, prompt_norm, title_hint=title, preserve_length=preserve_length)
+    body = _repair_daily_news_mismatched_comment(body, picked, prompt_norm, title_hint=title, preserve_length=preserve_length)
     topics = _normalize_daily_news_topics(
         ["每日新闻"],
         prompt_norm,
@@ -4764,6 +4918,30 @@ def _candidate_lookback_windows(
         "source": "default",
         "windows": windows,
     }
+
+
+def _ai_digest_lookback_windows(explicit_days: object = None) -> tuple[list[int], dict[str, Any]]:
+    """Resolve the AI digest collection window without admitting old filler.
+
+    The regular helper remains backward-compatible for other editorial
+    workflows.  The agent sets this policy explicitly so an AI digest run
+    fetches only the publishing day and the preceding Beijing calendar day.
+    The final publication gate still performs the independent item-level
+    check.
+    """
+    strict = str(os.getenv("AI_DIGEST_STRICT_RECENT", "0")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if strict:
+        return [2], {
+            "mode": "strict_two_day",
+            "source": "agent_policy",
+            "windows": [2],
+        }
+    return _candidate_lookback_windows(
+        explicit_days,
+        env_names=("AI_DIGEST_LOOKBACK_DAYS", "AI_DIGEST_MAX_AGE_DAYS", "CONTENT_LOOKBACK_DAYS"),
+    )
 
 
 def _daily_news_lookback_window(
@@ -5931,11 +6109,11 @@ def create_daily_ai_digest_posts(
         max_value=20,
     )
     target_count = minimum_count
-    min_official_count = _env_int("AI_DIGEST_MIN_OFFICIAL_ITEMS", 6, min_value=1, max_value=20)
-    lookback_windows, lookback_meta = _candidate_lookback_windows(
-        lookback_days,
-        env_names=("AI_DIGEST_LOOKBACK_DAYS", "AI_DIGEST_MAX_AGE_DAYS", "CONTENT_LOOKBACK_DAYS"),
-    )
+    # Keep the default official-source gate strict, but allow an explicit 0
+    # for controlled runs where the source classifier is known to be stale.
+    # The prompt and date/dedupe gates remain active in that mode.
+    min_official_count = _env_int("AI_DIGEST_MIN_OFFICIAL_ITEMS", 6, min_value=0, max_value=20)
+    lookback_windows, lookback_meta = _ai_digest_lookback_windows(lookback_days)
     min_domestic_model_count = _env_int(
         "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS",
         AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS,
@@ -6954,6 +7132,8 @@ def create_post_with_draft(
                 title_hint=seed_title,
                 prompt_hint=news_prompt,
                 asset_paths=asset_paths,
+                preserve_body=True,
+                concise_news=True,
             )
             if draft.get("_fallback_error"):
                 reason = _daily_news_llm_unavailable_reason(draft.get("_fallback_error"))
@@ -7004,19 +7184,27 @@ def create_post_with_draft(
                 picked,
                 prompt_norm,
                 title_hint=str(draft.get("title") or ""),
+                preserve_length=True,
             )
             draft["body"] = _repair_daily_news_mismatched_comment(
                 draft["body"],
                 picked,
                 prompt_norm,
                 title_hint=str(draft.get("title") or ""),
+                preserve_length=True,
             )
             draft = _simplify_daily_news_draft(draft)
+            draft, length_issue = _resummarize_daily_news_length_once(
+                draft, cfgs=cfgs, picked=picked, prompt_norm=prompt_norm,
+                news_prompt=news_prompt, asset_paths=asset_paths,
+            )
+            platform_meta["news"]["length_review"] = draft["_length_review"]
             quality_issue = _daily_news_quality_issue(
                 draft.get("title", ""),
                 draft.get("body", ""),
                 prompt_norm,
             )
+            quality_issue = quality_issue or length_issue
             if quality_issue:
                 raise RuntimeError(f"daily news quality check failed: {quality_issue}")
             image_event = _normalize_daily_news_image_event(
@@ -7587,6 +7775,8 @@ def _prepare_daily_news_candidate(
             title_hint="每日新闻",
             prompt_hint=news_prompt,
             asset_paths=asset_paths,
+            preserve_body=not wow_column,
+            concise_news=not wow_column,
         ).result()
     except Exception as exc:
         _emit_daily_news_progress(
@@ -7668,6 +7858,10 @@ def _prepare_daily_news_candidate(
         prompt_norm,
         max_len=daily_wow_title_max_len() if wow_column else 18,
     )
+    if wow_column:
+        draft["title"] = daily_wow_display_title(
+            draft.get("title", ""), max_len=daily_wow_title_max_len()
+        )
     topics = draft.get("topics") or []
     if not isinstance(topics, list):
         topics = [str(topics)]
@@ -7682,12 +7876,14 @@ def _prepare_daily_news_candidate(
         picked,
         prompt_norm,
         title_hint=str(draft.get("title") or ""),
+        preserve_length=not wow_column,
     )
     draft["body"] = _repair_daily_news_mismatched_comment(
         draft["body"],
         picked,
         prompt_norm,
         title_hint=str(draft.get("title") or ""),
+        preserve_length=not wow_column,
     )
     if wow_column:
         draft["body"] = _daily_wow_repair_comment(draft["body"], picked, prompt_norm)
@@ -7700,12 +7896,31 @@ def _prepare_daily_news_candidate(
     if quality_issue == "generic_body" and single_material_mode:
         # A user-supplied single material is the source of truth.  If the model
         # turns it into generic copy, rebuild from that material before rejecting it.
-        draft = _source_grounded_single_material_draft(picked, prompt_norm)
+        draft = _source_grounded_single_material_draft(picked, prompt_norm, preserve_length=not wow_column)
         quality_issue = _daily_news_quality_issue(
             draft.get("title", ""),
             draft.get("body", ""),
             prompt_norm,
         )
+    if not wow_column:
+        _emit_daily_news_progress(
+            progress_callback, "篇幅复核", "in_progress",
+            candidate_index=candidate_index,
+        )
+        try:
+            draft, length_issue = _resummarize_daily_news_length_once(
+                draft, cfgs=cfgs, picked=picked, prompt_norm=prompt_norm,
+                news_prompt=news_prompt, asset_paths=asset_paths, model_queues=model_queues,
+            )
+            quality_issue = _daily_news_quality_issue(
+                draft.get("title", ""), draft.get("body", ""), prompt_norm,
+            ) or length_issue
+        except Exception as exc:
+            return _DailyNewsCandidateResult(
+                candidate_index=candidate_index, status="failed", picked=picked,
+                lookup_meta=lookup_meta, focus_meta=focus_meta, draft=draft,
+                dedupe_item=dedupe_item, reason="length_resummary_failed", error=str(exc),
+            )
     if quality_issue:
         _emit_daily_news_progress(
             progress_callback,
@@ -7770,6 +7985,7 @@ def _prepare_daily_news_candidate(
                 "pick_total": target_count,
                 "candidate_index": candidate_index,
                 "image_event": image_event,
+                **({"length_review": draft["_length_review"]} if not wow_column else {}),
             }
         },
     )
@@ -7983,6 +8199,7 @@ def _run_parallel_daily_news_candidates(
     skipped_quality_count = 0
     skipped_quota_count = 0
     llm_unavailable_reasons: list[str] = []
+    provider_capacity_error = ""
     candidate_retry_counts: dict[int, int] = {}
 
     # Enrich once before submitting work. This avoids duplicate source requests
@@ -8197,6 +8414,8 @@ def _run_parallel_daily_news_candidates(
                     ):
                         break
                     if result.status != "success" or result.post is None or result.picked is None:
+                        if _daily_news_provider_capacity_exhausted(result.error):
+                            provider_capacity_error = _daily_news_llm_unavailable_reason(result.error)
                         if _schedule_daily_news_candidate_retry(
                             result,
                             candidate_retry_counts,
@@ -8331,12 +8550,17 @@ def _run_parallel_daily_news_candidates(
                                 reason="combined_editorial_quota_reserved", candidate_index=result.candidate_index)
                             continue
                         # Domain caps are based on the requested batch, never on
-                        # the temporary number of completed results.
-                        from src.news.daily_news import _source_domain_max_ratio
-                        import math
+                        # the temporary number of completed results.  Use the
+                        # same bounded relaxation as candidate discovery when
+                        # only a few publisher domains are reachable.
                         domains = {news_domain(item) for item in picks}
-                        cap = max(1, math.ceil(target_count * _source_domain_max_ratio()))
-                        if len(domains) > 1 and sum(news_domain(item) == news_domain(picked) for item in proposed) > cap:
+                        cap = source_domain_cap(
+                            picks,
+                            target_count,
+                            required=slots_left,
+                            accepted=proposed,
+                        )
+                        if slots_left and len(domains) > 1 and sum(news_domain(item) == news_domain(picked) for item in proposed) > cap:
                             skipped_quota_count += 1
                             _emit_daily_news_progress(progress_callback, "候选配额", "skipped",
                                 reason="source_domain_quota_reserved", candidate_index=result.candidate_index)
@@ -8382,6 +8606,21 @@ def _run_parallel_daily_news_candidates(
                         target=target_count,
                         candidate_index=result.candidate_index,
                     )
+
+                if provider_capacity_error:
+                    pending_indices.clear()
+                    for future in in_flight:
+                        future.cancel()
+                    in_flight.clear()
+                    _emit_daily_news_progress(
+                        progress_callback,
+                        "鐢熸垚鑽夌",
+                        "failed",
+                        completed=len(posts),
+                        target=target_count,
+                        reason="provider_capacity_exhausted",
+                    )
+                    break
 
     if discovery is not None:
         complete = (len(posts) == target_count and accepted_china_count >= required_china_count
@@ -8446,6 +8685,7 @@ def create_daily_news_posts(
     post_quality_callback: DailyNewsPostQualityCallback | None = None,
     performance_mode: str | None = None,
     column: str = "daily_news",
+    exclude_story_keys: set[str] | None = None,
 ) -> list[Post]:
     """
     Special workflow for title="每日新闻".
@@ -8502,16 +8742,29 @@ def create_daily_news_posts(
         discovery_holder=discovery_holder,
         performance_policy=performance_policy,
         column=column_norm,
+        exclude_story_keys=exclude_story_keys,
     )
+    excluded_story_keys = {str(item).strip() for item in (exclude_story_keys or set()) if str(item).strip()}
+    if excluded_story_keys:
+        candidates = [
+            item for item in candidates
+            if not (_daily_news_story_identity(item) & excluded_story_keys)
+        ]
+        if len(candidates) < count:
+            raise RuntimeError(
+                "daily news replenishment material insufficient after story dedupe: "
+                f"需要 {count} 条新事件，当前只有 {len(candidates)} 条未使用事件。"
+            )
     target_count = count
+    soft_preferences = daily_news_soft_preferences_enabled()
     required_china_count = (
         0
-        if single_material_mode or wow_column
+        if single_material_mode or wow_column or soft_preferences
         else _required_china_count_for_daily_news(target_count)
     )
     required_international_conflict_count = (
         0
-        if single_material_mode or wow_column
+        if single_material_mode or wow_column or soft_preferences
         else daily_news_international_conflict_quota(target_count)
     )
     available_conflict_count = sum(
@@ -8602,7 +8855,7 @@ def create_daily_news_posts(
         main_keys = {news_key(item) for item in main}
         picks = main + [item for item in picks if news_key(item) not in main_keys]
 
-    return _run_parallel_daily_news_candidates(
+    generated_posts = _run_parallel_daily_news_candidates(
         picks=picks,
         cfgs=cfgs,
         asset_paths=asset_paths,
@@ -8621,3 +8874,25 @@ def create_daily_news_posts(
         discovery=discovery,
         column=column_norm,
     )
+    # The runner may ask the discovery session for more candidates after a
+    # quality failure. Read the final mutable ``picks`` list after it returns,
+    # so the next visual-replenishment batch excludes every event considered
+    # in this run, including candidates that never became a Post.
+    batch_story_keys: set[str] = set()
+    for item in picks:
+        batch_story_keys.update(news_story_identity_keys(item))
+    if batch_story_keys:
+        encoded_keys = sorted(batch_story_keys)
+        for post in generated_posts:
+            news = post.platform.get("news") if isinstance(post.platform, dict) else None
+            if not isinstance(news, dict):
+                continue
+            existing_keys = news.get("batch_candidate_story_keys")
+            if isinstance(existing_keys, (list, tuple, set)):
+                batch_keys = {*map(str, existing_keys), *encoded_keys}
+            else:
+                batch_keys = set(encoded_keys)
+            news["batch_candidate_story_keys"] = sorted(
+                key for key in batch_keys if key.strip()
+            )
+    return generated_posts

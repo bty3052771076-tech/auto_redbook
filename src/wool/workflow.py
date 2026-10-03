@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import os
 from pathlib import Path
@@ -16,6 +16,7 @@ from src.text_integrity import repair_utf8_as_gbk_mojibake
 from .collect import collect_daily_wool_offers
 from .models import WoolOffer
 from .render import ensure_wool_assets
+from .reference_library import WoolReferenceLibrary, wool_asset_root
 
 
 WoolProgress = Callable[[str, str], None]
@@ -62,11 +63,14 @@ def _claim_details(offer: WoolOffer) -> str:
     return " ".join(unique[:3])[:220] or "以活动页面或客户端显示的领取规则为准。"
 
 
-def _deterministic_copy(offers: list[WoolOffer], *, max_age_days: int) -> tuple[str, str]:
+def _deterministic_copy(
+    offers: list[WoolOffer], *, max_age_days: int, issue_date: date | None = None
+) -> tuple[str, str]:
     if not offers:
+        day = issue_date or datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date()
         return (
-            "每日羊毛|今日暂无可核验福利",
-            f"截至今日，暂未发现生成日前{max_age_days}日内可核验的AI厂商免费额度、领取、试用或重置活动。\n"
+            f"每日羊毛|{day.month}月{day.day}日暂无可核验福利",
+            f"截至北京时间{day.isoformat()}，暂未发现生成日前{max_age_days}日内可核验的AI厂商免费额度、领取、试用或重置活动。\n"
             "本期不编造福利，后续如官方发布新的活动将按来源和发布时间重新核验。",
         )
     lines = ["今日发现以下可核验的AI福利："]
@@ -142,10 +146,17 @@ def create_daily_wool_posts(
     )
     if progress:
         progress("collect", f"success offers={len(offers)}")
-    fallback_title, fallback_body = _deterministic_copy(offers, max_age_days=max_age_days)
+    if isinstance(now, datetime):
+        instant = now if now.tzinfo else now.replace(tzinfo=timezone(timedelta(hours=8)))
+        issue_date = instant.astimezone(timezone(timedelta(hours=8))).date()
+    elif isinstance(now, date):
+        issue_date = now
+    else:
+        issue_date = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date()
+    fallback_title, fallback_body = _deterministic_copy(
+        offers, max_age_days=max_age_days, issue_date=issue_date
+    )
     title, body, generation_mode = _llm_copy(offers, (fallback_title, fallback_body))
-    image_sources = ensure_wool_assets()
-    selected = image_sources["with_wool" if offers else "without_wool"]
     post = Post(
         type="image",
         status=PostStatus.draft,
@@ -158,6 +169,7 @@ def create_daily_wool_posts(
                 "has_wool": bool(offers),
                 "offer_count": len(offers),
                 "max_age_days": max_age_days,
+                "issue_date": issue_date.isoformat(),
                 "generation_mode": generation_mode,
                 "offers": [offer.model_dump() for offer in offers],
                 "collection": collect_meta,
@@ -166,6 +178,22 @@ def create_daily_wool_posts(
             }
         },
     )
+    if (os.getenv("WOOL_IMAGE_MODE") == "reference_edit"
+            or os.getenv("IMAGE_PROVIDER") == "opencodex"
+            or WoolReferenceLibrary(wool_asset_root()).has_approved_references()):
+        from .image_edit import create_wool_image
+        if progress:
+            progress("image", "in_progress provider=opencodex")
+        selected, image_meta = create_wool_image(
+            post_id=post.id, offers=offers, issue_date=issue_date.isoformat()
+        )
+        post.platform["images"] = [image_meta]
+        post.platform["daily_wool"]["asset_variant"] = image_meta["asset_mode"]
+        if progress:
+            progress("image", f"success provider={image_meta['provider']} elapsed={image_meta['elapsed_s']}s")
+    else:
+        image_sources = ensure_wool_assets()
+        selected = image_sources["with_wool" if offers else "without_wool"]
     if copy_assets:
         copied = copy_assets_into_post(post.id, [selected])
         resolved = copied or [selected]

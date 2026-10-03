@@ -113,9 +113,9 @@ def _has_concrete_reset_benefit(text: str) -> bool:
         and any(marker in lowered for marker in ("redeem", "apply", "paid chatgpt", "eligible"))
     )
     chinese_signal = (
-        "银行重置" in lowered
-        and "符合条件" in lowered
-        and any(marker in lowered for marker in ("账户", "自行使用", "到账"))
+        "可留存额度重置" in lowered
+        and "第三方追踪" in lowered
+        and any(marker in lowered for marker in ("账户", "到账"))
     )
     return english_signal or chinese_signal
 

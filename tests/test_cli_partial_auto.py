@@ -11,6 +11,19 @@ from src.storage.models import AssetInfo, Execution, Post
 from src.workflow.create_post import PartialDailyNewsError
 
 
+def test_daily_wow_review_rejects_conflict_source_even_for_existing_post():
+    post = SimpleNamespace(
+        title="每日我去|Tigray alliance",
+        platform={"news": {"picked": {
+            "title": "Rebel offensive against Ethiopian army stokes fears of return to civil war",
+            "url": "https://www.theguardian.com/world/example",
+            "description": "Tigrayan rebels formed a coalition and attacked neighbouring states.",
+        }}},
+    )
+
+    assert cli._daily_wow_source_issues([post])
+
+
 def test_auto_help_uses_keywords_and_keeps_prompt_alias():
     result = CliRunner().invoke(cli.app, ["auto", "--help"])
 

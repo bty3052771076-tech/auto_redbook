@@ -92,6 +92,32 @@ def test_quality_gate_rejects_duplicate_event_across_different_urls(tmp_path):
     assert any(issue.code == "duplicate_event" and issue.post_id == second.id for issue in report.issues)
 
 
+def test_quality_gate_allows_distinct_articles_in_recurring_daily_title_series(tmp_path):
+    image_path = _image(tmp_path / "news.png")
+    current = _news_post(
+        image_path,
+        title="OLED面板亮度认证",
+        source_url="https://www.cnbc.com/2026/09/18/jim-cramer-friday.html",
+    )
+    historical = _news_post(
+        image_path,
+        title="英伟达财报前夕芯片股迎来反弹",
+        source_url="https://www.cnbc.com/2026/08/25/jim-cramer-tuesday.html",
+    )
+    current.platform["news"]["picked"]["title"] = (
+        "Jim Cramer's top 10 things to watch in the stock market Friday"
+    )
+    historical.platform["news"]["picked"]["title"] = (
+        "Jim Cramer's top 10 things to watch in the stock market Tuesday"
+    )
+    historical.status = PostStatus.saved_draft
+    historical.uploaded = True
+
+    report = validate_post_batch([current], expected_count=1, historical_posts=[historical])
+
+    assert report.ok
+
+
 def test_quality_gate_rejects_non_simplified_generated_fields(tmp_path):
     post = _news_post(
         _image(tmp_path / "news.png"),
@@ -205,6 +231,28 @@ def test_batch_gate_rejects_same_daily_wool_offer(tmp_path):
     report = validate_post_batch([current], expected_count=1, historical_posts=[historical])
 
     assert not report.ok
+    assert any(issue.code == "historical_duplicate" for issue in report.issues)
+
+
+def test_batch_gate_allows_new_day_without_wool_but_blocks_same_day(tmp_path):
+    image_path = _image(tmp_path / "wool-empty.png")
+    current = Post(
+        title="每日羊毛|9月24日暂无可核验福利",
+        body="截至2026-09-24，暂无可核验福利。",
+        assets=[AssetInfo(path=str(image_path), kind="image")],
+        platform={"daily_wool": {"has_wool": False, "offers": [], "issue_date": "2026-09-24"}},
+    )
+    yesterday = Post(
+        title="每日羊毛|9月23日暂无可核验福利",
+        status=PostStatus.saved_draft,
+        uploaded=True,
+        platform={"daily_wool": {"has_wool": False, "offers": [], "issue_date": "2026-09-23"}},
+    )
+    today = yesterday.model_copy(deep=True)
+    today.platform["daily_wool"]["issue_date"] = "2026-09-24"
+
+    assert validate_post_batch([current], expected_count=1, historical_posts=[yesterday]).ok
+    report = validate_post_batch([current], expected_count=1, historical_posts=[today])
     assert any(issue.code == "historical_duplicate" for issue in report.issues)
 
 

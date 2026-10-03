@@ -1,6 +1,7 @@
 import json
 import re
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -10,8 +11,12 @@ from src.news.daily_news import NewsItem
 from src.workflow import create_post
 from src.workflow.news_discovery import DailyNewsDiscovery
 
-# 2026-09-15（周三）在栏目的 1/2/3/5 天窗口内，保证日期门禁通过。
-WOW_DATE = "2026-09-15"
+# Keep fixtures inside the 3-day Beijing calendar window even when the suite
+# is run on a later date; production freshness rules remain unchanged.
+WOW_DATE = (
+    datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date()
+    - timedelta(days=1)
+).isoformat()
 
 
 def _wow_item(index: int, *, title: str, description: str, domain: str = "example.com"):
@@ -274,6 +279,7 @@ def test_create_daily_wow_posts_skips_quota_and_uses_wow_prompt(monkeypatch, tmp
     assert post.platform["news"]["content_type"] == "daily_wow"
     assert post.platform["news"]["column"] == "daily_wow"
     assert post.platform["news"]["image_policy"] == "ai_required"
+    assert post.title.startswith("每日我去｜")
     assert "每日我去" in post.topics
     assert "每日我去" in captured["prompt"]
     assert "评价风格" in captured["prompt"]
@@ -336,6 +342,35 @@ def test_wow_body_without_usable_comment_fails_quality_gate():
     )
 
     assert issue == "wow_comment_unusable"
+
+
+def test_wow_title_action_must_appear_in_content():
+    title = "每日我去｜澳总理称OpenAI智能体入侵政府网站"
+    incomplete = _wow_body(
+        "澳大利亚总理阿尔巴尼斯称，他已经就此向OpenAI创始人提出担忧。",
+        "政府网站都成了试验场，这操作真够离谱。",
+    )
+    complete = _wow_body(
+        "澳大利亚总理称OpenAI智能体入侵政府网站，随后向该公司表达担忧。",
+        "政府网站都成了试验场，这操作真够离谱。",
+    )
+
+    assert create_post._daily_wow_quality_issue(title, incomplete) == "wow_event_missing_from_body"
+    assert create_post._daily_wow_quality_issue(title, complete) == ""
+
+
+def test_wow_fallback_never_chops_a_sentence_into_a_comment():
+    item = _wow_item(
+        50,
+        title="阿尔巴尼斯称已向OpenAI提出政府网站安全担忧",
+        description="阿尔巴尼斯称已向OpenAI提出政府网站安全担忧。",
+    )
+    fallback = daily_wow.daily_wow_fallback_comment(item, item.description)
+
+    assert "政府网站安全担忧" in fallback
+    assert "就这结果" not in fallback
+    assert daily_wow.daily_wow_comment_is_valid(fallback)
+    assert not daily_wow.daily_wow_comment_is_valid("这事本身就够说明问题了。")
 
 
 def test_image_event_strips_model_narration_and_json_leak():
@@ -532,6 +567,18 @@ def test_conflict_and_disaster_stories_are_hard_rejected():
     assert meta["hard_reject_count"] == 1
 
 
+def test_civil_war_story_cannot_be_selected_as_daily_wow():
+    conflict = NewsItem(
+        title="Rebel offensive against Ethiopian army stokes fears of return to civil war",
+        url="https://www.theguardian.com/world/example",
+        description="Tigrayan rebels formed a new coalition and attacked neighbouring states.",
+        seendate=WOW_DATE,
+    )
+
+    assert daily_wow.daily_wow_is_hard_reject(conflict)
+    assert daily_wow.daily_wow_candidate_pool([conflict])[0] == []
+
+
 def test_serious_crime_and_casualty_stories_are_hard_rejected():
     sabotage = _wow_item(
         11,
@@ -563,9 +610,8 @@ def test_comment_rejects_english_leak_and_fallback_avoids_it():
     )
     fallback = daily_wow.daily_wow_fallback_comment(english_item, "Rail services were disrupted.")
 
-    assert re.search(r"[\u4e00-\u9fff]", fallback)
-    assert not re.search(r"[A-Za-z]{3,}", fallback)
-    assert daily_wow.daily_wow_comment_is_valid(fallback)
+    assert fallback == ""
+    assert not daily_wow.daily_wow_comment_is_valid(fallback)
 
 
 def test_political_statement_is_hard_rejected_but_absurd_official_case_is_kept():

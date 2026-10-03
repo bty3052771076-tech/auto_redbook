@@ -19,6 +19,7 @@ import certifi
 from .fetchers import (
     _strip_html,
     parse_aihot_daily_html,
+    parse_aihot_v1_items_json,
     parse_benefit_html,
     parse_codex_reset_html,
     parse_github_releases_json,
@@ -397,6 +398,8 @@ def fetch_ai_digest_source(
     text = _http_get_text(source.url, timeout_s=timeout_s)
     if source.parser == "rss":
         items = parse_rss_feed(text, source_name=source.vendor, vendor=source.vendor)
+    elif source.parser == "aihot_v1":
+        items = parse_aihot_v1_items_json(text)
     elif source.parser == "github_releases":
         items = parse_github_releases_json(text, source_name=source.vendor, vendor=source.vendor)
     elif source.parser == "social_html":

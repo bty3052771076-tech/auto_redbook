@@ -449,7 +449,7 @@ def test_daily_news_skips_recent_failed_provider_before_rss_fallback(tmp_path, m
     monkeypatch.setattr(
         daily_news,
         "_load_additional_news_sources_config",
-        lambda: daily_news.AdditionalNewsSourcesConfig(None, None, None, None),
+        lambda: daily_news.AdditionalNewsSourcesConfig(None, None, None, None, None),
     )
     monkeypatch.setattr(
         daily_news,
@@ -820,6 +820,17 @@ def test_create_daily_news_falls_back_when_llm_echoes_prompt(monkeypatch, tmp_pa
     monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
 
     def fake_generate_draft(*_args, **_kwargs):
+        if "上一版完整草稿" in _kwargs.get("prompt_hint", ""):
+            return {
+                "title": "AI写作工具引发行业讨论",
+                "body": _test_daily_news_body(
+                    original_title=picked.title,
+                    content="AI写作工具引发内容行业讨论，多家公司讨论其对内容生产的影响，业内关注工具效率、质量和识别问题。",
+                    comment="讨论体现行业对工具效果的关注，实际影响仍待进一步观察。",
+                    date=_recent_news_date(), source=picked.source,
+                ),
+                "topics": ["每日新闻", "AI"],
+            }
         return {
             "title": "每日新闻｜AI写作工具",
             "body": (
@@ -880,7 +891,10 @@ def test_daily_news_prompt_requires_chinese_translation_no_url_and_target_length
 
     assert "必须全部使用简体中文" in prompt
     assert "英文新闻" in prompt and "翻译" in prompt
-    assert "建议220-350字" in prompt
+    assert "150–220字" in prompt
+    assert "20–40字" in prompt
+    assert "最多300字" in prompt
+    assert "建议220-350字" not in prompt
     assert "150字以内" not in prompt
     for key in ("内容", "评价", "日期", "来源"):
         assert key in prompt
@@ -1346,8 +1360,9 @@ def test_daily_news_prompt_prioritizes_complete_event_summary_over_commentary():
     assert "主体、时间、地点、核心行为、关键数据、原因或背景、当前结果" in prompt
     assert "事实叙述应占正文主要篇幅" in prompt
     assert "评价不得替代、压缩或重复事实叙述" in prompt
-    assert "评价限制为1句且不超过60字" in prompt
-    assert "建议220-350字" in prompt
+    assert "评价目标20–40字" in prompt
+    assert "150–220字" in prompt
+    assert "禁止按字符截断" in prompt
     assert "150字以内" not in prompt
 
 
@@ -2321,6 +2336,17 @@ def test_create_daily_news_single_stores_url_locally_but_not_in_body(monkeypatch
     monkeypatch.setattr(create_post, "fetch_daily_news_candidates", fake_fetch)
 
     def fake_generate_draft(*_args, **_kwargs):
+        if "上一版完整草稿" in _kwargs.get("prompt_hint", ""):
+            return {
+                "title": "AI芯片新品发布",
+                "body": _test_daily_news_body(
+                    original_title=picked.title,
+                    content="AI芯片企业发布新的人工智能加速器，面向推理计算，并介绍性能和能效更新。",
+                    comment="AI芯片更新关系算力供给与应用成本，实际效果仍待产品部署检验。",
+                    date=_recent_news_date(), source="Example News https://example.com/source",
+                ),
+                "topics": ["每日新闻", "AI芯片", "科技"],
+            }
         return {
             "title": "AI芯片新品发布",
             "body": (
@@ -2387,6 +2413,17 @@ def test_create_daily_news_single_outputs_fixed_body_fields(monkeypatch, tmp_pat
     )
 
     def fake_generate_draft(*_args, **_kwargs):
+        if "上一版完整草稿" in _kwargs.get("prompt_hint", ""):
+            return {
+                "title": "AI芯片新品发布",
+                "body": _test_daily_news_body(
+                    original_title=picked.title,
+                    content="AI芯片企业发布新的人工智能加速器，面向推理计算，并介绍性能和能效更新。",
+                    comment="AI芯片更新关系算力供给与应用成本，实际效果仍待产品部署检验。",
+                    date=_recent_news_date(), source="Example News https://example.com/source",
+                ),
+                "topics": ["每日新闻", "AI芯片", "科技"],
+            }
         return {
             "title": "AI芯片新品发布",
             "body": (
@@ -2445,6 +2482,17 @@ def test_create_daily_news_posts_scrubs_url_and_persists_source_url(monkeypatch,
     )
 
     def fake_generate_draft(*_args, **_kwargs):
+        if "上一版完整草稿" in _kwargs.get("prompt_hint", ""):
+            return {
+                "title": "欧盟公布科技合作框架",
+                "body": _test_daily_news_body(
+                    original_title=picked.title,
+                    content="欧盟公布科技合作框架，围绕技术标准、产业投资和供应链对话展开，报道尚未说明具体执行安排。",
+                    comment="框架为科技合作提供讨论方向，实际执行效果仍待后续安排验证。",
+                    date=_recent_news_date(), source="Example Wire https://example.com/eu-tech",
+                ),
+                "topics": ["每日新闻", "科技合作", "国际"],
+            }
         return {
             "title": "欧盟科技合作框架",
             "body": (
@@ -4033,6 +4081,17 @@ def test_create_daily_news_fallback_does_not_publish_prompt_as_topic(monkeypatch
     monkeypatch.setattr(create_post, "_daily_news_context_is_incomplete", lambda _item: False)
 
     def fake_generate_draft(*_args, **_kwargs):
+        if "上一版完整草稿" in _kwargs.get("prompt_hint", ""):
+            return {
+                "title": "人工智能模型访问政策引争议",
+                "body": _test_daily_news_body(
+                    original_title=picked.title,
+                    content="先进人工智能模型访问政策引发行业分歧，报道讨论有关政策及业内争议。",
+                    comment="访问政策引发业内关注，具体分歧和后续安排仍需更多信息确认。",
+                    date=_recent_news_date(), source=picked.source,
+                ),
+                "topics": ["每日新闻", "人工智能"],
+            }
         return {
             "title": "每日新闻",
             "body": "你正在为小红书图文笔记写《每日新闻》栏目。\n请依据下面提供的新闻信息。",
@@ -4079,6 +4138,17 @@ def test_create_daily_news_rejects_prompt_topic_title_and_generic_body(monkeypat
     )
 
     def fake_generate_draft(*_args, **_kwargs):
+        if "上一版完整草稿" in _kwargs.get("prompt_hint", ""):
+            return {
+                "title": "美国审查新防晒成分",
+                "body": _test_daily_news_body(
+                    original_title=picked.title,
+                    content="美国食品药品监督管理局审查防晒成分贝莫曲嗪醇，报道同时介绍其他国家使用较新防晒成分的情况。",
+                    comment="防晒成分审查关系产品选择，是否获批及具体安排仍待确认。",
+                    date=_recent_news_date(), source=picked.source,
+                ),
+                "topics": ["每日新闻", "防晒"],
+            }
         return {
             "title": "科技、社会或国际新闻",
             "body": (
@@ -5571,10 +5641,20 @@ def test_single_news_material_repairs_generic_final_body_from_source(monkeypatch
         "load_llm_configs",
         lambda: [LLMConfig(model="fake", api_key="fake-key", base_url="https://example.com")],
     )
-    monkeypatch.setattr(
-        create_post,
-        "generate_draft",
-        lambda *_args, **_kwargs: {
+    def fake_generate_draft(*_args, **_kwargs):
+        if "上一版完整草稿" in _kwargs.get("prompt_hint", ""):
+            return {
+                "title": "中资石油企业营地遭滋扰",
+                "body": _test_daily_news_body(
+                    original_title="中资石油勘探企业营地遭滋扰",
+                    content="当地不法分子擅闯中资石油勘探企业营地，破坏公司财物并滋扰正常经营。主管部门已拘留滋事人员并立案调查，表示将保障企业和员工安全。",
+                    comment="人员拘留和立案回应了营地安全问题，后续调查结果仍待确认。",
+                    date=_recent_news_date(), source="驻外使馆",
+                ),
+                "topics": ["每日新闻", "中资企业"],
+                "image_event": "中资石油企业营地遭滋扰",
+            }
+        return {
             "title": "中资石油企业营地遭滋扰",
             "body": _test_daily_news_body(
                 original_title="中资石油勘探企业营地遭滋扰",
@@ -5585,8 +5665,8 @@ def test_single_news_material_repairs_generic_final_body_from_source(monkeypatch
             ),
             "topics": ["每日新闻", "中资企业"],
             "image_event": "中资石油企业营地遭滋扰",
-        },
-    )
+        }
+    monkeypatch.setattr(create_post, "generate_draft", fake_generate_draft)
 
     def fake_images(*, dest_dir, **_kwargs):
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -5811,6 +5891,49 @@ def test_fetch_daily_news_candidates_skips_urls_used_by_previous_posts(monkeypat
     assert [item.title for item in candidates] == ["Fresh news"]
     assert meta["history_dedupe"]["enabled"] is True
     assert meta["history_dedupe"]["skipped_count"] == 1
+
+
+def test_fetch_daily_news_candidates_can_use_unified_source_snapshot(monkeypatch):
+    from datetime import datetime, timezone
+    from src.sources.models import SourceArticle, SourceRequest, SourceSnapshot
+    from src.sources.service import UnifiedNewsSourceService
+
+    article = SourceArticle(
+        article_id="a1",
+        title="Unified source event",
+        url="https://publisher.test/event",
+        publisher_id="publisher",
+        publisher_family="publisher",
+        discovery_source_id="wm_bbc_world",
+        discovery_kind="native_rss",
+        network_group="bbc_direct",
+        description="Concrete details",
+        published_at="2026-09-21T02:00:00+00:00",
+    )
+    request = SourceRequest(
+        request_id="req", run_id="run", purpose="daily_news", prompt="technology",
+        as_of=datetime.now(timezone.utc), target_count=1, max_records=1,
+    )
+    snapshot = SourceSnapshot(
+        snapshot_id="snapshot-1", request=request, status="ready", items=(article,),
+        decisions=(), coverage={"source_attempts": []},
+    )
+
+    monkeypatch.setenv("UNIFIED_NEWS_SOURCES", "1")
+    monkeypatch.delenv("NEWS_PROVIDER", raising=False)
+    monkeypatch.setattr(
+        UnifiedNewsSourceService,
+        "from_environment",
+        classmethod(lambda cls: type("FakeService", (), {
+            "search": lambda self, request, **kwargs: snapshot,
+        })()),
+    )
+
+    candidates, meta = daily_news.fetch_daily_news_candidates("technology", max_records=1)
+
+    assert [item.url for item in candidates] == [article.url]
+    assert meta["unified_source_tool"] is True
+    assert meta["source_snapshot_id"] == "snapshot-1"
 
 
 def test_create_daily_news_posts_raises_when_all_news_sources_fail(monkeypatch, tmp_path):
@@ -6240,6 +6363,16 @@ def test_daily_news_quality_rejects_directional_placeholder_content():
     )
 
     assert _daily_news_quality_issue("市场监管总局更新智能驾驶安全监管动态", body, "") == "generic_body"
+
+
+def test_daily_news_quality_rejects_source_limit_placeholder_as_entire_content():
+    body = (
+        "内容：\n摘要未给出各类别进出口拆分与官方回应细节，现有事实以上述摘要为限。\n\n"
+        "评价：\n英国食饮贸易逆差升至210亿英镑，后续政策走向有待确认。\n\n"
+        "日期：2026-09-24\n\n来源：卫报"
+    )
+
+    assert _daily_news_quality_issue("英国食饮贸易逆差创2000年来新高", body, "") == "generic_body"
 
 
 def test_finalize_daily_news_body_replaces_21jingji_sidebar_noise_with_source_lead():

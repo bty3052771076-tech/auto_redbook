@@ -8,6 +8,7 @@ from src.sources.health import (
     SourceHealthSnapshot,
     is_source_in_cooldown,
     load_source_health_snapshot,
+    replacement_probe_due,
     save_source_health_snapshot,
     should_replace_source,
 )
@@ -137,6 +138,22 @@ def test_source_health_replaces_source_when_timeout_ratio_reaches_sixty_percent(
     decision = should_replace_source(attempt, min_samples=5, timeout_ratio=0.6)
 
     assert decision is True
+
+
+def test_source_health_replacement_becomes_half_open_after_probe_interval():
+    checked_at = datetime(2026, 8, 23, tzinfo=timezone.utc)
+    attempt = SourceAttempt(
+        collection="daily_news",
+        source_name="unstable-api",
+        source_url="https://example.com/news",
+        tier="keyed_api",
+        status="timeout",
+        checked_at=checked_at.isoformat(),
+        recent_statuses=("timeout", "timeout", "empty", "success", "error"),
+    )
+
+    assert not replacement_probe_due(attempt, now=checked_at + timedelta(hours=1))
+    assert replacement_probe_due(attempt, now=checked_at + timedelta(hours=6))
 
 
 def test_source_health_does_not_replace_before_minimum_sample_count():

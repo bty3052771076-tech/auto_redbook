@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable, Optional
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from src.network.tls import ensure_ssl_ca_bundle
 from .history import collect_used_news_url_keys, filter_used_news_items, news_history_dedupe_enabled
 from src.sources.health import (
     SourceAttempt,
@@ -26,12 +27,20 @@ from src.sources.health import (
     append_source_status,
     is_source_in_cooldown,
     load_source_health_snapshot,
+    replacement_probe_due,
     save_source_health_snapshot,
     should_replace_source,
 )
+from src.integrations.worldmonitor.client import WorldMonitorClient
+from src.integrations.worldmonitor.runtime import WorldMonitorRuntime
 
 DEFAULT_PROVIDER = "gnews"
 DEFAULT_TZ = "Asia/Shanghai"
+
+# Legacy API adapters in this module use urllib directly.  Configure the
+# process-wide CA fallback once so they work in the same Python environment as
+# the unified source service.
+ensure_ssl_ca_bundle()
 DEFAULT_QUERY = "technology"
 DEFAULT_QUERY_POOL = (
     "technology",
@@ -107,6 +116,7 @@ NEWSAPI_BASE_URL = "https://newsapi.org"
 GNEWS_BASE_URL = "https://gnews.io/api/v4"
 JUHE_NEWS_BASE_URL = "https://v.juhe.cn/toutiao"
 JUHE_FINANCE_NEWS_BASE_URL = "https://apis.juhe.cn/fapigx/caijing"
+TIANAPI_BASE_URL = "https://apis.tianapi.com"
 NEWSDATA_BASE_URL = "https://newsdata.io/api/1/latest"
 ALPHAVANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 THENEWSAPI_BASE_URL = "https://api.thenewsapi.com/v1/news/top"
@@ -204,6 +214,8 @@ def _news_provider_health_url(provider: str) -> str:
         return GNEWS_BASE_URL
     if provider == "juhe":
         return JUHE_NEWS_BASE_URL
+    if provider == "tianapi":
+        return TIANAPI_BASE_URL
     if provider == "newsdata":
         return NEWSDATA_BASE_URL
     if provider == "alphavantage":
@@ -222,6 +234,8 @@ def _news_provider_health_url(provider: str) -> str:
         return "https://www.cbc.ca/webfeed/rss/"
     if provider == "hotnews":
         return _hotnews_base_url()
+    if provider == "worldmonitor":
+        return (os.getenv("WORLDMONITOR_BASE_URL") or "http://127.0.0.1:3000").rstrip("/")
     return ""
 
 
@@ -234,6 +248,7 @@ def _news_provider_health_tier(provider: str) -> str:
         "alphavantage",
         "thenewsapi",
         "finnhub",
+        "tianapi",
     }:
         return "keyed_api"
     if provider in {"google_rss", "google_rss_cn", "bbc_rss", "odd_news_rss"}:
@@ -449,6 +464,7 @@ class AdditionalNewsSourcesConfig:
     alphavantage_api_key: Optional[str]
     thenewsapi_token: Optional[str]
     finnhub_api_key: Optional[str]
+    tianapi_key: Optional[str]
 
 
 def _resolve_tz(tz_name: str):
@@ -749,6 +765,12 @@ def _required_china_count_for_daily_news(count: int) -> int:
     if count > 2:
         return 1
     return 0
+
+
+def daily_news_soft_preferences_enabled() -> bool:
+    """Return whether category mix is advisory instead of a hard gate."""
+    value = (os.getenv("DAILY_NEWS_SELECTION_POLICY") or "").strip().lower()
+    return value in {"soft", "preferred", "agent", "adaptive"}
 
 
 def daily_news_international_conflict_quota(count: int) -> int:
@@ -1362,6 +1384,10 @@ def rank_news_candidate_pool(
         score += _attention_score(item) * 0.2
         if _is_china_item(item):
             score += china_bonus
+        if daily_news_soft_preferences_enabled() and is_international_conflict_news(item):
+            # Advisory preference only. The score must never turn into a
+            # feasibility requirement when the lane is unavailable.
+            score += max(0.0, float(os.getenv("NEWS_CONFLICT_BONUS", "0.25") or 0.25))
         seen_at = _parse_seendate_utc(item.seendate) or datetime.min.replace(
             tzinfo=timezone.utc
         )
@@ -1694,6 +1720,7 @@ def _load_additional_news_sources_config(
             "THENEWS_API_TOKEN",
         ),
         finnhub_api_key=first_value("FINNHUB_API_KEY", "FINNHUB_TOKEN"),
+        tianapi_key=first_value("TIANAPI_KEY", "TIANAPI_API_KEY"),
     )
 
 
@@ -1704,6 +1731,7 @@ def _load_additional_news_source_key(provider: str) -> str:
         "alphavantage": config.alphavantage_api_key,
         "thenewsapi": config.thenewsapi_token,
         "finnhub": config.finnhub_api_key,
+        "tianapi": config.tianapi_key,
     }
     value = values.get(provider)
     if value:
@@ -1713,6 +1741,7 @@ def _load_additional_news_source_key(provider: str) -> str:
         "alphavantage": "ALPHAVANTAGE_API_KEY",
         "thenewsapi": "THENEWSAPI_TOKEN",
         "finnhub": "FINNHUB_API_KEY",
+        "tianapi": "TIANAPI_KEY",
     }.get(provider, "API_KEY")
     raise RuntimeError(
         f"{provider} api_key missing: set {env_name} or docs/news_sources_api-key.md"
@@ -2847,6 +2876,54 @@ def _bbc_rss_fetch_articles(
     return _dedupe_candidates(items)[: max(1, int(max_records))]
 
 
+def _tianapi_fetch_articles(
+    *,
+    api_key: str,
+    channel: str,
+    max_records: int,
+    timeout_s: float,
+) -> list[NewsItem]:
+    """Fetch mainland-direct TianAPI news (guonei/world/social endpoints)."""
+    url = TIANAPI_BASE_URL + "/" + channel + "/index?" + urllib.parse.urlencode(
+        {"key": api_key, "num": str(min(30, max(1, int(max_records))))}
+    )
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (redbook-workflow tianapi)"})
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    if int(payload.get("code", -1)) != 200:
+        raise RuntimeError("TianAPI " + channel + " error: code=" + str(payload.get("code")) + " msg=" + str(payload.get("msg")))
+    newslist = (payload.get("result") or {}).get("newslist") or []
+    items: list[NewsItem] = []
+    for row in newslist:
+        title = str(row.get("title") or "").strip()
+        link = str(row.get("url") or "").strip()
+        if not title or not link:
+            continue
+        ctime = str(row.get("ctime") or "").strip()
+        seen = None
+        if ctime:
+            parsed = None
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    parsed = datetime.strptime(ctime, fmt).replace(tzinfo=timezone(timedelta(hours=8)))
+                    break
+                except ValueError:
+                    continue
+            if parsed is not None:
+                seen = parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        items.append(
+            NewsItem(
+                title=title,
+                url=link,
+                source=str(row.get("source") or "TianAPI").strip() or "TianAPI",
+                description=str(row.get("description") or "") or None,
+                domain=urllib.parse.urlparse(link).netloc.strip().lower() or None,
+                seendate=seen,
+                language="zh",
+                provider="tianapi",
+            )
+        )
+    return _dedupe_candidates(items)[: max(1, int(max_records))]
 def _hotnews_base_url() -> str:
     return (os.getenv("HOTNEWS_BASE_URL") or HOTNEWS_BASE_URL).strip().rstrip("/")
 
@@ -3016,6 +3093,38 @@ def _hotnews_fetch_articles(
     if not items and platform_errors:
         raise RuntimeError("; ".join(platform_errors[-3:]))
     return items
+
+
+def _worldmonitor_fetch_articles(*, base_url: str, max_records: int, timeout_s: float) -> list[NewsItem]:
+    client = WorldMonitorClient(base_url, timeout=timeout_s)
+    auto_start = str(os.getenv("WORLDMONITOR_AUTO_START", "0")).lower() in {"1", "true", "yes", "on"}
+    root = (os.getenv("WORLDMONITOR_DIR") or "").strip()
+    runtime = WorldMonitorRuntime(client, root=Path(root) if root else None, auto_start=auto_start)
+    probe = runtime.ensure_ready()
+    if not probe.ready:
+        raise RuntimeError(str(probe.message or probe.error_code or "World Monitor is not ready"))
+    try:
+        batch = client.fetch_digest()
+        items: list[NewsItem] = []
+        for item in batch.items[: max(1, int(max_records))]:
+            items.append(NewsItem(
+                title=item.title,
+                url=item.url,
+                source=f"worldmonitor:{item.source}",
+                description=item.snippet or None,
+                content=item.snippet or None,
+                domain=urllib.parse.urlparse(item.url).netloc.lower() or None,
+                seendate=item.published_at.isoformat() if item.published_at else None,
+                language="zh",
+                sourcecountry=str(item.raw.get("country") or "") or None,
+                attention=item.importance_score,
+                provider="worldmonitor",
+            ))
+        if batch.coverage.served_stale or batch.coverage.state in {"stale", "unavailable"}:
+            raise RuntimeError(f"World Monitor coverage={batch.coverage.state}; served_stale={batch.coverage.served_stale}")
+        return items
+    finally:
+        runtime.release()
 
 
 def _file_fetch_articles(*, path: str, max_records: int) -> list[NewsItem]:
@@ -3477,6 +3586,27 @@ def _fetch_news_provider(
                 ]
                 candidates = in_range or raw
                 used_time_range = used_time_range or bool(in_range)
+            elif provider == "tianapi":
+                api_key = _load_additional_news_source_key("tianapi")
+                chosen_source_api = {"provider": "tianapi", "base_url": TIANAPI_BASE_URL}
+                channels = ("guonei", "world", "social")
+                raw: list[NewsItem] = []
+                for channel in channels:
+                    try:
+                        raw.extend(_tianapi_fetch_articles(
+                            api_key=api_key,
+                            channel=channel,
+                            max_records=max_records,
+                            timeout_s=provider_timeout_s,
+                        ))
+                    except Exception:
+                        continue
+                raw = _dedupe_candidates(raw)
+                candidates = [
+                    item for item in raw
+                    if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                ] or raw
+                used_time_range = used_time_range or bool(candidates)
             elif provider == "newsdata":
                 api_key = _load_additional_news_source_key("newsdata")
                 chosen_source_api = {"provider": "newsdata", "base_url": NEWSDATA_BASE_URL}
@@ -3589,6 +3719,14 @@ def _fetch_news_provider(
                     max_records=max_records,
                     timeout_s=provider_timeout_s,
                 )
+            elif provider == "worldmonitor":
+                base_url = (os.getenv("WORLDMONITOR_BASE_URL") or "http://127.0.0.1:3000").rstrip("/")
+                chosen_source_api = {"provider": "worldmonitor", "base_url": base_url}
+                candidates = _worldmonitor_fetch_articles(
+                    base_url=base_url,
+                    max_records=max_records,
+                    timeout_s=provider_timeout_s,
+                )
             elif provider == "manual":
                 if not manual_materials_file:
                     raise RuntimeError(
@@ -3657,6 +3795,7 @@ def fetch_daily_news_candidates(
     additional_queries: Iterable[str] | None = None,
     session: NewsFetchSession | None = None,
     preferred_providers: Iterable[str] | None = None,
+    _unified_sources: bool | None = None,
 ) -> tuple[list[NewsItem], dict[str, Any]]:
     """
     Fetch today's news via an external API.
@@ -3726,6 +3865,95 @@ def fetch_daily_news_candidates(
     to_iso = end_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
 
     manual_materials_file = str(materials_file or os.getenv("NEWS_MATERIALS_FILE") or "").strip()
+    unified_setting = str(os.getenv("UNIFIED_NEWS_SOURCES", "0")).strip().lower()
+    use_unified_sources = (
+        _unified_sources
+        if _unified_sources is not None
+        else unified_setting in {"1", "true", "yes", "on"}
+    )
+    if (
+        use_unified_sources
+        and not manual_materials_file
+        and not provider_env
+        and (session is None or session.previous_days == 0)
+    ):
+        # The unified service owns the fan-out between the legacy API adapters,
+        # reviewed World Monitor RSS entries, and the optional digest.  The
+        # legacy callback disables this branch so migration cannot recurse.
+        from src.sources.models import SourceRequest
+        from src.sources.service import UnifiedNewsSourceService, source_snapshot_items
+        from uuid import uuid4
+
+        def _legacy_fetcher(query: str, **kwargs: Any) -> tuple[list[NewsItem], dict[str, Any]]:
+            return fetch_daily_news_candidates(
+                query,
+                tz_name=tz_name,
+                max_records=int(kwargs.get("max_records") or max_records),
+                search_days=int(kwargs.get("search_days") or search_days),
+                timeout_s=float(kwargs.get("timeout_s") or timeout_s),
+                expand_query_variants=expand_query_variants,
+                materials_file=materials_file,
+                source_health_path=source_health_path,
+                source_cooldown_seconds=source_cooldown_seconds,
+                persist_source_health=persist_source_health,
+                exhaustive_sources=bool(kwargs.get("exhaustive_sources", exhaustive_sources)),
+                progress_callback=None,
+                minimum_qualified_records=minimum_qualified_records,
+                qualified_count_callback=qualified_count_callback,
+                additional_queries=additional_queries,
+                preferred_providers=preferred_providers,
+                _unified_sources=False,
+            )
+
+        source_request = SourceRequest(
+            request_id=uuid4().hex,
+            run_id=uuid4().hex,
+            purpose="daily_news",
+            prompt=(prompt_hint or "technology").strip() or "technology",
+            as_of=datetime.now(timezone.utc),
+            timezone_name=tz_name,
+            target_count=max(1, int(minimum_qualified_records or max_records)),
+            search_days=search_days,
+            timeout_s=max(1.0, float(timeout_s)),
+            source_packs=("daily_news", "world", "china", "business", "technology", "conflict", "global_map"),
+            additional_queries=tuple(str(item).strip() for item in (additional_queries or ()) if str(item).strip()),
+            max_records=max_records,
+        )
+        snapshot = UnifiedNewsSourceService.from_environment().search(
+            source_request,
+            legacy_fetcher=_legacy_fetcher,
+            progress_callback=progress_callback,
+        )
+        candidates: list[NewsItem] = []
+        for item in source_snapshot_items(snapshot):
+            url = str(item.get("url") or "").strip()
+            title = str(item.get("title") or "").strip()
+            if not url or not title:
+                continue
+            domain = urllib.parse.urlsplit(url).netloc.lower()
+            candidates.append(NewsItem(
+                title=title,
+                url=url,
+                source=str(item.get("publisher_id") or item.get("discovery_source_id") or "").strip(),
+                description=str(item.get("description") or "").strip(),
+                content=str(item.get("content") or "").strip(),
+                domain=domain,
+                seendate=str(item.get("published_at") or "").strip() or None,
+                language=str(item.get("language") or "").strip() or None,
+                provider=str(item.get("discovery_source_id") or "unified").strip(),
+            ))
+        meta = {
+            "provider_plan": [str(item.get("discovery_source_id") or "") for item in source_snapshot_items(snapshot)],
+            "unified_source_tool": True,
+            "source_snapshot_id": snapshot.snapshot_id,
+            "source_snapshot_status": snapshot.status,
+            "source_snapshot": snapshot.to_dict(),
+            "provider_attempts": snapshot.coverage.get("source_attempts", []),
+            "warnings": list(snapshot.warnings),
+            "queries_used": [source_request.prompt, *source_request.additional_queries],
+        }
+        return _dedupe_candidates(candidates)[:max_records], meta
+
     auto_provider_selection = not provider_env and not manual_materials_file
     provider_plan: list[str]
     if manual_materials_file:
@@ -3742,8 +3970,18 @@ def fetch_daily_news_candidates(
             # aggregator happened to respond first.
             provider_plan = []
             try:
+                _load_additional_news_source_key("tianapi")
+                provider_plan = ["tianapi", *provider_plan]
+            except Exception:
+                pass
+            try:
                 _load_juhe_config()
                 provider_plan.append("juhe")
+            except Exception:
+                pass
+            try:
+                _load_additional_news_source_key("tianapi")
+                provider_plan.append("tianapi")
             except Exception:
                 pass
             additional_sources = _load_additional_news_sources_config()
@@ -3761,6 +3999,8 @@ def fetch_daily_news_candidates(
                 provider_plan.append("gnews")
             except Exception:
                 pass
+            if str(os.getenv("WORLDMONITOR_ENABLED", "0")).lower() in {"1", "true", "yes", "on"}:
+                provider_plan.append("worldmonitor")
             try:
                 _load_additional_news_source_key("alphavantage")
                 provider_plan.append("alphavantage")
@@ -3792,6 +4032,7 @@ def fetch_daily_news_candidates(
         "gnews",
         "juhe",
         "newsdata",
+        "tianapi",
         "alphavantage",
         "thenewsapi",
         "finnhub",
@@ -3800,6 +4041,7 @@ def fetch_daily_news_candidates(
         "bbc_rss",
         "odd_news_rss",
         "hotnews",
+        "worldmonitor",
         "file",
         "manual",
     )
@@ -3906,6 +4148,7 @@ def fetch_daily_news_candidates(
                 previous_attempt is not None
                 and previous_attempt.source_url == _news_provider_health_url(provider)
                 and should_replace_source(previous_attempt)
+                and not replacement_probe_due(previous_attempt)
             ):
                 continue
             if is_source_in_cooldown(previous_attempt, cooldown_seconds=cooldown_seconds):
@@ -3999,6 +4242,7 @@ def fetch_daily_news_candidates(
             and previous_attempt is not None
             and previous_attempt.source_url == _news_provider_health_url(provider)
             and should_replace_source(previous_attempt)
+            and not replacement_probe_due(previous_attempt)
         ):
             replacement_skipped.append(provider)
             if progress_callback is not None:
@@ -4185,6 +4429,27 @@ def fetch_daily_news_candidates(
                             in_today.append(item)
                     candidates = in_today or raw
                     used_time_range = bool(in_today)
+                elif provider == "tianapi":
+                    api_key = _load_additional_news_source_key("tianapi")
+                    chosen_source_api = {"provider": "tianapi", "base_url": TIANAPI_BASE_URL}
+                    raw = []
+                    for channel in ("guonei", "world", "social"):
+                        try:
+                            raw.extend(_tianapi_fetch_articles(
+                                api_key=api_key,
+                                channel=channel,
+                                max_records=max_records,
+                                timeout_s=provider_timeout_s,
+                            ))
+                        except Exception:
+                            continue
+                    raw = _dedupe_candidates(raw)
+                    in_today = [
+                        item for item in raw
+                        if (seen := _parse_seendate_utc(item.seendate)) and start_dt <= seen <= end_dt
+                    ]
+                    candidates = in_today or raw
+                    used_time_range = bool(in_today)
                 elif provider == "newsdata":
                     api_key = _load_additional_news_source_key("newsdata")
                     chosen_source_api = {"provider": "newsdata", "base_url": NEWSDATA_BASE_URL}
@@ -4301,6 +4566,15 @@ def fetch_daily_news_candidates(
                     candidates = _hotnews_fetch_articles(
                         base_url=base_url,
                         platforms=platforms,
+                        max_records=max_records,
+                        timeout_s=provider_timeout_s,
+                    )
+                    used_time_range = False
+                elif provider == "worldmonitor":
+                    base_url = (os.getenv("WORLDMONITOR_BASE_URL") or "http://127.0.0.1:3000").rstrip("/")
+                    chosen_source_api = {"provider": "worldmonitor", "base_url": base_url}
+                    candidates = _worldmonitor_fetch_articles(
+                        base_url=base_url,
                         max_records=max_records,
                         timeout_s=provider_timeout_s,
                     )

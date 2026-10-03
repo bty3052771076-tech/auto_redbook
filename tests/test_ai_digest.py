@@ -1127,6 +1127,28 @@ def test_ai_update_history_key_dedupes_claude_fable_release_across_official_urls
     assert rank_mod.ai_update_history_key(previous) == rank_mod.ai_update_history_key(rewritten)
 
 
+def test_ai_update_history_key_does_not_merge_opus_release_with_compared_fable_model():
+    fable = _item(
+        "Anthropic 发布 Claude Fable 5.1",
+        source_name="Anthropic",
+        vendor="Anthropic",
+        url="https://www.anthropic.com/claude/fable",
+        summary="Anthropic 发布 Claude Fable 5.1，面向编程和知识工作。",
+        raw_excerpt="Anthropic officially released Claude Fable 5.1 for coding and knowledge work.",
+    )
+    opus = _item(
+        "Introducing Claude Opus 5.5",
+        source_name="Anthropic",
+        vendor="Anthropic",
+        product="Claude Opus 5.5",
+        url="https://www.anthropic.com/claude-opus-5-5",
+        summary="Claude Opus 5.5 performs at the level of Claude Fable 5.1 and costs 40% less.",
+        raw_excerpt="Anthropic introduced Claude Opus 5.5, the first model in its new family; it performs at the level of Fable 5.1.",
+    )
+
+    assert rank_mod.ai_update_history_key(fable) != rank_mod.ai_update_history_key(opus)
+
+
 def test_ai_update_history_key_dedupes_same_generic_listing_item_by_raw_excerpt():
     previous = _item(
         "Tencent Cloud TokenHub service terms update and third-party deployment note",

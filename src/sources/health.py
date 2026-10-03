@@ -178,6 +178,26 @@ def should_replace_source(
     return ratio >= max(0.0, min(1.0, float(timeout_ratio)))
 
 
+def replacement_probe_due(
+    attempt: SourceAttempt | None,
+    *,
+    now: datetime | None = None,
+    probe_interval_seconds: int = 6 * 3600,
+) -> bool:
+    """Return whether a degraded source may receive a bounded half-open probe."""
+    if attempt is None or not should_replace_source(attempt):
+        return False
+    checked_at = _parse_datetime(attempt.checked_at)
+    if checked_at is None:
+        return True
+    reference = now or _utc_now()
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return reference.astimezone(timezone.utc) >= checked_at + timedelta(
+        seconds=max(0, int(probe_interval_seconds))
+    )
+
+
 def save_source_health_snapshot(snapshot: SourceHealthSnapshot, path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)

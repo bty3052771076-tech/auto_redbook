@@ -2,7 +2,13 @@ import json
 
 from src.config import LLMConfig
 import src.llm.generate as generate_mod
-from src.llm.generate import _coerce_text, _parse_json_text, _should_try_next_llm, generate_json
+from src.llm.generate import (
+    _coerce_text,
+    _is_provider_capacity_exhausted,
+    _parse_json_text,
+    _should_try_next_llm,
+    generate_json,
+)
 from src.text_integrity import repair_utf8_as_gbk_mojibake
 
 
@@ -242,6 +248,13 @@ def test_repair_utf8_as_gbk_mojibake_handles_one_and_two_passes():
 
 def test_provider_account_overdue_error_allows_the_next_configured_candidate():
     assert _should_try_next_llm(RuntimeError("403 AccountOverdue: account is overdue"))
+
+
+def test_token_plan_capacity_error_skips_rate_limit_backoff():
+    assert _is_provider_capacity_exhausted(
+        RuntimeError("429: 已达到 Token Plan 用量上限，请升级套餐或购买积分")
+    )
+    assert not _is_provider_capacity_exhausted(RuntimeError("429 RATE_LIMIT_EXCEEDED"))
 
 
 def test_generate_draft_repairs_model_mojibake_and_retries_rate_limit(monkeypatch):

@@ -240,7 +240,7 @@ def test_gui_exposes_publish_platform_selector():
 
 def test_gui_exposes_llm_and_image_provider_model_options():
     assert LLM_PROVIDER_OPTIONS == ["aliyun", "volcengine", "siliconflow", "minimax", "ppinfra", "auto"]
-    assert IMAGE_SOURCE_OPTIONS == ["local", "auto", "aliyun", "volcengine", "siliconflow", "minimax", "pexels"]
+    assert IMAGE_SOURCE_OPTIONS == ["local", "auto", "aliyun", "volcengine", "siliconflow", "minimax", "opencodex", "pexels"]
     assert "qwen3.7-plus" in ALIYUN_LLM_MODEL_OPTIONS
     assert "deepseek-v4-flash" in ALIYUN_LLM_MODEL_OPTIONS
     assert "doubao-seed-2-1-turbo-260628" in VOLCENGINE_LLM_MODEL_OPTIONS
@@ -1228,6 +1228,15 @@ def test_open_xhs_creator_launches_chrome_with_workspace_profile(monkeypatch, tm
     ]
 
 
+def test_open_xhs_creator_does_not_fall_back_to_default_browser(monkeypatch, tmp_path: Path):
+    opened: list[str] = []
+    monkeypatch.setattr("apps.gui.find_chrome_executable", lambda env=None: None)
+    monkeypatch.setattr("apps.gui.webbrowser.open", lambda url: opened.append(url) or True)
+
+    assert open_xhs_creator(project_root=tmp_path, env={}) is False
+    assert opened == []
+
+
 def test_quick_launch_scripts_are_workspace_local():
     root = Path(__file__).resolve().parents[1]
     assert (root / "scripts" / "start_gui.ps1").exists()
@@ -1355,6 +1364,7 @@ def test_material_quota_rows_follow_material_model_selection():
             display_value="7 / 10 image",
         ),
     ]
+
 
     selected = select_material_quota_rows(
         rows,

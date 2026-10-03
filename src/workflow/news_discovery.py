@@ -19,6 +19,7 @@ from src.news.daily_news import (
     _domain_for_item, _is_china_item, _parse_seendate_utc, _resolve_tz,
     _required_china_count_for_daily_news, _same_cjk_story_event,
     _source_domain_max_ratio, daily_news_international_conflict_quota,
+    daily_news_soft_preferences_enabled,
     filter_prompt_relevant_news_items, filter_recent_news_items,
     is_international_conflict_news, rank_news_candidate_pool,
 )
@@ -64,8 +65,67 @@ def news_key(item: Any) -> str:
     return normalize_news_url_key(item.url) or str(item.title)
 
 
+def news_story_identity_keys(value: Any) -> set[str]:
+    """Return URL/title identities used to exclude an already-used event."""
+    if isinstance(value, dict):
+        url = str(value.get("url") or "").strip()
+        title = str(value.get("title") or "").strip()
+    else:
+        url = str(getattr(value, "url", "") or "").strip()
+        title = str(getattr(value, "title", "") or "").strip()
+    identities: set[str] = set()
+    normalized_url = normalize_news_url_key(url)
+    if normalized_url:
+        identities.add(f"url:{normalized_url}")
+    normalized_title = re.sub(r"[\W_]+", "", title.casefold())
+    if normalized_title:
+        identities.add(f"title:{normalized_title}")
+    return identities
+
+
 def news_domain(item: Any) -> str:
     return _canonical_domain(_domain_for_item(item)) or "unknown"
+
+
+def source_domain_cap(
+    items: list[Any],
+    total: int,
+    *,
+    required: int | None = None,
+    accepted: list[Any] | None = None,
+) -> int:
+    """Return the per-domain cap, relaxing only when strict coverage is impossible.
+
+    The normal cap preserves source diversity.  If the run can reach only a
+    small number of publisher domains, however, the strict cap can make a
+    valid batch mathematically impossible.  In that case use the smallest
+    balanced cap that can cover the requested batch and let the caller record
+    the reduced source coverage in its run diagnostics.
+    """
+    required = total if required is None else max(0, int(required))
+    if total <= 0 or required <= 0:
+        return 0
+    accepted = accepted or []
+    groups: dict[str, int] = Counter(news_domain(item) for item in items)
+    used = Counter(news_domain(item) for item in accepted)
+    domains = set(groups) | set(used)
+    if len(domains) <= 1:
+        return total
+    cap = max(1, math.ceil(total * _source_domain_max_ratio()))
+    # Previously accepted items are part of the same batch, so a relaxed cap
+    # can never be below the largest already-used domain count.
+    cap = max(cap, max(used.values(), default=0))
+    capacity = sum(min(max(0, cap - used[domain]), count) for domain, count in groups.items())
+    if capacity >= required:
+        return cap
+    for candidate_cap in range(cap + 1, total + 1):
+        capacity = sum(
+            min(max(0, candidate_cap - used[domain]), count)
+            for domain, count in groups.items()
+        )
+        if capacity >= required:
+            return candidate_cap
+    return total
 
 
 def feasible_news_batch(items: list[Any], count: int, *, china: int, conflict: int,
@@ -83,10 +143,7 @@ def feasible_news_batch(items: list[Any], count: int, *, china: int, conflict: i
     for index, item in enumerate(items):
         groups[news_domain(item)].append((index, item))
     used = Counter(news_domain(item) for item in accepted)
-    cap = max(1, math.ceil(total * _source_domain_max_ratio()))
-    # Preserve the existing single-source exception, but never invent domains.
-    if len(set(groups) | set(used)) <= 1:
-        cap = total
+    cap = source_domain_cap(items, total, required=count, accepted=accepted)
     states = {(0, 0, 0): ()}
 
     def keep(table, state, indices):
@@ -122,7 +179,8 @@ class DailyNewsDiscovery:
                  raw_target: int, preferred_target: int, budget_seconds: float,
                  fetch: Callable, prepare: Callable, incomplete: Callable,
                  progress: Callable | None = None, history_signatures: list | None = None,
-                 column: str = "daily_news"):
+                 column: str = "daily_news",
+                 excluded_story_keys: set[str] | None = None):
         self.prompt, self.count = prompt, count
         self.column = str(column or "daily_news").strip().lower() or "daily_news"
         self.wow_column = self.column == DAILY_WOW_CONTENT_TYPE
@@ -137,11 +195,23 @@ class DailyNewsDiscovery:
         else:
             self.reserve_target = min(5, max(1, math.ceil(count * 0.3)))
         # 本栏目不设国内/国际冲突配额，按栏目适配选稿。
-        self.china = 0 if self.wow_column else _required_china_count_for_daily_news(count)
-        self.conflict = 0 if self.wow_column else daily_news_international_conflict_quota(count)
+        soft_preferences = daily_news_soft_preferences_enabled()
+        self.china = (
+            0
+            if self.wow_column or soft_preferences
+            else _required_china_count_for_daily_news(count)
+        )
+        self.conflict = (
+            0
+            if self.wow_column or soft_preferences
+            else daily_news_international_conflict_quota(count)
+        )
         if max(self.china, self.conflict) > count:
             raise ValueError("新闻数量与国内/国际争议配额矛盾，请调整数量。")
         self.fetch, self.prepare, self.incomplete, self.progress = fetch, prepare, incomplete, progress
+        self.excluded_story_keys = {
+            str(key).strip() for key in (excluded_story_keys or set()) if str(key).strip()
+        }
         self.session = NewsFetchSession(datetime.now(timezone.utc), budget_seconds)
         self.raw: dict[str, Any] = {}
         self.prepared: dict[str, tuple] = {}
@@ -187,6 +257,11 @@ class DailyNewsDiscovery:
         recent, dates = filter_recent_news_items(
             list(self.raw.values()), tz_name="Asia/Shanghai", max_age_days=days, now=self.session.now)
         recent = [item for item in recent if self._valid_time(item)]
+        if self.excluded_story_keys:
+            recent = [
+                item for item in recent
+                if not (news_story_identity_keys(item) & self.excluded_story_keys)
+            ]
         if self.wow_column:
             # 栏目复用采集与日期窗口，但按反差信号做本地兜底筛选，
             # 且不使用国内/国际冲突配额。
@@ -255,6 +330,8 @@ class DailyNewsDiscovery:
         self.meta.update(meta)
         for item in items:
             key = news_key(item)
+            if self.excluded_story_keys and news_story_identity_keys(item) & self.excluded_story_keys:
+                continue
             # Never refresh an old event's date from a later syndicated copy.
             if key not in self.raw:
                 self.raw[key] = item
@@ -434,6 +511,7 @@ class DailyNewsDiscovery:
                 break
         self.meta["selection_pool"] = {
             "rule_version": "adaptive_1_2_3_5_v1", "requested_count": self.count,
+            "category_policy": "soft_preference" if daily_news_soft_preferences_enabled() else "hard_quota",
             "target_fetch_count": self.preferred_target, "raw_fetch_count": self.raw_target,
             "raw_candidate_count": len(self.raw), "actual_candidate_count": len(available),
             "prompt_relevant_candidate_count": len(ordered), "recent_candidate_count": recent_count,

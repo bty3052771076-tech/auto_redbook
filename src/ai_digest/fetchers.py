@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
+from ipaddress import ip_address
 from urllib.parse import urljoin, urlsplit
 from xml.etree import ElementTree as ET
 
@@ -446,6 +447,73 @@ def _parse_official_listing_items(html_text: str) -> list[tuple[str, str, str]]:
     return items
 
 
+def parse_aihot_v1_items_json(payload: str) -> list[AIUpdateItem]:
+    """Consume local AIHOT's versioned API as leads with traceable origins."""
+    data = json.loads(payload)
+    if not isinstance(data, dict) or data.get("schemaVersion") != 1 or not isinstance(data.get("items"), list):
+        raise ValueError("invalid AIHOT v1 items payload")
+
+    items: list[AIUpdateItem] = []
+    seen_urls: set[str] = set()
+    for row in data["items"]:
+        if not isinstance(row, dict) or not isinstance(row.get("selected"), bool):
+            continue
+        title = _strip_html(str(row.get("title") or ""))
+        summary = _strip_html(str(row.get("summary") or ""))
+        source = row.get("source") or {}
+        links = row.get("links") or {}
+        if not isinstance(source, dict) or not isinstance(links, dict):
+            continue
+        source_name = _strip_html(str(source.get("name") or ""))
+        original_url = str(links.get("original") or "").strip()
+        original_parts = urlsplit(original_url)
+        original_host = (original_parts.hostname or "").lower()
+        try:
+            private_original = not ip_address(original_host).is_global
+        except ValueError:
+            private_original = original_host in {"localhost", "aihot.virxact.com"} or original_host.endswith(
+                (".localhost", ".local", ".internal", ".aihot.virxact.com")
+            )
+        published_at = str(row.get("publishedAt") or "").strip()
+        try:
+            published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if (
+            len(title) < 6
+            or len(summary) < 20
+            or not source_name
+            or re.match(r"^\d{1,2}\s*(?:产品发布|模型发布|行业动态)", title)
+            or original_parts.scheme not in {"http", "https"}
+            or not original_host
+            or private_original
+            or published.tzinfo is None
+            or original_url in seen_urls
+        ):
+            continue
+        seen_urls.add(original_url)
+        aihot_url = str(links.get("aihot") or "").strip()
+        evidence = [aihot_url] if urlsplit(aihot_url).scheme in {"http", "https"} else []
+        category = str(row.get("category") or "").strip()
+        items.append(
+            AIUpdateItem(
+                title=title,
+                summary=summary,
+                source_name=source_name,
+                source_type="aggregator",
+                url=original_url,
+                published_at=published_at,
+                vendor=source_name,
+                raw_excerpt=summary,
+                confidence_score=0.62,
+                verification_status="aggregator_only",
+                evidence_urls=evidence,
+                tags=["AI", "AIHOT 本地", *([category] if category else [])],
+            )
+        )
+    return items
+
+
 def _looks_like_official_ai_update(text: str, vendor: str) -> bool:
     value = re.sub(r"\s+", " ", text or "").strip()
     if len(value) < 8 or len(value) > 260:
@@ -740,13 +808,14 @@ def parse_codex_reset_html(
         evidence_url = json.loads(f'"{evidence_url}"') if "\\" in evidence_url else evidence_url
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
+    reset_kind = "可留存额度重置" if "banked reset" in str(note).lower() else "额度重置"
     summary = (
-        "公开重置追踪页记录：OpenAI Codex向尚未获得GPT-6 Astra的部分付费ChatGPT用户发放银行重置；"
-        "重置可由符合条件的用户自行使用，最终资格和到账情况以账户页面为准。"
+        f"第三方追踪页记录：Codex 出现{reset_kind}信号；"
+        "适用范围和到账情况须以官方通知或账户页面为准。"
     )
     return [
         AIUpdateItem(
-            title="OpenAI Codex向符合条件的付费用户发放银行重置",
+            title=f"Codex {reset_kind}：第三方追踪信号",
             summary=summary,
             source_name=source_name,
             source_type="aggregator",
@@ -754,7 +823,7 @@ def parse_codex_reset_html(
             published_at=reset_at,
             vendor=vendor,
             product="Codex banked reset",
-            raw_excerpt=f"{summary} 追踪页引用的公开帖：{evidence_url}".strip(),
+            raw_excerpt=f"{summary} 追踪页原始说明：{note} 追踪页引用的公开帖：{evidence_url}".strip(),
             confidence_score=0.78,
             verification_status="aggregator_confirmed",
             evidence_urls=[url for url in (evidence_url, base_url) if url],

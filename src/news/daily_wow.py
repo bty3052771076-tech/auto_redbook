@@ -71,6 +71,12 @@ _HARD_REJECT_MARKERS: tuple[str, ...] = (
 # emergencies.  These are ordinary news; framing them as silly would misread
 # the story and risk trivialising real harm.
 _WOW_SERIOUS_INCIDENT_MARKERS: tuple[str, ...] = (
+    "civil war",
+    "armed offensive",
+    "military offensive",
+    "rebel offensive",
+    "\u5185\u6218",
+    "\u6b66\u88c5\u51b2\u7a81",
     "sabotage",
     "蓄意破坏",
     "恐怖袭击",
@@ -362,7 +368,8 @@ def daily_wow_news_item(**kwargs: Any) -> NewsItem:
     return NewsItem(**kwargs)
 
 
-_WOW_TITLE_MAX_LEN = 20
+_WOW_TITLE_MAX_LEN = 60
+DAILY_WOW_TITLE_PREFIX = "每日我去｜"
 
 
 def daily_wow_title_max_len() -> int:
@@ -372,6 +379,17 @@ def daily_wow_title_max_len() -> int:
     20-character column title mid-word (for example ending at "…世锦赛主").
     """
     return _WOW_TITLE_MAX_LEN
+
+
+def daily_wow_display_title(value: object, *, max_len: int | None = None) -> str:
+    """Return the visible, idempotent title marker used by every wow draft."""
+    text = re.sub(r"^\s*每日我去\s*[|｜:：-]?\s*", "", str(value or "").strip())
+    text = text.rstrip("，,、。.!！?？:：|｜-—–") or "待审事件"
+    limit = max_len if max_len is not None else daily_wow_title_max_len()
+    available = max(1, int(limit) - len(DAILY_WOW_TITLE_PREFIX))
+    if len(text) > available:
+        text = text[:available].rstrip("，,、。.!！?？:：|｜-—–")
+    return DAILY_WOW_TITLE_PREFIX + text
 
 
 _WOW_NARRATION_MARKERS: tuple[str, ...] = (
@@ -570,6 +588,8 @@ def daily_wow_comment_is_valid(comment: str) -> bool:
     text = re.sub(r"\s+", "", raw)
     if len(text) < WOW_COMMENT_MIN_CHARS:
         return False
+    if text == "这事本身就够说明问题了。" or re.fullmatch(r"就这结果，.+，挺行。", text):
+        return False
     # The column is written in Simplified Chinese.  A leftover English phrase
     # (for example a raw source headline) is not an evaluation.
     if not re.search(r"[\u4e00-\u9fff]", text):
@@ -587,18 +607,9 @@ def daily_wow_comment_is_valid(comment: str) -> bool:
 
 
 def daily_wow_fallback_comment(picked: Any, content: str = "") -> str:
-    """Source-bound observation used when the model's comment is unusable."""
-    title = str(getattr(picked, "title", "") or "").strip()
-    body_text = re.sub(r"\s+", " ", str(content or "")).strip()
-    # Only Chinese source text can become a Chinese one-liner; a raw English
-    # headline would otherwise leak into the comment.
-    for candidate in (title, body_text):
-        if not re.search(r"[\u4e00-\u9fff]", candidate):
-            continue
-        head = re.split(r"[。！？!?；;]", candidate)[0].strip()
-        head = re.sub(r"[A-Za-z0-9]+", "", head).strip("，,。、 \t")
-        if len(head) < 4:
-            continue
-        subject = head[:18].rstrip("，,。 ")
-        return f"就这结果，{subject}，挺行。"
-    return "这事本身就够说明问题了。"
+    """Use an intact Chinese fact title, or leave the comment for retry."""
+    del content
+    title = re.sub(r"\s+", " ", str(getattr(picked, "title", "") or "")).strip(" ，,。 \t")
+    if not re.search(r"[\u4e00-\u9fff]{4,}", title) or len(title) > 50:
+        return ""
+    return f"{title}，这反差确实离谱。"

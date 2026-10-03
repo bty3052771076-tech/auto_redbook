@@ -614,9 +614,12 @@ def _explicit_event_key(value: str) -> str:
 def _stable_cross_source_event_key(item: AIUpdateItem) -> str:
     """Identify high-risk events whose wording and URLs vary by source."""
     blob = _text_blob(item)
+    headline_blob = " ".join(
+        part for part in (item.product, item.title, _url_topic_text(item.url)) if part
+    )
     if (
-        _contains_any_marker(blob, ("claude fable", "claude-fable"))
-        and _contains_any_marker(blob, ("5.1", "5-1"))
+        _contains_any_marker(headline_blob, ("claude fable", "claude-fable"))
+        and _contains_any_marker(headline_blob, ("5.1", "5-1"))
         and _contains_any_marker(blob, ("anthropic", "claude"))
     ):
         # Anthropic's Fable announcement has appeared under multiple official

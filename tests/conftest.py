@@ -51,3 +51,62 @@ def _isolate_local_news_credentials(monkeypatch):
         return original_parse(candidate)
 
     monkeypatch.setattr(daily_news, "_parse_kv_file", _parse_test_key_file)
+from copy import deepcopy
+
+import pytest
+
+
+class InMemoryConversationStore:
+    """Explicit test double; production Workbench always defaults to PostgreSQL."""
+
+    def __init__(self):
+        self.rows = {}
+
+    def get(self, conversation_id):
+        if conversation_id not in self.rows:
+            raise KeyError(conversation_id)
+        return deepcopy(self.rows[conversation_id])
+
+    def save(self, conversation):
+        value = deepcopy(conversation)
+        expected = int(value.pop("_revision", 0))
+        current = self.rows.get(value["id"])
+        if current and int(current.get("_revision", 0)) != expected:
+            from src.agent.conversation_store import ConversationConflict
+            raise ConversationConflict("conversation changed in another process; reload before saving")
+        if not current and expected:
+            from src.agent.conversation_store import ConversationConflict
+            raise ConversationConflict("conversation does not exist")
+        value["_revision"] = expected + 1
+        value.setdefault("_last_message_seq", len(value.get("messages", [])))
+        self.rows[value["id"]] = deepcopy(value)
+        return deepcopy(value)
+
+    def import_legacy(self, conversation):
+        if conversation["id"] in self.rows:
+            return self.get(conversation["id"])
+        return self.save(conversation)
+
+    def list(self, *, limit=100):
+        return [
+            {"id": value["id"], "title": value.get("title", "新对话"),
+             "created_at": value.get("created_at"), "updated_at": value.get("updated_at"),
+             "status": value.get("status", "idle"), "message_count": len(value.get("messages", [])),
+             "latest_plan_id": (value.get("plans") or [{}])[-1].get("id", ""),
+             "_revision": value.get("_revision", 0)}
+            for value in sorted(self.rows.values(), key=lambda item: item.get("updated_at", 0), reverse=True)[:limit]
+        ]
+
+
+@pytest.fixture
+def workbench_factory():
+    from apps.web_service import Workbench
+
+    stores = {}
+
+    def create(root):
+        key = str(root.resolve())
+        store = stores.setdefault(key, InMemoryConversationStore())
+        return Workbench(root, conversation_store=store)
+
+    return create

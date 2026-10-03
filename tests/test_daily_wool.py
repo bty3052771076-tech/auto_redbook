@@ -73,15 +73,35 @@ def test_parse_codex_reset_tracker_keeps_today_reset_and_x_evidence():
         "https://x.com/thsottiaux/status/2095651088502591861",
         "https://codex.gussuriworks.com/en",
     ]
+    assert "银行重置" not in items[0].title
+
+
+def test_parse_codex_reset_tracker_does_not_invent_eligibility_from_other_event():
+    html = (
+        '<script>\\"resetAt\\":\\"2026-09-23T01:12:50Z\\",'
+        '\\"note\\":\\"A BANKED Reset was distributed to all Codex users.\\"</script>'
+    )
+
+    items = parse_codex_reset_html(
+        html,
+        source_name="Codex Reset Observatory",
+        vendor="Codex Reset Observatory",
+        base_url="https://codex.gussuriworks.com/en",
+    )
+
+    assert len(items) == 1
+    assert "GPT-6" not in items[0].summary
+    assert "部分付费" not in items[0].summary
+    assert "第三方追踪页" in items[0].summary
 
 
 def test_extract_wool_offers_accepts_current_codex_reset_signal():
     now = datetime(2026, 9, 4, 12, tzinfo=timezone(timedelta(hours=8)))
     item = AIUpdateItem(
-        title="OpenAI Codex向符合条件的付费用户发放银行重置",
+        title="Codex 可留存额度重置：第三方追踪信号",
         summary=(
-            "公开重置追踪页记录：OpenAI Codex向部分付费ChatGPT用户发放银行重置；"
-            "重置可由符合条件的用户自行使用，最终以账户页面为准。"
+            "第三方追踪页记录：Codex 出现可留存额度重置信号；"
+            "适用范围和到账情况须以官方通知或账户页面为准。"
         ),
         source_name="Codex Reset Observatory",
         source_type="aggregator",
@@ -89,13 +109,13 @@ def test_extract_wool_offers_accepts_current_codex_reset_signal():
         published_at="2026-09-04T03:34:46.386Z",
         vendor="Codex Reset Observatory",
         product="Codex banked reset",
-        raw_excerpt="公开重置追踪页记录，最终以账户页面为准。",
+        raw_excerpt="第三方追踪页记录，最终以账户页面为准。",
     )
 
     offers = extract_wool_offers([item], now=now, max_age_days=3)
 
     assert len(offers) == 1
-    assert offers[0].provider == "OpenAI"
+    assert offers[0].provider == "Codex"
     assert offers[0].published_at.startswith("2026-09-04T11:34")
 
 
@@ -246,6 +266,8 @@ def test_create_daily_wool_posts_creates_no_wool_draft_without_fabricating_offer
     assert len(posts) == 1
     post = posts[0]
     assert post.platform["daily_wool"]["has_wool"] is False
+    assert post.platform["daily_wool"]["issue_date"] == "2026-08-29"
+    assert "8月29日" in post.title
     assert "暂无可核验福利" in post.title
     assert Path(post.assets[0].path).name == "无羊毛的羊.png"
     assert len(list(list_posts())) == 1

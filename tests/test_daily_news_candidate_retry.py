@@ -1,5 +1,7 @@
 from src.workflow.create_post import (
     _DailyNewsCandidateResult,
+    _daily_news_llm_unavailable_reason,
+    _daily_news_provider_capacity_exhausted,
     _schedule_daily_news_candidate_retry,
 )
 
@@ -37,3 +39,10 @@ def test_permanent_model_failure_is_not_requeued(monkeypatch):
     assert pending == []
     assert attempts == {}
 
+
+def test_provider_token_plan_exhaustion_is_fatal_for_candidate_batch():
+    error = "429 rate_limit_error: 已达到 Token Plan 用量上限，请升级 Token Plan 套餐或购买积分补充用量"
+
+    assert _daily_news_provider_capacity_exhausted(error) is True
+    assert "Token Plan" in _daily_news_llm_unavailable_reason(error)
+    assert _daily_news_provider_capacity_exhausted("connection reset by peer") is False

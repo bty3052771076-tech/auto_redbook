@@ -12,9 +12,9 @@ from src.storage.files import save_post
 from src.storage.models import Post
 
 
-def test_web_feature_pages_and_confirmation(tmp_path, monkeypatch):
+def test_web_feature_pages_and_confirmation(tmp_path, monkeypatch, workbench_factory):
     playwright = pytest.importorskip("playwright.sync_api")
-    service = Workbench(tmp_path)
+    service = workbench_factory(tmp_path)
     post = Post(title="隔离测试新闻", body="测试正文，不上传真实平台。")
     save_post(post, tmp_path / "data")
     planned = []
@@ -39,7 +39,7 @@ def test_web_feature_pages_and_confirmation(tmp_path, monkeypatch):
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.goto(f"http://127.0.0.1:{server.server_port}", wait_until="networkidle")
             playwright.expect(page.get_by_text("本地服务已连接", exact=True)).to_be_visible()
-            pages = ["自动发帖", "材料发帖", "任务中心", "本地草稿处理", "平台草稿", "已发布数据", "模型与额度", "账号与设置", "删除平台草稿", "信源健康"]
+            pages = ["自动发帖", "材料发帖", "任务中心", "本地草稿处理", "平台草稿", "已发布数据", "模型与供应商", "账号与设置", "删除平台草稿", "信源健康"]
 
             def navigate(name):
                 if page.viewport_size["width"] <= 600:
@@ -95,6 +95,33 @@ def test_web_feature_pages_and_confirmation(tmp_path, monkeypatch):
             assert not errors, errors
             (out / "report.json").write_text(json.dumps({"passed": True, "pages": 10, "viewports": [1440,390],
                 "real_platform_mutations": 0, "javascript_errors": errors}, indent=2), encoding="utf-8")
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_agent_page_is_separate_from_automatic_page(tmp_path, workbench_factory):
+    playwright = pytest.importorskip("playwright.sync_api")
+    service = workbench_factory(tmp_path)
+    server = Server(("127.0.0.1", 0), service)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as p:
+            browser = p.chromium.launch(channel="chrome", headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            page.goto(f"http://127.0.0.1:{server.server_port}", wait_until="networkidle")
+            playwright.expect(page.get_by_text("本地服务已连接", exact=True)).to_be_visible()
+            page.locator("nav").get_by_role("button", name="自动发帖", exact=True).click()
+            playwright.expect(page.get_by_text("使用智能调度", exact=True)).not_to_be_visible()
+            page.locator("nav").get_by_role("button", name="智能体", exact=True).click()
+            playwright.expect(page.get_by_role("heading", name="智能体", exact=True)).to_be_visible()
+            page.get_by_label("告诉智能体你要完成什么", exact=True).fill("生成1篇每日AI讯息")
+            page.get_by_role("button", name="发送", exact=True).click()
+            playwright.expect(page.get_by_text("每日AI讯息 1条", exact=False).first).to_be_visible()
+            playwright.expect(page.get_by_role("button", name="执行计划", exact=True)).to_be_visible()
             browser.close()
     finally:
         server.shutdown()

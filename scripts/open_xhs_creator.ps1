@@ -36,5 +36,6 @@ if ($Chrome) {
         $Url
     )
 } else {
-    Start-Process $Url
+    Write-Error "XHS_BROWSER_NOT_FOUND: 未找到项目专用 Chrome，请设置 XHS_CHROME_PATH；不会回退到默认浏览器。"
+    exit 1
 }

@@ -98,7 +98,7 @@ FILTER_REFRESH_DEBOUNCE_MS = 140
 
 LLM_PROVIDER_OPTIONS = ["aliyun", "volcengine", "siliconflow", "minimax", "ppinfra", "auto"]
 IMAGE_SOURCE_LOCAL = "local"
-IMAGE_PROVIDER_OPTIONS = ["auto", "aliyun", "volcengine", "siliconflow", "minimax", "pexels"]
+IMAGE_PROVIDER_OPTIONS = ["auto", "aliyun", "volcengine", "siliconflow", "minimax", "opencodex", "pexels"]
 IMAGE_SOURCE_OPTIONS = [IMAGE_SOURCE_LOCAL] + IMAGE_PROVIDER_OPTIONS
 
 ALIYUN_LLM_MODEL_OPTIONS = list(ALIYUN_FREE_LLM_MODELS)
@@ -1585,7 +1585,7 @@ def open_xhs_creator(
         profile_dir.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(args, cwd=str(project_root))
         return True
-    return bool(webbrowser.open(url))
+    return False
 
 
 def open_xhs_profile_login() -> bool:
@@ -1616,7 +1616,7 @@ def open_toutiao_creator(
             os.environ["TOUTIAO_CDP_URL"] = f"http://127.0.0.1:{port}"
         subprocess.Popen(args, cwd=str(project_root))
         return True
-    return bool(webbrowser.open(url))
+    return False
 
 
 def _python_for_cli() -> str:
@@ -2221,6 +2221,9 @@ def build_provider_env_overrides(
         env.pop("VOLCENGINE_IMAGE_MODELS", None)
         env.pop("MINIMAX_IMAGE_MODEL", None)
         env.pop("MINIMAX_IMAGE_MODELS", None)
+    elif img_provider == "opencodex":
+        env["OPENCODEX_IMAGE_ENABLED"] = "1"
+        env["OPENCODEX_IMAGE_MODEL"] = "gpt-image-2"
     elif img_provider == "minimax":
         selected_image = (image_model or DEFAULT_MINIMAX_IMAGE_MODELS).strip()
         env["MINIMAX_IMAGE_MODEL"] = selected_image

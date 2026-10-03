@@ -14,6 +14,8 @@ from langchain_core.messages import HumanMessage
 
 from src.config import (
     DEFAULT_ALIYUN_LLM_BASE_URL,
+    DEFAULT_MINIMAX_LLM_BASE_URL,
+    DEFAULT_MINIMAX_LLM_MODEL,
     DEFAULT_VOLCENGINE_LLM_BASE_URL,
     LLMConfig,
     _parse_llm_key_file,
@@ -98,13 +100,20 @@ def configured_vision_review_model(provider: str | None = None) -> str:
         return (os.getenv("VOLCENGINE_VLM_MODEL") or "").strip()
     if provider_name == "aliyun":
         return (os.getenv("ALIYUN_VLM_MODEL") or "").strip()
+    if provider_name == "minimax":
+        return (
+            explicit
+            or os.getenv("MINIMAX_VLM_MODEL")
+            or os.getenv("MINIMAX_LLM_MODEL")
+            or DEFAULT_MINIMAX_LLM_MODEL
+        ).strip()
     return ""
 
 
 def load_vision_review_config() -> LLMConfig:
     provider = (os.getenv("VLM_REVIEW_PROVIDER") or "").strip().lower()
     model = configured_vision_review_model(provider)
-    if provider not in {"aliyun", "volcengine"} or not model:
+    if provider not in {"aliyun", "volcengine", "minimax"} or not model:
         raise RuntimeError("没有选择具备免费额度的视觉复核模型")
     if provider == "aliyun":
         file_cfg = _parse_llm_key_file(Path("docs") / "aliyun_image_api-key.md")
@@ -119,7 +128,7 @@ def load_vision_review_config() -> LLMConfig:
             os.getenv("ALIYUN_LLM_BASE_URL")
             or DEFAULT_ALIYUN_LLM_BASE_URL
         ).strip().rstrip("/")
-    else:
+    elif provider == "volcengine":
         file_cfg = _parse_llm_key_file(Path("docs") / "volcengine_api-key.md")
         api_key = (
             os.getenv("VOLCENGINE_LLM_API_KEY")
@@ -132,6 +141,31 @@ def load_vision_review_config() -> LLMConfig:
             os.getenv("VOLCENGINE_LLM_BASE_URL")
             or os.getenv("ARK_BASE_URL")
             or DEFAULT_VOLCENGINE_LLM_BASE_URL
+        ).strip().rstrip("/")
+    else:
+        file_cfg = _parse_llm_key_file(Path("docs") / "minimax_api-key.md")
+        api_key = (
+            os.getenv("MINIMAX_TOKEN_PLAN_API_KEY")
+            or file_cfg.get("api_key")
+            or ""
+        ).strip()
+        billing_mode = (
+            os.getenv("MINIMAX_BILLING_MODE")
+            or file_cfg.get("billing_mode")
+            or "subscription_only"
+        ).strip().lower()
+        if billing_mode not in {"subscription_only", "subscription"}:
+            raise RuntimeError("MiniMax 视觉复核仅允许 subscription_only 模式")
+        if any(
+            (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+            for name in ("MINIMAX_ALLOW_PAID_CREDITS", "MINIMAX_ALLOW_PAYGO")
+        ):
+            raise RuntimeError("MiniMax 视觉复核禁止使用付费积分或按量付费")
+        base_url = (
+            os.getenv("MINIMAX_BASE_URL")
+            or os.getenv("MINIMAX_LLM_BASE_URL")
+            or file_cfg.get("base_url")
+            or DEFAULT_MINIMAX_LLM_BASE_URL
         ).strip().rstrip("/")
     if not api_key:
         raise RuntimeError(f"{provider} 视觉复核模型已选择，但 API key 未配置")

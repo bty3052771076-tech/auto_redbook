@@ -112,6 +112,54 @@ class QuotaModelRecord:
         return max(0.0, self.remaining / self.total)
 
 
+def build_subscription_runtime_records(
+    provider: str,
+    *,
+    llm_model: str = "",
+    image_model: str = "",
+    now: datetime | None = None,
+    snapshot_path: Path | str = Path("data") / "quota" / "subscription_runtime.json",
+) -> list[QuotaModelRecord]:
+    """Represent an explicitly configured subscription without calling it free quota.
+
+    A subscription-only run may intentionally skip quota synchronization.  The
+    normal quota loader cannot admit a model without a positive free-quota row,
+    so this helper creates narrow, in-memory eligibility records only for the
+    explicitly supported subscription provider.  ``remaining=1`` is a
+    selection sentinel, not an account balance; the cost class and unit keep
+    that distinction visible to callers and logs.
+    """
+    provider_name = (provider or "").strip().lower()
+    if provider_name != "minimax":
+        return []
+    captured_at = now or datetime.now(timezone.utc)
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=timezone.utc)
+    path = Path(snapshot_path)
+    records: list[QuotaModelRecord] = []
+    for model, kind in ((llm_model, "llm"), (image_model, "image")):
+        model_name = (model or "").strip()
+        if not model_name or any(record.model.lower() == model_name.lower() for record in records):
+            continue
+        records.append(
+            QuotaModelRecord(
+                provider="minimax",
+                model=model_name,
+                kind=kind,
+                status="available",
+                remaining=1.0,
+                total=None,
+                unit="subscription (not synchronized)",
+                expires_at=None,
+                snapshot_path=path,
+                captured_at=captured_at,
+                cost_class="subscription_included",
+                quota_pool="token_plan_shared",
+            )
+        )
+    return records
+
+
 @dataclass(frozen=True)
 class ModelChoice:
     provider: str

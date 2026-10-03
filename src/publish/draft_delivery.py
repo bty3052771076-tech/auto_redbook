@@ -69,3 +69,23 @@ def has_current_draft_receipt(post: Post, *, platform: str) -> bool:
         return False
     recorded = str(receipt.get("revision_fingerprint") or "").strip().lower()
     return bool(recorded) and recorded == content_revision_fingerprint(post)
+
+
+def has_current_delivery_receipt(post: Post, *, platform: str, delivery: str) -> bool:
+    """Check the receipt for the requested delivery stage.
+
+    A saved-draft receipt is deliberately insufficient for a publish request.
+    The publication receipt must match the current content revision and carry
+    an observed visibility, so a resumed agent cannot silently skip submission.
+    """
+
+    normalized_delivery = str(delivery or "save_draft").strip().lower()
+    if normalized_delivery != "publish":
+        return has_current_draft_receipt(post, platform=platform)
+    key = f"{str(platform or '').strip().lower()}_publication"
+    receipt = post.platform.get(key) if isinstance(post.platform, Mapping) else None
+    if not isinstance(receipt, Mapping):
+        return False
+    recorded = str(receipt.get("revision_fingerprint") or "").strip().lower()
+    visibility = str(receipt.get("visibility") or receipt.get("observed_visibility") or "").strip().lower()
+    return bool(recorded) and recorded == content_revision_fingerprint(post) and visibility in {"public", "private"}

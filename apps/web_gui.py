@@ -9,9 +9,9 @@ import os
 import webbrowser
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-from apps.web_service import ROOT, Workbench, read_json, valid_id
+from apps.web_service import ROOT, Workbench, read_json, valid_conversation_id, valid_id
 
 
 class Server(ThreadingHTTPServer):
@@ -127,14 +127,28 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请求格式错误")
             if path == "/api/bootstrap" and self.command == "GET":
                 result = service.bootstrap()
+            elif path == "/api/wool-library" and self.command == "GET":
+                result = service.wool_library().snapshot()
+            elif path.startswith("/api/wool-library/images/") and self.command == "GET":
+                file = service.wool_library().image(path.removeprefix("/api/wool-library/images/"))
+                self.reply(file.read_bytes(), mime=mimetypes.guess_type(file.name)[0] or "image/png")
+                return
+            elif path in {"/api/wool-library/review", "/api/wool-library/select", "/api/wool-library/fetch"} and self.command == "POST":
+                result = service.wool_library_action(path.rsplit("/", 1)[-1], data)
             elif path == "/api/models" and self.command == "GET":
                 result = service.models()
+            elif path == "/api/providers" and self.command in {"GET", "POST"}:
+                result = service.save_provider(data) if self.command == "POST" else service.providers()
+            elif path == "/api/model-bindings" and self.command == "PUT":
+                result = service.save_model_bindings(data)
             elif path == "/api/settings" and self.command == "PUT":
                 result = service.save_settings(data)
             elif path == "/api/configuration" and self.command in {"GET", "PUT"}:
                 result = service.save_configuration(data) if self.command == "PUT" else service.configuration()
             elif path == "/api/sources" and self.command == "GET":
                 result = service.sources()
+            elif path == "/api/global-map/preview" and self.command == "POST":
+                result = service.global_map_preview(data)
             elif path == "/api/analysis" and self.command == "GET":
                 result = service.analysis()
             elif path == "/api/posts" and self.command == "GET":
@@ -152,6 +166,49 @@ class Handler(BaseHTTPRequestHandler):
                 result = service.metrics()
             elif path == "/api/remote" and self.command == "GET":
                 result = read_json(service.directory / "remote.json", {"rows": [], "captured_at": None, "complete": None})
+            elif path == "/api/agent/conversations" and self.command == "GET":
+                result = {"rows": service.list_agent_conversations()}
+            elif path == "/api/agent/conversations" and self.command == "POST":
+                result = service.create_agent_conversation(data.get("title", "新对话"))
+            elif path == "/api/agent/capabilities" and self.command == "GET":
+                result = service.agent_capabilities()
+            elif path.startswith("/api/agent/conversations/"):
+                parts = path.split("/")
+                conversation_id = valid_id(parts[4])
+                if len(parts) == 5 and self.command == "GET":
+                    result = service.get_agent_conversation(conversation_id)
+                elif len(parts) == 6 and parts[5] == "context" and self.command == "GET":
+                    result = service.agent_context_status(conversation_id)
+                elif len(parts) == 6 and parts[5] == "compact" and self.command == "POST":
+                    result = service.compact_agent_conversation(conversation_id)
+                elif len(parts) == 6 and parts[5] == "messages" and self.command == "POST":
+                    result = service.append_agent_message(conversation_id, str(data.get("content") or ""))
+                elif len(parts) == 6 and parts[5] == "events" and self.command == "GET":
+                    query = parse_qs(urlsplit(self.path).query)
+                    result = service.agent_events(conversation_id, (query.get("after") or ["0"])[0])
+                else:
+                    raise ValueError("智能体会话操作无效")
+            elif path.startswith("/api/agent/plans/") and path.endswith("/execute") and self.command == "POST":
+                parts = path.split("/")
+                if len(parts) != 6:
+                    raise ValueError("智能体计划路径无效")
+                result = service.execute_agent_plan(
+                    str(data.get("conversation_id") or ""),
+                    parts[4],
+                    data.get("version"),
+                    self.headers.get("Idempotency-Key", ""),
+                    skill_mode=str(data.get("skill_mode") or "off"),
+                    skill_names=data.get("skill_names") if isinstance(data.get("skill_names"), list) else [],
+                )
+            elif path.startswith("/api/agent/runs/") and path.endswith("/resume") and self.command == "POST":
+                parts = path.split("/")
+                if len(parts) != 6:
+                    raise ValueError("智能体恢复路径无效")
+                result = service.resume_agent_run(
+                    valid_conversation_id(str(data.get("conversation_id") or "")),
+                    valid_id(parts[4]),
+                    self.headers.get("Idempotency-Key", ""),
+                )
             elif path == "/api/jobs":
                 result = service.submit(data, self.headers.get("Idempotency-Key", "")) if self.command == "POST" else service.list_jobs()
             elif path.startswith("/api/jobs/"):

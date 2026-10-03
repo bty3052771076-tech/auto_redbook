@@ -33,8 +33,14 @@ import {
   Activity,
   CircleHelp,
   Sparkles,
+  Settings2,
+  EyeOff,
+  Info,
+  Send,
+  Globe2,
 } from "lucide-react";
 import { DeleteDrafts, SourceHealth, AnalysisReport, LocalConfiguration } from "./WorkbenchTools";
+import { WoolGallery } from "./WoolGallery";
 import {
   api,
   connect,
@@ -50,10 +56,18 @@ import {
   type Job,
   type PostRow,
   type Post,
+  type ProviderCatalog,
+  type ProviderConnection,
+  type AgentConversation,
+  type AgentContextStatus,
+  type AgentCapabilities,
+  type AgentJobPlan,
+  type AgentEvent,
 } from "./api";
 import "./styles.css";
 
 const nav = [
+  ["agent", "智能体", Sparkles],
   ["auto", "自动发帖", Newspaper],
   ["material", "材料发帖", FileText],
   ["jobs", "任务中心", ListChecks],
@@ -62,7 +76,7 @@ const nav = [
   ["delete", "删除平台草稿", Trash2],
   ["metrics", "已发布数据", BarChart3],
   ["sources", "信源健康", Activity],
-  ["models", "模型与额度", Layers],
+  ["models", "模型与供应商", Layers],
   ["settings", "账号与设置", Settings],
 ] as const;
 type Page = (typeof nav)[number][0];
@@ -429,27 +443,36 @@ function ModelPicker({
   onChange,
   models,
   tourAnchor,
+  role,
+  onManageProviders,
 }: {
   kind: string;
   value: string;
   onChange: (id: string) => void;
   models: Model[];
   tourAnchor?: string;
+  role?: "agent" | "writer" | "image";
+  onManageProviders?: () => void;
 }) {
   const [open, setOpen] = useState(false),
     [query, setQuery] = useState(""),
     [provider, setProvider] = useState("");
   const selected = models.find((m) => m.id === value);
+  const labels = models.reduce<Record<string, string>>((result, model) => {
+    result[model.provider] = model.provider_name || providers[model.provider] || model.provider;
+    return result;
+  }, {});
+  const roleLabel = role === "agent" ? "智能体主控模型" : role === "image" ? "生图模型" : "写稿模型";
   const filtered = models.filter(
     (m) =>
       m.kind === kind &&
       (!provider || m.provider === provider) &&
-      m.model.toLowerCase().includes(query.toLowerCase()),
+      `${labels[m.provider] || m.provider} ${m.model}`.toLowerCase().includes(query.toLowerCase()),
   );
   return (
     <div className="model-picker" data-tour={tourAnchor}>
       <span className="field-label">
-        {kind === "llm" ? "语言模型" : "生图模型"}
+        {roleLabel}
       </span>
       <button
         type="button"
@@ -462,7 +485,7 @@ function ModelPicker({
         <Layers size={17} />
         <span>
           {selected
-            ? `${providers[selected.provider]} · ${selected.model}`
+            ? `${labels[selected.provider] || selected.provider} · ${selected.model}`
             : "选择模型"}
           {selected && !selected.selectable && (
             <small>{selected.disabled_reason}</small>
@@ -490,7 +513,7 @@ function ModelPicker({
             onChange={(e) => setProvider(e.target.value)}
           >
             <option value="">全部平台</option>
-            {Object.entries(providers).map(([id, name]) => (
+            {Object.entries(labels).map(([id, name]) => (
               <option key={id} value={id}>
                 {name}
               </option>
@@ -511,7 +534,7 @@ function ModelPicker({
               >
                 <strong>{m.model}</strong>
                 <small>
-                  {providers[m.provider]} ·{" "}
+                  {labels[m.provider] || m.provider} ·{" "}
                   {m.selectable
                     ? numberLabel(m.remaining) + " " + m.unit
                     : m.disabled_reason}
@@ -519,6 +542,11 @@ function ModelPicker({
               </button>
             ))}
           </div>
+          {onManageProviders && (
+            <button type="button" className="text-button provider-menu-action" onClick={onManageProviders}>
+              <Settings2 size={15} />管理供应商
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -541,12 +569,13 @@ function QuotaPanel({
     [q, setQ] = useState(""),
     [sort, setSort] = useState("name"),
     [usable, setUsable] = useState(false);
+  const labels = { ...providers, ...(data.provider_labels || {}) };
   const rows = data.rows
     .filter(
       (m) =>
         (!provider || m.provider === provider) &&
         (!usable || m.selectable) &&
-        `${providers[m.provider]} ${m.model}`
+        `${labels[m.provider] || m.provider} ${m.model}`
           .toLowerCase()
           .includes(q.toLowerCase()),
     )
@@ -572,7 +601,7 @@ function QuotaPanel({
         >
           全部
         </button>
-        {Object.entries(providers).map(([k, v]) => (
+        {Object.entries(labels).map(([k, v]) => (
           <button
             key={k}
             className={provider === k ? "selected" : ""}
@@ -625,7 +654,7 @@ function QuotaPanel({
                 {m.model}
               </button>
               <span className="subtle">
-                {providers[m.provider]} ·{" "}
+                {labels[m.provider] || m.provider} ·{" "}
                 {m.kind === "image"
                   ? "生图"
                   : m.kind === "llm"
@@ -670,18 +699,114 @@ function QuotaPanel({
     </section>
   );
 }
+function ProviderManagement({
+  catalog,
+  models,
+  reload,
+  onError,
+}: {
+  catalog: ProviderCatalog;
+  models: Models;
+  reload: () => Promise<void> | void;
+  onError: (message: string) => void;
+}) {
+  const [tab, setTab] = useState<"providers" | "bindings">("providers");
+  const [selected, setSelected] = useState(catalog.connections[0]?.id || "");
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState("");
+  const [id, setId] = useState("");
+  const [protocol, setProtocol] = useState("openai_chat");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [billing, setBilling] = useState("unknown");
+  const [apiKey, setApiKey] = useState("");
+  const [modelLines, setModelLines] = useState("");
+  const [bindings, setBindings] = useState(catalog.bindings);
+  useEffect(() => {
+    if (!catalog.connections.some((connection) => connection.id === selected)) {
+      setSelected(catalog.connections[0]?.id || "");
+    }
+    setBindings(catalog.bindings);
+  }, [catalog, selected]);
+  const labels = { ...providers, ...(models.provider_labels || {}) };
+  const selectedProvider = catalog.connections.find((connection) => connection.id === selected);
+  const resetForm = () => {
+    setAdding(false); setName(""); setId(""); setProtocol("openai_chat");
+    setBaseUrl(""); setBilling("unknown"); setApiKey(""); setModelLines("");
+  };
+  async function saveProvider() {
+    const parsedModels = modelLines.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
+      const [kind, ...parts] = line.split(":");
+      return { kind: kind === "image" ? "image" : "llm", id: parts.join(":").trim(), name: parts.join(":").trim() };
+    });
+    if (!name.trim() || !id.trim() || !baseUrl.trim()) {
+      onError("请填写供应商名称、ID和API地址");
+      return;
+    }
+    try {
+      await api("/providers", "POST", { id: id.trim(), name: name.trim(), protocol, base_url: baseUrl.trim(), billing, api_key: apiKey, models: parsedModels });
+      resetForm();
+      await reload();
+    } catch (error) { onError(String(error)); }
+  }
+  async function saveBindings() {
+    try { await api("/model-bindings", "PUT", bindings); await reload(); }
+    catch (error) { onError(String(error)); }
+  }
+  const selectable = (kind: string) => models.rows.filter((model) => model.kind === kind && model.selectable);
+  return (
+    <section className="provider-management">
+      <div className="section-heading">
+        <div><h2>模型与供应商</h2><p className="subtle">智能体、写稿和生图分别绑定；供应商凭据只保存在本机。</p></div>
+        <button className="primary" type="button" onClick={() => setAdding(true)}><Plus size={16} />添加供应商</button>
+      </div>
+      <div className="platform-tabs" role="tablist" aria-label="供应商设置">
+        <button className={tab === "providers" ? "selected" : ""} onClick={() => setTab("providers")}>供应商</button>
+        <button className={tab === "bindings" ? "selected" : ""} onClick={() => setTab("bindings")}>默认模型</button>
+      </div>
+      {tab === "providers" ? (
+        <div className="provider-layout">
+          <div className="provider-list">
+            {catalog.connections.map((connection) => (
+              <button type="button" key={connection.id} className={selected === connection.id ? "provider-item selected" : "provider-item"} onClick={() => setSelected(connection.id)}>
+                <strong>{connection.name}</strong>
+                <small>{connection.builtin ? "内置" : "自定义"} · {connection.configured ? "已配置" : "未配置"}</small>
+              </button>
+            ))}
+          </div>
+          <div className="provider-detail">
+            {selectedProvider ? <>
+              <div className="provider-detail-head"><div><h3>{selectedProvider.name}</h3><p className="subtle">{selectedProvider.protocol} · {selectedProvider.billing === "subscription" ? "订阅" : selectedProvider.billing === "free" ? "免费" : selectedProvider.billing === "unknown" ? "费用未知" : "按量"}</p></div><Status value={selectedProvider.configured ? "success" : "pending"} /></div>
+              <div className="provider-facts"><span>连接状态</span><strong>{selectedProvider.verification_status === "configured" ? "已配置，待测试" : selectedProvider.verification_status}</strong><span>模型数量</span><strong>{selectedProvider.models.length} 个</strong><span>凭据</span><strong>{selectedProvider.configured ? "已配置（不显示密钥）" : "未配置"}</strong></div>
+              <div className="provider-model-list"><h3>模型目录</h3>{selectedProvider.models.length ? selectedProvider.models.map((model) => <div className="provider-model-row" key={model.id}><span>{model.name || model.id}</span><small>{model.kind === "image" ? "生图" : "语言"} · {model.id}</small></div>) : <p className="subtle">内置模型从额度快照读取；自定义供应商可在添加时手动录入模型。</p>}</div>
+              <div className="policy-strip"><Info size={16} />连接成功、模型列表成功和费用已确认是三个状态；费用未知的模型不会自动执行。</div>
+            </> : <Empty text="请选择供应商" />}
+          </div>
+        </div>
+      ) : (
+        <div className="binding-form">
+          <p className="subtle">保存为默认值只影响之后的新任务；运行中的任务使用启动时冻结的配置。</p>
+          {(["agent", "writer", "image"] as const).map((role) => <Field key={role} label={catalog.roles[role]}><select value={bindings[role]} onChange={(event) => setBindings({ ...bindings, [role]: event.target.value })}><option value="">自动使用当前配置</option>{selectable(role === "image" ? "image" : "llm").map((model) => <option value={model.id} key={model.id}>{labels[model.provider] || model.provider} · {model.model}</option>)}</select></Field>)}
+          <button className="primary" type="button" onClick={saveBindings}><Save size={16} />保存默认模型</button>
+        </div>
+      )}
+      {adding && <div className="modal-backdrop"><section className="modal provider-form" role="dialog" aria-modal="true" aria-label="添加供应商"><div className="section-heading"><h2>添加供应商</h2><IconButton label="关闭添加供应商" onClick={resetForm}><X size={18} /></IconButton></div><Field label="供应商名称"><input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：我的模型服务" /></Field><Field label="供应商 ID"><input value={id} onChange={(event) => setId(event.target.value.toLowerCase())} placeholder="my-provider" /></Field><Field label="接口协议"><select value={protocol} onChange={(event) => setProtocol(event.target.value)}><option value="openai_chat">OpenAI 兼容聊天</option><option value="openai_image">OpenAI 兼容生图</option></select></Field><Field label="API 地址"><input type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" /></Field><Field label="计费类型"><select value={billing} onChange={(event) => setBilling(event.target.value)}><option value="free">免费</option><option value="subscription">订阅</option><option value="unknown">未知</option><option value="payg">按量付费</option></select></Field><Field label="API Key（仅本机保存）"><div className="secret-input"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="留空表示暂不配置" autoComplete="new-password" /><EyeOff size={16} /></div></Field><Field label="模型目录（每行一个：llm:模型ID 或 image:模型ID）"><textarea rows={4} value={modelLines} onChange={(event) => setModelLines(event.target.value)} placeholder="llm:writer-v1\nimage:image-v1" /></Field><div className="modal-actions"><button type="button" onClick={resetForm}>取消</button><button className="primary" type="button" onClick={saveProvider}><Save size={16} />保存供应商</button></div></section></div>}
+    </section>
+  );
+}
 function Creation({
   material,
   boot,
   submit,
   sync,
   onError,
+  onManageProviders,
 }: {
   material: boolean;
   boot: Bootstrap;
   submit: (r: Request) => Promise<void>;
   sync: () => void;
   onError: (s: string) => void;
+  onManageProviders?: () => void;
 }) {
   const tourPrefix = material ? "material" : "auto";
   const [title, setTitle] = useState("每日新闻"),
@@ -691,8 +816,8 @@ function Creation({
     [mode, setMode] = useState(boot.settings.performance_mode),
     [platform, setPlatform] = useState(boot.settings.platform),
     [view, setView] = useState("无视角评价"),
-    [llm, setLLM] = useState(""),
-    [img, setImg] = useState(""),
+    [llm, setLLM] = useState(boot.providers.bindings.writer || ""),
+    [img, setImg] = useState(boot.providers.bindings.image || ""),
     [source, setSource] = useState(""),
     [materialTitle, setMaterialTitle] = useState(""),
     [time, setTime] = useState(""),
@@ -706,6 +831,7 @@ function Creation({
     [assetsGlob, setAssetsGlob] = useState("assets/*"),
     [sending, setSending] = useState(false);
   const isNews = material || title === "每日新闻" || title === "每日我去" || title === "每日假新闻";
+  const isGlobalMap = !material && title === "每日全球事件关注图";
   const choose = (m: Model) => (m.kind === "llm" ? setLLM(m.id) : setImg(m.id));
   async function run(e: React.FormEvent) {
     e.preventDefault();
@@ -775,7 +901,9 @@ function Creation({
                 </button>
               ))}
             </div>
-            <section>
+            {isGlobalMap ? (
+              <GlobalMapPage submit={submit} onError={onError} />
+            ) : <section>
               <div className="section-heading">
                 <h2>选题与范围</h2>
                 <span className="subtle">
@@ -852,7 +980,7 @@ function Creation({
                   </span>
                 </div>
               )}
-            </section>
+            </section>}
           </>
         ) : (
           <>
@@ -934,26 +1062,34 @@ function Creation({
             </section>
           </>
         )}
+        {!isGlobalMap && <>
+        {!material && title === "每日羊毛" && <section><WoolGallery request={api}/></section>}
         <section data-tour={`${tourPrefix}.models`}>
           <h2>模型与生成</h2>
-          <ModelPicker
-            kind="llm"
-            tourAnchor={`${tourPrefix}.llm`}
-            value={llm}
-            onChange={setLLM}
-            models={boot.models.rows}
-          />
-          {isNews && <label className="check-label" data-tour={`${tourPrefix}.image`}><input type="checkbox" checked={localImages} onChange={e=>setLocalImages(e.target.checked)}/>使用本地图片</label>}
-          {isNews && localImages && <Field label="工作区图片路径"><input value={assetsGlob} onChange={e=>setAssetsGlob(e.target.value)}/></Field>}
-          {isNews && !localImages && (
-            <ModelPicker
-              kind="image"
-              tourAnchor={`${tourPrefix}.image`}
-              value={img}
-              onChange={setImg}
-              models={boot.models.rows}
-            />
-          )}
+          <>
+              <ModelPicker
+                kind="llm"
+                role="writer"
+                tourAnchor={`${tourPrefix}.llm`}
+                value={llm}
+                onChange={setLLM}
+                models={boot.models.rows}
+                onManageProviders={onManageProviders}
+              />
+              {isNews && <label className="check-label" data-tour={`${tourPrefix}.image`}><input type="checkbox" checked={localImages} onChange={e=>setLocalImages(e.target.checked)}/>使用本地图片</label>}
+              {isNews && localImages && <Field label="工作区图片路径"><input value={assetsGlob} onChange={e=>setAssetsGlob(e.target.value)}/></Field>}
+              {isNews && !localImages && (
+                <ModelPicker
+                  kind="image"
+                  role="image"
+                  tourAnchor={`${tourPrefix}.image`}
+                  value={img}
+                  onChange={setImg}
+                  models={boot.models.rows}
+                  onManageProviders={onManageProviders}
+                />
+              )}
+          </>
           <div className="form-grid" data-tour={`${tourPrefix}.options`}>
             <Field label="评价视角">
               <input value={view} onChange={(e) => setView(e.target.value)} />
@@ -992,9 +1128,409 @@ function Creation({
             <span className="subtle">专用浏览器 · 无窗口上传</span>
           </div>
         </section>
+        </>}
       </form>
       <aside className="resource-column">
         <QuotaPanel data={boot.models} sync={sync} choose={choose} tourScope={tourPrefix} />
+      </aside>
+    </div>
+  );
+}
+function GlobalMapPage({
+  submit,
+  onError,
+}: {
+  submit: (request: Request) => Promise<void>;
+  onError: (value: string) => void;
+}) {
+  const [targetDate, setTargetDate] = useState("auto");
+  const [mapMode, setMapMode] = useState("coordinate-grid");
+  const [maxEvents, setMaxEvents] = useState("8");
+  const [preview, setPreview] = useState<{
+    quality_state: string;
+    upload_allowed: boolean;
+    warning: string;
+    source_state: string;
+    frozen_scope: { cutoff_at: string };
+    coverage: Record<string, number>;
+    events: { title: string; location_name?: string; country?: string; summary?: string }[];
+  } | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [running, setRunning] = useState(false);
+
+  async function checkCoverage() {
+    if (checking) return;
+    setChecking(true);
+    try {
+      const result = await api<typeof preview>("/global-map/preview", "POST", {
+        target_date: targetDate,
+        cutoff: "now",
+        map_mode: mapMode,
+        max_events: Number(maxEvents),
+        delivery: "local",
+      });
+      setPreview(result);
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function createMap(delivery: "local" | "xhs") {
+    if (running) return;
+    setRunning(true);
+    try {
+      await submit({
+        kind: "daily-global-map",
+        title: "每日全球事件关注图",
+        target_date: targetDate,
+        cutoff: preview?.frozen_scope.cutoff_at || "now",
+        map_mode: mapMode,
+        max_events: Number(maxEvents),
+        delivery,
+      });
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setRunning(false);
+    }
+  }
+  return (
+    <section className="global-map-page" data-tour-page="global-map">
+      <div className="global-map-intro">
+        <div>
+          <span className="eyebrow">EVIDENCE MAP</span>
+          <h2>每日全球事件关注图</h2>
+          <p>按北京时间整理当日已核验、可定位的全球事件。地图表示本轮信源中的关注分布，不代表全球真实热度或完整世界态势。</p>
+        </div>
+        <div className="global-map-actions">
+          <button type="button" onClick={checkCoverage} disabled={checking || running}>
+            <Eye size={16} />{checking ? "正在检查覆盖" : "检查今日覆盖"}
+          </button>
+          <button className="primary" type="button" onClick={() => createMap("local")} disabled={running}>
+            <Globe2 size={17} />{running ? "正在准备地图" : "生成本地简报"}
+          </button>
+        </div>
+      </div>
+      <section className="global-map-controls">
+        <div className="section-heading"><div><span className="eyebrow">SCOPE & QUALITY</span><h2>任务范围与质量门禁</h2></div><Status value={preview?.quality_state || "待检查"} /></div>
+        <div className="form-grid">
+          <Field label="目标日期（北京时间）"><input type="date" value={targetDate === "auto" ? "" : targetDate} onChange={(e) => setTargetDate(e.target.value || "auto")} /></Field>
+          <Field label="截止时间"><input value={preview?.frozen_scope.cutoff_at || "点击检查覆盖后冻结"} readOnly /></Field>
+          <Field label="地图模式"><select value={mapMode} onChange={(e) => { setMapMode(e.target.value); setPreview(null); }}><option value="coordinate-grid">坐标网格示意</option><option value="approved-boundaries">已审阅底图</option></select></Field>
+          <Field label="重点事件上限"><select value={maxEvents} onChange={(e) => { setMaxEvents(e.target.value); setPreview(null); }}>{[3, 4, 5, 6, 7, 8].map((v) => <option value={v} key={v}>{v} 条</option>)}</select></Field>
+        </div>
+        {preview && <div className="global-map-coverage">
+          {[["原始条目", "raw_items"], ["独立事件", "independent_events"], ["当日合格", "eligible_events"], ["可定位", "located_events"], ["覆盖国家", "countries"], ["独立发布者", "publishers"]].map(([label, key]) => <div key={key}><span>{label}</span><strong>{preview.coverage[key] ?? 0}</strong></div>)}
+        </div>}
+        {preview && <div className="policy-strip"><ShieldCheck size={17} /><span>来源状态：{preview.source_state}。{preview.warning || "覆盖达到自动保存草稿的最低条件。"}</span></div>}
+      </section>
+      {preview && <section className="global-map-events">
+        <div className="section-heading"><div><span className="eyebrow">VERIFIED EVENTS</span><h2>事件预览</h2></div><span className="subtle">先看证据，再保存草稿</span></div>
+        {preview.events.length ? <div className="global-map-event-list">{preview.events.map((event, index) => <article key={`${event.title}-${index}`}><span className="event-number">{index + 1}</span><div><strong>{event.title}</strong><p>{event.summary || "暂无摘要"}</p><small>{event.location_name || event.country || "位置未核验"}</small></div></article>)}</div> : <Empty text="当前没有通过当日门禁的事件" />}
+        <div className="global-map-delivery"><button type="button" onClick={() => createMap("local")} disabled={running}><Save size={16} />保存本地简报</button><button className="primary" type="button" onClick={() => createMap("xhs")} disabled={running || !preview.upload_allowed}><Upload size={16} />保存到小红书草稿</button></div>
+      </section>}
+      <div className="global-map-rules">
+        <div><strong>时间门禁</strong><span>只收录北京时间当日有具体进展的事件，抓取时间不等于事件时间。</span></div>
+        <div><strong>覆盖门禁</strong><span>已定位事件少于3条或只有一个国家时，仅保存本地报告，不自动上传。</span></div>
+        <div><strong>证据说明</strong><span>World Monitor 用于发现，原始发布者与核验记录决定事件是否入图。</span></div>
+      </div>
+    </section>
+  );
+}
+
+function AgentWorkspace({
+  onError,
+  onOpenJobs,
+}: {
+  onError: (value: string) => void;
+  onOpenJobs: () => void;
+}) {
+  const [conversations, setConversations] = useState<AgentConversation[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [conversation, setConversation] = useState<AgentConversation | null>(null);
+  const [events, setEvents] = useState<AgentEvent[]>([]);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [executing, setExecuting] = useState(false);
+  const [run, setRun] = useState<Job | null>(null);
+  const [contextStatus, setContextStatus] = useState<AgentContextStatus | null>(null);
+  const [compactionResult, setCompactionResult] = useState<Record<string, unknown> | null>(null);
+  const [capabilities, setCapabilities] = useState<AgentCapabilities | null>(null);
+  const [loadingCapabilities, setLoadingCapabilities] = useState(false);
+  const [skillMode, setSkillMode] = useState<"off" | "auto" | "manual">("off");
+  const [skillNames, setSkillNames] = useState<string[]>([]);
+
+  async function loadContextStatus(id: string) {
+    const value = await api<AgentContextStatus>("/agent/conversations/" + id + "/context");
+    setContextStatus(value);
+  }
+
+  async function loadConversation(id: string) {
+    const value = await api<AgentConversation>("/agent/conversations/" + id);
+    setSelectedId(id);
+    setConversation(value);
+    await loadContextStatus(id).catch(() => setContextStatus(null));
+    const latest = value.plans[value.plans.length - 1];
+    if (latest?.status === "running" || value.runs.length) {
+      const snapshot = await api<{ events: AgentEvent[]; jobs: Job[] }>(
+        "/agent/conversations/" + id + "/events?after=0",
+      );
+      setEvents(snapshot.events);
+      setRun(snapshot.jobs[snapshot.jobs.length - 1] || null);
+    }
+  }
+
+  async function loadList() {
+    const result = await api<{ rows: AgentConversation[] }>("/agent/conversations");
+    setConversations(result.rows as AgentConversation[]);
+    const id = selectedId || result.rows[0]?.id;
+    if (id) {
+      await loadConversation(id);
+      return;
+    }
+    const created = await api<AgentConversation>("/agent/conversations", "POST", {});
+    setConversations([created]);
+    setSelectedId(created.id);
+    setConversation(created);
+  }
+
+  useEffect(() => {
+    loadList().catch((error) => onError(String(error)));
+    loadCapabilities().catch((error) => onError(String(error)));
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    const timer = window.setInterval(() => {
+      api<{ events: AgentEvent[]; jobs: Job[] }>(
+        "/agent/conversations/" + selectedId + "/events?after=0",
+      )
+        .then((snapshot) => {
+          setEvents(snapshot.events);
+          const latest = snapshot.jobs[snapshot.jobs.length - 1];
+          if (latest) setRun(latest);
+          if (latest && !active(latest)) {
+            loadConversation(selectedId).catch((error) => onError(String(error)));
+          }
+        })
+        .catch(() => undefined);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [selectedId]);
+
+  async function newConversation() {
+    try {
+      const created = await api<AgentConversation>("/agent/conversations", "POST", {});
+      setConversations((rows) => [created, ...rows]);
+      setSelectedId(created.id);
+      setConversation(created);
+      setEvents([]);
+      setRun(null);
+    } catch (error) {
+      onError(String(error));
+    }
+  }
+
+  async function sendMessage(event: React.FormEvent) {
+    event.preventDefault();
+    if (!selectedId || !draft.trim() || sending) return;
+    setSending(true);
+    try {
+      const result = await api<{ message: AgentConversation["messages"][number]; assistant: AgentConversation["messages"][number]; plan: AgentJobPlan }>(
+        "/agent/conversations/" + selectedId + "/messages",
+        "POST",
+        { content: draft.trim() },
+      );
+      setDraft("");
+      setConversation((current) =>
+        current
+          ? { ...current, messages: [...current.messages, result.message, result.assistant], plans: [...current.plans, result.plan], status: result.plan.status }
+          : current,
+      );
+      await loadContextStatus(selectedId).catch(() => setContextStatus(null));
+      setConversations((rows) => rows.map((row) => row.id === selectedId ? { ...row, title: draft.trim().slice(0, 60), status: result.plan.status } : row));
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function executePlan() {
+    const plan = conversation?.plans[conversation.plans.length - 1];
+    if (!selectedId || !plan?.executable || executing) return;
+    setExecuting(true);
+    try {
+      const job = await api<Job>(
+        "/agent/plans/" + plan.id + "/execute",
+        "POST",
+        { conversation_id: selectedId, version: plan.version, skill_mode: skillMode, skill_names: skillNames },
+        crypto.randomUUID(),
+      );
+      setRun(job);
+      setConversation((current) => current ? {
+        ...current,
+        status: "running",
+        runs: current.runs.includes(job.id) ? current.runs : [...current.runs, job.id],
+        plans: current.plans.map((item) => item.id === plan.id ? { ...item, status: "running" } : item),
+      } : current);
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setExecuting(false);
+    }
+  }
+
+  async function stopRun() {
+    if (!run || !active(run)) return;
+    try {
+      setRun(await api<Job>("/jobs/" + run.id + "/stop", "POST", {}));
+    } catch (error) {
+      onError(String(error));
+    }
+  }
+
+  async function resumeRun() {
+    if (!run || active(run) || !selectedId) return;
+    try {
+      const resumed = await api<Job>(
+        "/agent/runs/" + run.id + "/resume",
+        "POST",
+        { conversation_id: selectedId },
+        crypto.randomUUID(),
+      );
+      setRun(resumed);
+      setConversation((current) => current ? { ...current, status: "running", runs: [...current.runs, resumed.id] } : current);
+    } catch (error) {
+      onError(String(error));
+    }
+  }
+
+  async function compactConversation() {
+    if (!selectedId || executing || sending) return;
+    try {
+      const result = await api<Record<string, unknown>>(
+        "/agent/conversations/" + selectedId + "/compact", "POST", {},
+      );
+      setCompactionResult(result);
+      await loadContextStatus(selectedId);
+    } catch (error) {
+      onError(String(error));
+    }
+  }
+
+  async function loadCapabilities() {
+    setLoadingCapabilities(true);
+    try {
+      setCapabilities(await api<AgentCapabilities>("/agent/capabilities"));
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setLoadingCapabilities(false);
+    }
+  }
+
+  const plan = conversation?.plans[conversation.plans.length - 1] || null;
+  return (
+    <div className="agent-workspace" data-tour-page="agent">
+      <aside className="agent-conversations">
+        <div className="section-heading"><div><h2>会话</h2><span className="subtle">用自然语言安排内容任务</span></div><IconButton label="新建会话" onClick={newConversation}><Plus size={17} /></IconButton></div>
+        <div className="agent-conversation-list">
+          {conversations.map((row) => (
+            <button type="button" key={row.id} className={row.id === selectedId ? "agent-conversation selected" : "agent-conversation"} onClick={() => loadConversation(row.id).catch((error) => onError(String(error)))}>
+              <strong>{row.title}</strong><small>{row.status === "running" ? "执行中" : row.status === "planned" ? "有待执行计划" : "空闲"}</small>
+            </button>
+          ))}
+        </div>
+      </aside>
+      <section className="agent-chat">
+        <div className="agent-chat-header"><div><span className="eyebrow">CONVERSATION AGENT</span><h2>{conversation?.title || "新对话"}</h2></div><span className="subtle">主控、写稿、生图按默认绑定运行</span></div>
+        <div className="agent-messages" aria-live="polite">
+          {!conversation?.messages.length && <Empty text="告诉智能体你要完成什么，例如：生成1篇每日AI讯息并保存到小红书草稿" />}
+          {conversation?.messages.map((message) => (
+            <div className={"agent-message " + message.role} key={message.id}><span>{message.role === "user" ? "你" : "智能体"}</span><p>{message.content}</p></div>
+          ))}
+          {events.filter((event) => event.kind === "job").slice(-8).map((event) => (
+            <div className="agent-event" key={"event-" + event.id}><Activity size={15} /><span>{typeof event.message === "string" ? event.message : JSON.stringify(event.message)}</span></div>
+          ))}
+        </div>
+        <form className="agent-composer" onSubmit={sendMessage}>
+          <label htmlFor="agent-message">告诉智能体你要完成什么</label>
+          <textarea id="agent-message" aria-label="告诉智能体你要完成什么" rows={3} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="例如：用已配置的 MiniMax 生成3条每日新闻，只保存到小红书草稿箱" />
+          <div className="agent-composer-actions"><span className="subtle">明确写出栏目、数量和保存平台</span><button className="primary" type="submit" disabled={sending || !draft.trim()}><Send size={16} />{sending ? "解析中" : "发送"}</button></div>
+        </form>
+      </section>
+      <aside className="agent-inspector">
+        <div className="section-heading"><div><h2>本次计划</h2><span className="subtle">解析后再执行</span></div></div>
+        {!plan || !plan.executable ? (
+          <Empty text="发送一条明确任务后，这里会显示执行计划" />
+        ) : (
+          <>
+            <div className="agent-plan-summary"><CheckCircle2 size={17} /><span>{plan.assistant_summary}</span></div>
+            <div className="agent-plan-jobs">
+              {plan.plan_kind === "draft_management" ? (
+                <div className="agent-plan-job">
+                  <strong>小红书已有平台草稿</strong>
+                  <span>{plan.management?.mode === "publish" ? "审查后串行发布" : "读取并审查，不公开发布"} · {plan.management?.max_items ? `最多 ${plan.management.max_items} 条` : "不限制数量"}</span>
+                </div>
+              ) : plan.jobs.map((job) => <div className="agent-plan-job" key={job.kind}><strong>{job.title}</strong><span>{job.count} 条 · {plan.delivery === "save_draft" ? "保存草稿" : "只生成本地稿"}</span></div>)}
+            </div>
+            <div className="agent-policy-list"><span>平台：{plan.platform === "xhs" ? "小红书创作者中心" : plan.platform === "toutiao" ? "今日头条" : "小红书 + 今日头条"}</span><span>模式：{plan.performance_mode === "speed" ? "速度优先" : "速度与稳定平衡"}</span><span>主控：已配置默认模型</span></div>
+            <button className="primary agent-execute" type="button" disabled={executing || plan.status === "running" || (skillMode === "manual" && skillNames.length === 0)} onClick={executePlan}><Play size={16} />{executing ? "正在提交" : plan.status === "running" ? "任务执行中" : "执行计划"}</button>
+          </>
+        )}
+        <section className="agent-memory-panel" aria-label="会话记忆与运行组件">
+          <div className="section-heading"><div><h3>记忆与工具</h3><span className="subtle">原始对话保留在 PostgreSQL</span></div></div>
+          {contextStatus?.status === "ready" ? (
+            <>
+              <div className="agent-policy-list">
+                <span>活动摘要：{contextStatus.snapshot_version ? `v${contextStatus.snapshot_version}` : "尚无"}</span>
+                <span>原始消息：{contextStatus.raw_message_count ?? 0} 条</span>
+                <span>当前上下文估算：{contextStatus.active_context_tokens_estimate ?? 0} tokens</span>
+              </div>
+              {contextStatus.context?.snapshot?.summary && <p className="subtle">{contextStatus.context.snapshot.summary}</p>}
+              <button type="button" onClick={compactConversation} disabled={sending || executing || !!run && active(run)}>
+                压缩上下文（仅超阈值时调用 MiniMax）
+              </button>
+              {compactionResult && <small role="status">压缩状态：{String(compactionResult.status || "完成")} · 原文保留</small>}
+            </>
+          ) : <p className="subtle">会话记忆状态暂不可用；执行任务仍要求 PostgreSQL 正常。</p>}
+          <button type="button" onClick={loadCapabilities} disabled={loadingCapabilities}>
+            {loadingCapabilities ? "检查中…" : "检查数据库、MCP 与 Skills"}
+          </button>
+          {capabilities && <div className="agent-policy-list">
+            <span>知识库：{capabilities.database.status}{capabilities.database.index_ready ? " · 向量索引就绪" : " · 向量索引待就绪"}</span>
+            <span>MCP：{capabilities.mcp.status} · {capabilities.mcp.tools.length} 个工具</span>
+            <span>Skills：{capabilities.skills.status} · {capabilities.skills.items.length} 项</span>
+            {capabilities.mcp.error && <small>{capabilities.mcp.error}</small>}
+          </div>}
+          <label className="agent-skill-mode" htmlFor="agent-skill-mode">本次任务使用 Skills</label>
+          <select id="agent-skill-mode" value={skillMode} onChange={(event) => setSkillMode(event.target.value as "off" | "auto" | "manual")}>
+            <option value="off">关闭</option>
+            <option value="auto">按任务自动选择</option>
+            <option value="manual">手动选择</option>
+          </select>
+          {skillMode === "manual" && <div className="agent-skill-list">
+            {(capabilities?.skills.items || []).map((skill) => (
+              <label key={skill.name}>
+                <input
+                  type="checkbox"
+                  checked={skillNames.includes(skill.name)}
+                  disabled={!skillNames.includes(skill.name) && skillNames.length >= 3}
+                  onChange={(event) => setSkillNames((current) => event.target.checked
+                    ? [...current, skill.name].slice(0, 3)
+                    : current.filter((name) => name !== skill.name))}
+                />
+                <span><strong>{skill.name}</strong><small>{skill.description}</small></span>
+              </label>
+            ))}
+            {!capabilities?.skills.items.length && <small>没有已安装的 Skill；可以先导入，再刷新能力状态。</small>}
+            <small>最多选 3 项。Skill 只提供不可信参考文本，不会执行其命令或扩大工具权限。</small>
+          </div>}
+        </section>
+        {run && <div className="agent-run-status"><Status value={run.status} /><strong>{run.title}</strong><span>{run.stage} · {run.message}</span><div className="agent-run-actions">{active(run) && <button type="button" onClick={stopRun}><Square size={14} />停止任务</button>}{!active(run) && ["interrupted", "failed", "partial_success", "cancelled"].includes(run.status) && <button type="button" onClick={resumeRun}><RefreshCw size={14} />继续未完成任务</button>}<button type="button" onClick={onOpenJobs}><ListChecks size={15} />打开任务中心</button></div></div>}
       </aside>
     </div>
   );
@@ -1367,7 +1903,7 @@ function Drafts({
     <div className="draft-workbench" data-tour-page={remote ? "remote" : "local"}>
       <div className="toolbar" data-tour={remote ? "remote.publish" : "local.filters"}>
         {!remote && <select aria-label="上传目标平台" value={destination} onChange={e=>setDestination(e.target.value)}><option value="xhs">小红书</option><option value="toutiao">今日头条</option><option value="both">两个平台</option></select>}
-        {remote && <button data-tour="remote.publish" disabled={!selected.length} onClick={()=>{const confirmation=prompt(`将公开发布已选择的 ${selected.length} 条草稿，请输入确认发布`);if(confirmation === "确认发布")submit({kind:"publish-batch",post_ids:selected,confirmation}).catch(e=>onError(String(e)));}}><Upload size={16}/>发布已选（{selected.length}）</button>}
+        {remote && <button data-tour="remote.publish" disabled={!selected.length} onClick={()=>{const confirmation=prompt(`将以“仅自己可见”发布已选择的 ${selected.length} 条草稿，请输入确认仅自己可见`);if(confirmation === "确认仅自己可见")submit({kind:"publish-batch",post_ids:selected,confirmation,visibility:"private"}).catch(e=>onError(String(e)));}}><Upload size={16}/>仅自己可见发布（{selected.length}）</button>}
         <div className="search">
           <Search size={16} />
           <input
@@ -1460,13 +1996,14 @@ function Drafts({
                           disabled={!r.post_id}
                           onClick={() => {
                             const answer = prompt(
-                              "此操作将发布到公众。输入“确认发布”继续：",
+                              "此操作将以“仅自己可见”发布。输入“确认仅自己可见”继续：",
                             );
-                            if (answer === "确认发布")
+                            if (answer === "确认仅自己可见")
                               submit({
                                 kind: "publish-drafts",
                                 post_id: r.post_id,
                                 confirmation: answer,
+                                visibility: "private",
                               }).catch((e) => onError(String(e)));
                           }}
                         >
@@ -1902,8 +2439,8 @@ function App() {
         <nav>
           {nav.map(([id, name, Icon], i) => (
             <React.Fragment key={id}>
-              {i === 3 && <div className="nav-caption">内容与数据</div>}
-              {i === 7 && <div className="nav-caption">资源与设置</div>}
+              {i === 5 && <div className="nav-caption">内容与数据</div>}
+              {i === 10 && <div className="nav-caption">资源与设置</div>}
               <button
                 aria-current={page === id ? "page" : undefined}
                 className={page === id ? "active" : ""}
@@ -2003,7 +2540,8 @@ function App() {
           {!boot ? (
             <Empty text="等待本地服务连接" />
           ) : (
-            <>
+           <>
+              {page === "agent" && <AgentWorkspace onError={setError} onOpenJobs={() => setPage("jobs")} />}
               <div hidden={page !== "auto"}>
                 <Creation
                   material={false}
@@ -2011,6 +2549,7 @@ function App() {
                   submit={submit}
                   sync={() => setSyncOpen(true)}
                   onError={setError}
+                  onManageProviders={() => setPage("models")}
                 />
               </div>
               <div hidden={page !== "material"}>
@@ -2020,17 +2559,14 @@ function App() {
                   submit={submit}
                   sync={() => setSyncOpen(true)}
                   onError={setError}
+                  onManageProviders={() => setPage("models")}
                 />
               </div>
               {page === "jobs" && (
                 <Jobs jobs={boot.jobs} openPost={setPost} onError={setError} />
               )}{" "}
               {page === "models" && (
-                <QuotaPanel
-                  wide
-                  data={boot.models}
-                  sync={() => setSyncOpen(true)}
-                />
+                <><ProviderManagement catalog={boot.providers} models={boot.models} reload={reload} onError={setError} /><QuotaPanel wide data={boot.models} sync={() => setSyncOpen(true)} /></>
               )}{" "}
               {page === "local" && (
                 <Drafts

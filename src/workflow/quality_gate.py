@@ -24,6 +24,22 @@ _TRADITIONAL_MARKERS = set(
     "應該將會進實現選擇條聞內評價連結點擊瀏覽"
 )
 _BEIJING_TZ = timezone(timedelta(hours=8))
+_RECURRING_TITLE_WORDS = {
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "today",
+    "tomorrow",
+    "yesterday",
+    "daily",
+    "weekly",
+    "morning",
+    "evening",
+}
 
 
 def _created_on_beijing_today(post: Post) -> bool:
@@ -206,6 +222,36 @@ def _normalized_event_text(post: Post) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", title.lower())
 
 
+def _looks_like_recurring_source_title(left: Post, right: Post) -> bool:
+    """Avoid blocking separate entries in a publisher's daily title series.
+
+    Some feeds reuse almost the entire headline and change only a weekday or
+    relative-date word.  Treating those as the same event makes a valid fresh
+    article fail the historical gate, even though the source URLs differ.
+    """
+
+    left_url = _source_url(left)
+    right_url = _source_url(right)
+    if not left_url or not right_url or left_url == right_url:
+        return False
+    try:
+        left_url_parts = urllib.parse.urlsplit(left_url)
+        right_url_parts = urllib.parse.urlsplit(right_url)
+    except ValueError:
+        return False
+    if left_url_parts.netloc != right_url_parts.netloc:
+        return False
+
+    left_title = str(_picked_metadata(left).get("title") or left.title or "").lower()
+    right_title = str(_picked_metadata(right).get("title") or right.title or "").lower()
+    left_words = set(re.findall(r"[a-z0-9]+", left_title))
+    right_words = set(re.findall(r"[a-z0-9]+", right_title))
+    if len(left_words & right_words) < 5:
+        return False
+    differences = (left_words - right_words) | (right_words - left_words)
+    return bool(differences) and len(differences) <= 2 and differences <= _RECURRING_TITLE_WORDS
+
+
 def _ai_digest_metadata(post: Post) -> Mapping[str, object]:
     value = (post.platform or {}).get("ai_digest")
     return value if isinstance(value, Mapping) else {}
@@ -237,6 +283,21 @@ def _daily_wool_event_keys(post: Post) -> set[str]:
         elif title and published is not None:
             keys.add(f"title:{title}|date:{published.isoformat()}")
     return keys
+
+
+def _daily_wool_issue_date(post: Post, metadata: Mapping[str, object]) -> date | None:
+    explicit = _parse_date(metadata.get("issue_date"))
+    if explicit is not None:
+        return explicit
+    for raw in (metadata.get("generated_at"), post.created_at):
+        try:
+            parsed = datetime.fromisoformat(str(raw or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(_BEIJING_TZ).date()
+    return None
 
 
 def _ai_digest_item_keys(post: Post) -> set[str]:
@@ -292,7 +353,11 @@ def _same_event(left: Post, right: Post) -> bool:
         right_keys = _daily_wool_event_keys(right)
         if left_keys or right_keys:
             return bool(left_keys & right_keys)
-        return bool(left_wool.get("has_wool") is False and right_wool.get("has_wool") is False)
+        if left_wool.get("has_wool") is False and right_wool.get("has_wool") is False:
+            left_day = _daily_wool_issue_date(left, left_wool)
+            right_day = _daily_wool_issue_date(right, right_wool)
+            return left_day is None or right_day is None or left_day == right_day
+        return False
     left_digest = _ai_digest_metadata(left)
     right_digest = _ai_digest_metadata(right)
     if left_digest or right_digest:
@@ -311,6 +376,8 @@ def _same_event(left: Post, right: Post) -> bool:
     right_url = _source_url(right)
     if left_url and right_url and left_url == right_url:
         return True
+    if _looks_like_recurring_source_title(left, right):
+        return False
     a = _normalized_event_text(left)
     b = _normalized_event_text(right)
     if not a or not b:
@@ -370,7 +437,7 @@ def _post_issues(post: Post) -> list[QualityIssue]:
                 if isinstance(item, Mapping)
             }
             if not providers or not providers.issubset(
-                {"aliyun", "volcengine", "minimax", "siliconflow", "qwen", "doubao"}
+                {"aliyun", "volcengine", "minimax", "siliconflow", "qwen", "doubao", "opencodex"}
             ):
                 issues.append(
                     QualityIssue(

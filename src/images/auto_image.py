@@ -293,9 +293,51 @@ def _build_aliyun_image_prompt(*, title: str, body: str, topics: list[str], prom
 
     # Only use a short event summary (typically from LLM image_event) plus a tiny base instruction.
     # If the hint is missing, fall back to title-derived theme (still event-like).
+    lower_theme = theme.lower()
+    # A bare headline is too ambiguous for image models: they may render an
+    # attack, a logo, or a generic city. Add one concrete, neutral scene cue
+    # without inventing people, flags, exact documents, or outcomes.
+    scene_cue = ""
+    if any(token in theme for token in ("起诉", "诉讼", "法院", "法官", "判决", "罚款", "监管")) or any(
+        token in lower_theme for token in ("lawsuit", "sue", "court", "judge", "gdpr", "fine", "ruling")
+    ):
+        scene_cue = "以法院外景或法庭审理为单一主体，画面出现两份无文字法律文件和审理席，表现诉讼或裁决，不画具体名人肖像"
+    elif any(token in theme for token in ("化肥", "贸易", "关税", "采购", "货运", "港口")) or any(
+        token in lower_theme for token in ("fertilizer", "trade", "tariff", "purchase", "cargo")
+    ):
+        scene_cue = "以白天的货运港口为单一主体，画面出现集装箱、散装货物和装卸设备，表现贸易或采购变化，不画旗帜和文字"
+    elif any(token in theme for token in ("战机", "空袭", "防空", "武装", "冲突", "空中支援", "胡塞")) or any(
+        token in lower_theme for token in ("jets", "airstrike", "air support", "military", "fighters", "houthi", "war")
+    ):
+        scene_cue = "以天空和远处地形为主体，画面只出现一到两架无标识飞机平稳巡航，表现防御性或军事行动的态势，不画爆炸、射击、伤亡和徽章"
+    elif any(token in theme for token in ("议会", "选举", "政党", "内阁", "政治争议", "会议")) or any(
+        token in lower_theme for token in ("election", "parliament", "party", "coalition", "political", "meeting")
+    ):
+        scene_cue = "以室内议事会场为单一主体，画面出现无文字讲台、麦克风和两组代表隔桌讨论，表现政策分歧，不画具体人物肖像"
+    elif any(token in theme for token in ("人工智能", "大模型", "芯片", "软件", "科技", "SpaceX")) or any(
+        token in lower_theme for token in ("openai", "google", "model", "software", "chip", "technology", "spacex")
+    ):
+        scene_cue = "以无文字的服务器机房、芯片样品或抽象神经网络光线为主体，表现技术产品或科技公司事件，不画品牌标志和界面"
+    elif any(token in theme for token in ("机场", "航班", "航空")) or any(
+        token in lower_theme for token in ("airport", "flight", "airline")
+    ):
+        scene_cue = "以机场跑道和一架无标识客机为主体，表现航班运行或延误，不画航站楼招牌和屏幕文字"
+    elif any(token in theme for token in ("台风", "暴雨", "地震", "灾害", "风暴")) or any(
+        token in lower_theme for token in ("typhoon", "storm", "flood", "earthquake", "disaster")
+    ):
+        scene_cue = "以受天气影响的城市或道路为主体，表现预警和人员疏散的公共安全场景，不画伤亡和灾难化特写"
+    elif any(token in theme for token in ("枪", "枪击", "受伤", "死亡", "袭击")) or any(
+        token in lower_theme for token in ("gun", "shooting", "injured", "death", "attack")
+    ):
+        scene_cue = "以议事会场、纪念烛光或救援现场的克制构图表现事件，不画血迹、尸体、伤口和暴力特写"
+    else:
+        scene_cue = "用一个清晰动作和两个实体物件表现事件，不堆叠无关人物，不添加新闻海报元素"
+
     prompt = (
-        f"生成一张竖版3:4插画，描绘以下事件：{theme or '事件'}。"
-        "画面中不要出现任何文字、标志、水印、海报排版或UI元素。"
+        f"生成一张竖版3:4、单一清晰叙事的新闻编辑插画，事件是：{theme or '事件'}。"
+        f"具体画面：{scene_cue}。"
+        "画面中不要出现任何文字或可读字母、数字、标志、Logo、水印、旗帜、招牌、海报排版或UI元素；"
+        "不要凭空加入未被事件描述支持的身份、地点、伤亡、武器或结果。"
     )
     return _clip_text(prompt, limit=220)
 
@@ -742,6 +784,21 @@ def fetch_and_download_related_images(
     count = _resolve_image_count(count)
 
     query_original = build_image_query(title, body, topics, prompt_hint)
+
+    if provider_name == "opencodex":
+        from src.images.opencodex_images import generate_subscription_image
+
+        if requested_count is None and not (os.getenv("AUTO_IMAGE_COUNT") or "").strip():
+            count = 1
+        prompt = _resolve_image_prompt()
+        post_id = dest_dir.parent.name if dest_dir.name == "assets" else dest_dir.name
+        results = [
+            generate_subscription_image(post_id=post_id, prompt=prompt, dest_dir=dest_dir / f"image-{i}")
+            for i in range(count)
+        ]
+        return [result.path for result in results], [
+            {**result.meta, "query_original": query_original} for result in results
+        ]
 
     if provider_name in ("aliyun", "dashscope", "bailian", "qwen_image", "qwen-image"):
         from src.images.aliyun_images import generate_aliyun_image

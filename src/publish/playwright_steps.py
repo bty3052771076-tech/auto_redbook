@@ -17,6 +17,8 @@ from src.storage.events import save_event
 from src.storage.files import evidence_dir, save_execution
 from src.storage.models import Execution, Post, PublishedMetric, StepResult
 from src.publish.concurrency import xhs_upload_slot
+from src.publish.draft_management import build_platform_snapshot, inspection_completeness
+from src.publish.platform_guard import detect_platform_risk
 
 TARGET_URL = "https://creator.xiaohongshu.com/publish/publish?target=image"
 WAIT_TEXTS = [
@@ -236,6 +238,14 @@ def _resolve_cdp_url() -> Optional[str]:
     return raw
 
 
+def _assert_xhs_operable(page, *, profile_dir: Path | None = None) -> str:
+    """Check persisted account state and visible platform risk before an action."""
+    resolved = profile_dir
+    if resolved is None:
+        resolved, _channel, _args = _resolve_profile_config()
+    return detect_platform_risk(page, profile_key=resolved)
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -259,6 +269,33 @@ def _format_progress_message(name: str, status: str, detail: str = "") -> str:
     if detail:
         message += f" | {detail}"
     return message
+
+
+def _classify_write_failure(message: str, *, submitted: bool, operation: str) -> str:
+    """Preserve the no-retry boundary after a browser write may have landed."""
+
+    text = str(message or "").strip() or "unknown platform write error"
+    if submitted and not text.startswith("XHS_"):
+        return f"XHS_WRITE_UNCERTAIN: {operation} result unknown: {text}"
+    return text
+
+
+def _capture_publication_failure_evidence(page, *, post_id: str, operation: str) -> str:
+    """Capture the final read-only page state for post-submit diagnosis."""
+
+    evidence = evidence_dir(str(post_id), f"publish-{uuid.uuid4().hex}")
+    evidence.mkdir(parents=True, exist_ok=True)
+    try:
+        page.screenshot(path=str(evidence / f"{operation}_failure.png"), full_page=True)
+    except Exception:
+        pass
+    try:
+        (evidence / f"{operation}_failure.html").write_text(
+            page.content(), encoding="utf-8"
+        )
+    except Exception:
+        pass
+    return str(evidence)
 
 
 def _emit_progress(
@@ -740,6 +777,9 @@ def _wait_for_xhs_ready(
     because the user cannot scan a QR/captcha in an invisible browser.
     """
     reader = state_reader or _detect_xhs_page_state
+    # Risk/challenge overlays must win over an editor visible behind them.
+    # The guard intentionally inspects only platform system surfaces.
+    _assert_xhs_operable(page)
     state, detail = reader(page)
     if state == "not_found":
         raise XHSPageUnavailableError(f"xiaohongshu creator page unavailable; {detail}")
@@ -784,6 +824,7 @@ def _wait_for_xhs_ready(
     last_detail = detail
     while monotonic_fn() < deadline:
         sleep_fn(1)
+        _assert_xhs_operable(page)
         state, detail = reader(page)
         last_detail = detail
         if state == "not_found":
@@ -2440,6 +2481,45 @@ def _read_editor_draft_snapshot(page) -> dict[str, str]:
     return out
 
 
+def _read_editor_image_sources(page) -> list[str]:
+    """Read visible editor media references without treating the cover as proof of all images."""
+    try:
+        values = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 1 && rect.height > 1 &&
+                  style.visibility !== 'hidden' && style.display !== 'none';
+              };
+              const nodes = Array.from(document.querySelectorAll(
+                "img[src], video[poster], [style*='background-image']"
+              )).filter(visible).filter((el) => {
+                const marker = `${el.className || ''} ${el.id || ''} ${el.getAttribute('alt') || ''}`.toLowerCase();
+                const src = (el.getAttribute('src') || el.getAttribute('poster') || '').toLowerCase();
+                if (/(avatar|头像|icon|logo|图标|emoji|loading)/.test(`${marker} ${src}`)) return false;
+                const rect = el.getBoundingClientRect();
+                const width = Number(el.naturalWidth || rect.width || 0);
+                const height = Number(el.naturalHeight || rect.height || 0);
+                return width >= 120 && height >= 120;
+              });
+              const result = [];
+              for (const el of nodes) {
+                const src = el.getAttribute('src') || el.getAttribute('poster') || '';
+                if (src && !result.includes(src)) result.push(src);
+              }
+              return result;
+            }
+            """
+        )
+    except Exception:
+        return []
+    if not isinstance(values, list):
+        return []
+    return [str(value).strip() for value in values if str(value or "").strip()]
+
+
 def _matches_value(actual: str, expected: str) -> bool:
     if not actual:
         return False
@@ -2735,7 +2815,7 @@ def _find_platform_draft_index_for_post(page, post: Post) -> tuple[Optional[int]
     return None, {}
 
 
-def run_collect_platform_drafts_sync(
+def _run_collect_platform_drafts_sync_unlocked(
     *,
     draft_type: str = "image",
     login_hold: int = 0,
@@ -2753,6 +2833,7 @@ def run_collect_platform_drafts_sync(
         "draft_type": draft_type,
         "items": [],
         "total": 0,
+        "complete": False,
         "errors": [],
         "profile_dir": "",
     }
@@ -2803,6 +2884,7 @@ def run_collect_platform_drafts_sync(
                 for item in raw_items
             ]
             result["total"] = len(result["items"])
+            result["complete"] = True
             _emit_progress(
                 progress_callback,
                 "collect_platform_drafts",
@@ -2813,6 +2895,182 @@ def run_collect_platform_drafts_sync(
     except Exception as exc:
         result["errors"].append(str(exc))
         _emit_progress(progress_callback, "collect_platform_drafts", "failed", str(exc))
+        return result
+    finally:
+        try:
+            if context is not None and should_close_context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None and not should_close_context:
+                browser.close()
+        except Exception:
+            pass
+
+
+def run_collect_platform_drafts_sync(
+    *,
+    draft_type: str = "image",
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Read the platform draft list while holding the shared XHS session lock."""
+    with xhs_upload_slot():
+        return _run_collect_platform_drafts_sync_unlocked(
+            draft_type=draft_type,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout_ms,
+            headless=headless,
+            progress_callback=progress_callback,
+        )
+
+
+def run_inspect_platform_drafts_sync(
+    *,
+    draft_type: str = "image",
+    max_items: int = 0,
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Read each live draft editor and return auditable content snapshots."""
+    result: dict[str, Any] = {
+        "draft_type": draft_type,
+        "snapshots": [],
+        "items": [],
+        "total": 0,
+        "inspected": 0,
+        "complete": False,
+        "enumeration_complete": False,
+        "inspection_complete": False,
+        "stop_reason": "",
+        "errors": [],
+        "profile_dir": "",
+    }
+    profile_dir, channel, args = _resolve_profile_config()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    result["profile_dir"] = str(profile_dir)
+    headless_value = _resolve_headless(headless)
+    context = None
+    browser = None
+    should_close_context = True
+    page = None
+    captured_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    try:
+        with xhs_upload_slot():
+            with sync_playwright() as p:
+                cdp_url = _resolve_cdp_url()
+                if cdp_url:
+                    browser = p.chromium.connect_over_cdp(cdp_url)
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                    should_close_context = False
+                else:
+                    launch_kwargs = {"headless": headless_value}
+                    if channel:
+                        launch_kwargs["channel"] = channel
+                    if args:
+                        launch_kwargs["args"] = args
+                    context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
+                context.set_default_timeout(_context_default_timeout_ms(wait_timeout_ms))
+                page = context.new_page() if not should_close_context else (context.pages[0] if context.pages else context.new_page())
+                _open_platform_draft_list(
+                    page,
+                    draft_type=draft_type,
+                    login_hold=login_hold,
+                    wait_timeout_ms=wait_timeout_ms,
+                    headless=headless_value,
+                    progress_callback=progress_callback,
+                )
+                raw_items = _collect_draft_items(page, limit=None)
+                title_counts: dict[str, int] = {}
+                for raw_item in raw_items:
+                    normalized_title = re.sub(r"\s+", " ", str(raw_item.get("title") or "").strip()).casefold()
+                    if normalized_title:
+                        title_counts[normalized_title] = title_counts.get(normalized_title, 0) + 1
+                items = []
+                for raw_item in raw_items:
+                    item = dict(raw_item)
+                    normalized_title = re.sub(r"\s+", " ", str(item.get("title") or "").strip()).casefold()
+                    if (
+                        normalized_title
+                        and title_counts.get(normalized_title, 0) > 1
+                        and not str(item.get("platform_draft_id") or item.get("draft_id") or "").strip()
+                    ):
+                        item["identity_ambiguous"] = True
+                    items.append(item)
+                result["total"] = len(items)
+                result["enumeration_complete"] = True
+                bounded_items = items[:max(0, int(max_items))] if max_items else items
+                result["items"] = bounded_items
+                for item in bounded_items:
+                    title = str(item.get("title") or "").strip()
+                    try:
+                        if item.get("identity_ambiguous"):
+                            snapshot = build_platform_snapshot(
+                                item=item,
+                                editor={},
+                                image_sources=(),
+                                snapshot_id=uuid.uuid4().hex,
+                                profile_fingerprint=str(profile_dir),
+                                captured_at=captured_at,
+                            )
+                            result["snapshots"].append(snapshot.to_dict())
+                            result["inspected"] += 1
+                            _emit_progress(
+                                progress_callback,
+                                "inspect_platform_draft",
+                                "warning",
+                                f"identity_ambiguous:{snapshot.snapshot_id}",
+                            )
+                            continue
+                        if not title:
+                            raise RuntimeError("平台草稿标题为空，无法唯一打开编辑器")
+                        _open_draft_editor_for_post(page, Post(title=title))
+                        editor = _read_editor_draft_snapshot(page)
+                        image_sources = _read_editor_image_sources(page)
+                        snapshot = build_platform_snapshot(
+                            item=item,
+                            editor=editor,
+                            image_sources=image_sources,
+                            snapshot_id=uuid.uuid4().hex,
+                            profile_fingerprint=str(profile_dir),
+                            captured_at=captured_at,
+                        )
+                        result["snapshots"].append(snapshot.to_dict())
+                        result["inspected"] += 1
+                        _emit_progress(progress_callback, "inspect_platform_draft", "success", snapshot.snapshot_id)
+                    except Exception as exc:
+                        result["errors"].append(f"index={item.get('index', '')}: {exc}")
+                        _emit_progress(progress_callback, "inspect_platform_draft", "failed", str(exc))
+                    finally:
+                        try:
+                            _open_platform_draft_list(
+                                page,
+                                draft_type=draft_type,
+                                login_hold=0,
+                                wait_timeout_ms=wait_timeout_ms,
+                                headless=headless_value,
+                                progress_callback=progress_callback,
+                            )
+                        except Exception as exc:
+                            result["errors"].append(f"return_to_draft_list: {exc}")
+                            break
+                result.update(
+                    inspection_completeness(
+                        total=len(items),
+                        inspected=result["inspected"],
+                        requested_limit=max_items,
+                        errors=result["errors"],
+                    )
+                )
+                return result
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        _emit_progress(progress_callback, "inspect_platform_drafts", "failed", str(exc))
         return result
     finally:
         try:
@@ -2899,12 +3157,33 @@ def _open_draft_editor_for_titles(
 
 
 def _click_publish_button(page) -> str:
+    custom_publish = page.locator("xhs-publish-btn").first
+    if custom_publish.count() > 0:
+        disabled = (custom_publish.get_attribute("submit-disabled") or "").strip().lower()
+        if disabled in {"true", "1", "yes"}:
+            raise RuntimeError("publish button disabled")
+        try:
+            custom_publish.scroll_into_view_if_needed()
+            box = custom_publish.bounding_box()
+            if not box or box["width"] < 120 or box["height"] < 40:
+                raise RuntimeError("publish control geometry is invalid")
+            # XHS renders this custom element without child DOM. Its left and
+            # right halves are the separate save/publish hit areas; clicking
+            # the element center can be a no-op. Keep the point inside the
+            # right-side submit area and report the exact interaction.
+            x = box["x"] + box["width"] * 0.66
+            y = box["y"] + box["height"] * 0.5
+            page.mouse.click(x, y)
+            return f"xhs-publish-btn@{round(x)},{round(y)}"
+        except Exception as exc:
+            raise RuntimeError(f"publish button interaction failed: {exc}") from exc
     detail = page.evaluate(
         """
         () => {
           const labels = ['发布', '立即发布', '发布笔记'];
           const nodes = Array.from(document.querySelectorAll(
-            'button,[role="button"],.btn,.d-button,.publish,.publish-btn'
+            'button,[role="button"],.btn,.d-button,.publish,.publish-btn,' +
+            '.publish-video,.publish-video .btn-wrapper,.publish-video .btn-inner'
           ));
           const visible = (el) => {
             const rect = el.getBoundingClientRect();
@@ -2983,7 +3262,204 @@ def _confirm_publish_dialog(page, timeout_s: float = 5.0) -> bool:
     return False
 
 
-def run_publish_drafts_sync(
+def _read_visibility_state(page) -> str:
+    """Read the visible platform visibility control, failing closed on ambiguity."""
+    try:
+        state = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden';
+              };
+              const nodes = Array.from(document.querySelectorAll(
+                'button,[role="button"],label,[role="option"],[role="radio"],input,' +
+                '.d-select-content,.permission-card-select,.permission-card-wrapper,.d-select'
+              )).filter(visible);
+              const textOf = (el) => (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ');
+              const privateNode = nodes.find((el) => /仅自己可见|仅自己|私密/.test(textOf(el)) && !/设置|选项/.test(textOf(el)));
+              if (privateNode && (privateNode.getAttribute('aria-checked') === 'true' || privateNode.getAttribute('aria-selected') === 'true' || /active|selected|checked/.test(privateNode.className || '') || textOf(privateNode) === '仅自己可见')) return 'private';
+              const publicNode = nodes.find((el) => /公开可见|所有人可见|公开/.test(textOf(el)) && !/不公开/.test(textOf(el)));
+              if (publicNode) return 'public';
+              return 'unknown';
+            }
+            """
+        )
+    except Exception:
+        return "unknown"
+    return str(state or "unknown")
+
+
+def _set_private_visibility(page, *, timeout_s: float = 8.0) -> dict[str, str]:
+    """Set and read back the platform's exact ``仅自己可见`` state."""
+    deadline = time.time() + max(1.0, timeout_s)
+    opened = False
+    while time.time() < deadline:
+        if _read_visibility_state(page) == "private":
+            return {"requested_visibility": "private", "observed_visibility": "private", "opened": str(opened).lower()}
+        try:
+            options = page.locator('.d-popover:visible .d-grid-item')
+            selected = False
+            for index in range(options.count()):
+                option = options.nth(index)
+                if (option.inner_text() or "").strip() == "仅自己可见":
+                    option.click(force=True)
+                    selected = True
+                    opened = True
+                    break
+            if not selected:
+                control = page.locator(
+                    '.permission-card-select .d-select-main,'
+                    '.permission-card-select .d-select-content,'
+                    '.permission-card-select .d-select'
+                ).first
+                if control.count() > 0:
+                    control.click(force=True)
+                    opened = True
+                else:
+                    page.get_by_text("公开可见", exact=True).last.click(force=True)
+                    opened = True
+            time.sleep(0.25)
+        except Exception:
+            time.sleep(0.25)
+    observed = _read_visibility_state(page)
+    raise RuntimeError(
+        f"VISIBILITY_PRIVATE_NOT_CONFIRMED: 无法在发布前读回‘仅自己可见’，当前状态={observed}；已停止，不会公开提交"
+    )
+
+
+def _set_visibility(page, visibility: str, *, timeout_s: float = 8.0) -> dict[str, str]:
+    """Set an explicitly requested visibility and read it back before submit."""
+    requested = str(visibility or "private").strip().lower()
+    if requested == "private":
+        return _set_private_visibility(page, timeout_s=timeout_s)
+    if requested != "public":
+        raise RuntimeError(f"VISIBILITY_UNSUPPORTED: unsupported visibility={visibility}")
+    deadline = time.time() + max(1.0, timeout_s)
+    opened = False
+    while time.time() < deadline:
+        if _read_visibility_state(page) == "public":
+            return {"requested_visibility": "public", "observed_visibility": "public", "opened": str(opened).lower()}
+        try:
+            options = page.locator('.d-popover:visible .d-grid-item')
+            selected = False
+            for index in range(options.count()):
+                option = options.nth(index)
+                text = (option.inner_text() or "").strip()
+                if text in {"公开可见", "所有人可见", "公开"}:
+                    option.click(force=True)
+                    selected = True
+                    opened = True
+                    break
+            if not selected:
+                control = page.locator(
+                    '.permission-card-select .d-select-main,'
+                    '.permission-card-select .d-select-content,'
+                    '.permission-card-select .d-select'
+                ).first
+                if control.count() > 0:
+                    control.click(force=True)
+                    opened = True
+                else:
+                    current = None
+                    for label in ("仅自己可见", "私密", "公开可见", "所有人可见", "公开"):
+                        candidate = page.get_by_text(label, exact=True)
+                        for candidate_index in range(candidate.count()):
+                            item = candidate.nth(candidate_index)
+                            if item.is_visible():
+                                current = item
+                                break
+                        if current is not None:
+                            break
+                    if current is None:
+                        time.sleep(0.25)
+                        continue
+                    current.click(force=True)
+                    opened = True
+            time.sleep(0.25)
+        except Exception:
+            time.sleep(0.25)
+    observed = _read_visibility_state(page)
+    raise RuntimeError(
+        f"VISIBILITY_PUBLIC_NOT_CONFIRMED: 无法在发布前读回‘公开可见’，当前状态={observed}；已停止提交"
+    )
+
+
+def _verify_publication(page, title: str, *, visibility: str = "private", timeout_s: float = 12.0) -> dict[str, str]:
+    """Read the note manager after submission and require the requested state."""
+    requested = str(visibility or "private").strip().lower()
+    deadline = time.time() + max(2.0, timeout_s)
+    while time.time() < deadline:
+        try:
+            _assert_xhs_operable(page)
+            page.goto(_published_url_candidates()[0], wait_until="domcontentloaded", timeout=max(1000, int((deadline - time.time()) * 1000)))
+            _wait_for_xhs_ready(page, login_hold=0, headless=True)
+            # A moderation/review detail may only appear after navigation.
+            _assert_xhs_operable(page)
+            body = _read_page_body_text(page, timeout_ms=2000, max_chars=20000)
+            record = page.evaluate(
+                """
+                (title) => {
+                  const cards = Array.from(document.querySelectorAll('.note-card'));
+                  const textOf = (el) => (el?.innerText || el?.textContent || '').trim();
+                  const hit = cards.find((card) => {
+                    const cardTitle = textOf(card.querySelector('.note-card__title'));
+                    return cardTitle === title;
+                  });
+                  if (!hit) return null;
+                  const cardText = textOf(hit);
+                  const impression = hit.getAttribute('data-impression') || '';
+                  const idMatch = impression.match(/"noteId"\s*:\s*"([^"]+)"/);
+                  return {
+                    title: textOf(hit.querySelector('.note-card__title')),
+                    body: cardText,
+                    image_count: hit.querySelectorAll('.note-card__cover img.content').length,
+                    private: /仅自己可见/.test(cardText),
+                    public: /公开可见|所有人可见/.test(cardText),
+                    note_id: idMatch ? idMatch[1] : ''
+                  };
+                }
+                """,
+                title,
+            )
+            if not record:
+                if title and title not in body:
+                    time.sleep(0.5)
+                    continue
+                raise RuntimeError("PUBLISH_ID_NOT_CONFIRMED: 内容管理中未找到对应笔记卡片")
+            if record.get("private"):
+                observed = "private"
+            elif record.get("public"):
+                observed = "public"
+            else:
+                raise RuntimeError("XHS_WRITE_UNCERTAIN: 内容管理卡片未正向显示可见性")
+            if observed != requested:
+                label = "仅自己可见" if requested == "private" else "公开可见"
+                raise RuntimeError(f"VISIBILITY_{requested.upper()}_NOT_CONFIRMED: 内容管理卡片未显示‘{label}’")
+            note_id = str(record.get("note_id") or "").strip()
+            if not note_id:
+                raise RuntimeError("PUBLISH_ID_NOT_CONFIRMED: 内容管理卡片未读到笔记标识")
+            return {
+                "observed_visibility": observed,
+                "note_id": note_id,
+                "platform_title": str(record.get("title") or ""),
+                "platform_body": str(record.get("body") or ""),
+                "platform_image_count": str(record.get("image_count") or 0),
+            }
+        except RuntimeError:
+            raise
+        except Exception:
+            time.sleep(0.5)
+    raise RuntimeError("PUBLISH_UNCERTAIN: 提交后未能在内容管理中核实笔记和私密状态")
+
+
+def _verify_private_publication(page, title: str, *, timeout_s: float = 12.0) -> dict[str, str]:
+    """Backward-compatible private publication verifier."""
+    return _verify_publication(page, title, visibility="private", timeout_s=timeout_s)
+
+
+def _run_publish_drafts_sync_unlocked(
     *,
     posts: list[Post],
     draft_type: str = "image",
@@ -2992,6 +3468,7 @@ def run_publish_drafts_sync(
     wait_timeout_ms: int = WAIT_TIMEOUT_MS,
     headless: Optional[bool] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
+    visibility: str = "private",
 ) -> dict:
     result = {
         "draft_type": draft_type,
@@ -3000,6 +3477,7 @@ def run_publish_drafts_sync(
         "items": [],
         "published_post_ids": [],
         "errors": [],
+        "requested_visibility": visibility,
     }
     if not posts:
         return result
@@ -3010,6 +3488,7 @@ def run_publish_drafts_sync(
     context = None
     browser = None
     should_close_context = True
+    page = None
 
     try:
         with sync_playwright() as p:
@@ -3038,6 +3517,8 @@ def run_publish_drafts_sync(
             )
 
             for post in posts:
+                write_submitted = False
+                item_data = {"post_id": post.id}
                 try:
                     idx, item_data = _find_platform_draft_index_for_post(page, post)
                     if idx is None:
@@ -3052,14 +3533,41 @@ def run_publish_drafts_sync(
                     snapshot = _read_editor_draft_snapshot(page)
                     if snapshot:
                         item_data.update(snapshot)
+                    editor_images = _read_editor_image_sources(page)
+                    item_data["image_count"] = len(editor_images)
+                    _assert_xhs_operable(page, profile_dir=profile_dir)
+                    if visibility not in {"private", "public"}:
+                        raise RuntimeError(f"VISIBILITY_UNSUPPORTED: visibility={visibility}")
+                    item_data.update(_set_visibility(page, visibility))
+                    _emit_progress(progress_callback, "set_visibility", "success", visibility)
+                    _assert_xhs_operable(page, profile_dir=profile_dir)
                     detail = _click_publish_button(page)
                     _emit_progress(progress_callback, "click_publish", "success", detail)
+                    # From this point the platform may have accepted the
+                    # write even if confirmation or readback later fails.
+                    write_submitted = True
                     confirmed = _confirm_publish_dialog(page, timeout_s=5.0)
                     if confirmed:
                         _emit_progress(progress_callback, "confirm_publish", "success", "")
                     time.sleep(2)
+                    publication = _verify_publication(
+                        page,
+                        post.title,
+                        visibility=visibility,
+                        timeout_s=max(8.0, wait_timeout_ms / 1000),
+                    )
+                    item_data.update(publication)
+                    _emit_progress(progress_callback, "verify_publication", "success", publication.get("note_id", ""))
 
-                    # Re-open the draft list to verify the draft is no longer available and to process the next one.
+                    # Persist the confirmed result before navigating to the
+                    # next page. A later navigation timeout must not erase a
+                    # publication that has already been positively verified.
+                    result["published"] += 1
+                    result["published_post_ids"].append(post.id)
+                    _emit_progress(progress_callback, "verify_published", "success", f"post_id={post.id}")
+
+                    # Re-open the draft list to process the next item. A draft
+                    # disappearing by itself is not proof of publication.
                     _open_platform_draft_list(
                         page,
                         draft_type=draft_type,
@@ -3068,15 +3576,33 @@ def run_publish_drafts_sync(
                         headless=headless_value,
                         progress_callback=progress_callback,
                     )
-                    if _draft_item_exists(page, post.title):
-                        raise RuntimeError(f"publish verification failed; draft still exists for post_id={post.id}")
-                    result["published"] += 1
-                    result["published_post_ids"].append(post.id)
-                    _emit_progress(progress_callback, "verify_published", "success", f"post_id={post.id}")
                 except Exception as exc:
-                    msg = str(exc)
+                    evidence_ref = _capture_publication_failure_evidence(
+                        page, post_id=post.id, operation="publish"
+                    )
+                    item_data["evidence_ref"] = evidence_ref
+                    result.setdefault("evidence_refs", []).append(evidence_ref)
+                    msg = _classify_write_failure(
+                        str(exc), submitted=write_submitted, operation="publish"
+                    )
+                    msg = f"{msg} evidence_ref={evidence_ref}"
                     result["errors"].append(msg)
                     _emit_progress(progress_callback, "publish_draft", "failed", msg)
+                    if any(
+                        code in msg
+                        for code in (
+                            "XHS_RISK_BLOCKED",
+                            "XHS_CHALLENGE_REQUIRED",
+                            "XHS_LOGIN_REQUIRED",
+                            "XHS_RATE_LIMITED",
+                            "XHS_WRITE_UNCERTAIN",
+                            "XHS_PENDING_REVIEW",
+                            "XHS_PLATFORM_RESTRICTED",
+                            "XHS_PLATFORM_REJECTED",
+                        )
+                    ):
+                        result["stopped"] = True
+                        break
                     if not dry_run:
                         try:
                             _open_platform_draft_list(
@@ -3103,7 +3629,16 @@ def run_publish_drafts_sync(
             result["event_path"] = str(event_path)
             return result
     except Exception as exc:
-        result["errors"].append(str(exc))
+        message = str(exc)
+        if page is not None:
+            evidence_ref = _capture_publication_failure_evidence(
+                page,
+                post_id=(posts[0].id if posts else "unknown"),
+                operation="publish",
+            )
+            result.setdefault("evidence_refs", []).append(evidence_ref)
+            message = f"{message} evidence_ref={evidence_ref}"
+        result["errors"].append(message)
         return result
     finally:
         try:
@@ -3116,6 +3651,31 @@ def run_publish_drafts_sync(
                 browser.close()
         except Exception:
             pass
+
+
+def run_publish_drafts_sync(
+    *,
+    posts: list[Post],
+    draft_type: str = "image",
+    dry_run: bool = False,
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    visibility: str = "private",
+) -> dict:
+    """Publish platform drafts while serializing the shared XHS session."""
+    with xhs_upload_slot():
+        return _run_publish_drafts_sync_unlocked(
+            posts=posts,
+            draft_type=draft_type,
+            dry_run=dry_run,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout_ms,
+            headless=headless,
+            progress_callback=progress_callback,
+            visibility=visibility,
+        )
 
 
 def _run_save_draft_sync_unlocked(
@@ -3140,6 +3700,7 @@ def _run_save_draft_sync_unlocked(
     assets = [str(Path(p)) for p in (assets or []) if Path(p).is_file()]
     context = None
     should_close_context = True
+    write_submitted = False
 
     try:
         profile_dir, channel, args = _resolve_profile_config()
@@ -3248,6 +3809,7 @@ def _run_save_draft_sync_unlocked(
                     return exec_rec
 
                 if assets:
+                    _assert_xhs_operable(page, profile_dir=profile_dir)
                     _step("upload_images", "in_progress", f"{len(assets)} files")
                     uploaded, method = _try_upload_with_button(page, assets)
                     if not uploaded:
@@ -3343,6 +3905,10 @@ def _run_save_draft_sync_unlocked(
                 steps[-1].status = "success"
 
                 _step("save_draft", "in_progress", "")
+                _assert_xhs_operable(page, profile_dir=profile_dir)
+                # Saving may have a remote side effect before toast/list/readback
+                # verification finishes, so a later failure is not retryable.
+                write_submitted = True
                 clicked, detail = _click_draft(page)
                 steps[-1].detail = detail
                 if not clicked:
@@ -3414,6 +3980,22 @@ def _run_save_draft_sync_unlocked(
 
                 _step("open_draft_box", "in_progress", "")
                 opened = _open_draft_box(page)
+                if not opened:
+                    # Saving can navigate to a creator-console settings route
+                    # where the drawer trigger is absent. Re-enter the known
+                    # image publish route before declaring delivery uncertain.
+                    try:
+                        _open_platform_draft_list(
+                            page,
+                            draft_type=post.type.value,
+                            login_hold=0,
+                            wait_timeout_ms=wait_timeout_ms,
+                            headless=headless_value,
+                            progress_callback=progress_callback,
+                        )
+                        opened = True
+                    except Exception:
+                        opened = False
                 steps[-1].detail = f"opened={opened}"
                 if not opened:
                     raise RuntimeError("draft box not opened after save")
@@ -3502,8 +4084,11 @@ def _run_save_draft_sync_unlocked(
                     context.close()
     except Exception as exc:  # pragma: no cover
         exec_rec.result = "failed"
-        exec_rec.error = {"message": str(exc)}
-        _emit_progress(progress_callback, "save_draft_chain", "failed", str(exc))
+        message = _classify_write_failure(
+            str(exc), submitted=write_submitted, operation="draft_save"
+        )
+        exec_rec.error = {"message": message}
+        _emit_progress(progress_callback, "save_draft_chain", "failed", message)
     finally:
         exec_rec.steps = steps
         save_execution(exec_rec)
@@ -3538,7 +4123,7 @@ def run_save_draft_sync(
         )
 
 
-def run_update_draft_sync(
+def _run_update_draft_sync_unlocked(
     post: Post,
     *,
     existing_title: str = "",
@@ -3561,6 +4146,8 @@ def run_update_draft_sync(
     context = None
     browser = None
     should_close_context = True
+    page = None
+    write_submitted = False
 
     try:
         profile_dir, channel, args = _resolve_profile_config()
@@ -3625,6 +4212,7 @@ def run_update_draft_sync(
                 return exec_rec
 
             _step("update_title_body", "in_progress", "")
+            _assert_xhs_operable(page, profile_dir=profile_dir)
             title_ok, body_ok = _fill_text_fields(page, post.title, post.body)
             steps[-1].detail = f"title={title_ok} body={body_ok}"
             if not (title_ok and body_ok):
@@ -3643,6 +4231,8 @@ def run_update_draft_sync(
             steps[-1].status = "success"
 
             _step("save_draft", "in_progress", "")
+            _assert_xhs_operable(page, profile_dir=profile_dir)
+            write_submitted = True
             clicked, detail = _click_draft(page)
             steps[-1].detail = detail
             if not clicked:
@@ -3701,8 +4291,11 @@ def run_update_draft_sync(
             _emit_progress(progress_callback, "update_draft_chain", "success", post.id)
     except Exception as exc:  # pragma: no cover
         exec_rec.result = "failed"
-        exec_rec.error = {"message": str(exc)}
-        _emit_progress(progress_callback, "update_draft_chain", "failed", str(exc))
+        message = _classify_write_failure(
+            str(exc), submitted=write_submitted, operation="draft_update"
+        )
+        exec_rec.error = {"message": message}
+        _emit_progress(progress_callback, "update_draft_chain", "failed", message)
     finally:
         exec_rec.steps = steps
         save_execution(exec_rec)
@@ -3720,7 +4313,34 @@ def run_update_draft_sync(
     return exec_rec
 
 
-def run_delete_drafts_sync(
+def run_update_draft_sync(
+    post: Post,
+    *,
+    existing_title: str = "",
+    draft_type: str = "image",
+    dry_run: bool = False,
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    execution: Optional[Execution] = None,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Execution:
+    """Update a platform draft while serializing the shared XHS session."""
+    with xhs_upload_slot():
+        return _run_update_draft_sync_unlocked(
+            post,
+            existing_title=existing_title,
+            draft_type=draft_type,
+            dry_run=dry_run,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout_ms,
+            execution=execution,
+            headless=headless,
+            progress_callback=progress_callback,
+        )
+
+
+def _run_delete_drafts_sync_unlocked(
     *,
     draft_type: str = "image",
     draft_location: str = "publish",
@@ -3918,7 +4538,34 @@ def run_delete_drafts_sync(
         return result
 
 
-def run_collect_published_metrics_sync(
+def run_delete_drafts_sync(
+    *,
+    draft_type: str = "image",
+    draft_location: str = "publish",
+    draft_url: str = "",
+    title_contains: str = "",
+    limit: int = 0,
+    dry_run: bool = False,
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    headless: Optional[bool] = None,
+) -> dict:
+    """Delete platform drafts while serializing the shared XHS session."""
+    with xhs_upload_slot():
+        return _run_delete_drafts_sync_unlocked(
+            draft_type=draft_type,
+            draft_location=draft_location,
+            draft_url=draft_url,
+            title_contains=title_contains,
+            limit=limit,
+            dry_run=dry_run,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout_ms,
+            headless=headless,
+        )
+
+
+def _run_collect_published_metrics_sync_unlocked(
     *,
     limit: int = 0,
     login_hold: int = 0,
@@ -4071,3 +4718,22 @@ def run_collect_published_metrics_sync(
         result["errors"].append(str(exc))
         _emit_progress(progress_callback, "collect_metrics", "failed", str(exc))
         return result
+
+
+def run_collect_published_metrics_sync(
+    *,
+    limit: int = 0,
+    login_hold: int = 0,
+    wait_timeout_ms: int = WAIT_TIMEOUT_MS,
+    headless: Optional[bool] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Collect published metrics under the same creator-center session lock."""
+    with xhs_upload_slot():
+        return _run_collect_published_metrics_sync_unlocked(
+            limit=limit,
+            login_hold=login_hold,
+            wait_timeout_ms=wait_timeout_ms,
+            headless=headless,
+            progress_callback=progress_callback,
+        )

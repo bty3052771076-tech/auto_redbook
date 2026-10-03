@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 import apps.cli as cli
 from src.storage.models import AssetInfo, Execution, Post
-from src.workflow.pipeline import FreeQuotaUnavailableError
+from src.workflow.pipeline import FreeQuotaUnavailableError, build_subscription_runtime_records
 from src.workflow.vision_review import VisionReviewResult
 
 
@@ -155,6 +155,66 @@ def test_prepare_auto_pipeline_snapshot_only_never_refreshes_quota(monkeypatch, 
     assert called == {"quotas": 0}
     assert report.quota_mode == "snapshot_only"
     assert report.model_plan.llm.model == "glm-5.2"
+
+
+def test_prepare_auto_pipeline_uses_explicit_minimax_subscription_without_sync(
+    monkeypatch,
+    tmp_path,
+):
+    now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+    metrics = tmp_path / "data" / "analytics" / "published_metrics_latest.csv"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_text("title,likes\n测试,1\n", encoding="utf-8")
+    os.utime(metrics, (now.timestamp(), now.timestamp()))
+    quota_dir = tmp_path / "data" / "quota"
+    monkeypatch.setenv("LLM_PROVIDER", "minimax")
+    monkeypatch.setenv("IMAGE_PROVIDER", "minimax")
+    monkeypatch.setenv("MINIMAX_USE_SUBSCRIPTION", "1")
+    monkeypatch.setenv("MINIMAX_LLM_MODEL", "MiniMax-M3")
+    monkeypatch.setenv("MINIMAX_IMAGE_MODEL", "image-01")
+    monkeypatch.setattr(
+        cli,
+        "_refresh_quotas_for_preflight",
+        lambda **_kwargs: pytest.fail("subscription-only preflight must not sync quotas"),
+    )
+
+    report = cli._prepare_auto_pipeline(
+        headless=True,
+        login_hold=0,
+        wait_timeout=30,
+        metrics_max_age_hours=24,
+        quota_max_age_hours=2,
+        require_image=True,
+        refresh_quotas=False,
+        metrics_path=metrics,
+        quota_dir=quota_dir,
+        provider_keys={"minimax": True},
+        now=now,
+    )
+
+    assert report.quota_mode == "subscription_configured"
+    assert report.model_plan.llm.model == "MiniMax-M3"
+    assert report.model_plan.image.model == "image-01"
+    assert report.model_plan.llm.cost_class == "subscription_included"
+    assert report.model_plan.llm.unit == "subscription (not synchronized)"
+
+
+def test_build_subscription_runtime_records_are_narrow_and_not_free(tmp_path):
+    records = build_subscription_runtime_records(
+        "minimax",
+        llm_model="MiniMax-M3",
+        image_model="image-01",
+        now=datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc),
+        snapshot_path=tmp_path / "runtime.json",
+    )
+
+    assert [(record.kind, record.model) for record in records] == [
+        ("llm", "MiniMax-M3"),
+        ("image", "image-01"),
+    ]
+    assert all(record.cost_class == "subscription_included" for record in records)
+    assert all(record.unit == "subscription (not synchronized)" for record in records)
+    assert build_subscription_runtime_records("aliyun", llm_model="x", image_model="y") == []
 
 
 def test_prepare_auto_pipeline_reuses_recent_valid_quota_after_empty_snapshot(monkeypatch, tmp_path):

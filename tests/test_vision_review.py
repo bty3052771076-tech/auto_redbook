@@ -6,9 +6,17 @@ from pathlib import Path
 from PIL import Image
 
 from apps import cli
-from apps.cli import _review_with_bounded_image_repair
+from apps.cli import (
+    _apply_visual_spare_selection,
+    _daily_news_visual_spare_count,
+    _replenish_visual_news_until_target,
+    _review_with_bounded_image_repair,
+)
 from src.config import LLMConfig
+from src.images.auto_image import _build_aliyun_image_prompt
 from src.storage.models import AssetInfo, Post
+from src.workflow.create_post import _daily_news_image_repair_hint
+from src.workflow.create_post import _daily_news_story_identity
 from src.workflow.vision_review import (
     VisionReviewResult,
     load_vision_review_config,
@@ -44,6 +52,58 @@ def test_load_vision_review_config_accepts_provider_specific_model_alias(monkeyp
 
     assert config.provider == "volcengine"
     assert config.model == "doubao-seed-1-6-251015"
+
+
+def test_load_vision_review_config_accepts_minimax_subscription_multimodal_model(monkeypatch):
+    monkeypatch.delenv("VLM_REVIEW_MODEL", raising=False)
+    monkeypatch.delenv("MINIMAX_LLM_MODEL", raising=False)
+    monkeypatch.setenv("VLM_REVIEW_PROVIDER", "minimax")
+    monkeypatch.setenv("MINIMAX_TOKEN_PLAN_API_KEY", "test-token-plan-key")
+    monkeypatch.setenv("MINIMAX_BILLING_MODE", "subscription_only")
+    monkeypatch.setenv("MINIMAX_ALLOW_PAID_CREDITS", "0")
+    monkeypatch.setenv("MINIMAX_ALLOW_PAYGO", "0")
+
+    config = load_vision_review_config()
+
+    assert config.provider == "minimax"
+    assert config.model == "MiniMax-M3"
+    assert config.base_url == "https://api.minimax.cn/v1"
+
+
+def test_news_image_prompt_adds_specific_scene_and_hard_negatives():
+    prompt = _build_aliyun_image_prompt(
+        title="UK to give support to Saudi jets",
+        body="英国将提供防御性空中支援。",
+        topics=["每日新闻"],
+        prompt_hint="UK to give support to Saudi jets in attempt to counter Houthi fighters",
+    )
+
+    assert "一到两架无标识飞机平稳巡航" in prompt
+    assert "不要出现任何文字" in prompt
+    assert "爆炸" in prompt
+    assert "皇家空军" not in prompt
+
+
+def test_visual_repair_hint_does_not_echo_logo_or_text_prescription():
+    hint = _daily_news_image_repair_hint(
+        "建议加入皇家空军圆形标志；画面缺少防御性巡航动作；请去除机身乱码文字。"
+    )
+
+    assert "皇家空军圆形标志" not in hint
+    assert "乱码文字" not in hint
+    assert "防御性巡航动作" in hint
+    assert "不得采纳视觉模型提出的具体标志" in hint
+
+
+def test_daily_news_story_identity_dedupes_url_and_title_variants():
+    first = _daily_news_story_identity(
+        {"url": "https://example.com/story?id=7&utm_source=rss", "title": "同一事件出现新进展"}
+    )
+    second = _daily_news_story_identity(
+        {"url": "https://example.com/story?id=7", "title": "同一事件出现新进展"}
+    )
+
+    assert first & second
 
 
 def test_ai_digest_quality_gate_never_replaces_rendered_cards(tmp_path, monkeypatch):
@@ -89,6 +149,233 @@ def test_ai_digest_quality_gate_never_replaces_rendered_cards(tmp_path, monkeypa
     assert repairs == []
 
 
+def test_visual_spares_replace_failed_news_before_upload(tmp_path, monkeypatch):
+    def reviewed_post(post_id: str, *, ok: bool) -> Post:
+        post_dir = tmp_path / post_id
+        post_dir.mkdir()
+        post = _post_with_image(post_dir)
+        post.id = post_id
+        post.platform["quality_gate"] = {
+            "deterministic_ok": True,
+            "vision": {
+                "ok": ok,
+                "score": 90 if ok else 20,
+                "issues": [] if ok else ["图片与正文不一致"],
+            },
+        }
+        return post
+
+    saved: list[Post] = []
+    monkeypatch.setattr(cli, "save_post", lambda post: saved.append(post))
+    posts = [
+        reviewed_post("ready-1", ok=True),
+        reviewed_post("failed-1", ok=False),
+        reviewed_post("ready-2", ok=True),
+    ]
+
+    applied, selected_count, failed_count, unused_count = _apply_visual_spare_selection(
+        posts,
+        requested_count=2,
+    )
+
+    assert applied is True
+    assert [post.id for post in posts] == ["ready-1", "ready-2"]
+    assert selected_count == 2
+    assert failed_count == 1
+    assert unused_count == 0
+    assert saved[0].id == "failed-1"
+    assert saved[0].platform["batch_selection"]["status"] == "visual_quality_failed"
+
+
+def test_visual_selection_accepts_exactly_one_reviewed_news(tmp_path):
+    post = _post_with_image(tmp_path)
+    post.platform["quality_gate"] = {
+        "deterministic_ok": True,
+        "vision": {"ok": True, "score": 72, "issues": []},
+    }
+    posts = [post]
+
+    applied, selected_count, failed_count, unused_count = _apply_visual_spare_selection(
+        posts,
+        requested_count=1,
+    )
+
+    assert applied is True
+    assert posts == [post]
+    assert (selected_count, failed_count, unused_count) == (1, 0, 0)
+
+
+def test_daily_news_visual_spare_budget_covers_ten_item_batch():
+    assert _daily_news_visual_spare_count(1) == 0
+    assert _daily_news_visual_spare_count(10) == 4
+    assert _daily_news_visual_spare_count(20) == 5
+
+
+def test_visual_news_replenishment_fills_gap_after_initial_review(tmp_path):
+    def reviewed_post(post_id: str, *, ok: bool) -> Post:
+        post_dir = tmp_path / post_id
+        post_dir.mkdir()
+        post = _post_with_image(post_dir)
+        post.id = post_id
+        post.title = f"芯片企业发布新方案-{post_id}"
+        post.platform["quality_gate"] = {
+            "deterministic_ok": True,
+            "vision": {"ok": ok, "score": 90 if ok else 20, "issues": [] if ok else ["乱码"]},
+        }
+        return post
+
+    posts = [reviewed_post("ready-1", ok=True), reviewed_post("failed-1", ok=False)]
+    generated: list[int] = []
+
+    def generate_more(batch_size: int, _round: int) -> list[Post]:
+        generated.append(batch_size)
+        return [reviewed_post("ready-2", ok=True)]
+
+    complete, rounds, selected_count, failed_count, unused_count, errors = _replenish_visual_news_until_target(
+        posts,
+        requested_count=2,
+        generate_batch=generate_more,
+        review_batch=lambda _new_posts: [],
+        max_rounds=2,
+        max_candidates=6,
+    )
+
+    assert complete is True
+    assert rounds == 1
+    assert selected_count == 2
+    assert failed_count == 1
+    assert unused_count == 0
+    assert errors == []
+    assert generated == [3]
+    assert [post.id for post in posts] == ["ready-1", "failed-1", "ready-2"]
+
+
+def test_low_scoring_best_of_two_does_not_count_as_visual_ready(tmp_path):
+    first_dir = tmp_path / "first"
+    first_dir.mkdir()
+    poor = _post_with_image(first_dir)
+    poor.platform["quality_gate"] = {
+        "deterministic_ok": True,
+        "vision": {
+            "ok": False,
+            "score": 15,
+            "issues": ["画面主体与新闻无关"],
+            "selection_mode": "best_of_two",
+            "best_effort_eligible": True,
+        },
+    }
+    replacement_dir = tmp_path / "replacement"
+    replacement_dir.mkdir()
+    replacement = _post_with_image(replacement_dir)
+    replacement.id = "replacement"
+    replacement.title = "另一条有合格图片的新闻"
+    replacement.platform["quality_gate"] = {
+        "deterministic_ok": True,
+        "vision": {"ok": True, "score": 90, "issues": []},
+    }
+    posts = [poor]
+    calls = []
+
+    complete, rounds, selected_count, failed_count, _, errors = _replenish_visual_news_until_target(
+        posts,
+        requested_count=1,
+        generate_batch=lambda size, round_no: calls.append((size, round_no)) or [replacement],
+        review_batch=lambda _new_posts: [],
+        max_rounds=1,
+        max_candidates=4,
+    )
+
+    assert complete is True
+    assert rounds == 1
+    assert selected_count == 1
+    assert failed_count == 1
+    assert calls == [(3, 1)]
+    assert errors == []
+
+
+def test_visual_news_replenishment_respects_candidate_cap(tmp_path):
+    post_dir = tmp_path / "failed"
+    post_dir.mkdir()
+    post = _post_with_image(post_dir)
+    post.platform["quality_gate"] = {
+        "deterministic_ok": True,
+        "vision": {"ok": False, "score": 0, "issues": ["视觉失败"]},
+    }
+    posts = [post]
+    calls = 0
+
+    def generate_more(batch_size: int, _round: int) -> list[Post]:
+        nonlocal calls
+        calls += 1
+        assert batch_size == 1
+        extra_dir = tmp_path / f"extra-{calls}"
+        extra_dir.mkdir()
+        extra = _post_with_image(extra_dir)
+        extra.id = f"extra-{calls}"
+        extra.title = f"补偿候选-{calls}"
+        extra.platform["quality_gate"] = {
+            "deterministic_ok": True,
+            "vision": {"ok": False, "score": 0, "issues": ["视觉失败"]},
+        }
+        return [extra]
+
+    complete, rounds, selected_count, _failed_count, _unused_count, errors = _replenish_visual_news_until_target(
+        posts,
+        requested_count=2,
+        generate_batch=generate_more,
+        review_batch=lambda _new_posts: [],
+        max_rounds=3,
+        max_candidates=2,
+    )
+
+    assert complete is False
+    assert rounds == 1
+    assert selected_count == 0
+    assert calls == 1
+    assert any("候选上限" in error for error in errors)
+
+
+def test_visual_news_replenishment_stops_on_provider_limit(tmp_path):
+    post_dir = tmp_path / "failed"
+    post_dir.mkdir()
+    post = _post_with_image(post_dir)
+    post.platform["quality_gate"] = {
+        "deterministic_ok": True,
+        "vision": {"ok": False, "score": 0, "issues": ["视觉失败"]},
+    }
+    posts = [post]
+    calls = 0
+
+    def generate_more(_batch_size: int, _round: int) -> list[Post]:
+        nonlocal calls
+        calls += 1
+        extra_dir = tmp_path / "extra"
+        extra_dir.mkdir()
+        extra = _post_with_image(extra_dir)
+        extra.id = "extra"
+        extra.title = "供应商限流后的新候选"
+        extra.platform["quality_gate"] = {
+            "deterministic_ok": True,
+            "vision": {"ok": False, "score": 0, "issues": ["视觉失败"]},
+        }
+        return [extra]
+
+    complete, rounds, selected_count, _failed_count, _unused_count, errors = _replenish_visual_news_until_target(
+        posts,
+        requested_count=2,
+        generate_batch=generate_more,
+        review_batch=lambda _new_posts: ["HTTP 429: Token Plan 用量上限"],
+        max_rounds=3,
+        max_candidates=10,
+    )
+
+    assert complete is False
+    assert rounds == 1
+    assert selected_count == 0
+    assert calls == 1
+    assert any("HTTP 429" in error for error in errors)
+
+
 def test_ai_digest_quality_gate_accepts_complete_local_render_without_vlm(tmp_path, monkeypatch):
     assets = []
     for index in range(4):
@@ -129,6 +416,36 @@ def test_ai_digest_quality_gate_accepts_complete_local_render_without_vlm(tmp_pa
     assert post.platform["quality_gate"]["vision"]["ok"] is True
     assert post.platform["quality_gate"]["vision"]["provider"] == "local_renderer"
     assert post.platform["quality_gate"]["vision"]["model"] == "ai_digest_template"
+
+
+def test_quality_gate_does_not_treat_missing_vlm_as_pass_for_normal_news(monkeypatch):
+    post = Post(
+        title="明确的新闻标题",
+        body="发布日期：2026-09-20\n来源链接：https://example.com/news",
+        assets=[],
+        platform={"news": {"source_url": "https://example.com/news", "picked": {"seendate": "2026-09-20"}}},
+    )
+    monkeypatch.setattr(cli, "configured_vision_review_model", lambda: "")
+    monkeypatch.setattr(cli, "list_posts", lambda: [])
+
+    errors = cli._run_auto_quality_gate(
+        [post], expected_count=1, evaluation_viewpoint="无视角评价", require_vision=True
+    )
+
+    assert errors
+    assert "视觉" in errors[0]
+
+
+def test_quality_gate_does_not_treat_disabled_vlm_as_pass_when_required(monkeypatch):
+    post = Post(title="新闻标题", body="新闻正文", assets=[])
+    monkeypatch.setenv("AUTO_VLM_REVIEW", "0")
+
+    errors = cli._run_auto_quality_gate(
+        [post], expected_count=1, evaluation_viewpoint="无视角评价", require_vision=True
+    )
+
+    assert errors
+    assert "关闭" in errors[0]
 
 
 def test_parse_vision_review_requires_strict_fields():
@@ -283,7 +600,7 @@ def test_bounded_image_repair_rechecks_daily_news_once():
     assert [item.score for item in history] == [48, 91]
 
 
-def test_bounded_image_repair_falls_back_after_ai_retry_semantic_failure():
+def test_bounded_image_repair_stops_after_one_redraw_without_stock_fallback():
     post = Post(
         title="Memory optimization news",
         body="The company will optimize operating-system memory use.",
@@ -313,14 +630,6 @@ def test_bounded_image_repair_falls_back_after_ai_retry_semantic_failure():
                 provider="volcengine",
                 model=config.model,
             ),
-            VisionReviewResult(
-                ok=True,
-                score=94,
-                issues=(),
-                retry_prompt="",
-                provider="volcengine",
-                model=config.model,
-            ),
         ]
     )
     ai_repairs: list[str] = []
@@ -336,12 +645,116 @@ def test_bounded_image_repair_falls_back_after_ai_retry_semantic_failure():
         fallback_regenerate_fn=lambda _post, prompt: pexels_fallbacks.append(prompt) or True,
     )
 
-    assert result.score == 94
+    assert result.score == 24
     assert repair_count == 1
     assert repair_errors == []
     assert ai_repairs == ["Show a generic laptop RAM upgrade scene with no text."]
-    assert pexels_fallbacks == ["Show a generic laptop RAM upgrade scene with no text."]
-    assert [item.score for item in history] == [24, 18, 94]
+    assert pexels_fallbacks == []
+    assert [item.score for item in history] == [24, 18]
+
+
+def test_bounded_image_repair_keeps_higher_score_when_redraw_is_worse():
+    post = Post(
+        title="News",
+        body="Body",
+        platform={"news": {"source_url": "https://example.com/news"}, "marker": "first"},
+    )
+    config = LLMConfig(
+        provider="volcengine",
+        model="doubao-seed-1-6-vision",
+        api_key="test-key",
+        base_url="https://example.com/v1",
+    )
+    results = iter(
+        [
+            VisionReviewResult(False, 64, ("first",), "redraw", "volcengine", config.model),
+            VisionReviewResult(False, 41, ("worse",), "", "volcengine", config.model),
+        ]
+    )
+
+    def redraw(current_post, _prompt):
+        current_post.platform["marker"] = "second"
+        return True
+
+    result, repair_count, repair_errors, history = _review_with_bounded_image_repair(
+        post,
+        config=config,
+        viewpoint="neutral",
+        max_repairs=3,
+        review_fn=lambda *_args, **_kwargs: next(results),
+        regenerate_fn=redraw,
+    )
+
+    assert result.score == 64
+    assert repair_count == 1
+    assert repair_errors == []
+    assert [item.score for item in history] == [64, 41]
+    assert post.platform["marker"] == "first"
+    assert post.platform["vision_selection"] == {
+        "strategy": "best_of_two",
+        "candidate_count": 2,
+        "selected_index": 1,
+        "selected_score": 64,
+        "alternate_score": 41,
+        "below_threshold": True,
+    }
+
+
+def test_bounded_image_repair_reuses_completed_best_of_two_after_resume():
+    post = Post(
+        title="News",
+        body="Body",
+        platform={
+            "news": {"source_url": "https://example.com/news"},
+            "vision_selection": {
+                "strategy": "best_of_two",
+                "candidate_count": 2,
+                "selected_index": 1,
+                "selected_score": 64,
+                "alternate_score": 41,
+                "below_threshold": True,
+            },
+            "quality_gate": {
+                "vision": {
+                    "ok": False,
+                    "score": 3,
+                    "issues": ["text is garbled"],
+                    "retry_prompt": "",
+                    "provider": "volcengine",
+                    "model": "doubao-seed-1-6-vision",
+                    "repair_count": 0,
+                    "selection_mode": "best_of_two",
+                    "best_effort_eligible": True,
+                    "repair_errors": [],
+                    "history": [{"ok": False, "score": 3, "issues": ["text is garbled"]}],
+                }
+            },
+        },
+    )
+    config = LLMConfig(
+        provider="volcengine",
+        model="doubao-seed-1-6-vision",
+        api_key="test-key",
+        base_url="https://example.com/v1",
+    )
+    review_calls: list[str] = []
+    repair_calls: list[str] = []
+
+    result, repair_count, repair_errors, history = _review_with_bounded_image_repair(
+        post,
+        config=config,
+        viewpoint="neutral",
+        max_repairs=1,
+        review_fn=lambda *_args, **_kwargs: review_calls.append("review"),
+        regenerate_fn=lambda _post, prompt: repair_calls.append(prompt) or True,
+    )
+
+    assert result.score == 64
+    assert repair_count == 1
+    assert repair_errors == []
+    assert review_calls == []
+    assert repair_calls == []
+    assert [item.score for item in history] == [64, 41]
 
 
 def test_bounded_image_repair_retries_inconsistent_zero_score_even_if_ok_flag_is_true():

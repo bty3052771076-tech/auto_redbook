@@ -265,11 +265,12 @@ def test_resolve_ai_digest_sources_places_aggregators_before_social_sources_by_d
     monkeypatch.delenv("AI_DIGEST_PRIMARY_SOURCES", raising=False)
     monkeypatch.delenv("AI_DIGEST_SOCIAL_SOURCES", raising=False)
     monkeypatch.delenv("AI_DIGEST_AGGREGATOR_SOURCES", raising=False)
+    monkeypatch.delenv("AI_DIGEST_LOCAL_AIHOT_BASE_URL", raising=False)
 
     names = [source.name for source in resolve_ai_digest_sources()]
 
-    assert "aihot-daily" in names
-    assert names.index("huggingface") > names.index("aihot-daily")
+    assert "aihot-daily" not in names
+    assert "huggingface" in names
     assert names.index("github-ai") > names.index("huggingface")
     assert names.index("github-ai") < names.index("x-openai")
     assert names[-1] == "x-tibo-maker"
@@ -322,10 +323,92 @@ def test_resolve_ai_digest_sources_filters_by_env_names(monkeypatch):
 def test_resolve_ai_digest_sources_includes_enabled_search_backfill_by_default(monkeypatch):
     monkeypatch.delenv("AI_DIGEST_PRIMARY_SOURCES", raising=False)
     monkeypatch.delenv("AI_DIGEST_SOCIAL_SOURCES", raising=False)
+    monkeypatch.delenv("AI_DIGEST_LOCAL_AIHOT_BASE_URL", raising=False)
 
     names = [source.name for source in resolve_ai_digest_sources()]
 
-    assert "aihot-daily" in names
+    assert "aihot-daily" not in names
+
+
+def test_local_aihot_is_opt_in_and_cannot_point_to_remote_host():
+    sources = resolve_ai_digest_sources({"AI_DIGEST_LOCAL_AIHOT_BASE_URL": "http://127.0.0.1:8767"})
+    local = next(source for source in sources if source.name == "aihot-local")
+    assert local.kind == "aggregator"
+    assert local.parser == "aihot_v1"
+    assert local.url.startswith("http://127.0.0.1:8767/api/v1/items?mode=all&")
+    with pytest.raises(ValueError, match="loopback"):
+        resolve_ai_digest_sources({"AI_DIGEST_LOCAL_AIHOT_BASE_URL": "https://example.com"})
+    with pytest.raises(ValueError, match="loopback"):
+        resolve_ai_digest_sources({"AI_DIGEST_LOCAL_AIHOT_BASE_URL": "http://127.0.0.1:8767#outside"})
+
+
+def test_local_aihot_v1_uses_original_links_and_rejects_untraceable_cards(monkeypatch):
+    source = AIDigestSource(
+        "aihot-local", "aggregator",
+        "http://127.0.0.1:8767/api/v1/items?mode=all&window=7d&by=published&limit=100",
+        "AIHOT 本地", "aihot_v1",
+    )
+    payload = {
+        "schemaVersion": 1,
+        "items": [
+            {
+                "title": "OpenAI发布新模型并开放API",
+                "summary": "OpenAI公布模型名称、开放方式以及面向开发者的API调用安排。",
+                "source": {"name": "OpenAI News"},
+                "links": {
+                    "original": "https://openai.com/index/new-model/",
+                    "aihot": "http://127.0.0.1:8768/items/one",
+                },
+                "publishedAt": "2026-09-30T01:00:00Z",
+                "score": 82,
+                "selected": True,
+                "category": "model",
+            },
+            {
+                "title": "02 产品发布/更新",
+                "summary": "这张卡只有分类占位词，没有能够核验的原始页面。",
+                "source": {"name": "错误聚合卡"},
+                "links": {"original": "", "aihot": "http://127.0.0.1:8768/items/two"},
+                "publishedAt": "2026-09-30T01:00:00Z",
+                "score": 90,
+                "selected": True,
+            },
+            {
+                "title": "Anthropic上线Claude模型新功能",
+                "summary": "Anthropic公开了该模型新功能的适用范围、访问方式和产品更新细节。",
+                "source": {"name": "Anthropic News"},
+                "links": {"original": "https://www.anthropic.com/news/claude-update"},
+                "publishedAt": "2026-09-30T02:00:00Z",
+                "score": 58,
+                "selected": False,
+            },
+        ],
+    }
+    monkeypatch.setattr(collect_mod, "_http_get_text", lambda *_args, **_kwargs: json.dumps(payload))
+    items = fetch_ai_digest_source(source)
+    assert len(items) == 2
+    assert items[0].url == "https://openai.com/index/new-model/"
+    assert items[0].source_name == "OpenAI News"
+    assert items[0].source_type == "aggregator"
+    assert items[0].published_at == "2026-09-30T01:00:00Z"
+    assert items[0].evidence_urls == ["http://127.0.0.1:8768/items/one"]
+    assert items[1].source_type == "aggregator"
+    assert items[1].url == "https://www.anthropic.com/news/claude-update"
+
+
+def test_local_aihot_v1_rejects_private_original_url_and_invalid_schema():
+    parse = fetchers.parse_aihot_v1_items_json
+    row = {
+        "title": "模型厂商发布新版本并公布参数",
+        "summary": "厂商公开了新模型的名称、可用渠道以及一项具体功能更新。",
+        "source": {"name": "厂商官网"},
+        "links": {"original": "http://192.168.1.5/news"},
+        "publishedAt": "2026-09-30T02:00:00Z",
+        "selected": False,
+    }
+    assert parse(json.dumps({"schemaVersion": 1, "items": [row]})) == []
+    with pytest.raises(ValueError, match="AIHOT v1"):
+        parse(json.dumps({"items": [row]}))
 
 
 def test_parse_aihot_daily_html_maps_traceable_digest_items():

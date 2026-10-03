@@ -72,6 +72,11 @@ docs/aliyun_image_api-key.md
 *.key
 
 # Local runtime config and credential exports
+**/chrome-profile/
+.gitnexus/
+*.dump
+*.backup
+*.sqlite*
 config.local.*
 settings.local.*
 *.credentials.json

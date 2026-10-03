@@ -10,6 +10,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
 
 from src.config import LLMConfig
+from src.news.length_policy import news_length_instruction
 from src.text_integrity import repair_utf8_as_gbk_mojibake
 
 
@@ -403,6 +404,23 @@ def _should_try_next_llm(exc: Exception) -> bool:
     return any(k in msg for k in keywords)
 
 
+def _is_provider_capacity_exhausted(exc: Exception) -> bool:
+    """Return true for account/token-plan exhaustion, not transient throttling."""
+    msg = str(exc or "").lower()
+    return any(
+        marker in msg
+        for marker in (
+            "token plan",
+            "用量上限",
+            "套餐用量",
+            "quota exhausted",
+            "free quota exhausted",
+            "insufficient balance",
+            "余额不足",
+        )
+    )
+
+
 def _is_rate_limited(exc: Exception) -> bool:
     msg = str(exc or "").lower()
     return any(marker in msg for marker in ("429", "rate_limit", "rate limit", "throttl", "限流"))
@@ -501,22 +519,30 @@ def generate_draft(
     asset_paths: List[str],
     max_title: int = 20,
     max_body: int = 1000,
+    preserve_body: bool = False,
+    concise_news: bool = False,
 ) -> Dict[str, Any]:
     """
     Generate a structured draft (title/body/topics) using the configured LLM.
     Fallback to offline template if the API call fails.
+    preserve_body lets news callers resummarize before applying their length gate.
+    concise_news applies field-level limits before generation without clipping output.
     """
     cfg_list = _ensure_cfg_list(cfg)
 
+    writing_length_instruction = news_length_instruction() if concise_news else (
+        "Body <= 1000 chars. "
+        "Body must be at least 200 Chinese characters (count punctuation). "
+        "If the body is shorter, expand it with more explanation or commentary. "
+    )
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 (
                     "You are a Xiaohongshu image-post assistant. Write in Chinese. "
-                    "Generate a short title and body. Title <= 20 chars. Body <= 1000 chars. "
-                    "Body must be at least 200 Chinese characters (count punctuation). "
-                    "If the body is shorter, expand it with more explanation or commentary. "
+                    "Generate a short title and body. Title <= 20 chars. "
+                    f"{writing_length_instruction if not concise_news else ''}"
                     "If the initial title is long, rewrite it into <= 20 chars (do NOT just truncate with '...'). "
                     "Body may include hashtags (e.g. #topic) but do not spam. "
                     "Only output the final publishable article body. Do NOT include any prompt text, requirements, metadata, or links. "
@@ -526,7 +552,8 @@ def generate_draft(
                     "Return strict JSON only: no Markdown, no code fences, no extra text. "
                     "JSON keys: title, body, topics (array of strings). "
                     "Optional JSON key: image_event (a short event-only description for image generation). "
-                    "The body is normally plain text; if the user prompt explicitly requires body to be a JSON object text, follow that stricter body format."
+                    "The body is normally plain text; if the user prompt explicitly requires body to be a JSON object text, follow that stricter body format. "
+                    f"{writing_length_instruction if concise_news else ''}"
                 ),
             ),
             (
@@ -580,7 +607,11 @@ def generate_draft(
                 break
             except Exception as exc:
                 last_exc = exc
-                if _is_rate_limited(exc) and request_attempt < max_rate_limit_retries:
+                if (
+                    _is_rate_limited(exc)
+                    and not _is_provider_capacity_exhausted(exc)
+                    and request_attempt < max_rate_limit_retries
+                ):
                     request_attempt += 1
                     wait_s = _rate_limit_retry_seconds()
                     print(
@@ -663,7 +694,8 @@ def generate_draft(
         data["_fallback_error"] = str(data.get("_fallback_error") or "LLM returned an empty body")
 
     data["title"] = _truncate(repair_utf8_as_gbk_mojibake(raw_title), max_title)
-    data["body"] = _truncate(repair_utf8_as_gbk_mojibake(raw_body), max_body)
+    repaired_body = repair_utf8_as_gbk_mojibake(raw_body)
+    data["body"] = repaired_body if preserve_body or concise_news else _truncate(repaired_body, max_body)
     data["topics"] = [
         repair_utf8_as_gbk_mojibake(topic)
         for topic in _normalize_topics(data.get("topics"))
@@ -731,7 +763,11 @@ def generate_json(
                 return data
             except Exception as exc:
                 last_exc = exc
-                if _is_rate_limited(exc) and request_attempt < max_rate_limit_retries:
+                if (
+                    _is_rate_limited(exc)
+                    and not _is_provider_capacity_exhausted(exc)
+                    and request_attempt < max_rate_limit_retries
+                ):
                     request_attempt += 1
                     wait_s = _rate_limit_retry_seconds()
                     print(

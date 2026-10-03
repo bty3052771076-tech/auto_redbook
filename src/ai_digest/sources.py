@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass, replace
 from typing import Literal
+from urllib.parse import urlsplit
 
 
 SourceKind = Literal["official", "social", "github", "search", "aggregator"]
@@ -344,10 +345,32 @@ def _split_env_names(value: str) -> list[str]:
 def resolve_ai_digest_sources(env: dict[str, str] | None = None) -> list[AIDigestSource]:
     env = env if env is not None else os.environ
     rsshub_base = (env.get("AI_DIGEST_RSSHUB_BASE_URL") or "").strip().rstrip("/")
+    aihot_base = (env.get("AI_DIGEST_LOCAL_AIHOT_BASE_URL") or "").strip().rstrip("/")
     primary_names = _split_env_names(env.get("AI_DIGEST_PRIMARY_SOURCES", ""))
     social_names = _split_env_names(env.get("AI_DIGEST_SOCIAL_SOURCES", ""))
     aggregator_names = _split_env_names(env.get("AI_DIGEST_AGGREGATOR_SOURCES", ""))
     sources = default_ai_digest_sources()
+    if aihot_base:
+        parts = urlsplit(aihot_base)
+        if (
+            parts.scheme != "http"
+            or parts.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parts.path not in {"", "/"}
+            or parts.query
+            or parts.fragment
+            or parts.username
+            or parts.password
+        ):
+            raise ValueError("AI_DIGEST_LOCAL_AIHOT_BASE_URL must be a loopback HTTP base URL")
+        sources.append(
+            AIDigestSource(
+                "aihot-local",
+                "aggregator",
+                f"{aihot_base}/api/v1/items?mode=all&window=7d&by=published&limit=100",
+                "AIHOT 本地",
+                "aihot_v1",
+            )
+        )
     expanded: list[AIDigestSource] = []
     for source in sources:
         if source.url.startswith("rsshub://"):
@@ -380,5 +403,8 @@ def resolve_ai_digest_sources(env: dict[str, str] | None = None) -> list[AIDiges
     elif aggregator_names:
         fallback = [by_name[name] for name in aggregator_names if name in by_name]
     else:
-        fallback = [source for source in sources if source.kind == "aggregator" and source.enabled]
+        fallback = [
+            source for source in sources
+            if source.kind == "aggregator" and source.enabled and source.name != "aihot-daily"
+        ]
     return [*primary, *fallback, *social]
