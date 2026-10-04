@@ -104,3 +104,11 @@ AutoRedbookGUI*.exe
 
 # Local root backups
 *.bak/
+
+# Local third-party deployments (source checkouts, dependencies and binaries)
+/tools/worldmonitor/
+/tools/RSSHub/
+/tools/AIHOT/
+/tools/opencodex/
+/tools/postgresql/
+/tools/*.local.json

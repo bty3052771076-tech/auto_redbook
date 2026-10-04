@@ -20,6 +20,14 @@ Auto Redbook 是一个运行在 Windows 本地的中文内容生产与草稿分�
 
 ## 快速开始
 
+### 本机目录与工具
+
+工作流的代码、前端和 Python 环境都在本项目内。World Monitor、RSSHub、AIHOT、OpenCodex 软件包及 PostgreSQL 二进制的本地副本放在 `tools/`；原来的工具目录保留，不会自动删除。副本包含已有依赖和构建产物，不需要在 C 盘安装内容。部署脚本：`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/provision_local_tools.ps1`。
+
+数据仍在本项目的 `data/`、`assets/`，API Key 仍在被忽略的 `.env.gui`。独立智能体的数据仍在 `E:\AI\codex\redbook_runtime`。两个程序的 OpenCodex 并发锁及请求状态继续共享，避免重复生图。系统 Python、Node.js、Chrome 和已授权的 OpenCodex 服务仍使用本机环境。
+
+`Start-RSSHub.cmd` 启动本项目的 RSSHub 副本。AIHOT 使用 `scripts/manage_aihot.ps1 -Action start -Worker`，结束后使用 `-Action stop`；其数据继续在 `E:\AI\codex\AIHOT-data`。两个程序使用同一个 AIHOT 数据库，不能同时启动两份 AIHOT 服务。PostgreSQL 管理入口为 `scripts/manage_postgresql.ps1`，不自动初始化或搬动旧数据库。
+
 ### OpenCodex / ChatGPT 订阅生图
 
 可在本地 `.env.gui` 启用 `OPENCODEX_IMAGE_ENABLED=1`，在工作台选择 `OpenCodex / ChatGPT订阅` 的 `gpt-image-2`；终端使用 `IMAGE_PROVIDER=opencodex`。适配器仅调用本机订阅图片路由，最多 2 并发，成功图片缓存复用；不确定请求不会自动重发。`OPENCODEX_IMAGE_FALLBACK=minimax` 允许普通生图转用 MiniMax Token Plan，禁止付费 API/paygo。
