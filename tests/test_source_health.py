@@ -79,7 +79,7 @@ def test_stale_or_missing_date_source_is_cooled_down_briefly():
         checked_at=checked_at.isoformat(),
     )
 
-    assert is_source_in_cooldown(stale_attempt, now=checked_at + timedelta(minutes=2), cooldown_seconds=300)
+    assert not is_source_in_cooldown(stale_attempt, now=checked_at + timedelta(minutes=2), cooldown_seconds=300)
     assert is_source_in_cooldown(missing_date_attempt, now=checked_at + timedelta(minutes=2), cooldown_seconds=300)
 
 

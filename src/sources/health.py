@@ -8,13 +8,13 @@ from typing import Any
 
 
 COOLDOWN_STATUSES = frozenset(
-    {"timeout", "transport_error", "http_error", "error", "empty", "missing_date", "stale"}
+    {"timeout", "transport_error", "http_error", "error", "empty", "missing_date"}
 )
 # A source that repeatedly fails in any of these ways should be replaced or
 # demoted.  Replacement used to count only literal timeouts, which left a
 # source returning HTTP errors or empty payloads in the hot path.
 REPLACEMENT_FAILURE_STATUSES = frozenset(
-    {"timeout", "transport_error", "http_error", "error", "empty", "missing_date", "stale"}
+    {"timeout", "transport_error", "http_error", "error", "empty", "missing_date"}
 )
 
 

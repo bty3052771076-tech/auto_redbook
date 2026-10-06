@@ -1191,7 +1191,18 @@ def source_health_status_label(status: str) -> str:
         "success": "正常",
         "empty": "无结果",
         "missing_date": "缺发布日期",
-        "stale": "内容过期",
+        "stale": "可达但无近期消息",
+        "rate_limited": "接口限流",
+        "unauthorized": "权限或认证失败",
+        "not_found": "地址不存在",
+        "api_error": "接口请求失败",
+        "local_service_unavailable": "本地服务未连接",
+        "parse_error": "响应解析失败",
+        "future_dates": "日期晚于当前时间",
+        "disabled": "未启用",
+        "not_selected": "未纳入采集配置",
+        "not_configured": "未配置密钥",
+        "not_checked": "尚未检测",
         "cooldown": "冷却中",
         "timeout": "请求超时",
         "transport_error": "网络错误",
@@ -1220,6 +1231,16 @@ def load_latest_source_health_snapshots(
         if not name:
             continue
         snapshot = load_source_health_snapshot(root / f"{name}.json")
+        diagnostic = root / f"diagnostics_{name}.json"
+        regular = root / f"{name}.json"
+        if diagnostic.exists() and (not regular.exists() or diagnostic.stat().st_mtime >= regular.stat().st_mtime):
+            try:
+                from src.sources.health import SourceAttempt
+                payload = json.loads(diagnostic.read_text(encoding="utf-8"))
+                snapshot = SourceHealthSnapshot(collection=name, generated_at=str(payload.get("generated_at") or ""),
+                    attempts=[SourceAttempt.from_dict(row) for row in payload.get("rows", []) if isinstance(row, dict)])
+            except (OSError, ValueError, TypeError):
+                pass
         if snapshot is None or not snapshot.attempts:
             continue
         snapshots[name] = snapshot

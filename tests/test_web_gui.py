@@ -615,7 +615,10 @@ def test_provider_quota_uses_existing_cli(service, provider):
 
 
 def test_sources_analysis_and_local_approval(service):
-    assert service.sources() == {"rows": []}
+    report = service.sources()
+    assert report["rows"]
+    assert report["check"] is None
+    assert all(row["status"] in {"not_checked", "not_configured", "disabled", "not_selected"} for row in report["rows"])
     assert service.analysis()["text"] == ""
     args, _ = service.plan({"kind": "check-sources", "collection": "ai_digest", "max_age_days": 3}, "a" * 32)
     assert "ai_digest" in args

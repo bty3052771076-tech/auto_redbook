@@ -1232,6 +1232,7 @@ def collect_ai_digest_updates(
     )
     if allow_social_backfill and aggregator_sources and (
         force_aggregator_backfill
+        or include_pool_items
         or _needs_search_backfill(
             ranked,
             target_count=target_count,
@@ -1352,6 +1353,7 @@ def collect_ai_digest_updates(
         and social_sources
         and (
             force_social_backfill
+            or include_pool_items
             or _needs_search_backfill(
                 ranked,
                 target_count=target_count,

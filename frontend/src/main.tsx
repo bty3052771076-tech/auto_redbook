@@ -810,7 +810,7 @@ function Creation({
 }) {
   const tourPrefix = material ? "material" : "auto";
   const [title, setTitle] = useState("每日新闻"),
-    [prompts, setPrompts] = useState(["国际争议事件", "中国产业与公司政策"]),
+    [prompts, setPrompts] = useState(["国际冲突", "科技产业", "社会民生", "财经产业"]),
     [count, setCount] = useState(10),
     [days, setDays] = useState("auto"),
     [mode, setMode] = useState(boot.settings.performance_mode),

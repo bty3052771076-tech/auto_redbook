@@ -25,6 +25,7 @@ from src.storage.files import _write_json_atomic, latest_execution, load_post, s
 from src.storage.models import now_iso
 from src.global_map.models import GlobalMapRequest
 from src.global_map.service import preview_global_map_from_service
+from src.news.topics import DEFAULT_DAILY_NEWS_PROMPT
 
 ROOT = Path(__file__).resolve().parents[1]
 PROVIDERS = {"aliyun": "阿里云", "volcengine": "火山引擎", "siliconflow": "硅基流动", "minimax": "MiniMax", "opencodex": "OpenCodex / ChatGPT订阅"}
@@ -267,7 +268,7 @@ class Workbench:
                 "kind": "daily_news",
                 "title": "每日新闻",
                 "count": self._agent_count(cleaned),
-                "prompt": "国际冲突 争议事件 全球热点 财经产业 科技产业 芯片 AI 社会民生 体育文化 中国国内",
+                "prompt": DEFAULT_DAILY_NEWS_PROMPT,
                 "evaluation_viewpoint": "无视角评价",
                 "lookback_days": "auto",
             })
@@ -322,7 +323,8 @@ class Workbench:
         )
         delivery = "generate_only" if generate_only else "save_draft"
         bindings = self.providers()["bindings"]
-        return {
+        from src.agent.task_intent import enrich_local_plan
+        return enrich_local_plan({
             "executable": bool(jobs),
             "jobs": jobs,
             "platform": platform,
@@ -336,7 +338,7 @@ class Workbench:
                 + f"；目标平台：{'小红书+今日头条' if platform == 'both' else '小红书' if platform == 'xhs' else '今日头条'}；"
                 + ("只生成本地稿，不上传平台。" if delivery == "generate_only" else "完成后保存到草稿箱。")
             ) if jobs else "请明确要生成的栏目，例如“生成1篇每日AI讯息”或“生成3条每日新闻并保存到小红书草稿”。",
-        }
+        }, cleaned)
 
     def append_agent_message(self, conversation_id: str, text: str) -> dict:
         conversation = self._read_agent_conversation(valid_conversation_id(conversation_id))
@@ -925,8 +927,13 @@ class Workbench:
         return {"rows": rows, "snapshots": snapshots, "provider_labels": labels}
 
     def sources(self) -> dict:
-        snapshots = gui.load_latest_source_health_snapshots(source_dir=self.root / "data/source_health")
-        return self.redact({"rows": [asdict(r) for r in gui.build_source_health_dashboard_rows(snapshots)]})
+        from src.sources.diagnostics import diagnostic_dashboard
+        report = diagnostic_dashboard(root=self.root, env=self.environment())
+        with self.lock:
+            checks = [j for j in self.jobs.values() if j.get("kind") == "check-sources"]
+            latest = max(checks, key=lambda j: j.get("created_at", 0), default=None)
+            report["check"] = {k: latest.get(k) for k in ("id", "status", "stage", "message", "started_at", "ended_at")} if latest else None
+        return self.redact(report)
 
     def analysis(self) -> dict:
         path = self.root / "data/analytics/published_metrics_analysis.md"
@@ -1063,7 +1070,7 @@ class Workbench:
                 raise ValueError("模式或目标平台无效")
             prompt = gui.combine_prompt_entries(request.get("prompts", []))
             if not prompt:
-                prompt = "国际冲突 争议事件 全球热点 财经产业 科技产业 芯片 AI 社会民生 体育文化 中国国内"
+                prompt = DEFAULT_DAILY_NEWS_PROMPT
             lookback = str(request.get("lookback_days", "auto") or "auto")
             try:
                 budget_minutes = max(0.1, min(120.0, float(request.get("budget_minutes", 30))))
@@ -1318,8 +1325,8 @@ class Workbench:
             args += [kind, "--top-n", str(bounded_int(request.get("top_n", 6), 1, 20)), "--save"]
         elif kind == "check-sources":
             args = gui.build_cli_args(kind, params={"collection": request.get("collection", "all"),
-                "keywords": str(request.get("keywords", "科技")),
-                "max_age_days": bounded_int(request.get("max_age_days", 3), 1, 14)})
+                "keywords": str(request.get("keywords", DEFAULT_DAILY_NEWS_PROMPT)),
+                "max_age_days": bounded_int(request.get("max_age_days", 2), 1, 14)})
         elif kind in {"delete-preview", "delete-drafts"}:
             scope = deletion_scope(request)
             if kind == "delete-drafts":

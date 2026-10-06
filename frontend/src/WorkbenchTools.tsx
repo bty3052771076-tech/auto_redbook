@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { Eye, Trash2, RefreshCw, Search, Save, ExternalLink, Download, BarChart3 } from "lucide-react";
 import { api, dateLabel, download, type Job } from "./api";
+import { SourceDiagnostics } from "./SourceDiagnostics";
+import "./source-diagnostics.css";
 
 type Actions = { submit: (r: Record<string, unknown>) => Promise<void>; onError: (s: string) => void };
 type Scope = { draft_type: string; title_contains: string; limit: number };
@@ -47,31 +49,9 @@ export function DeleteDrafts({ jobs, submit, onError }: Actions & { jobs: Job[] 
   </section>;
 }
 
-type Source = { collection: string; source_name: string; source_url: string; status: string; item_count: number;
-  dated_count: number; elapsed_seconds: number; error: string; checked_at: string };
-export function SourceHealth({ submit, onError }: Actions) {
-  const [rows, setRows] = useState<Source[]>([]), [query, setQuery] = useState(""), [collection, setCollection] = useState("all"),
-    [keywords, setKeywords] = useState("科技"), [days, setDays] = useState(3), [sort, setSort] = useState("status");
-  const refresh = () => api<{ rows: Source[] }>("/sources").then(r => setRows(r.rows)).catch(e => onError(String(e)));
-  useEffect(() => { void refresh(); }, []);
-  const filtered = rows.filter(r => (collection === "all" || r.collection === collection)
-    && `${r.source_name} ${r.error} ${r.status}`.toLowerCase().includes(query.toLowerCase()))
-    .sort((a,b) => sort === "elapsed" ? b.elapsed_seconds-a.elapsed_seconds : sort === "items" ? b.item_count-a.item_count : a.status.localeCompare(b.status));
+export function SourceHealth(_actions: Actions) {
   return <section className="tool-surface" data-tour-page="sources">
-    <div className="form-grid" data-tour="sources.scope">
-      <label className="field">检查范围<select value={collection} onChange={e=>setCollection(e.target.value)}><option value="all">全部信源</option><option value="daily_news">每日新闻</option><option value="ai_digest">每日AI讯息</option></select></label>
-      <label className="field">检索关键词<input value={keywords} onChange={e=>setKeywords(e.target.value)}/></label>
-      <label className="field">回溯天数<input type="number" min={1} max={14} value={days} onChange={e=>setDays(Number(e.target.value))}/></label>
-    </div>
-    <div className="toolbar" data-tour="sources.check"><button className="primary" onClick={()=>submit({kind:"check-sources",collection,keywords,max_age_days:days}).catch(e=>onError(String(e)))}><RefreshCw size={16}/>检查信源</button>
-      <button onClick={refresh}><RefreshCw size={16}/>刷新状态</button>
-      <label className="search-input"><Search size={16}/><input aria-label="搜索信源" value={query} onChange={e=>setQuery(e.target.value)}/></label>
-      <select aria-label="信源排序" value={sort} onChange={e=>setSort(e.target.value)}><option value="status">按状态</option><option value="elapsed">耗时从高到低</option><option value="items">条数从高到低</option></select>
-    </div>
-    <div className="table-wrap" data-tour="sources.results"><table><thead><tr><th>信源</th><th>状态</th><th>材料 / 有日期</th><th>耗时</th><th>检查时间</th><th>错误</th></tr></thead><tbody>
-      {filtered.map((r,i)=><tr key={i}><td>{/^https?:\/\//.test(r.source_url) ? <a href={r.source_url} target="_blank" rel="noreferrer">{r.source_name}<ExternalLink size={13}/></a> : r.source_name}</td>
-        <td>{r.status}</td><td>{r.item_count} / {r.dated_count}</td><td>{r.elapsed_seconds.toFixed(1)} 秒</td><td>{dateLabel(r.checked_at)}</td><td className="source-error">{r.error || "—"}</td></tr>)}
-    </tbody></table></div>{!filtered.length && <p>暂无匹配的信源检查结果</p>}
+    <SourceDiagnostics read={() => api("/sources")} check={request => api("/jobs", "POST", request, crypto.randomUUID())}/>
   </section>;
 }
 

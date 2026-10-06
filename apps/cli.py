@@ -52,6 +52,7 @@ from src.ai_digest.collect import collect_ai_digest_updates
 from src.config import load_llm_config
 from src.llm.generate import generate_json
 from src.news.daily_news import fetch_daily_news_candidates, _required_china_count_for_daily_news
+from src.news.topics import DEFAULT_DAILY_NEWS_PROMPT
 from src.publish.playwright_steps import (
     run_collect_platform_drafts_sync,
     run_inspect_platform_drafts_sync,
@@ -3375,7 +3376,7 @@ def auto(
 def editorial_agent_command(
     ctx: typer.Context,
     prompt: str = typer.Option(
-        "国际冲突 争议事件 全球热点 财经产业 科技产业 芯片 AI 社会民生 体育文化 中国国内",
+        DEFAULT_DAILY_NEWS_PROMPT,
         "--prompt",
         "--keywords",
         help="每日新闻主题；智能体会按质量排序并把国内/国际争议作为偏好",
@@ -4297,13 +4298,13 @@ def check_sources(
         help="source collection to check: all, daily_news, or ai_digest",
     ),
     prompt: str = typer.Option(
-        "technology",
+        DEFAULT_DAILY_NEWS_PROMPT,
         "--keywords",
         "--prompt",
         help="每日新闻信源检查使用的检索关键词（--prompt 保留为兼容别名）",
     ),
     max_age_days: int = typer.Option(
-        3,
+        2,
         "--max-age-days",
         min=1,
         max=14,
@@ -4315,62 +4316,18 @@ def check_sources(
     if collection_norm not in {"all", "daily_news", "ai_digest"}:
         raise typer.BadParameter("collection must be one of: all, daily_news, ai_digest")
 
-    root = Path("data") / "source_health"
-    report: dict[str, dict] = {}
-    warnings: list[str] = []
+    from src.sources.diagnostics import run_source_diagnostics
 
-    if collection_norm in {"all", "daily_news"}:
-        _emit_progress_event("check-sources", "检查每日新闻信源", "in_progress")
-        try:
-            candidates, meta = fetch_daily_news_candidates(
-                (prompt or "technology").strip() or "technology",
-                max_records=20,
-                search_days=max_age_days,
-                source_health_path=root / "daily_news.json",
-                persist_source_health=True,
-            )
-            health = meta.get("source_health") if isinstance(meta, dict) else {}
-            report["daily_news"] = {
-                "candidates": len(candidates),
-                "attempts": len((health or {}).get("attempts") or []),
-                "snapshot": (health or {}).get("snapshot_path") or str(root / "daily_news.json"),
-            }
-            _emit_progress_event("check-sources", "检查每日新闻信源", "success", f"candidates={len(candidates)}")
-        except Exception as exc:
-            warnings.append(f"daily_news: {exc}")
-            report["daily_news"] = {"error": str(exc), "snapshot": str(root / "daily_news.json")}
-            _emit_progress_event("check-sources", "检查每日新闻信源", "warning", f"error={exc}")
-
-    if collection_norm in {"all", "ai_digest"}:
-        _emit_progress_event("check-sources", "检查每日AI讯息信源", "in_progress")
-        try:
-            updates, meta = collect_ai_digest_updates(
-                target_count=1,
-                min_official_count=1,
-                allow_social_backfill=False,
-                max_age_days=max_age_days,
-                source_health_path=root / "ai_digest.json",
-                persist_source_health=True,
-            )
-            health = meta.get("source_health") if isinstance(meta, dict) else {}
-            report["ai_digest"] = {
-                "candidates": len(updates),
-                "attempts": len((health or {}).get("attempts") or []),
-                "snapshot": (health or {}).get("snapshot_path") or str(root / "ai_digest.json"),
-            }
-            _emit_progress_event("check-sources", "检查每日AI讯息信源", "success", f"candidates={len(updates)}")
-        except Exception as exc:
-            warnings.append(f"ai_digest: {exc}")
-            report["ai_digest"] = {"error": str(exc), "snapshot": str(root / "ai_digest.json")}
-            _emit_progress_event("check-sources", "检查每日AI讯息信源", "warning", f"error={exc}")
-
+    _emit_progress_event("check-sources", "检查信源", "in_progress", collection_norm)
+    report = run_source_diagnostics(
+        collection_norm, keywords=prompt, max_age_days=max_age_days,
+        progress=lambda message: _emit_progress_event("check-sources", "检查信源", "in_progress", message),
+    )
+    failed = [row for row in report["rows"] if row["connection_status"] == "failed"]
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
-    if warnings:
-        typer.echo(f"warnings: {warnings}")
-        _emit_progress_event("check-sources", "检查完成", "warning", f"warnings={len(warnings)}")
-    else:
-        _emit_progress_event("check-sources", "检查完成", "success")
-    typer.echo("检查完成：已更新本地信源健康快照。")
+    _emit_progress_event("check-sources", "检查完成", "warning" if failed else "success",
+                         f"来源={len(report['rows'])} 请求失败={len(failed)} 耗时={report['elapsed_seconds']:.1f}秒")
+    typer.echo("检查完成：只读检测报告已保存；近期条目仍需经过热度、核验及查重才能发布。")
 
 
 def _run_global_map_command(
