@@ -20,6 +20,7 @@ from src.agent.editorial_agent import (
     AgentJob,
     EditorialAgentConfig,
     EditorialAgentTools,
+    load_agent_checkpoint,
     run_editorial_agent,
 )
 from src.aliyun.quota import (
@@ -136,6 +137,8 @@ app = typer.Typer(
 from apps.wool_library_cli import app as wool_library_app
 
 app.add_typer(wool_library_app, name="wool-library")
+from src.model_platforms.cli import app as model_platforms_app
+app.add_typer(model_platforms_app, name="model-platforms")
 
 
 @app.command("knowledge-status")
@@ -546,6 +549,8 @@ def _prepare_auto_pipeline(
     provider_keys: Mapping[str, bool] | None = None,
     now: datetime | None = None,
 ) -> AutoPreflightReport:
+    from src.model_platforms.integration import platform_config
+    explicit_writer = platform_config("writer")
     current = now or datetime.now(timezone.utc)
     warnings: list[str] = []
     metrics_max_age = timedelta(hours=max(0.1, float(metrics_max_age_hours)))
@@ -586,6 +591,14 @@ def _prepare_auto_pipeline(
                 )
 
     key_states = dict(provider_keys or _configured_free_provider_keys())
+    if explicit_writer:
+        from src.model_platforms.preflight import authorized_plan
+        plan = authorized_plan(explicit_writer, require_image=require_image, current=current,
+                               quota_dir=quota_dir, provider_keys=key_states)
+        _emit_progress_event("auto", "检查模型连接授权", "success",
+                             f"writer={explicit_writer.platform_snapshot['connection_name']}/{explicit_writer.model}；不触发额度同步")
+        return AutoPreflightReport(metrics_mode=metrics_mode, quota_mode="connection_authorized",
+                                   model_plan=plan, warnings=tuple(warnings))
     subscription_requested = (
         (os.getenv("LLM_PROVIDER") or "").strip().lower() in {"minimax", "mini-max", "tokenplan", "token-plan"}
         or (os.getenv("IMAGE_PROVIDER") or "").strip().lower() in {"minimax", "mini-max", "tokenplan", "token-plan"}
@@ -1536,8 +1549,15 @@ def _ensure_utf8_output() -> None:
 
 
 @app.callback()
-def _main_callback() -> None:
+def _main_callback(
+    writer_model_ref: str = typer.Option("", "--writer-model-ref"),
+    controller_model_ref: str = typer.Option("", "--controller-model-ref"),
+    image_model_ref: str = typer.Option("", "--image-model-ref"),
+) -> None:
     _ensure_utf8_output()
+    for key, value in (("WRITER_MODEL_REF", writer_model_ref), ("CONTROLLER_MODEL_REF", controller_model_ref), ("IMAGE_MODEL_REF", image_model_ref)):
+        if value:
+            os.environ[key] = value
 
 
 def _resolve_asset_paths(post, assets_glob: str) -> list[str]:
@@ -3406,6 +3426,9 @@ def editorial_agent_command(
     skill_name: Optional[list[str]] = typer.Option(None, "--skill", help="手动加载的 Skill 名称，可重复指定"),
 ):
     """Run the autonomous editorial agent for news, AI digest and AI benefits."""
+    if resume_from:
+        from src.model_platforms.integration import resume_model_environment
+        _apply_scoped_environment(ctx, resume_model_environment(load_agent_checkpoint(resume_from), os.environ))
     if count < 1:
         typer.echo("error: count 必须 >= 1")
         raise typer.Exit(code=1)
@@ -3455,6 +3478,8 @@ def editorial_agent_command(
         },
     )
 
+    from src.model_platforms.integration import freeze_run_environment
+    _apply_scoped_environment(ctx, freeze_run_environment(os.environ))
     metrics_sync_mode = "not_run"
     if preflight:
         try:
@@ -3911,34 +3936,8 @@ def editorial_agent_command(
         controller gets a short-lived provider/model override so selecting a
         different agent model cannot mutate the writer or image configuration.
         """
-        agent_provider = (os.getenv("AGENT_LLM_PROVIDER") or "").strip().lower()
-        agent_model = (os.getenv("AGENT_LLM_MODEL") or "").strip()
-        override_keys = {
-            "LLM_PROVIDER": agent_provider,
-            "ALIYUN_LLM_MODEL": agent_model,
-            "VOLCENGINE_LLM_MODEL": agent_model,
-            "VOLCENGINE_PRESERVE_MODEL_ID": "1",
-            "SILICONFLOW_LLM_MODEL": agent_model,
-            "MINIMAX_LLM_MODEL": agent_model,
-        }
-        previous = {key: os.environ.get(key) for key in override_keys}
-        if agent_provider:
-            for key, value in override_keys.items():
-                if value:
-                    os.environ[key] = value
-                else:
-                    os.environ.pop(key, None)
-        try:
-            cfg = load_llm_config()
-        finally:
-            if agent_provider:
-                for key, value in previous.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
-        if str(cfg.provider).strip().lower() not in {"minimax", "aliyun", "volcengine", "siliconflow"}:
-            raise RuntimeError(f"智能体主控模型未解析为已接入供应商，当前为 {cfg.provider}")
+        from src.model_platforms.integration import platform_config, frozen_legacy_config, legacy_controller
+        cfg = platform_config('agent') or frozen_legacy_config('agent') or legacy_controller(os.environ)
         payload = [
             {"index": index, "kind": job.kind, "title": job.title, "count": job.count}
             for index, job in enumerate(planned_jobs)

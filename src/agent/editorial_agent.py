@@ -107,7 +107,9 @@ class EditorialAgentConfig:
         provider = str(self.provider or "").strip().lower().replace("-", "_")
         checkpoint_backend = str(self.checkpoint_backend or "json").strip().lower()
         if provider not in {"minimax", "aliyun", "volcengine", "siliconflow"}:
-            raise ValueError("智能体主控模型供应商必须是已接入的内置供应商")
+            from src.model_platforms.integration import platform_config
+            if platform_config('agent') is None:
+                raise ValueError("智能体主控模型供应商必须是已接入的内置供应商或已验证的自定义模型")
         if provider == "minimax" and self.use_subscription and str(os.getenv("ALLOW_PAID_LLM_FALLBACK", "0")).lower() in {
             "1", "true", "yes", "on"
         }:
@@ -170,6 +172,7 @@ class EditorialAgentTools:
 
 class AgentState(TypedDict, total=False):
     run_id: str
+    model_runtime: dict[str, Any]
     jobs: list[dict[str, Any]]
     job_index: int
     attempts: dict[str, int]
@@ -250,8 +253,10 @@ def _safe_value(value: Any) -> Any:
 
 def _checkpoint_payload(state: AgentState) -> dict[str, Any]:
     """Persist state needed for audit/resume without credentials or raw secrets."""
+    from src.model_platforms.integration import checkpoint_models
     return {
         "run_id": state.get("run_id", ""),
+        "model_runtime": checkpoint_models(saved=state['model_runtime']) if state.get('model_runtime') else {},
         "jobs": _safe_value(state.get("jobs", [])),
         "job_index": int(state.get("job_index", 0)),
         "attempts": _safe_value(state.get("attempts", {})),
@@ -776,8 +781,10 @@ def run_editorial_agent(
     cfg = replace(cfg, checkpoint_dir=run_directory)
     run_directory.mkdir(parents=True, exist_ok=True)
     (run_directory / "tmp").mkdir(parents=True, exist_ok=True)
+    from src.model_platforms.integration import checkpoint_models
     initial: AgentState = {
         "run_id": identifier,
+        "model_runtime": checkpoint_models(saved=resume_checkpoint.get('model_runtime')),
         "jobs": [job.__dict__ for job in normalized_jobs],
         "job_index": 0,
         "attempts": {},

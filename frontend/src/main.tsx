@@ -41,6 +41,7 @@ import {
 } from "lucide-react";
 import { DeleteDrafts, SourceHealth, AnalysisReport, LocalConfiguration } from "./WorkbenchTools";
 import { WoolGallery } from "./WoolGallery";
+import { ModelPlatforms } from "./ModelPlatforms";
 import {
   api,
   connect,
@@ -699,99 +700,8 @@ function QuotaPanel({
     </section>
   );
 }
-function ProviderManagement({
-  catalog,
-  models,
-  reload,
-  onError,
-}: {
-  catalog: ProviderCatalog;
-  models: Models;
-  reload: () => Promise<void> | void;
-  onError: (message: string) => void;
-}) {
-  const [tab, setTab] = useState<"providers" | "bindings">("providers");
-  const [selected, setSelected] = useState(catalog.connections[0]?.id || "");
-  const [adding, setAdding] = useState(false);
-  const [name, setName] = useState("");
-  const [id, setId] = useState("");
-  const [protocol, setProtocol] = useState("openai_chat");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [billing, setBilling] = useState("unknown");
-  const [apiKey, setApiKey] = useState("");
-  const [modelLines, setModelLines] = useState("");
-  const [bindings, setBindings] = useState(catalog.bindings);
-  useEffect(() => {
-    if (!catalog.connections.some((connection) => connection.id === selected)) {
-      setSelected(catalog.connections[0]?.id || "");
-    }
-    setBindings(catalog.bindings);
-  }, [catalog, selected]);
-  const labels = { ...providers, ...(models.provider_labels || {}) };
-  const selectedProvider = catalog.connections.find((connection) => connection.id === selected);
-  const resetForm = () => {
-    setAdding(false); setName(""); setId(""); setProtocol("openai_chat");
-    setBaseUrl(""); setBilling("unknown"); setApiKey(""); setModelLines("");
-  };
-  async function saveProvider() {
-    const parsedModels = modelLines.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
-      const [kind, ...parts] = line.split(":");
-      return { kind: kind === "image" ? "image" : "llm", id: parts.join(":").trim(), name: parts.join(":").trim() };
-    });
-    if (!name.trim() || !id.trim() || !baseUrl.trim()) {
-      onError("请填写供应商名称、ID和API地址");
-      return;
-    }
-    try {
-      await api("/providers", "POST", { id: id.trim(), name: name.trim(), protocol, base_url: baseUrl.trim(), billing, api_key: apiKey, models: parsedModels });
-      resetForm();
-      await reload();
-    } catch (error) { onError(String(error)); }
-  }
-  async function saveBindings() {
-    try { await api("/model-bindings", "PUT", bindings); await reload(); }
-    catch (error) { onError(String(error)); }
-  }
-  const selectable = (kind: string) => models.rows.filter((model) => model.kind === kind && model.selectable);
-  return (
-    <section className="provider-management">
-      <div className="section-heading">
-        <div><h2>模型与供应商</h2><p className="subtle">智能体、写稿和生图分别绑定；供应商凭据只保存在本机。</p></div>
-        <button className="primary" type="button" onClick={() => setAdding(true)}><Plus size={16} />添加供应商</button>
-      </div>
-      <div className="platform-tabs" role="tablist" aria-label="供应商设置">
-        <button className={tab === "providers" ? "selected" : ""} onClick={() => setTab("providers")}>供应商</button>
-        <button className={tab === "bindings" ? "selected" : ""} onClick={() => setTab("bindings")}>默认模型</button>
-      </div>
-      {tab === "providers" ? (
-        <div className="provider-layout">
-          <div className="provider-list">
-            {catalog.connections.map((connection) => (
-              <button type="button" key={connection.id} className={selected === connection.id ? "provider-item selected" : "provider-item"} onClick={() => setSelected(connection.id)}>
-                <strong>{connection.name}</strong>
-                <small>{connection.builtin ? "内置" : "自定义"} · {connection.configured ? "已配置" : "未配置"}</small>
-              </button>
-            ))}
-          </div>
-          <div className="provider-detail">
-            {selectedProvider ? <>
-              <div className="provider-detail-head"><div><h3>{selectedProvider.name}</h3><p className="subtle">{selectedProvider.protocol} · {selectedProvider.billing === "subscription" ? "订阅" : selectedProvider.billing === "free" ? "免费" : selectedProvider.billing === "unknown" ? "费用未知" : "按量"}</p></div><Status value={selectedProvider.configured ? "success" : "pending"} /></div>
-              <div className="provider-facts"><span>连接状态</span><strong>{selectedProvider.verification_status === "configured" ? "已配置，待测试" : selectedProvider.verification_status}</strong><span>模型数量</span><strong>{selectedProvider.models.length} 个</strong><span>凭据</span><strong>{selectedProvider.configured ? "已配置（不显示密钥）" : "未配置"}</strong></div>
-              <div className="provider-model-list"><h3>模型目录</h3>{selectedProvider.models.length ? selectedProvider.models.map((model) => <div className="provider-model-row" key={model.id}><span>{model.name || model.id}</span><small>{model.kind === "image" ? "生图" : "语言"} · {model.id}</small></div>) : <p className="subtle">内置模型从额度快照读取；自定义供应商可在添加时手动录入模型。</p>}</div>
-              <div className="policy-strip"><Info size={16} />连接成功、模型列表成功和费用已确认是三个状态；费用未知的模型不会自动执行。</div>
-            </> : <Empty text="请选择供应商" />}
-          </div>
-        </div>
-      ) : (
-        <div className="binding-form">
-          <p className="subtle">保存为默认值只影响之后的新任务；运行中的任务使用启动时冻结的配置。</p>
-          {(["agent", "writer", "image"] as const).map((role) => <Field key={role} label={catalog.roles[role]}><select value={bindings[role]} onChange={(event) => setBindings({ ...bindings, [role]: event.target.value })}><option value="">自动使用当前配置</option>{selectable(role === "image" ? "image" : "llm").map((model) => <option value={model.id} key={model.id}>{labels[model.provider] || model.provider} · {model.model}</option>)}</select></Field>)}
-          <button className="primary" type="button" onClick={saveBindings}><Save size={16} />保存默认模型</button>
-        </div>
-      )}
-      {adding && <div className="modal-backdrop"><section className="modal provider-form" role="dialog" aria-modal="true" aria-label="添加供应商"><div className="section-heading"><h2>添加供应商</h2><IconButton label="关闭添加供应商" onClick={resetForm}><X size={18} /></IconButton></div><Field label="供应商名称"><input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：我的模型服务" /></Field><Field label="供应商 ID"><input value={id} onChange={(event) => setId(event.target.value.toLowerCase())} placeholder="my-provider" /></Field><Field label="接口协议"><select value={protocol} onChange={(event) => setProtocol(event.target.value)}><option value="openai_chat">OpenAI 兼容聊天</option><option value="openai_image">OpenAI 兼容生图</option></select></Field><Field label="API 地址"><input type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.example.com/v1" /></Field><Field label="计费类型"><select value={billing} onChange={(event) => setBilling(event.target.value)}><option value="free">免费</option><option value="subscription">订阅</option><option value="unknown">未知</option><option value="payg">按量付费</option></select></Field><Field label="API Key（仅本机保存）"><div className="secret-input"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="留空表示暂不配置" autoComplete="new-password" /><EyeOff size={16} /></div></Field><Field label="模型目录（每行一个：llm:模型ID 或 image:模型ID）"><textarea rows={4} value={modelLines} onChange={(event) => setModelLines(event.target.value)} placeholder="llm:writer-v1\nimage:image-v1" /></Field><div className="modal-actions"><button type="button" onClick={resetForm}>取消</button><button className="primary" type="button" onClick={saveProvider}><Save size={16} />保存供应商</button></div></section></div>}
-    </section>
-  );
+function ProviderManagement({ models, reload }: { catalog: ProviderCatalog; models: Models; reload: () => Promise<void> | void; onError: (message: string) => void }) {
+  return <ModelPlatforms call={(path, method, data, key) => api(path.replace(/^\/api/, ""), method, data, key)} legacyModels={models.rows} onChanged={reload} />;
 }
 function Creation({
   material,
@@ -1475,7 +1385,11 @@ function AgentWorkspace({
                   <strong>小红书已有平台草稿</strong>
                   <span>{plan.management?.mode === "publish" ? "审查后串行发布" : "读取并审查，不公开发布"} · {plan.management?.max_items ? `最多 ${plan.management.max_items} 条` : "不限制数量"}</span>
                 </div>
-              ) : plan.jobs.map((job) => <div className="agent-plan-job" key={job.kind}><strong>{job.title}</strong><span>{job.count} 条 · {plan.delivery === "save_draft" ? "保存草稿" : "只生成本地稿"}</span></div>)}
+              ) : plan.jobs.map((job) => <div className="agent-plan-job" key={job.kind}>
+                <strong>{job.title}</strong><span>{job.count} 条 · {plan.delivery === "save_draft" ? "保存草稿" : "只生成本地稿"}</span>
+                {!!job.keywords?.length && <span className="agent-plan-keywords">{job.keyword_mode === "preference" ? "选题偏向" : "关键词"}：{job.keywords.join("、")}</span>}
+                {job.topic_brief && <span className="agent-plan-topic">{job.topic_brief}</span>}
+              </div>)}
             </div>
             <div className="agent-policy-list"><span>平台：{plan.platform === "xhs" ? "小红书创作者中心" : plan.platform === "toutiao" ? "今日头条" : "小红书 + 今日头条"}</span><span>模式：{plan.performance_mode === "speed" ? "速度优先" : "速度与稳定平衡"}</span><span>主控：已配置默认模型</span></div>
             <button className="primary agent-execute" type="button" disabled={executing || plan.status === "running" || (skillMode === "manual" && skillNames.length === 0)} onClick={executePlan}><Play size={16} />{executing ? "正在提交" : plan.status === "running" ? "任务执行中" : "执行计划"}</button>

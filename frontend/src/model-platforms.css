@@ -1,0 +1,55 @@
+.mp-root { color: #253136; min-width: 0; }
+.mp-root *, .mp-picker * { box-sizing: border-box; letter-spacing: 0; }
+.mp-root h2 { font-size: 20px; margin: 0; }
+.mp-root h3 { font-size: 16px; margin: 0 0 8px; }
+.mp-root p { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.mp-root button, .mp-picker button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 9px 12px; min-height: 38px; border: 1px solid #d4dce0; background: #fff; color: #253136; border-radius: 6px; cursor: pointer; font-size: 14px; white-space: normal; text-align: left; }
+.mp-root button:disabled, .mp-picker button:disabled { cursor: not-allowed; color: #6d767b; }
+.mp-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; }
+.mp-heading > div { min-width: 0; }
+.mp-tabs { display: flex; gap: 20px; border-bottom: 1px solid #d4dce0; margin-bottom: 20px; }
+.mp-root .mp-tabs button { border: 0; border-radius: 0; background: none; padding: 10px 0; border-bottom: 2px solid transparent; }
+.mp-root .mp-tabs button[aria-selected="true"] { color: #a72140; border-bottom-color: #a72140; font-weight: 600; }
+.mp-layout { display: grid; grid-template-columns: minmax(160px, 220px) minmax(0, 1fr); gap: 24px; }
+.mp-connections { display: flex; flex-direction: column; gap: 4px; }
+.mp-root .mp-connections button { display: flex; align-items: flex-start; flex-direction: column; border: 0; width: 100%; overflow-wrap: anywhere; }
+.mp-root .mp-connections button.selected { background: #eef6f3; color: #176957; }
+.mp-root small { display: block; font-size: 12px; font-weight: 400; overflow-wrap: anywhere; }
+.mp-detail dl { display: grid; grid-template-columns: 90px minmax(0, 1fr); font-size: 13px; line-height: 1.7; gap: 8px; }
+.mp-detail dd { margin: 0; overflow-wrap: anywhere; }
+.mp-detail dt, .mp-muted { color: #63727a; }
+.mp-actions, .mp-icon-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.mp-icon-actions { flex: 0 0 auto; }
+.mp-root .mp-icon-actions button { width: 36px; height: 36px; padding: 0; min-height: 36px; }
+.mp-inline-models { margin-top: 20px; }
+.mp-inline-models > div { border-bottom: 1px solid #e4e9eb; padding: 12px 0; }
+.mp-root code { display: block; font-size: 12px; overflow-wrap: anywhere; color: #53626c; }
+.mp-model { padding: 20px 0; border-bottom: 1px solid #d4dce0; }
+.mp-field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 16px; min-width: 0; font-size: 13px; }
+.mp-root input:not([type="checkbox"]), .mp-root select, .mp-picker input { min-width: 0; width: 100%; border: 1px solid #cbd6da; border-radius: 5px; padding: 10px; min-height: 40px; background: #fff; color: #253136; font: inherit; }
+.mp-checkbox { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 12px 0; }
+.mp-checkbox input { width: 16px; height: 16px; flex: 0 0 16px; }
+.mp-error { color: #ab2339 !important; }
+.mp-notice { color: #176957; display: flex; gap: 8px; align-items: center; }
+.mp-search { display: flex; gap: 8px; align-items: center; }
+.mp-roles { max-width: 720px; }
+.mp-backdrop { position: fixed; inset: 0; z-index: 200; background: #0006; display: grid; place-items: center; padding: 16px; }
+.mp-dialog { width: min(560px, 100%); max-height: calc(100dvh - 32px); overflow-y: auto; background: #fff; border-radius: 8px; padding: 24px; box-shadow: 0 16px 50px #0003; }
+.mp-dialog summary { cursor: pointer; margin-bottom: 14px; }
+.mp-picker { position: relative; min-width: 0; }
+.mp-picker .mp-select { width: 100%; justify-content: space-between; min-height: 44px; }
+.mp-select span { overflow-wrap: anywhere; }
+.mp-menu { position: absolute; top: calc(100% + 4px); width: 100%; z-index: 30; padding: 8px; border: 1px solid #cbd6da; border-radius: 6px; background: #fff; box-shadow: 0 8px 24px #0002; }
+.mp-menu [role="listbox"] { max-height: 320px; overflow-y: auto; }
+.mp-menu [role="option"] { width: 100%; justify-content: space-between; border: 0; margin-top: 4px; }
+.mp-menu [role="option"] span { min-width: 0; overflow-wrap: anywhere; }
+.mp-menu [role="option"]:hover:not(:disabled) { background: #eef6f3; }
+@media (max-width: 600px) {
+  .mp-layout { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .mp-heading { align-items: flex-start; gap: 8px; }
+  .mp-heading h2 { font-size: 18px; }
+  .mp-root button { font-size: 13px; padding: 8px; }
+  .mp-dialog { padding: 18px; }
+  .mp-menu { position: fixed; top: 20%; left: 12px; width: calc(100vw - 24px); }
+  .mp-detail dl { grid-template-columns: 75px minmax(0, 1fr); }
+}

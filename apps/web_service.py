@@ -99,6 +99,42 @@ def parse_time(value: str) -> float | None:
 
 
 class Workbench:
+    def model_platforms(self):
+        from src.model_platforms import PlatformStore
+        env = gui.build_subprocess_env(gui.load_env_file(self.root / ".env.gui"))
+        return PlatformStore(env.get("MODEL_PLATFORMS_DIR") or self.root / "data/model_platforms",
+                             namespace=env.get("MODEL_PLATFORMS_NAMESPACE", "workflow"), env=env)
+
+    def freeze_model_roles(self, env, request):
+        store = self.model_platforms()
+        previous_id = request.get("resume_model_job_id") or request.get("resume_of")
+        previous = self.jobs.get(previous_id, {}) if previous_id else {}
+        snapshot = previous.get("model_snapshots")
+        if previous_id and snapshot is None:
+            from src.model_platforms import PlatformError
+            if any(str(request.get(k) or "").startswith("m_") for k in ("agent_id", "llm_id")):
+                raise PlatformError("SNAPSHOT_MISSING", "原运行缺少模型快照；请显式创建新计划，不自动改配")
+        inherited = snapshot is not None
+        snapshot = dict(snapshot or {})
+        legacy = dict(previous.get('legacy_model_roles') or {})
+        fields = {"agent": "agent_id", "writer": "llm_id", "image": "image_id"}
+        required = ('agent',) if request.get('kind') == 'compaction' else ('agent', 'writer', 'image') if request.get('kind', 'agent') == 'agent' else ('writer', 'image')
+        for role in required:
+            field = fields[role]
+            ref = request.get(field) or store.state()["roles"].get(role, "")
+            if not inherited and ref and str(ref).startswith("m_"):
+                snapshot[role] = store.resolve(role, ref)
+            elif not inherited and ref:
+                legacy[role] = ref
+                env.pop({'agent': 'CONTROLLER_MODEL_REF', 'writer': 'WRITER_MODEL_REF', 'image': 'IMAGE_MODEL_REF'}[role], None)
+        env.update(MODEL_PLATFORMS_DIR=str(store.directory), MODEL_PLATFORMS_NAMESPACE=store.namespace,
+                   RUN_MODEL_SNAPSHOTS=json.dumps(snapshot, ensure_ascii=False), RUN_LEGACY_MODEL_ROLES=json.dumps(legacy, ensure_ascii=False))
+        if "writer" in snapshot:
+            env.update(WRITER_MODEL_REF=snapshot["writer"]["model_ref"], LLM_PROVIDER="custom")
+        if "agent" in snapshot:
+            env.update(CONTROLLER_MODEL_REF=snapshot["agent"]["model_ref"], AGENT_LLM_PROVIDER="custom")
+        return env
+
     def wool_library(self):
         from src.wool.reference_library import WoolReferenceLibrary, wool_asset_root
         return WoolReferenceLibrary(wool_asset_root(self.root, gui.load_env_file(self.root / ".env.gui")))
@@ -403,14 +439,19 @@ class Workbench:
 
     def compact_agent_conversation(self, conversation_id: str) -> dict:
         conversation_id = valid_conversation_id(conversation_id)
-        self._read_agent_conversation(conversation_id)
+        conversation = self._read_agent_conversation(conversation_id)
         if not hasattr(self.conversation_store, "save_snapshot"):
             raise RuntimeError("CONVERSATION_COMPACTION_REQUIRES_POSTGRES")
         from src.agent.compaction import compact_conversation, minimax_summary
+        from src.model_platforms.integration import platform_config, legacy_controller
+        plans = conversation.get('plans') or []
+        selected = (plans[-1].get('model_roles') or {}).get('agent', '') if plans else ''
+        env = self.freeze_model_roles(self.environment(), {'kind': 'compaction', 'agent_id': selected})
+        config = platform_config('agent', env=env) or legacy_controller(env)
         result = compact_conversation(
             self.conversation_store,
             conversation_id,
-            summarize=minimax_summary,
+            summarize=lambda payload: minimax_summary(payload, config=config),
             task_state={"conversation_status": self.conversation_store.get(conversation_id).get("status", "idle")},
         )
         return self.redact(result)
@@ -601,6 +642,7 @@ class Workbench:
             "delivery": plan["delivery"],
             "resume_from": str(checkpoint),
             "run_id": run_id,
+            "resume_model_job_id": previous["id"],
         }
         job = self.submit(request, key)
         for item in conversation["plans"]:
@@ -737,7 +779,14 @@ class Workbench:
                 "verification_status": str(row.get("verification_status") or "unverified"),
                 "models": [{"id": str(m.get("id") or ""), "name": str(m.get("name") or m.get("id") or ""), "kind": str(m.get("kind") or "llm")} for m in models],
             })
-        return {"connections": self._builtin_provider_rows() + custom, "bindings": state["bindings"], "roles": ROLE_NAMES}
+        platforms = self.model_platforms().catalog_rows()
+        for row in platforms["connections"]:
+            custom.append({"id": row["connection_id"], "name": row["name"], "label": row["name"], "builtin": False,
+                           "protocol": row["adapter"], "base_url": row["base_url"], "billing": row["billing"],
+                           "configured": bool(row["credential_ref"] or row["auth_mode"] == "none"),
+                           "verification_status": "managed", "models": [{"id": m["upstream_model_id"], "name": m["name"], "kind": "llm"}
+                            for m in platforms["models"] if m["connection_id"] == row["connection_id"]]})
+        return {"connections": self._builtin_provider_rows() + custom, "bindings": {**state["bindings"], **platforms["roles"]}, "roles": ROLE_NAMES}
 
     def save_provider(self, data: dict) -> dict:
         provider_id = str(data.get("id") or "").strip().lower()
@@ -787,15 +836,16 @@ class Workbench:
         bindings = {role: str(data.get(role) or "").strip() for role in ROLE_NAMES}
         catalog = {row["id"]: row for row in self.models()["rows"]}
         for role, model_id in bindings.items():
-            if len(model_id) > 260 or (model_id and ":" not in model_id):
+            if len(model_id) > 260 or (model_id and ":" not in model_id and not model_id.startswith("m_")):
                 raise ValueError(f"{ROLE_NAMES[role]}的模型标识无效")
             if not model_id:
                 continue
             model = catalog.get(model_id)
             expected_kind = "image" if role == "image" else "llm"
-            if not model or not model.get("selectable") or model.get("kind") != expected_kind:
+            if not model or (model.get('role_reasons', {}).get(role, '' if model.get('selectable') else '不可用')) or model.get("kind") != expected_kind:
                 raise ValueError(f"{ROLE_NAMES[role]}只能绑定当前目录中可执行的{('生图' if role == 'image' else '语言')}模型")
-        _write_json_atomic(self.directory / "providers.json", {"connections": state["connections"], "bindings": bindings})
+        store = self.model_platforms()
+        store.bind(bindings, store.state()["revision"], allow_legacy=True)
         return {"bindings": bindings}
 
     def models(self) -> dict:
@@ -924,6 +974,14 @@ class Workbench:
                          "cost_class": "subscription_included", "quota_pool": "ChatGPT subscription",
                          "status": "preflight_required", "selectable": True, "disabled_reason": "",
                          "snapshot_at": 0, "expires_at": ""})
+        for model in self.model_platforms().catalog_rows()["models"]:
+            labels[model["connection_id"]] = model["connection_name"]
+            reason = model["eligible"]["writer"]
+            rows.append({"id": model["model_ref"], "provider": model["connection_id"], "provider_name": model["connection_name"],
+                         "model": model["upstream_model_id"], "kind": "llm", "remaining": None, "total": None, "used": None,
+                         "unit": "费用已授权，金额未验证", "cost_class": "explicit_authorization", "quota_pool": "",
+                         "status": "verified" if not reason else "unverified", "selectable": not reason, "disabled_reason": reason,
+                         "role_reasons": model["eligible"], "snapshot_at": 0, "expires_at": ""})
         return {"rows": rows, "snapshots": snapshots, "provider_labels": labels}
 
     def sources(self) -> dict:
@@ -1059,6 +1117,13 @@ class Workbench:
     def plan(self, request: dict, job_id: str) -> tuple[list[str], dict]:
         kind = request.get("kind")
         env = self.environment()
+        if kind in {"agent", "auto", "material", "ai-digest", "wool", "daily-wool", "global-map"}:
+            env = self.freeze_model_roles(env, request)
+            request = dict(request)
+            for role, field in (("agent", "agent_id"), ("writer", "llm_id")):
+                frozen = json.loads(env.get("RUN_MODEL_SNAPSHOTS") or "{}").get(role)
+                if frozen:
+                    request[field] = frozen["model_ref"]
         args = [sys.executable, "-u", "-m", "apps.cli"]
         if kind == "agent":
             count = int(request.get("count", 10))
@@ -1107,7 +1172,7 @@ class Workbench:
                     return {"provider": fallback_provider, "model": fallback_model}
                 selected = catalog.get(requested)
                 expected_kind = "image" if role == "image" else "llm"
-                if not selected or not selected.get("selectable") or selected.get("kind") != expected_kind:
+                if not selected or selected.get('role_reasons', {}).get(role, '' if selected.get('selectable') else '不可用') or selected.get("kind") != expected_kind:
                     expected = "生图" if role == "image" else "语言"
                     raise ValueError(f"{ROLE_NAMES[role]}模型不可用：请重新选择有有效额度的{expected}模型")
                 return selected
@@ -1369,6 +1434,8 @@ class Workbench:
             job = {"id": job_id, "key": key, "digest": digest, "kind": request["kind"], "title": request.get("title") or request["kind"],
                    "status": "queued", "created_at": time.time(), "started_at": None, "ended_at": None,
                    "message": "等待启动", "stage": "准备", "events": [], "post_ids": [], "exit_code": None}
+            job["model_snapshots"] = json.loads(env.get("RUN_MODEL_SNAPSHOTS") or "{}")
+            job['legacy_model_roles'] = json.loads(env.get('RUN_LEGACY_MODEL_ROLES') or '{}')
             if request.get("kind") == "agent":
                 job["agent_run_id"] = job_id
             if request["kind"] in {"delete-preview", "delete-drafts"}:

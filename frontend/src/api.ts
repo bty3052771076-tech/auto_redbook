@@ -93,7 +93,7 @@ export type AgentJobPlan = {
   version: number;
   status: string;
   executable: boolean;
-  jobs: { kind: string; title: string; count: number; prompt: string }[];
+  jobs: { kind: string; title: string; count: number; prompt: string; keywords?: string[]; keyword_mode?: "default" | "filter" | "preference"; topic_brief?: string }[];
   plan_kind?: "editorial" | "draft_management";
   management?: { mode: string; draft_type: string; max_items: number; title_contains?: string; max_age_days?: number };
   platform: string;

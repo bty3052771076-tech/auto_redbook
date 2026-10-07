@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +18,9 @@ class LLMConfig:
     # with purchased credits after the subscription allowance is exhausted.
     cost_class: str = "free"
     account_scope: str = ""
+    platform_snapshot: dict | None = field(default=None, repr=False)
+    platform_directory: str = ""
+    platform_credentials: dict | None = field(default=None, repr=False)
 
 
 DEFAULT_LLM_BASE_URL = "https://api.ppinfra.com/openai"
@@ -436,7 +439,15 @@ def _normalize_llm_provider(value: str) -> str:
 def load_llm_configs(
     *,
     llm_file: Path | str = Path("docs/llm_api-key.md"),
+    role: str = "writer",
 ) -> list[LLMConfig]:
+    from src.model_platforms.integration import platform_config, frozen_legacy_config
+    explicit = platform_config(role)
+    if explicit is not None:
+        return [explicit]
+    frozen = frozen_legacy_config(role)
+    if frozen is not None:
+        return [frozen]
     configs: list[LLMConfig] = []
     provider = _normalize_llm_provider(os.getenv("LLM_PROVIDER") or "auto")
     allow_paid_fallback = provider == "auto" and _env_enabled("ALLOW_PAID_LLM_FALLBACK")
@@ -503,5 +514,6 @@ def load_llm_configs(
 def load_llm_config(
     *,
     llm_file: Path | str = Path("docs/llm_api-key.md"),
+    role: str = "writer",
 ) -> LLMConfig:
-    return load_llm_configs(llm_file=llm_file)[0]
+    return load_llm_configs(llm_file=llm_file, role=role)[0]

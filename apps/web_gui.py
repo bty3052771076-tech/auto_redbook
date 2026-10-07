@@ -70,7 +70,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", ""))
             self.send_header("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Workbench,Idempotency-Key")
-            self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
             self.end_headers()
         except PermissionError as exc:
             self.reply({"error": str(exc)}, 403)
@@ -82,6 +82,12 @@ class Handler(BaseHTTPRequestHandler):
         self.dispatch()
 
     def do_PUT(self):
+        self.dispatch()
+
+    def do_PATCH(self):
+        self.dispatch()
+
+    def do_DELETE(self):
         self.dispatch()
 
     def dispatch(self):
@@ -118,14 +124,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.guard()
             data = {}
-            if self.command in {"POST", "PUT"}:
+            if self.command in {"POST", "PUT", "PATCH", "DELETE"}:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 2 * 1024 * 1024:
                     raise ValueError("请求为空或超过2MiB")
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ValueError("请求格式错误")
-            if path == "/api/bootstrap" and self.command == "GET":
+            if path.startswith("/api/model-platforms/"):
+                from src.model_platforms.service import platform_request
+                result = platform_request(service, self.command, path, data, self.headers.get("Idempotency-Key", ""))
+            elif path == "/api/bootstrap" and self.command == "GET":
                 result = service.bootstrap()
             elif path == "/api/wool-library" and self.command == "GET":
                 result = service.wool_library().snapshot()
@@ -227,6 +236,10 @@ class Handler(BaseHTTPRequestHandler):
         except PermissionError as exc:
             self.reply({"error": str(exc)}, 403)
         except (ValueError, RuntimeError, KeyError, FileNotFoundError) as exc:
+            from src.model_platforms import PlatformError
+            if isinstance(exc, PlatformError):
+                self.reply(exc.public(), exc.status)
+                return
             self.reply({"error": self.server.service.redact(str(exc))}, 400)
         except (BrokenPipeError, ConnectionResetError):
             pass

@@ -136,15 +136,18 @@ def _minimax_environment() -> Iterator[None]:
                 os.environ[key] = value
 
 
-def minimax_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    """Use only the configured MiniMax subscription; never fall back to another provider."""
-    with _minimax_environment():
+def minimax_summary(payload: dict[str, Any], *, config=None) -> dict[str, Any]:
+    """Compatibility name: summarize with the controller, never the writer."""
+    from contextlib import nullcontext
+    from src.model_platforms.integration import platform_config
+    explicit = config or platform_config('agent')
+    with nullcontext() if explicit else _minimax_environment():
         from src.config import load_llm_config
         from src.llm.generate import generate_json
 
-        config = load_llm_config()
+        config = explicit or load_llm_config()
         configs = config if isinstance(config, list) else [config]
-        if len(configs) != 1 or str(configs[0].provider).lower() != "minimax":
+        if len(configs) != 1 or (not explicit and str(configs[0].provider).lower() != "minimax"):
             raise RuntimeError("COMPACTION_PROVIDER_BLOCKED: expected exactly one MiniMax LLM configuration")
         return generate_json(
             configs[0],

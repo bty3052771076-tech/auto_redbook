@@ -595,17 +595,20 @@ def generate_draft(
                     "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
                 }
                 model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.4))
-                model = init_chat_model(
-                    llm_cfg.model,
-                    **model_kwargs,
-                )
+                model = None if llm_cfg.platform_snapshot else init_chat_model(llm_cfg.model, **model_kwargs)
                 print(
                     f"[llm] provider={llm_cfg.provider} model={llm_cfg.model} base_url={llm_cfg.base_url}"
                 )
-                resp = model.invoke(messages)
+                if llm_cfg.platform_snapshot:
+                    from src.model_platforms.integration import invoke
+                    resp = invoke(llm_cfg, messages, max_tokens=model_kwargs["max_tokens"])
+                else:
+                    resp = model.invoke(messages)
                 generated_text = resp.content if hasattr(resp, "content") else str(resp)
                 break
             except Exception as exc:
+                if llm_cfg.platform_snapshot:
+                    raise
                 last_exc = exc
                 if (
                     _is_rate_limited(exc)
@@ -747,21 +750,24 @@ def generate_json(
                     "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
                 }
                 model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.1))
-                model = init_chat_model(
-                    llm_cfg.model,
-                    **model_kwargs,
-                )
+                model = None if llm_cfg.platform_snapshot else init_chat_model(llm_cfg.model, **model_kwargs)
                 print(
                     f"[llm-json] provider={llm_cfg.provider} model={llm_cfg.model} "
                     f"base_url={llm_cfg.base_url}"
                 )
-                response = model.invoke(messages)
+                if llm_cfg.platform_snapshot:
+                    from src.model_platforms.integration import invoke
+                    response = invoke(llm_cfg, messages, max_tokens=model_kwargs["max_tokens"])
+                else:
+                    response = model.invoke(messages)
                 text = response.content if hasattr(response, "content") else str(response)
                 data = _parse_json_text(text)
                 if not isinstance(data, dict):
                     raise RuntimeError("model did not return a parseable JSON object")
                 return data
             except Exception as exc:
+                if llm_cfg.platform_snapshot:
+                    raise
                 last_exc = exc
                 if (
                     _is_rate_limited(exc)
