@@ -1,10 +1,12 @@
 # Auto Redbook
 
-> 当前公开版本：2026-09-17。项目面向 Windows 本地运行，建议将项目、虚拟环境和浏览器缓存放在非系统盘。
+> 文档更新：2026-10-11。项目面向 Windows 本地运行，建议将项目、虚拟环境和下载缓存放在 E 盘。
 
 Auto Redbook 是一个运行在 Windows 本地的中文内容生产与草稿分发工具。它从多种新闻和 AI 官方信源采集材料，生成图文内容，保存到小红书创作者中心和今日头条草稿箱，并同步小红书已发布内容的互动数据。
 
-> 当前版本以本地运行和人工复核为前提。它不会替你绕过平台登录、短信验证、风控或发布审核，也不会把 API Key 自动上传到 GitHub。
+> 当前版本以本地运行和人工复核为前提。它不会替你绕过平台登录、短信验证、风控或发布审核。真实密钥、登录态和生成记录不属于公开源码，提交前仍须检查。
+
+本仓库是可人工使用的工作流。需要独立对话智能体时，使用 [redbook_auto_agent](https://github.com/bty3052771076-tech/redbook_auto_agent)；两者的代码、配置和运行数据分开管理，修复不会自动双向同步。
 
 ## 当前能力
 
@@ -19,6 +21,35 @@ Auto Redbook 是一个运行在 Windows 本地的中文内容生产与草稿分�
 - 配图策略：自动每日新闻要求使用 AI 生图，AI 生图失败会让该稿件失败，不会静默改用 Pexels；材料模式可以按配置使用 Pexels 回退；每日 AI 讯息使用本地简报卡片渲染。
 
 ## 快速开始
+
+### 已经配置过的本机
+
+1. 双击 `Start-Web-GUI.cmd`，默认浏览器会打开 <http://127.0.0.1:8765>。保留终端窗口；关闭服务后网页不能执行新任务。
+2. 在“模型与供应商”确认写稿、生图及智能体主控的绑定。在“账号与设置”使用专用浏览器登录小红书；生成前关闭占用同一 profile 的手动窗口，默认浏览器无需关闭。
+3. 在“自动发帖”选择栏目，先生成 1 条验证配置，再增加数量。“每日全球事件关注图”是其中的子功能，不另占左侧导航。
+4. 查看“任务中心”和草稿保存结果。保存草稿不等于公开发布；公开发布、删除等操作需要另外确认。
+
+MiniMax 订阅已经配置时可以直接选择 MiniMax，不必先同步其他平台额度。订阅仍有平台限制；禁止付费回退不代表无限额度。
+
+### 首次获取源码
+
+已有项目请跳过 `git clone`，不要覆盖本地 `.env.gui`、`data/`、`assets/` 或数据库。
+
+```powershell
+Set-Location E:\AI\codex
+git clone https://github.com/bty3052771076-tech/auto_redbook.git redbook_workflow
+Set-Location E:\AI\codex\redbook_workflow
+$env:PIP_CACHE_DIR="$PWD\.pip-cache"
+$env:PLAYWRIGHT_BROWSERS_PATH="$PWD\.playwright-browsers"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Set-Location frontend
+npm ci --cache E:\AI\codex\redbook_workflow\.npm-cache
+npm run build
+Set-Location ..
+```
+
+随后在 GUI 配置本人的模型凭据和专用浏览器。源码不包含模型账号、参考图库、登录态、数据库二进制或已生成的稿件。Python/Node.js/Chrome 需由本机提供；本项目不会要求在 C 盘全局安装 npm 包。使用 Playwright 自带浏览器时，另执行 `.\.venv\Scripts\python.exe -m playwright install chromium`，下载目录由上面的变量指定。
 
 ### 本机目录与工具
 
@@ -44,6 +75,7 @@ AI 福利可使用 `WOOL_IMAGE_MODE=reference_edit`，由 `assets/wool/参考原
 ```powershell
 Set-Location E:\AI\codex\redbook_workflow
 if (-not (Test-Path '.venv\Scripts\python.exe')) { python -m venv .venv }
+$env:PIP_CACHE_DIR="$PWD\.pip-cache"
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Set-Location frontend
 npm ci --cache E:\AI\codex\redbook_workflow\.npm-cache
@@ -56,7 +88,7 @@ Set-Location ..
 
 工作台只绑定本机，不要直接用于公网部署。额度同步需要显式点击。页面标题右侧的“打开创作者中心”使用项目专用 profile；“账号与设置”也提供头条号专用浏览器入口。不要同时用旧 GUI 和新工作台启动浏览器任务。
 
-Web 工作台包含智能体、全球事件关注图、自动发帖、材料发帖、任务中心、本地草稿处理、平台草稿、删除平台草稿、已发布数据、信源健康、模型与额度、账号与设置十二个页面：
+Web 工作台包含智能体、自动发帖、材料发帖、任务中心、本地草稿处理、平台草稿、删除平台草稿、已发布数据、信源健康、模型与供应商、账号与设置十一项导航；全球事件关注图位于自动发帖中：
 
 - 材料支持单条/多条、粘贴文字/上传 UTF-8 文件；本地图片可填写工作区 `assets` 或 `data/posts` 下的路径通配符。
 - 本地草稿可编辑、校验、审核、上传到指定平台及重试失败上传；已保存的小红书草稿可原位更新与回读。
@@ -64,7 +96,7 @@ Web 工作台包含智能体、全球事件关注图、自动发帖、材料发�
 - 已发布数据页可生成、查看和下载选题分析；信源健康页支持检查、搜索和排序。
 - 额度同步支持全部平台或指定平台/模型；配置页支持本机密钥和参数编辑，已有密钥仅返回“已配置/未配置”，空输入保留原值。密钥写入 `.env.gui`，若该文件被 Git 跟踪或未忽略则拒绝保存。
 
-首次启动建议先同步一次额度、确认模型选择，再使用 `--count 1` 验证配置。生成、删除、发布属于真实平台操作；正式执行前应确认平台、标题、图片和正文，并留意短信验证、草稿校验和平台风控。
+首次启动先确认模型绑定；使用按免费额度路由的供应商时，再显式同步所需额度。生成、删除、发布属于真实平台操作；正式执行前应确认平台、标题、图片和正文，并留意短信验证、草稿校验和平台风控。
 
 ### 智能体对话工作台
 
@@ -125,10 +157,10 @@ $env:WORLDMONITOR_DIR="E:\AI\codex\worldmonitor"
 $env:WORLDMONITOR_AUTO_START="1"
 ```
 
-可以在 GUI 左侧进入“全球事件关注图”，或使用：
+可以在 GUI 的“自动发帖”选择“每日全球事件关注图”，或使用：
 
 ```powershell
-.\.venv\Scripts\python.exe -m apps.cli global-map --generate-only --headless
+.\.venv\Scripts\python.exe -m apps.cli daily-global-map --generate-only --headless
 ```
 
 `--generate-only` 只保存 `data/global_map/` 下的地图和证据快照；正式提交平台草稿时去掉该参数。World Monitor 返回陈旧覆盖、事件定位不足或服务不可用时，程序会给出具体错误并停止上传，不会把不足数据伪装成全球热力图。
@@ -137,15 +169,7 @@ $env:WORLDMONITOR_AUTO_START="1"
 
 ### 1. 获取项目和依赖
 
-    Set-Location E:\AI\codex
-    git clone https://github.com/bty3052771076-tech/auto_redbook.git redbook_workflow
-    Set-Location E:\AI\codex\redbook_workflow
-    python -m venv .venv
-    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-    $env:PLAYWRIGHT_BROWSERS_PATH="$PWD\.playwright-browsers"
-    .\.venv\Scripts\python.exe -m playwright install chromium
-
-已有本地副本时，直接进入项目目录即可。
+首次安装命令见上方“首次获取源码”。已有本地副本时，直接进入项目目录，不重新克隆或覆盖运行数据。
 
 如果已经安装依赖，推荐直接运行：
 
@@ -254,8 +278,11 @@ auto 模式只选择最新额度快照中已验证、未过期且剩余额度为
 
 需要排查内容或模型时，先不打开平台，直接生成本地草稿：
 
-    .\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --keywords "财经产业 公司政策 市场变化" --count 1 --performance-mode speed --no-preflight --no-refresh-quotas
-    .\.venv\Scripts\python.exe -m apps.cli auto --title "每日AI讯息" --count 1 --performance-mode speed --no-preflight --no-refresh-quotas
+    .\.venv\Scripts\python.exe -m apps.cli agent --keywords "科技产业 社会民生" --count 1 --no-ai-digest --no-wool --delivery generate_only --performance-mode speed --no-preflight --no-refresh-quotas
+
+这个命令使用现有 MiniMax 智能体入口，仅生成 1 条本地新闻，并要求知识库已配置。仅生成 AI 讯息时，也可在 GUI 智能体页面输入“生成1篇每日AI讯息，只生成本地稿，不上传平台”，检查计划后执行。
+
+`auto` 默认会保存到小红书平台草稿，不能把省略 `--platform` 当成“不要上传”。当前 CLI 未注册 `create` 命令。CLI 不自动读取 `.env.gui`，请先在当前终端配置环境变量，或使用 GUI 传递本地配置；`--no-preflight` 只关闭预检，不会绕过内容审核或知识库要求。
 
 生成完成后，程序会在 `data/posts/<post_id>/post.json` 保存本地记录。确认模型、标题、正文和配图没有问题，再使用项目专用 profile 上传：
 
@@ -267,7 +294,7 @@ auto 模式只选择最新额度快照中已验证、未过期且剩余额度为
 
 ## 生成每日新闻
 
-程序争取约 20N 条原始材料和 10N 条初筛候选，这两个数是优选目标，不是硬性生成门槛。原文补全、事件去重、国内新闻和国际争议配额检查后，能组成 N 条主候选及替补即可进入生成。10条任务优先准备3条替补；最终窗口只有10条合格材料时也允许继续，但后续图文仍须通过审查。默认整批通过后才上传，不会把部分成功报告为全部完成。
+程序争取约 20N 条原始材料和 10N 条初筛候选，这两个数是优选目标，不是硬性生成门槛。原文补全、事件去重、国内新闻和国际争议配额检查后，能组成 N 条主候选及替补即可进入生成。10条任务优先准备3条替补；最终窗口只有10条合格材料时也允许继续，但后续图文仍须通过审查。此工作流的 `auto` 默认整批通过后才上传；显式使用 `--allow-partial` 才允许保存已完成草稿，并仍报告整批未完成。这不同于独立智能体的交付策略。
 
     .\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --keywords "财经产业 公司政策 市场变化 / 国际争议事件 外交安全 / 科技产业 芯片 AI" --evaluation-viewpoint "无视角评价" --assets-glob "assets/empty/*" --count 10 --platform xhs --headless --login-hold 0 --wait-timeout 600
 
@@ -281,13 +308,15 @@ RSS和最新列表在本批任务内复用，支持历史日期的接口只补�
 
 CLI与GUI区分原始、初筛、材料合格、成稿数量，并显示实际窗口、类别缺口及检索预算状态。预算不足时会说明覆盖未完成，不能据此断言五天内没有新闻。本策略不改变每日AI讯息、每日羊毛或材料模式的日期规则。
 
-此前离线回归验收（2026-09-13）：`1111 passed in 261.15s`。智能体首版另完成专项与全量回归；真实新闻 API、模型额度、AI 生图、浏览器登录和创作者中心回读仍受账号、网络和平台状态影响，应在本机先用 `--count 1` 实测。
+真实新闻 API、模型额度、AI 生图、浏览器登录和创作者中心回读仍受账号、网络和平台状态影响。离线测试通过不能替代这些验证，应在本机先用 1 条任务实测。
 
 ## 生成每日 AI 讯息
 
     .\.venv\Scripts\python.exe -m apps.cli auto --title "每日AI讯息" --count 1 --platform xhs --headless --login-hold 0 --wait-timeout 600
 
 每日 AI 讯息要求每条有可追溯 URL、发布时间、明确主体、具体动作和事实细节；严格限制为北京时间生成日及前一日，生成前执行历史查重和事件级去重，同一规范化信源最多 2 条。程序会优先模型发布、版本更新、开放权重、API/产品上线等具体事件，拒绝“披露AI产品变化”“动态3”等空泛或占位内容。候选不足时允许少于 8 条，最多保留 20 条高质量动态，不用旧闻硬凑数量。每日 AI 讯息使用本地简报卡片渲染图。
+
+默认启用 AIHOT 公开日报作为补充线索；显式配置 `AI_DIGEST_SOURCE_IDS` 时遵循用户白名单，不擅自加入。采集会按文章边界绑定标题、摘要与外链，有限并发补查受信任官方原文及其发布时间；无法核验的线索不冒充官方消息，也不用日报日期替代事件发布时间。原文核验后仍执行两日时效与历史查重；本地 AIHOT 服务并非使用公开日报的前提。
 
 ### 本地 AIHOT 信源（可选）
 
@@ -353,6 +382,9 @@ AIHOT 的 `.env`、PostgreSQL 凭据和 MiniMax Key 只保存在 E 盘本地，�
     git status --short
     git ls-files
     git diff --cached --check
+    git ls-files --cached --ignored --exclude-standard
+
+`.gitignore` 不会撤销已有跟踪，也不能发现源码中任意命名的密钥。最后一条命令的结果须逐项检查，合法的已跟踪项目文档不要直接删除；暂存内容也必须进行密钥检查。本地 `docs/`、生成记录和图片继续保留，忽略规则不会删除它们。
 
 如果密钥曾经进入 Git 历史，不能只删除当前文件；应立即撤销并重新生成密钥，再按仓库安全流程清理历史。
 
@@ -374,7 +406,7 @@ Web GUI 的左侧「信源健康」可以选择每日新闻、每日AI讯息或�
 
 ## AI agent 快速交互提示词
 
-将下面这段提示词发送给 AI agent，可以让它按当前项目的完整流程执行。使用前请确认项目 Profile 已登录，额度同步页面已经能够读取免费额度。
+将下面这段提示词发送给已配置的 AI agent。先确认本项目专用 profile 已登录，模型绑定有效；MiniMax 订阅不必先同步其他平台额度。计划须经用户确认，正文、图片和平台结果仍受审核限制，不保证所有网络和账号环境下都能一次完成。
 
 我已经完成了额度同步，不需要你再次进行额度同步，重新为我获取截至当前的所有帖子的数据，并以无窗口形式完成以下任务，同时上传到小红书创作者中心的草稿箱中，不要使用我的默认浏览器，使用工作区中配置的专用浏览器，实时为我汇报进度：
 1、为我分析我今天要生成哪些 每日新闻，并生成10条，确保AI生成的图和内容与评价相符合，你需要使用有额度的LLM模型和生图模型，至少需要包含两条国际上热度较高的争议事件。
@@ -382,18 +414,18 @@ Web GUI 的左侧「信源健康」可以选择每日新闻、每日AI讯息或�
 ## License
 
 本仓库主要用于个人本地自动化和工程案例研究。使用第三方平台、模型和新闻内容时，请遵守对应平台的服务条款、版权要求和当地法律法规。
-## Speed-first mode
+## 速度优先模式
 
-The default scheduler is `balanced`. Use `--performance-mode speed` when shorter wall time is more important than the widest discovery pass:
+默认调度模式是 `balanced`；偏重速度时使用 `--performance-mode speed`。下面的 `auto` 命令会尝试保存平台草稿，不是本地预览：
 
 ```powershell
 .\.venv\Scripts\python.exe -m apps.cli auto --title "每日新闻" --keywords "AI模型发布" --count 10 --performance-mode speed --headless --no-preflight --login-hold 0 --wait-timeout 600
 .\.venv\Scripts\python.exe -m apps.cli auto --title "每日AI讯息" --count 1 --performance-mode speed --headless --no-preflight --login-hold 0 --wait-timeout 600
 ```
 
-Speed mode uses a bounded completion-first coordinator and parallel AI search discovery. LLM and image generation remain in separate queues: MiniMax LLM uses up to five workers when the run is explicitly locked to MiniMax, other LLM providers use up to two, and image generation uses up to two. Xiaohongshu upload remains serial. It does not bypass freshness, deduplication, source-quality, image-quality, subscription-only, or remote readback checks.
+速度模式并行采集，写稿与生图使用不同队列：明确锁定 MiniMax 时，LLM 最多五路；其他 LLM 最多两路，生图最多两路。小红书上传仍然串行。速度模式不跳过时效、查重、来源核验、费用保护和平台回读；图片评分按当前任务的硬要求/仅参考设置执行，图片缺失等硬错误仍会阻止该稿上传。
 
-The mode is also available as `运行模式` in the GUI automatic-posting page. Use `balanced` when source coverage is more important than latency. Runtime events are stored under `data/runs/<run_id>/events.jsonl`; sensitive key names and values are excluded from telemetry.
+GUI 的自动发帖页也可选择“运行模式”。关注来源覆盖时选择 `balanced`。运行事件保存在 `data/runs/<run_id>/events.jsonl`；日志是本地记录，不上传。独立智能体的 `staged_v2` 阶段复用尚未移植到本仓库，不能混用两个程序的开关和检查点。
 
 ## AI鸡蛋参考图库
 

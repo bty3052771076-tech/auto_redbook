@@ -20,6 +20,7 @@ from .fetchers import (
     _strip_html,
     parse_aihot_daily_html,
     parse_aihot_v1_items_json,
+    parse_ai_digest_article_metadata,
     parse_benefit_html,
     parse_codex_reset_html,
     parse_github_releases_json,
@@ -44,6 +45,7 @@ from src.sources.health import (
     append_source_status,
     is_source_in_cooldown,
     load_source_health_snapshot,
+    replacement_probe_due,
     save_source_health_snapshot,
     should_replace_source,
 )
@@ -379,6 +381,33 @@ def resolve_aihot_detail_source(item: AIUpdateItem, *, timeout_s: float = 8.0) -
     else:
         data["verification_status"] = "aggregator_confirmed"
     return AIUpdateItem.model_validate(data)
+
+
+def resolve_ai_digest_discovery_source(item: AIUpdateItem, *, timeout_s: float = 8.0) -> AIUpdateItem:
+    """Promote a discovery lead only after its official original supplies a date and facts."""
+    if "aihot_original_unverified" not in item.tags:
+        return item
+    unverified = item.model_copy(update={"published_at": "", "source_type": "aggregator"})
+    if urlsplit(item.url).scheme != "https" or not _is_known_official_discovery_url(item.url):
+        return unverified
+    try:
+        metadata = parse_ai_digest_article_metadata(
+            _http_get_text(item.url, timeout_s=timeout_s), base_url=item.url,
+        )
+    except Exception:
+        return unverified
+    if not metadata["published_at"] or len(metadata["summary"]) < 28:
+        return unverified
+    host = (urlsplit(item.url).hostname or "").lower()
+    vendor = next((name for name, hosts in _VENDOR_OFFICIAL_HOSTS.items()
+        if any(host == expected or host.endswith(f".{expected}") for expected in hosts)), item.vendor)
+    return item.model_copy(update={
+        "source_type": "official", "vendor": vendor, "source_name": f"{vendor} 官网",
+        "published_at": metadata["published_at"], "summary": metadata["summary"][:220],
+        "raw_excerpt": metadata["summary"], "confidence_score": 0.9,
+        "verification_status": "aggregator_confirmed",
+        "tags": [tag for tag in item.tags if tag != "aihot_original_unverified"] + ["original_date_verified"],
+    })
 
 
 def fetch_ai_digest_source(
@@ -1006,6 +1035,7 @@ def collect_ai_digest_updates(
     aggregator_sources = [source for source in resolved if source.kind == "aggregator"]
     fetched: list[AIUpdateItem] = []
     errors: list[str] = []
+    discovery_items_by_source: dict[str, list[AIUpdateItem]] = {}
     excluded_history = {str(key).strip() for key in (exclude_history_keys or set()) if str(key).strip()}
     history_excluded_by_source: dict[str, int] = {}
 
@@ -1051,6 +1081,8 @@ def collect_ai_digest_updates(
             _emit_progress(progress, "fetch_source", f"failed name={source.name} error={error}")
             return
         filtered_source_items = _exclude_history_items(source_items, source.name)
+        if any("aihot_original_unverified" in item.tags for item in source_items):
+            discovery_items_by_source[source.name] = list(source_items)
         item_count, dated_count, url_count = _source_item_counts(filtered_source_items)
         attempt = SourceAttempt(
             collection="ai_digest",
@@ -1094,9 +1126,7 @@ def collect_ai_digest_updates(
             ):
                 # A replacement recommendation must not permanently disable
                 # official release discovery. Re-probe after a bounded cooldown.
-                recovery_due = source.kind == "official" and not is_source_in_cooldown(
-                    previous_attempt, now=health_now, cooldown_seconds=6 * 3600,
-                )
+                recovery_due = replacement_probe_due(previous_attempt, now=health_now)
                 if not recovery_due:
                     replacement_skipped.append(source.name)
                     _emit_progress(progress, "fetch_source", f"skipped_replacement name={source.name}")
@@ -1218,6 +1248,7 @@ def collect_ai_digest_updates(
     search_backfill_meta: dict = {}
     prompt_topic_items: list[AIUpdateItem] = []
     detail_source_resolution = {"considered": 0, "resolved": 0, "official": 0, "social": 0}
+    discovery_source_resolution = {"considered": 0, "official": 0, "unverified": 0}
 
     ranked = rank_ai_updates(
         fetched,
@@ -1243,6 +1274,36 @@ def collect_ai_digest_updates(
     ):
         aggregator_backfill_used = True
         _fetch_stage(aggregator_sources)
+        discovery_limit = _env_int("AI_DIGEST_AGGREGATOR_DETAIL_LIMIT", 24, min_value=1, max_value=80)
+        discovery_candidates = [item for item in fetched if "aihot_original_unverified" in item.tags][:discovery_limit]
+        if discovery_candidates:
+            timeout = _env_float("AI_DIGEST_AGGREGATOR_DETAIL_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
+            concurrency = _env_int("AI_DIGEST_AGGREGATOR_DETAIL_CONCURRENCY", 6, min_value=1, max_value=12)
+            with ThreadPoolExecutor(max_workers=min(concurrency, len(discovery_candidates))) as executor:
+                resolved_discovery = list(executor.map(
+                    lambda item: resolve_ai_digest_discovery_source(item, timeout_s=timeout), discovery_candidates,
+                ))
+            resolved_by_url = {item.url: item for item in resolved_discovery}
+            for index, attempt in enumerate(health_attempts):
+                original_items = discovery_items_by_source.get(attempt.source_name)
+                if original_items is None:
+                    continue
+                verified_items = [resolved_by_url.get(item.url, item) for item in original_items]
+                item_count, dated_count, url_count = _source_item_counts(verified_items)
+                status = _source_result_status(verified_items, max_age_days=max_age_days, now=now)
+                data = attempt.to_dict()
+                data.update(status=status, item_count=item_count, dated_count=dated_count, url_count=url_count,
+                    recent_statuses=[*attempt.recent_statuses[:-1], status])
+                verified_attempt = SourceAttempt.from_dict(data)
+                health_attempts[index] = verified_attempt
+                persisted_attempts[attempt.source_name] = verified_attempt
+            fetched = _exclude_history_items([resolved_by_url.get(item.url, item) for item in fetched], "discovery_resolution")
+            official_resolved = sum(item.source_type == "official" for item in resolved_discovery)
+            discovery_source_resolution = {"considered": len(discovery_candidates),
+                "official": official_resolved, "unverified": len(discovery_candidates) - official_resolved}
+            _emit_progress(progress, "discovery_resolution",
+                f"considered={len(discovery_candidates)} official={official_resolved} "
+                f"unverified={len(discovery_candidates) - official_resolved} original_date_required=1")
         detail_candidates = rank_ai_updates(
             [item for item in fetched if _is_aihot_detail_url(item.url)],
             target_count=max(24, target_count * 3),
@@ -1434,6 +1495,7 @@ def collect_ai_digest_updates(
         "aggregator_backfill_forced": bool(force_aggregator_backfill),
         "social_backfill_forced": bool(force_social_backfill),
         "detail_source_resolution": detail_source_resolution,
+        "discovery_source_resolution": discovery_source_resolution,
         "search_backfill": search_backfill_meta,
         "research_materials": {"path": research_path, "loaded": len(research_items), "retained": len(research_kept)},
         "quota_counts": ai_digest_quota_counts(ranked),

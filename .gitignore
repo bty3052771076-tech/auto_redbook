@@ -1,6 +1,6 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 .pytest_cache/
 .mypy_cache/
@@ -10,6 +10,7 @@ __pycache__/
 node_modules/
 frontend/dist/
 *.tsbuildinfo
+*.egg-info/
 
 # Local data
 data/
@@ -22,6 +23,7 @@ CODING_PROGRESS.md
 .tmp*
 *.log
 *.trace
+tmp_*
 
 # Local credentials and browser/session state
 secrets/
@@ -41,6 +43,23 @@ credentials/
 *.tokens
 *.secret
 *.secrets
+.git-credentials
+.netrc
+.pypirc
+.npmrc
+.pgpass
+pgpass.conf
+.auth/
+.opencodex/
+.codex/
+auth.json
+connection.json
+accounts.json
+account-pool*.json
+account_pool*.json
+**/*api_key*.json
+**/*api_key*.toml
+**/*token*.local.*
 
 # Local development records and images
 docs/
@@ -79,6 +98,11 @@ docs/aliyun_image_api-key.md
 *.sqlite*
 config.local.*
 settings.local.*
+*.local.json
+*.local.toml
+*.local.yaml
+*.local.yml
+*.sql.gz
 *.credentials.json
 *.secrets.json
 *.quota.json

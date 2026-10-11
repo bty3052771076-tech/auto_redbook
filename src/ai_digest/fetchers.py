@@ -1075,6 +1075,112 @@ def _aihot_rendered_detail_hrefs(html_text: str) -> dict[str, str]:
     return detail_hrefs
 
 
+class _AIHotArticleCollector(HTMLParser):
+    """Keep each rendered daily card's fields within its article boundary."""
+
+    def __init__(self):
+        super().__init__()
+        self.cards: list[dict[str, str]] = []
+        self.card: dict[str, str] | None = None
+        self.field = ""
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "article" and str(attributes.get("id") or "").startswith("r-"):
+            self.card = {"title": "", "summary": "", "href": "", "original": ""}
+            self.field = ""
+        if self.card is None:
+            return
+        if tag == "h3":
+            self.field = "title"
+        elif tag == "p" and not self.card["summary"]:
+            self.field = "summary"
+        elif tag == "a":
+            href = str(attributes.get("href") or "")
+            if self.field == "title":
+                self.card["href"] = href
+            elif attributes.get("target") == "_blank" and href.startswith("https://"):
+                self.card["original"] = href
+
+    def handle_endtag(self, tag):
+        if self.card is None:
+            return
+        if tag in {"h3", "p"}:
+            self.field = ""
+        elif tag == "article":
+            if all(self.card[key].strip() for key in ("title", "summary", "href", "original")):
+                self.cards.append(self.card)
+            self.card = None
+            self.field = ""
+
+    def handle_data(self, data):
+        if self.card is not None and self.field:
+            self.card[self.field] += data
+
+
+class _ArticleMetadataCollector(HTMLParser):
+    def __init__(self, base_url: str):
+        super().__init__()
+        self.base_url = base_url.rstrip("/")
+        self.metadata: dict[str, str] = {}
+        self.json_ld: list[str] = []
+        self.script: list[str] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "meta":
+            key = str(attributes.get("property") or attributes.get("name") or "").lower()
+            if key in {"article:published_time", "datepublished", "description", "og:description"}:
+                self.metadata.setdefault(key, str(attributes.get("content") or ""))
+        elif tag == "script" and attributes.get("type") == "application/ld+json":
+            self.script = []
+
+    def handle_data(self, data):
+        if self.script is not None:
+            self.script.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self.script is not None:
+            self.json_ld.append("".join(self.script))
+            self.script = None
+
+    def article_nodes(self, value):
+        if isinstance(value, list):
+            for node in value:
+                yield from self.article_nodes(node)
+        elif isinstance(value, dict):
+            types = value.get("@type") or []
+            types = [types] if isinstance(types, str) else types
+            url = value.get("url") or value.get("mainEntityOfPage") or ""
+            if isinstance(url, dict):
+                url = url.get("@id") or ""
+            if any(t in {"Article", "NewsArticle", "BlogPosting"} for t in types) and (
+                not url or str(url).rstrip("/") == self.base_url
+            ):
+                yield value
+            yield from self.article_nodes(value.get("@graph"))
+
+
+def parse_ai_digest_article_metadata(html_text: str, *, base_url: str) -> dict[str, str]:
+    parser = _ArticleMetadataCollector(base_url)
+    parser.feed(html_text or "")
+    published = parser.metadata.get("article:published_time") or parser.metadata.get("datepublished") or ""
+    summary = parser.metadata.get("description") or parser.metadata.get("og:description") or ""
+    for payload in parser.json_ld:
+        try:
+            nodes = parser.article_nodes(json.loads(payload))
+            for node in nodes:
+                published = published or str(node.get("datePublished") or "")
+                summary = summary or str(node.get("description") or "")
+        except (TypeError, ValueError):
+            continue
+    try:
+        datetime.fromisoformat(published.replace("Z", "+00:00"))
+    except ValueError:
+        published = ""
+    return {"published_at": published, "summary": _strip_html(summary)}
+
+
 def parse_aihot_daily_html(
     html_text: str,
     *,
@@ -1083,6 +1189,32 @@ def parse_aihot_daily_html(
     base_url: str,
     published_date: str,
 ) -> list[AIUpdateItem]:
+    rendered = _AIHotArticleCollector()
+    rendered.feed(html_text or "")
+    if rendered.cards:
+        items = []
+        seen_urls: set[str] = set()
+        for card in rendered.cards:
+            original = card["original"]
+            if original in seen_urls:
+                continue
+            seen_urls.add(original)
+            host = urlsplit(original).hostname or ""
+            items.append(AIUpdateItem(
+                title=re.sub(r"\s+", " ", card["title"]).strip(),
+                summary=re.sub(r"\s+", " ", card["summary"]).strip(),
+                source_name=host,
+                source_type="aggregator",
+                url=original,
+                published_at="",
+                vendor=_aihot_vendor(card["title"], host),
+                raw_excerpt=card["summary"].strip(),
+                confidence_score=0.72,
+                verification_status="aggregator_only",
+                evidence_urls=[urljoin(base_url, card["href"])],
+                tags=["AI", "aihot_original_unverified", f"discovery_date:{published_date}"],
+            ))
+        return items
     structured_entries = _aihot_structured_entries(html_text)
     rendered_detail_hrefs = _aihot_rendered_detail_hrefs(html_text)
     uses_structured_entries = bool(structured_entries)

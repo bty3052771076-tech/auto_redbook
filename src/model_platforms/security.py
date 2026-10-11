@@ -26,9 +26,6 @@ class PlatformError(ValueError):
 def file_lock(path: Path, *, timeout: float = 10):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a+b') as file:
-        if file.tell() == 0:
-            file.write(b'0')
-            file.flush()
         deadline = time.monotonic() + timeout
         while True:
             file.seek(0)
@@ -45,6 +42,10 @@ def file_lock(path: Path, *, timeout: float = 10):
                     raise PlatformError('CONFIG_BUSY', '连接正在被使用，请稍后重试', retryable=True) from None
                 time.sleep(.02)
         try:
+            # Windows can lock past EOF; initialize only after acquiring the lock.
+            if os.fstat(file.fileno()).st_size == 0:
+                file.write(b'0')
+                file.flush()
             yield
         finally:
             file.seek(0)

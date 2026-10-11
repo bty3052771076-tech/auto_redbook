@@ -269,7 +269,7 @@ def test_resolve_ai_digest_sources_places_aggregators_before_social_sources_by_d
 
     names = [source.name for source in resolve_ai_digest_sources()]
 
-    assert "aihot-daily" not in names
+    assert "aihot-daily" in names
     assert "huggingface" in names
     assert names.index("github-ai") > names.index("huggingface")
     assert names.index("github-ai") < names.index("x-openai")
@@ -327,7 +327,7 @@ def test_resolve_ai_digest_sources_includes_enabled_search_backfill_by_default(m
 
     names = [source.name for source in resolve_ai_digest_sources()]
 
-    assert "aihot-daily" not in names
+    assert "aihot-daily" in names
 
 
 def test_local_aihot_is_opt_in_and_cannot_point_to_remote_host():

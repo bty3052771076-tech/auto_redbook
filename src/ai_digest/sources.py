@@ -410,6 +410,6 @@ def resolve_ai_digest_sources(env: dict[str, str] | None = None) -> list[AIDiges
     else:
         fallback = [
             source for source in sources
-            if source.kind == "aggregator" and source.enabled and source.name != "aihot-daily"
+            if source.kind == "aggregator" and source.enabled
         ]
     return [*primary, *fallback, *social]
