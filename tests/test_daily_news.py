@@ -826,7 +826,7 @@ def test_create_daily_news_falls_back_when_llm_echoes_prompt(monkeypatch, tmp_pa
                 "body": _test_daily_news_body(
                     original_title=picked.title,
                     content="AI写作工具引发内容行业讨论，多家公司讨论其对内容生产的影响，业内关注工具效率、质量和识别问题。",
-                    comment="讨论体现行业对工具效果的关注，实际影响仍待进一步观察。",
+                    comment="AI写作的效率不能替代内容质量，作者仍应对成稿负责。",
                     date=_recent_news_date(), source=picked.source,
                 ),
                 "topics": ["每日新闻", "AI"],
@@ -1430,13 +1430,13 @@ def test_daily_news_prompt_defaults_to_no_viewpoint_and_accepts_custom_viewpoint
 
     default_prompt = _daily_news_prompt(picked, "")
 
-    assert "评价视角：无视角评价" in default_prompt
-    assert "坚持中国立场" not in default_prompt
-    assert "中国国家利益" not in default_prompt
+    assert "评价视角：按本事件类型自动选择" in default_prompt
+    assert "中国国家利益" in default_prompt
+    assert "人民立场" in default_prompt
 
     custom_prompt = _daily_news_prompt(picked, "", "产业政策视角")
 
-    assert "评价视角：产业政策视角" in custom_prompt
+    assert "评价视角：用户指定的产业政策视角优先" in custom_prompt
     assert "评价视角：无视角评价" not in custom_prompt
 
 
@@ -2488,7 +2488,7 @@ def test_create_daily_news_posts_scrubs_url_and_persists_source_url(monkeypatch,
                 "body": _test_daily_news_body(
                     original_title=picked.title,
                     content="欧盟公布科技合作框架，围绕技术标准、产业投资和供应链对话展开，报道尚未说明具体执行安排。",
-                    comment="框架为科技合作提供讨论方向，实际执行效果仍待后续安排验证。",
+                    comment="技术标准合作应以开放和规则平等为基础，不能成为排他壁垒。",
                     date=_recent_news_date(), source="Example Wire https://example.com/eu-tech",
                 ),
                 "topics": ["每日新闻", "科技合作", "国际"],
@@ -2754,7 +2754,7 @@ def test_create_daily_news_posts_keeps_trying_candidates_rejected_by_post_qualit
             "body": _test_daily_news_body(
                 original_title=item.title,
                 content=item.content,
-                comment="该进展的实际影响仍需结合后续执行结果观察。",
+                comment="公共事件的处置不能止于通报，必须保障当事人的知情权。",
                 date=_recent_news_date(),
                 source=item.source,
             ),
@@ -3069,7 +3069,7 @@ def test_create_daily_news_posts_fetches_double_pool_and_diversifies_sources(mon
             "body": _test_daily_news_body(
                 original_title=source_title,
                 content=f"{source_title}，相关公开信息已经披露，后续影响仍需观察。",
-                comment="这条新闻的价值在于提供了清晰的公共议题入口。",
+                comment=f"{source_title}应公开执行安排以保障公众知情权。",
                 date=_recent_news_date(),
                 source=source,
             ),
@@ -3316,7 +3316,7 @@ def test_daily_news_batch_uses_successful_supervisor_order_for_drafts(monkeypatc
             "body": _test_daily_news_body(
                 original_title=source_title,
                 content=f"{source_title}，相关公开信息已经披露，后续影响仍需观察。",
-                comment="这条新闻的价值在于提供了清晰的公共议题入口。",
+                comment="公共信息应明确实际动作和执行安排，保障读者的知情权。",
                 date=_recent_news_date(),
                 source=source_name,
             ),
@@ -4087,7 +4087,7 @@ def test_create_daily_news_fallback_does_not_publish_prompt_as_topic(monkeypatch
                 "body": _test_daily_news_body(
                     original_title=picked.title,
                     content="先进人工智能模型访问政策引发行业分歧，报道讨论有关政策及业内争议。",
-                    comment="访问政策引发业内关注，具体分歧和后续安排仍需更多信息确认。",
+                    comment="模型访问政策不能只照顾厂商利益，也应保障用户知情权。",
                     date=_recent_news_date(), source=picked.source,
                 ),
                 "topics": ["每日新闻", "人工智能"],
@@ -4144,7 +4144,7 @@ def test_create_daily_news_rejects_prompt_topic_title_and_generic_body(monkeypat
                 "body": _test_daily_news_body(
                     original_title=picked.title,
                     content="美国食品药品监督管理局审查防晒成分贝莫曲嗪醇，报道同时介绍其他国家使用较新防晒成分的情况。",
-                    comment="防晒成分审查关系产品选择，是否获批及具体安排仍待确认。",
+                    comment="防晒成分审查应兼顾安全与可及性，让消费者拥有可靠选择。",
                     date=_recent_news_date(), source=picked.source,
                 ),
                 "topics": ["每日新闻", "防晒"],

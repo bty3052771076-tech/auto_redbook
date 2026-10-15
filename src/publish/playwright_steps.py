@@ -5,10 +5,11 @@ import json
 import os
 import re
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Iterable, List, Optional
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -2072,19 +2073,38 @@ def _title_match_terms(title: str) -> list[str]:
     return terms[:4]
 
 
-def _draft_title_matches_expected(actual: str, expected: str) -> bool:
-    actual_text = (actual or "").strip()
-    if actual_text in GENERIC_DRAFT_TITLES:
-        return False
-    expected_text = (expected or "").strip()
-    if not actual_text or not expected_text:
-        return False
+def _normalize_draft_title(title: str) -> str:
+    text = unicodedata.normalize("NFKC", str(title or "")).strip().casefold()
+    text = re.sub(
+        r"^(?:每日新闻|每日假新闻|每日我去|每日ai(?:资讯|讯息)?|每日羊毛|ai鸡蛋)\s*(?:[|:]| - )\s*",
+        "", text,
+    )
+    return re.sub(r"\s+", "", text)
+
+
+def _draft_title_match_rank(actual: str, expected: str) -> int:
+    actual_text, expected_text = _normalize_draft_title(actual), _normalize_draft_title(expected)
+    if not actual_text or not expected_text or actual_text in GENERIC_DRAFT_TITLES:
+        return 0
     if actual_text == expected_text:
-        return True
-    terms = _title_match_terms(expected_text)
-    if not terms:
-        return expected_text[:6] in actual_text
-    return any(term and term in actual_text for term in terms)
+        return 2
+    # A list label can be truncated; token overlap never establishes identity.
+    shown = re.sub(r"\.{3,}$", "", actual_text)
+    minimum = 10 if shown != actual_text else 12
+    return int(len(shown) >= minimum and len(shown) >= len(expected_text) * 0.6
+               and expected_text.startswith(shown))
+
+
+def _draft_title_matches_expected(actual: str, expected: str) -> bool:
+    return _draft_title_match_rank(actual, expected) > 0
+
+
+def _matching_draft_items(items: list[dict], titles: Iterable[str]) -> list[dict]:
+    expected = tuple(title for title in titles if title)
+    ranked = [(max((_draft_title_match_rank(str(item.get("title") or ""), title)
+                    for title in expected), default=0), item) for item in items]
+    best = max((rank for rank, _ in ranked), default=0)
+    return [item for rank, item in ranked if rank == best] if best else []
 
 
 def _draft_item_matches_post(item: dict[str, str], post: Post) -> bool:
@@ -2153,69 +2173,29 @@ def _wait_for_upload_ready(
     return False
 
 
-def _draft_item_has_cover(page, title: str) -> bool:
-    return bool(
-        page.evaluate(
-            """
-            ({expected, terms, genericTitles}) => {
-              const items = Array.from(document.querySelectorAll('.draft-item'));
-              if (!items.length) return false;
-              const generic = new Set(genericTitles || []);
-              const titleMatches = (item) => {
-                const titleEl = item.querySelector('.draft-title-text');
-                const title = titleEl ? (titleEl.textContent || '').trim() : '';
-                if (!title || generic.has(title)) return false;
-                if (expected && title === expected) return true;
-                return (terms || []).some(term => term && title.includes(term));
-              };
-              const match = items.filter(titleMatches);
-              if (!match.length) return false;
-              const candidates = match.length ? match : [items[0]];
-              const hasCover = (item) => {
-                const img = item.querySelector('img.content, .draft-cover img');
-                const src = img ? (img.currentSrc || img.getAttribute('src') || '') : '';
-                if (src && /^https?:/.test(src)) return true;
-                const bg = item.querySelector('.media-bg');
-                if (!bg) return false;
-                const bgImage = window.getComputedStyle(bg).backgroundImage || '';
-                return bgImage && bgImage !== 'none' && bgImage.includes('http');
-              };
-              return candidates.some(hasCover);
-            }
-            """,
-            {
-                "expected": (title or "").strip(),
-                "terms": _title_match_terms(title),
-                "genericTitles": sorted(GENERIC_DRAFT_TITLES),
-            },
-        )
+def _draft_identity_items(page) -> list[dict]:
+    return page.evaluate(
+        """
+        () => Array.from(document.querySelectorAll('.draft-item')).map((item) => {
+          const title = (item.querySelector('.draft-title-text')?.textContent || '').trim();
+          const img = item.querySelector('img.content, .draft-cover img');
+          const src = img ? (img.currentSrc || img.getAttribute('src') || '') : '';
+          const bg = item.querySelector('.media-bg');
+          const bgImage = bg ? window.getComputedStyle(bg).backgroundImage || '' : '';
+          const has_cover = /^https?:/.test(src) || bgImage.includes('http');
+          return {title, has_cover};
+        })
+        """
     )
+
+
+def _draft_item_has_cover(page, title: str) -> bool:
+    matches = _matching_draft_items(_draft_identity_items(page), (title,))
+    return len(matches) == 1 and bool(matches[0].get("has_cover"))
 
 
 def _draft_item_exists(page, title: str) -> bool:
-    return bool(
-        page.evaluate(
-            """
-            ({expected, terms, genericTitles}) => {
-              const items = Array.from(document.querySelectorAll('.draft-item'));
-              if (!items.length) return false;
-              const generic = new Set(genericTitles || []);
-              return items.some(item => {
-                const titleEl = item.querySelector('.draft-title-text');
-                const title = titleEl ? (titleEl.textContent || '').trim() : '';
-                if (!title || generic.has(title)) return false;
-                if (expected && title === expected) return true;
-                return (terms || []).some(term => term && title.includes(term));
-              });
-            }
-            """,
-            {
-                "expected": (title or "").strip(),
-                "terms": _title_match_terms(title),
-                "genericTitles": sorted(GENERIC_DRAFT_TITLES),
-            },
-        )
-    )
+    return len(_matching_draft_items(_draft_identity_items(page), (title,))) == 1
 
 
 def _draft_item_key(page) -> str:
@@ -2805,14 +2785,13 @@ def _find_platform_draft_index_for_post(page, post: Post) -> tuple[Optional[int]
     except Exception:
         saved_title = ""
     expected_titles = tuple(title for title in (saved_title, post.title) if title)
-    for item in items:
-        if not any(_draft_title_matches_expected(str(item.get("title") or ""), title) for title in expected_titles):
-            continue
-        try:
-            return int(item.get("index", "0")), item
-        except ValueError:
-            return 0, item
-    return None, {}
+    matches = _matching_draft_items(items, expected_titles)
+    if len(matches) > 1:
+        raise RuntimeError(f"draft title ambiguous for post_id={post.id}: matches={len(matches)}")
+    if not matches:
+        return None, {}
+    item = matches[0]
+    return int(item.get("index", "0")), item
 
 
 def _run_collect_platform_drafts_sync_unlocked(

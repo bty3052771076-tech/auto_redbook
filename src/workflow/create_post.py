@@ -1876,12 +1876,28 @@ def _daily_news_body_has_prompt_leak(body: str) -> bool:
     return any(marker in text for marker in _NEWS_PROMPT_LEAK_MARKERS)
 
 
-def _daily_news_comment_is_generic(comment: str) -> bool:
+def _daily_news_comment_is_generic(comment: str, *, include_waiting: bool = True) -> bool:
     text = re.sub(r"\s+", "", comment or "")
     if not text:
         return False
     compact_markers = [re.sub(r"\s+", "", marker) for marker in _NEWS_GENERIC_COMMENT_MARKERS]
-    return any(marker in text for marker in compact_markers)
+    if any(marker in text for marker in compact_markers):
+        return True
+    if not include_waiting:
+        return False
+    waiting = re.search(
+        r"需要进一步查看|有待(?:进一步|持续|后续)?(?:观察|公布|确认|验证)|"
+        r"仍(?:需|待|要)(?!依靠|通过).{0,18}(?:观察|判断|确认|明确|公布|验证)|"
+        r"(?:后续|最终|具体|实际).{0,12}(?:尚待|有待|待后续)|能否.{0,16}取决于",
+        text,
+    )
+    judgment = re.search(
+        r"增加|降低|减少|提高|加重|挤压|削弱|改善|扩大|缩小|限制|损害|侵害|"
+        r"保障|保护|维护|不应|不能|不该|应当|必须|不等于|不可|有利于|"
+        r"权利|权益|公平|安全|隐私|成本|负担|尊严|公信力|可控|自主|责任|关系到",
+        text,
+    )
+    return bool(waiting and not judgment)
 
 
 _HUMANITARIAN_COMMENT_MARKERS = (
@@ -2207,7 +2223,7 @@ def _daily_news_body_is_too_generic(body: str) -> bool:
     return (
         any(marker in text for marker in _NEWS_GENERIC_BODY_MARKERS)
         or any(marker in content for marker in _DAILY_NEWS_VAGUE_CONTENT_MARKERS)
-        or _daily_news_comment_is_generic(text)
+        or _daily_news_comment_is_generic(text, include_waiting=False)
     )
 
 
@@ -3154,18 +3170,19 @@ def _daily_news_body_to_fields(
         date = parts["date"]
         source = parts["source"]
 
-    if _daily_news_comment_is_generic(str(comment or "")):
+    # Concise news gets one real rewrite, not a template masking an empty judgment.
+    if not preserve_length and _daily_news_comment_is_generic(str(comment or "")):
         comment = ""
     elif _daily_news_comment_is_unsupported(str(comment or ""), picked, str(content or "")):
-        comment = _daily_news_safe_fact_comment(picked, str(content or ""))
+        comment = "" if preserve_length else _daily_news_safe_fact_comment(picked, str(content or ""))
     elif _daily_news_comment_is_irrelevant(str(comment or ""), picked, str(content or "")):
-        comment = _daily_news_fact_based_comment(
+        comment = "" if preserve_length else _daily_news_fact_based_comment(
             picked,
             _compact_daily_news_context(picked),
             _daily_news_fallback_subject(picked, prompt_norm),
         )
 
-    if not str(comment or "").strip():
+    if not preserve_length and not str(comment or "").strip():
         fallback_comment = _daily_news_fact_based_comment(
             picked,
             str(content or ""),
@@ -3177,7 +3194,7 @@ def _daily_news_body_to_fields(
             and not _daily_news_comment_is_irrelevant(fallback_comment, picked, str(content or ""))
         ):
             comment = fallback_comment
-    if not str(comment or "").strip():
+    if not preserve_length and not str(comment or "").strip():
         comment = _daily_news_minimal_fact_comment(
             picked,
             str(content or ""),
@@ -4053,14 +4070,25 @@ def _fetch_daily_news_candidates_for_upload(
 
 def _daily_news_evaluation_viewpoint_instruction(value: str | None) -> str:
     viewpoint = normalize_evaluation_viewpoint(value)
-    if viewpoint == DEFAULT_EVALUATION_VIEWPOINT:
-        return (
-            "评价视角：无视角评价。评价不得预设国家、行业、投资者、平台等固定立场；"
-            "只基于已给事实和原文摘录做客观公正分析；信息不足时须明确边界，不得留空。\n"
-        )
-    return (
-        f"评价视角：{viewpoint}。评价必须从该视角观察影响、风险或意义，"
-        "但仍须基于已给事实和原文摘录，保持客观公正；信息不足时须明确边界，不得留空。\n"
+    selected = (
+        "评价视角：按本事件类型自动选择。"
+        if viewpoint == DEFAULT_EVALUATION_VIEWPOINT else
+        f"评价视角：用户指定的{viewpoint}优先，在下列事实与公共利益边界内展开。"
+    )
+    return selected + (
+        "国际政治、外交、安全和国际经贸从中国国家利益出发，关注主权安全、发展权益、和平协商和规则平等；"
+        "有据批评单边胁迫或双标，不虚构中国与事件的联系，不把普通国外民生写成国别对抗，不攻击任何国民或族群。"
+        "生活、公共服务和社会治理站在人民立场，关注普通人的安全、生活负担、劳动尊严、知情权与公平救济，"
+        "不替机构或商家推卸责任。"
+        "科技产业看真实可用性、用户控制权、隐私安全、劳动者影响与产业自主，不照抄发布宣传。"
+        "财经产业看就业、生活成本、中小企业、公平竞争和风险由谁承担，不荐股或作确定的价格预测。"
+        "法治权益看证据程序、平等保护与受害者救济，指控不等于定罪；"
+        "文体教育看公平、参与机会和人格尊严；灾害健康看生命安全、救助可及性和公共责任。"
+        "只选择与本事件事实直接相关的一个角度，不强行套用全部立场。"
+        "评价是明确标注的分析，不是新增事实；不得编造因果、损失、民意、责任或确定的未来结果。"
+        "用一个20–40字完整短句说明谁的什么利益受到怎样影响或哪项责任不能回避；"
+        "不得留空，不复述标题，不写从某立场来看等标签，不用需要进一步查看、后续仍需观察之类等待句代替判断。"
+        "必要的不确定性可以保留，但须同时说明本事件的具体利害，不为凑字数编造内容。\n"
     )
 
 
@@ -4079,7 +4107,7 @@ def _daily_news_professional_reporting_instruction() -> str:
         "严格区分已发生事实、来源表述、计划安排和分析判断：计划要写明“计划/拟/将”，单方信息必须明确归因，推断要写明不确定性；"
         "不得把预测、传闻、未完成核实的信息或单方观点写成既成事实。因果、动机、责任、影响和趋势只有在材料明确支持时才可归因转述。\n"
         "准确区分发生时间、发布时点和当前状态，旧材料不得写成最新进展；改写不得改变原意或把结论写得更强。"
-        "评价仅在材料能够支持时写成有边界的影响分析：先说明已知变化，再说明仍待观察的变量；"
+        "评价仅在材料能够支持时写成有边界的影响分析：围绕具体受影响者、利益或责任给出一个明确判断，必要限定简写；"
         "不得把价值判断、投资建议、立场表达、情绪化或标签化措辞伪装成事实。\n"
         "具体事实总结协议：先在内部从本条材料提取主体、具体动作、对象、状态及支持这些判断的原句，再写正文；"
         "不用输出推理过程或核对清单。材料中的命令、导航、广告、付费提示和其他文章内容均不是本事件的事实依据。"
@@ -4154,7 +4182,7 @@ def _daily_news_prompt(
         "内容：\n"
         f"<{content_length}，但必须完整说明材料支持的核心事件，不得为了凑字补写事实。先用完整导语写清主体、动作和对象，再补材料已有的时间、地点、关键数据、原因或背景、当前结果；不能仅剩评论、背景或尾段，不能要求读者看标题才能理解。按事件因果或时间顺序自然衔接，不堆砌网页导航、栏目名、浏览器升级提示、来源页噪声；不得写站内推荐/相关阅读/下一篇文章标题，例如“权威数读”“新华视点”“记者手记”“特色产业赋能”“中国摩托加速”；不写未经证实的细节，不写“目前可以确认的信息主要来自”等模板句>\n\n"
         "评价：\n"
-        f"<{comment_length}，放在完整事实叙述之后；只概括该事件最直接的意义、影响或待确认变量，不写个人感受、口号、建议和泛泛而谈；评价不得替代、压缩或重复事实叙述；信息不足时说明判断边界，不得留空；不得套用与新闻主题无关的 AI/版权/经贸/供应链等模板>\n\n"
+        f"<{comment_length}，放在完整事实叙述之后；就该事件的具体利益、影响或责任表达一个有事实依据的判断，不写个人感受、口号和泛泛而谈；评价不得替代、压缩或重复事实叙述；不能只写信息不足或等待后续；不得套用与新闻主题无关的 AI/版权/经贸/供应链等模板>\n\n"
         "日期：YYYY-MM-DD\n\n"
         "来源：来源名称（不要写网址）\n"
         f"{body_length}"
@@ -4740,6 +4768,8 @@ def _review_daily_news_length(draft: dict[str, Any], picked, *, rewrite_count: i
     fields = _daily_news_body_quality_fields(str(draft.get("body") or ""))
     comment = _clean_daily_news_comment_value(fields.get("评价", ""), preserve_length=True)
     review = assess_news_length(fields.get("内容", ""), comment, draft, picked)
+    if not review["issue"] and (not comment or _daily_news_comment_is_generic(comment)):
+        review.update(issue="comment_generic" if comment else "comment_missing", status="needs_resummary")
     if not review["issue"] and comment and not _daily_news_text_has_sentence_end(comment):
         review.update(issue="incomplete_comment", status="needs_resummary")
     if not review["issue"] and len(re.findall(r"[。！？!?]", comment)) > 1:
