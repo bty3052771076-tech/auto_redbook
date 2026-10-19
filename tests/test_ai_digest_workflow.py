@@ -727,7 +727,7 @@ def test_ai_digest_prompt_topic_coverage_replaces_low_priority_same_source_item(
     assert meta["missing"] == []
     assert meta["matched"] == [topic]
     assert any(topic in item.title for item in covered)
-    assert max(create_post.ai_digest_source_counts(covered).values()) == 2
+    assert max(create_post.ai_digest_source_counts(covered).values()) == 3
 
 
 def test_ai_digest_body_capacity_preserves_explicit_prompt_topics():
@@ -1243,11 +1243,11 @@ def test_create_daily_ai_digest_posts_uses_llm_brief_for_chinese_items(monkeypat
     assert collect_kwargs[0]["max_age_days"] == 14
     assert collect_kwargs[0]["include_pool_items"] is True
     assert collect_kwargs[0]["force_search_backfill"] is False
-    assert collect_kwargs[0]["min_domestic_model_count"] == 3
-    assert collect_kwargs[0]["min_foreign_ai_count"] == 3
+    assert collect_kwargs[0]["min_domestic_model_count"] == 0
+    assert collect_kwargs[0]["min_foreign_ai_count"] == 0
     assert llm_kwargs[0]["target_count"] == 8
-    assert llm_kwargs[0]["min_domestic_model_count"] == 3
-    assert llm_kwargs[0]["min_foreign_ai_count"] == 3
+    assert llm_kwargs[0]["min_domestic_model_count"] == 0
+    assert llm_kwargs[0]["min_foreign_ai_count"] == 0
     assert posts[0].platform["ai_digest"]["generation_mode"] == "llm"
     assert posts[0].platform["ai_digest"]["candidate_pool_target"] == 200
     assert posts[0].platform["ai_digest"]["actual_items"] == 8
@@ -1446,9 +1446,9 @@ def test_create_daily_ai_digest_posts_auto_mode_uses_best_recent_pool_after_offi
 
     assert lookback["selected_max_age_days"] == 3
     assert [attempt["official_count"] for attempt in lookback["attempts"]] == [2]
-    assert digest["official_target_items"] == 6
-    assert digest["effective_min_official_items"] == 2
-    assert digest["official_target_met"] is False
+    assert digest["official_target_items"] == 0
+    assert digest["effective_min_official_items"] == 0
+    assert digest["official_target_met"] is True
     assert digest["actual_items"] == 7
 
 
@@ -1470,7 +1470,7 @@ def test_create_daily_ai_digest_progress_reports_official_count(monkeypatch, tmp
 
     create_post.create_daily_ai_digest_posts(asset_paths=[], copy_assets=True)
 
-    assert "official=8/6" in capsys.readouterr().out
+    assert "official=8/0" in capsys.readouterr().out
 
 
 def test_create_daily_ai_digest_posts_default_lookback_stops_after_three_days_when_quota_is_met(monkeypatch, tmp_path: Path):
@@ -1578,9 +1578,9 @@ def test_create_daily_ai_digest_allows_traceable_backfill_when_official_target_i
     digest = post.platform["ai_digest"]
 
     assert digest["actual_items"] == 7
-    assert digest["effective_min_official_items"] == 2
-    assert digest["official_target_met"] is False
-    assert digest["adaptive_selection"]["official_target_relaxed"] is True
+    assert digest["effective_min_official_items"] == 0
+    assert digest["official_target_met"] is True
+    assert digest["adaptive_selection"]["official_target_relaxed"] is False
 
 
 def test_create_daily_ai_digest_posts_falls_back_when_llm_breaks_quota(monkeypatch, tmp_path: Path):
@@ -1624,8 +1624,8 @@ def test_create_daily_ai_digest_posts_falls_back_when_llm_breaks_quota(monkeypat
     meta = post.platform["ai_digest"]
 
     assert meta["generation_mode"] == "llm"
-    assert meta["actual_items"] == 7
-    assert meta["source_distribution_max"] <= 2
+    assert meta["actual_items"] == 8
+    assert meta["max_items_per_source"] is None
     assert 1 <= meta["actual_items"] <= 20
     assert meta["quota_counts"]["domestic_model"] >= 2
     assert meta["quota_counts"]["foreign_ai"] >= 3
@@ -1738,8 +1738,8 @@ def test_create_daily_ai_digest_impact_pool_preserves_region_quotas(monkeypatch,
     ]
     assert len(quota_preserving_pool_calls) >= 2
     assert all(
-        call.get("min_domestic_model_count") == 3
-        and call.get("min_foreign_ai_count") == 3
+        call.get("min_domestic_model_count") == 0
+        and call.get("min_foreign_ai_count") == 0
         for call in quota_preserving_pool_calls
     )
 
@@ -1845,7 +1845,7 @@ def test_create_daily_ai_digest_prefers_sources_not_used_by_uploaded_history(mon
         "collect_ai_digest_updates",
         lambda **_kwargs: (pool, {"sources": ["fixture"], "social_backfill_used": False}),
     )
-    monkeypatch.setattr(create_post, "list_posts", lambda: [historical_post], raising=False)
+    monkeypatch.setattr(create_post, "iter_posts", lambda: [historical_post])
     monkeypatch.setattr(
         create_post,
         "load_llm_configs",
@@ -1896,7 +1896,7 @@ def test_uploaded_ai_digest_history_ignores_generic_previous_item(monkeypatch, t
             }
         },
     )
-    monkeypatch.setattr(create_post, "list_posts", lambda: [historical_post], raising=False)
+    monkeypatch.setattr(create_post, "iter_posts", lambda: [historical_post])
 
     keys = create_post._uploaded_ai_digest_history_keys()
 
@@ -1923,7 +1923,7 @@ def test_uploaded_ai_digest_history_can_skip_same_day_regeneration(monkeypatch, 
         created_at=datetime.now(timezone.utc).isoformat(),
         platform={"ai_digest": {"mode": "daily_ai_digest", "items": [item.model_dump()]}},
     )
-    monkeypatch.setattr(create_post, "list_posts", lambda: [today_post], raising=False)
+    monkeypatch.setattr(create_post, "iter_posts", lambda: [today_post])
     key = create_post.ai_update_history_key(item)
 
     # Default behaviour keeps cross-run dedupe, including today's digest.
@@ -1981,7 +1981,7 @@ def test_create_daily_ai_digest_fails_when_history_blocks_quota(
             },
         ),
     )
-    monkeypatch.setattr(create_post, "list_posts", lambda: [historical_post])
+    monkeypatch.setattr(create_post, "iter_posts", lambda: [historical_post])
     monkeypatch.setattr(
         create_post,
         "load_llm_configs",

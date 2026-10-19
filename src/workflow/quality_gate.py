@@ -518,29 +518,29 @@ def validate_post_batch(
                     )
                 )
                 break
-    historical = [
-        post
-        for post in historical_posts
-        if post.id not in {item.id for item in items}
-        and (post.uploaded or post.status in {PostStatus.saved_draft, PostStatus.published})
-    ]
-    if _same_day_digest_regeneration():
-        # An explicit same-day regeneration replaces today's digest. Older
-        # digests and non-digest history still dedupe normally.
-        historical = [
-            post
-            for post in historical
-            if not (_ai_digest_metadata(post) and _created_on_beijing_today(post))
-        ]
-    for post in items:
-        for previous in historical:
+    current_ids = {post.id for post in items}
+    matches: dict[int, str] = {}
+    regenerate_today = _same_day_digest_regeneration()
+    # Keep only match IDs, not thousands of complete evidence payloads.
+    for previous in historical_posts:
+        if previous.id in current_ids or not (
+            previous.uploaded or previous.status in {PostStatus.saved_draft, PostStatus.published}
+        ):
+            continue
+        if regenerate_today and _ai_digest_metadata(previous) and _created_on_beijing_today(previous):
+            continue
+        for index, post in enumerate(items):
+            if index in matches:
+                continue
             if _same_event(post, previous):
-                issues.append(
-                    QualityIssue(
-                        "historical_duplicate",
-                        f"与历史草稿或已发布内容 {previous.id} 疑似重复。",
-                        post.id,
-                    )
-                )
-                break
+                matches[index] = previous.id
+        if len(matches) == len(items):
+            break
+    for index, post in enumerate(items):
+        if index in matches:
+            issues.append(QualityIssue(
+                "historical_duplicate",
+                f"与历史草稿或已发布内容 {matches[index]} 疑似重复。",
+                post.id,
+            ))
     return BatchQualityReport(issues=tuple(issues))

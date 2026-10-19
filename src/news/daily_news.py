@@ -2994,22 +2994,21 @@ def _hotnews_request_json(
     platform: str,
     timeout_s: float,
 ) -> dict[str, Any]:
+    import httpx
+
     url = f"{base_url.rstrip('/')}?{urllib.parse.urlencode({'platform': platform})}"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (redbook_workflow)"},
-        method="GET",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HotNews HTTP error {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        reason = _juhe_text(getattr(exc, "reason", "") or "network error")
-        raise RuntimeError(f"HotNews request failed: {reason}") from exc
-    except TimeoutError as exc:
+        # Preserve proxies without Windows urllib's blocking bypass DNS lookup.
+        with httpx.Client(verify=True, trust_env=True, timeout=timeout_s, follow_redirects=True) as client:
+            response = client.get(url, headers={"User-Agent": "Mozilla/5.0 (redbook_workflow)"})
+            response.raise_for_status()
+            raw = response.content
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"HotNews HTTP error {exc.response.status_code}") from exc
+    except httpx.TimeoutException as exc:
         raise RuntimeError("HotNews request timed out") from exc
+    except (httpx.HTTPError, OSError) as exc:
+        raise RuntimeError("HotNews request failed") from exc
     try:
         data = json.loads(raw.decode("utf-8", errors="replace"))
     except json.JSONDecodeError as exc:

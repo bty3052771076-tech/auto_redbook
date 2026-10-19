@@ -244,7 +244,7 @@ _OFFICIAL_HTML_KEYWORDS = (
 )
 
 _OFFICIAL_HTML_EN_KEYWORD_RE = re.compile(
-    r"\b(?:ai|api|claude|fable|glm|ernie|qwen|kimi|doubao|minimax|abab|model|models|release|releases|changelog|agent)\b",
+    r"\b(?:ai|api|claude|fable|deepseek|glm|ernie|qwen|kimi|doubao|minimax|abab|model|models|release|releases|changelog|agent)\b",
     re.IGNORECASE,
 )
 
@@ -587,6 +587,66 @@ def _apply_page_release_date(items: list[AIUpdateItem], page_release_date: str) 
     return [_with_published_at(item, page_release_date) for item in selected]
 
 
+class _DatedReleaseCollector(HTMLParser):
+    """Keep changelog entries attached to their date heading and own body."""
+
+    def __init__(self):
+        super().__init__()
+        self.entries: list[tuple[str, str, str, str]] = []
+        self._ignored = 0
+        self._heading = ""
+        self._heading_id = ""
+        self._heading_text: list[str] = []
+        self._date = ""
+        self._title = ""
+        self._anchor = ""
+        self._body: list[str] = []
+
+    def _finish(self):
+        body = re.sub(r"\s+", " ", " ".join(self._body)).strip()
+        if self._date and self._title and body:
+            self.entries.append((self._title, body, self._date, self._anchor))
+        self._title = ""
+        self._body = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"nav", "aside", "header", "footer", "script", "style"}:
+            self._ignored += 1
+        if self._ignored:
+            return
+        if tag in {"h1", "h2", "h3"}:
+            self._finish()
+            self._heading = tag
+            self._heading_id = dict(attrs).get("id", "")
+            self._heading_text = []
+
+    def handle_data(self, data):
+        if self._ignored:
+            return
+        if self._heading:
+            self._heading_text.append(data)
+        elif self._title:
+            self._body.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in {"nav", "aside", "header", "footer", "script", "style"}:
+            self._ignored = max(0, self._ignored - 1)
+            return
+        if self._ignored or tag != self._heading:
+            return
+        title = re.sub(r"\s+", " ", "".join(self._heading_text)).strip(" \u200b#")
+        if tag in {"h1", "h2"}:
+            self._date = _extract_release_date(title)
+        elif self._date:
+            self._title = title
+            self._anchor = self._heading_id
+        self._heading = ""
+
+    def close(self):
+        super().close()
+        self._finish()
+
+
 def parse_official_html(
     html_text: str,
     *,
@@ -600,6 +660,24 @@ def parse_official_html(
     current_date = ""
     page_release_date = _extract_page_release_date(html_text)
     article_html = _official_article_body_html(html_text)
+
+    # Changelog self-links are not newsroom cards. Parse dated sections first,
+    # retaining each entry's body instead of returning "Date: ..." TOC links.
+    changelog = _DatedReleaseCollector()
+    changelog.feed(article_html)
+    changelog.close()
+    page = urlsplit(base_url)
+    if changelog.entries or (page.hostname == "api-docs.deepseek.com" and page.path.rstrip("/") == "/updates"):
+        return [
+            AIUpdateItem(
+                title=title[:160], summary=body[:220], raw_excerpt=body[:4000],
+                source_name=source_name, source_type="official", vendor=vendor,
+                url=urljoin(base_url, f"#{anchor}") if anchor else base_url,
+                published_at=published, tags=["AI", "official", vendor],
+            )
+            for title, body, published, anchor in changelog.entries
+            if _looks_like_official_ai_update(title, vendor)
+        ]
 
     listing_items = _parse_official_listing_items(html_text)
     if listing_items:

@@ -30,8 +30,10 @@ DEFAULT_VOLCENGINE_LLM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_SILICONFLOW_LLM_BASE_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_MINIMAX_LLM_BASE_URL = "https://api.minimax.cn/v1"
 DEFAULT_MINIMAX_QUOTA_URL = "https://www.minimaxi.com/v1/token_plan/remains"
+MINIMAX_FLASH_LLM_MODEL = "MiniMax-M3.1-Flash"
 MINIMAX_LLM_MODELS = [
     "MiniMax-M3",
+    MINIMAX_FLASH_LLM_MODEL,
     "MiniMax-M2.7",
     "MiniMax-M2.7-highspeed",
     "MiniMax-M2.5",

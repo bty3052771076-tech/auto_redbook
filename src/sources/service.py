@@ -198,15 +198,22 @@ class UnifiedNewsSourceService:
         )
 
     def _fetch_rss(self, spec: SourceSpec, timeout_s: float) -> tuple[list[SourceArticle], dict[str, Any]]:
+        import httpx
+
         parsed = urlsplit(spec.source_url)
         if parsed.scheme != "https" or not parsed.hostname:
             raise ValueError("registry RSS URL must be HTTPS")
-        request = Request(spec.source_url, headers={"Accept": "application/rss+xml, application/atom+xml, application/xml", "User-Agent": "redbook-workflow-source/1.0"})
-        opener = build_opener(_NoRedirect, HTTPSHandler(context=https_context()))
-        with opener.open(request, timeout=max(0.5, timeout_s)) as response:
-            body = response.read(_MAX_FEED_BYTES + 1)
-        if len(body) > _MAX_FEED_BYTES:
-            raise ValueError("feed exceeds maximum size")
+        chunks: list[bytes] = []
+        size = 0
+        with httpx.Client(verify=https_context(), trust_env=True, timeout=max(0.5, timeout_s), follow_redirects=False) as client:
+            with client.stream("GET", spec.source_url, headers={"Accept": "application/rss+xml, application/atom+xml, application/xml", "User-Agent": "redbook-workflow-source/1.0"}) as response:
+                response.raise_for_status()
+                for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                    size += len(chunk)
+                    if size > _MAX_FEED_BYTES:
+                        raise ValueError("feed exceeds maximum size")
+                    chunks.append(chunk)
+        body = b"".join(chunks)
         items = parse_feed_bytes(body, source=spec)
         return items, {"source_id": spec.source_id, "status": "success", "item_count": len(items)}
 

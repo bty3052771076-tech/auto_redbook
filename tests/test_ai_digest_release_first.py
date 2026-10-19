@@ -43,7 +43,7 @@ def test_official_release_not_lost_when_another_candidate_passes_llm():
 def test_zero_official_pool_cannot_be_published_as_complete_digest():
     item = release("GPT-99", "aggregator")
     with pytest.raises(RuntimeError, match="official.*insufficient"):
-        select([item], {item.dedupe_key: {"high_impact": True}})
+        select([item], {item.dedupe_key: {"high_impact": True}}, min_official_count=1)
 
 
 def test_speed_queries_cover_current_vendor_releases_without_old_events(monkeypatch):

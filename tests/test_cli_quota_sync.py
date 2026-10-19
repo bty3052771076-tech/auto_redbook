@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from typer.testing import CliRunner
 
 import apps.cli as cli
 from src.aliyun.quota import AliyunQuotaRecord
 from src.volcengine.quota import VolcengineQuotaRecord
+
+
+@pytest.fixture(autouse=True)
+def isolate_other_quota_providers(monkeypatch):
+    for name in ("run_collect_siliconflow_quota_sync", "run_collect_minimax_quota_sync"):
+        monkeypatch.setattr(cli, name, lambda **kwargs: {"records": [], "errors": []})
 
 
 def test_sync_quotas_collects_both_platforms_and_saves_snapshots(monkeypatch, tmp_path):

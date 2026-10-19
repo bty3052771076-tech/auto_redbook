@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from apps import gui
 from src.agent.conversation_store import PostgresConversationStore
-from src.config import DEFAULT_MINIMAX_IMAGE_MODEL, DEFAULT_MINIMAX_LLM_MODEL
+from src.config import DEFAULT_MINIMAX_IMAGE_MODEL, DEFAULT_MINIMAX_LLM_MODEL, MINIMAX_FLASH_LLM_MODEL
 from src.storage.files import _write_json_atomic, latest_execution, load_post, save_post
 from src.storage.models import now_iso
 from src.global_map.models import GlobalMapRequest
@@ -896,7 +896,7 @@ class Workbench:
         # is shown as metadata, never converted into a fake remaining balance.
         existing_ids = {str(row.get("id") or "") for row in rows}
         minimax_key = str(env.get("MINIMAX_TOKEN_PLAN_API_KEY") or "").strip()
-        minimax_models = []
+        minimax_models = [(MINIMAX_FLASH_LLM_MODEL, "llm")]
         for key, default, kind in (
             ("MINIMAX_LLM_MODEL", DEFAULT_MINIMAX_LLM_MODEL, "llm"),
             ("MINIMAX_IMAGE_MODEL", DEFAULT_MINIMAX_IMAGE_MODEL, "image"),
@@ -930,6 +930,7 @@ class Workbench:
             model_id = f"minimax:{model}"
             if model_id in existing_ids:
                 continue
+            existing_ids.add(model_id)
             reason = "" if minimax_key and subscription_ok and paid_disabled else (
                 "未配置 MiniMax Token Plan 密钥" if not minimax_key else "MiniMax 订阅策略未确认"
             )

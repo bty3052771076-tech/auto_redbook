@@ -1,9 +1,17 @@
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 import apps.cli as cli
 from src.storage.models import AssetInfo, Execution, Post
+
+
+@pytest.fixture(autouse=True)
+def offline_rsshub_startup(monkeypatch):
+    from src.ai_digest import rsshub_local
+
+    monkeypatch.setattr(rsshub_local, "start_rsshub_if_needed", lambda: False)
 
 
 def _digest_post(asset: Path) -> Post:

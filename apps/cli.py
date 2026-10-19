@@ -88,6 +88,7 @@ from src.publish.targets import normalize_publish_platform, publish_targets
 from src.publish.toutiao_steps import adapt_post_for_toutiao, run_save_toutiao_draft_sync
 from src.storage.files import (
     append_run_record,
+    iter_posts,
     list_executions,
     list_posts,
     load_post,
@@ -1056,7 +1057,7 @@ def _run_auto_quality_gate(
     report = validate_post_batch(
         posts,
         expected_count=expected_count,
-        historical_posts=list_posts(),
+        historical_posts=iter_posts(),
     )
     errors = [issue.message for issue in report.issues]
     issues_by_post: dict[str, list[dict[str, str]]] = {}
@@ -1870,14 +1871,14 @@ def _normalize_agent_lookback(value: object) -> object:
 
 
 def _agent_ai_digest_policy_defaults() -> dict[str, str]:
-    """Require an official item by default without hiding explicit overrides."""
+    """Keep impact settings, but do not restore obsolete source quotas."""
 
     return {
         "AI_DIGEST_IMPACT_SUPERVISOR": os.getenv("AI_DIGEST_IMPACT_SUPERVISOR") or "0",
         "AI_DIGEST_HIGH_IMPACT_SCORE": os.getenv("AI_DIGEST_HIGH_IMPACT_SCORE") or "0",
-        "AI_DIGEST_MIN_OFFICIAL_ITEMS": os.getenv("AI_DIGEST_MIN_OFFICIAL_ITEMS") or "1",
-        "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS": os.getenv("AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS") or "0",
-        "AI_DIGEST_MIN_FOREIGN_AI_ITEMS": os.getenv("AI_DIGEST_MIN_FOREIGN_AI_ITEMS") or "0",
+        "AI_DIGEST_MIN_OFFICIAL_ITEMS": "0",
+        "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS": "0",
+        "AI_DIGEST_MIN_FOREIGN_AI_ITEMS": "0",
     }
 
 
@@ -1905,33 +1906,20 @@ def _daily_wow_source_issues(posts: list[Post]) -> list[str]:
 
 
 def _agent_ai_digest_review_issues(post: Post, *, min_official: int) -> list[str]:
+    from src.ai_digest.models import AIUpdateItem
+
     digest = post.platform.get("ai_digest") if isinstance(post.platform, dict) else None
     if not isinstance(digest, dict):
         return ["每日AI讯息缺少最终条目和信源元数据，不能保存到平台草稿"]
     items = digest.get("items")
     if not isinstance(items, list) or not items:
         return ["每日AI讯息没有可核验的最终条目"]
-    source_meta = digest.get("source_meta")
-    official_count = (
-        source_meta.get("selected_official_count", 0)
-        if isinstance(source_meta, dict) else 0
-    )
     issues = []
-    if int(official_count or 0) < min_official:
-        issues.append(
-            f"每日AI讯息官网原始信源不足：最终仅 {official_count} 条，需要至少 {min_official} 条；"
-            "请检查官网采集状态或等待新的官方消息"
-        )
-    sources = {
-        str(item.get("source_name") or "").strip().casefold()
-        for item in items if isinstance(item, dict)
-    }
-    sources.discard("")
-    if len(items) > 1 and len(sources) < 2:
-        issues.append(
-            f"每日AI讯息信源过于集中：{len(items)} 条仅来自 {len(sources)} 个已识别信源；"
-            "请补充其他独立来源，不要重复发布同一来源的多条摘要"
-        )
+    try:
+        for item in items:
+            AIUpdateItem.model_validate(item)
+    except (ValueError, TypeError):
+        return [*issues, "每日AI讯息最终条目结构无法核验"]
     return issues
 
 

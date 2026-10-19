@@ -449,10 +449,10 @@ def test_build_ai_digest_prompt_mentions_daily_digest_quota_rules():
         min_foreign_ai_count=3,
     )
 
-    assert "硬性配额" in prompt
+    assert "硬性配额" not in prompt
     assert "恰好 8 条" in prompt
-    assert "至少 3 条中国/国内模型" in prompt
-    assert "至少 3 条国外 AI" in prompt
+    assert "至少 3 条中国/国内模型" not in prompt
+    assert "至少 3 条国外 AI" not in prompt
 
 
 def test_build_ai_digest_prompt_requires_exact_compact_rewrite():

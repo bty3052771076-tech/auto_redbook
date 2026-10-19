@@ -99,7 +99,7 @@ from src.news.daily_news import (
     resolve_manual_material_times,
     daily_news_soft_preferences_enabled,
 )
-from src.storage.files import copy_assets_into_post, list_posts, post_dir, save_post, save_revision
+from src.storage.files import copy_assets_into_post, iter_posts, list_posts, post_dir, save_post, save_revision
 from src.storage.models import AssetInfo, Post, PostStatus, Revision, RevisionSource, now_iso
 from src.validation.rules import MAX_IMAGE_BODY, MAX_IMAGE_TITLE
 
@@ -5025,7 +5025,7 @@ def _enforce_ai_digest_publish_policy(
     source_cap_removed = 0
     for item in selected:
         source_key = ai_update_source_key(item)
-        if source_counts.get(source_key, 0) >= AI_DIGEST_MAX_ITEMS_PER_SOURCE:
+        if AI_DIGEST_MAX_ITEMS_PER_SOURCE is not None and source_counts.get(source_key, 0) >= AI_DIGEST_MAX_ITEMS_PER_SOURCE:
             source_cap_removed += 1
             continue
         source_counts[source_key] = source_counts.get(source_key, 0) + 1
@@ -5147,8 +5147,8 @@ def _ensure_ai_digest_prompt_topic_coverage(
         available_matches = [
             item
             for item in matches
-            if source_counts.get(ai_update_source_key(item), 0)
-            < AI_DIGEST_MAX_ITEMS_PER_SOURCE
+            if AI_DIGEST_MAX_ITEMS_PER_SOURCE is None
+            or source_counts.get(ai_update_source_key(item), 0) < AI_DIGEST_MAX_ITEMS_PER_SOURCE
         ]
         available_matches.sort(
             key=lambda item: (
@@ -5346,12 +5346,15 @@ def _ai_digest_selection_error(
     item_list = list(items or [])
     counts = ai_digest_quota_counts(item_list)
     source_counts = ai_digest_source_counts(item_list)
-    source_capacity = sum(min(count, AI_DIGEST_MAX_ITEMS_PER_SOURCE) for count in source_counts.values())
+    source_capacity = (
+        len(item_list) if AI_DIGEST_MAX_ITEMS_PER_SOURCE is None
+        else sum(min(count, AI_DIGEST_MAX_ITEMS_PER_SOURCE) for count in source_counts.values())
+    )
     official_count = ai_digest_official_count(item_list)
     problems = []
     if len(item_list) < target_count:
         problems.append(f"有效资讯不足{target_count}条，当前{len(item_list)}条")
-    if source_capacity < target_count:
+    if AI_DIGEST_MAX_ITEMS_PER_SOURCE is not None and source_capacity < target_count:
         problems.append(
             f"信源多样性不足：目标{target_count}条，同一信源最多{AI_DIGEST_MAX_ITEMS_PER_SOURCE}条，"
             f"当前最多可生成{source_capacity}条"
@@ -5381,7 +5384,7 @@ def _ai_digest_source_cap_error(
     over_limit = {
         source: count
         for source, count in source_counts.items()
-        if count > AI_DIGEST_MAX_ITEMS_PER_SOURCE
+        if AI_DIGEST_MAX_ITEMS_PER_SOURCE is not None and count > AI_DIGEST_MAX_ITEMS_PER_SOURCE
     }
     if over_limit:
         source, count = max(over_limit.items(), key=lambda pair: pair[1])
@@ -5391,7 +5394,7 @@ def _ai_digest_source_cap_error(
         )
     if target_count is not None and len(item_list) < int(target_count):
         return (
-            f"每日AI讯息信源多样性不足：目标 {int(target_count)} 条，"
+            f"每日AI讯息条目数量不足：目标 {int(target_count)} 条，"
             f"当前仅 {len(item_list)} 条"
         )
     return ""
@@ -5427,7 +5430,7 @@ def _uploaded_ai_digest_history_keys() -> set[str]:
     }
     today = datetime.now(timezone.utc).astimezone(BEIJING_TZ).strftime("%Y-%m-%d")
     keys: set[str] = set()
-    for post in list_posts():
+    for post in iter_posts():
         if not (post.uploaded or post.status in {PostStatus.saved_draft, PostStatus.published}):
             continue
         if skip_today and created_on_beijing_date(post, today):
@@ -5468,9 +5471,9 @@ def _select_adaptive_ai_digest_items(
     protected_topics: Iterable[str] | None = None,
     min_items: int = AI_DIGEST_MIN_ITEMS,
     max_items: int = 20,
-    min_official_count: int = 6,
-    min_domestic_model_count: int = AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS,
-    min_foreign_ai_count: int = AI_DIGEST_MIN_FOREIGN_AI_ITEMS,
+    min_official_count: int = 0,
+    min_domestic_model_count: int = 0,
+    min_foreign_ai_count: int = 0,
     allow_official_relaxation: bool = True,
     impact_threshold: float = 75.0,
 ) -> tuple[list[AIUpdateItem], dict[str, Any]]:
@@ -5675,6 +5678,12 @@ def _select_adaptive_ai_digest_items(
         "fallback_tiers": selected_tier_counts,
         "fallback_tiers_used": tiers_used,
         "target_items": target,
+        "source_diversity": {
+            "eligible_sources": len(ai_digest_source_counts(strict_ranked)),
+            "selected_sources": len(ai_digest_source_counts(selected)),
+            "limited_to_single_item": False,
+            "enforced": False,
+        },
         "actual_items": len(selected),
         "historical_reused_count": reused_selected,
         "max_historical_reuse": max_historical_reuse,
@@ -5783,7 +5792,8 @@ def _fit_ai_digest_items_to_body_capacity(
     optional = [
         item
         for item in optional
-        if protected_source_counts.get(ai_update_source_key(item), 0) < AI_DIGEST_MAX_ITEMS_PER_SOURCE
+        if AI_DIGEST_MAX_ITEMS_PER_SOURCE is None
+        or protected_source_counts.get(ai_update_source_key(item), 0) < AI_DIGEST_MAX_ITEMS_PER_SOURCE
     ]
     minimum = max(
         1,
@@ -6139,23 +6149,12 @@ def create_daily_ai_digest_posts(
         max_value=20,
     )
     target_count = minimum_count
-    # Keep the default official-source gate strict, but allow an explicit 0
-    # for controlled runs where the source classifier is known to be stale.
-    # The prompt and date/dedupe gates remain active in that mode.
-    min_official_count = _env_int("AI_DIGEST_MIN_OFFICIAL_ITEMS", 6, min_value=0, max_value=20)
+    # Legacy source quotas must not re-enable origin limits from an old .env.
+    # Source evidence, dates and event deduplication remain independently checked.
+    min_official_count = 0
     lookback_windows, lookback_meta = _ai_digest_lookback_windows(lookback_days)
-    min_domestic_model_count = _env_int(
-        "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS",
-        AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS,
-        min_value=0,
-        max_value=max_items,
-    )
-    min_foreign_ai_count = _env_int(
-        "AI_DIGEST_MIN_FOREIGN_AI_ITEMS",
-        AI_DIGEST_MIN_FOREIGN_AI_ITEMS,
-        min_value=0,
-        max_value=max_items,
-    )
+    min_domestic_model_count = 0
+    min_foreign_ai_count = 0
     candidate_pool_target, candidate_pool_factor = _ai_digest_candidate_pool_target(max_items)
     items = []
     selection_pool_count = 0
@@ -6784,6 +6783,9 @@ def create_daily_ai_digest_posts(
     if not adaptive_mode:
         target_count = min(legacy_target_count, target_count)
         items = items[:target_count]
+    source_error = _ai_digest_source_cap_error(items, target_count=target_count)
+    if source_error:
+        raise RuntimeError(source_error)
     max_age_days = 2
     effective_min_official_count = min(
         effective_min_official_count,

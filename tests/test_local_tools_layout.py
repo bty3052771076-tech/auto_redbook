@@ -1,5 +1,6 @@
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import src.ai_digest.rsshub_local as rsshub
 
@@ -17,10 +18,12 @@ def test_rsshub_log_is_in_data_not_tool_root(monkeypatch, tmp_path):
     (root / "dist").mkdir(parents=True)
     (root / "dist/index.mjs").touch()
     monkeypatch.setattr(rsshub, "RSSHUB_DIR", root)
+    monkeypatch.setattr(rsshub.socket, "create_connection", lambda *a, **k: (_ for _ in ()).throw(ConnectionRefusedError()))
     captured = {}
 
     def spawn(*args, **kwargs):
         captured.update(kwargs)
+        return SimpleNamespace(poll=lambda: 1)
 
     monkeypatch.setattr(rsshub.subprocess, "Popen", spawn)
     monkeypatch.setattr(rsshub.time, "sleep", lambda *_: None)

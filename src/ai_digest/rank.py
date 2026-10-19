@@ -120,7 +120,7 @@ _EXPLICIT_EVENT_MARKERS = (
     ("model-hardware-standard", ("model hardware standard", "mhs")),
     ("openai-jalapeno", ("jalapeno", "jalapeño")),
 )
-AI_DIGEST_MAX_ITEMS_PER_SOURCE = 2
+AI_DIGEST_MAX_ITEMS_PER_SOURCE: int | None = None
 _MODEL_RELEASE_MARKERS = (
     "模型",
     "版本",
@@ -783,6 +783,7 @@ def _model_history_topic_key(item: AIUpdateItem) -> str:
         item.raw_excerpt,
         _url_topic_text(item.url),
     )
+    primary_topic = ""
     for text in parts:
         if not text or not text.strip():
             continue
@@ -795,16 +796,23 @@ def _model_history_topic_key(item: AIUpdateItem) -> str:
             continue
         suffix_words: list[str] = []
         suffix_text = text[match.end() : match.end() + 64]
-        for word in re.findall(r"[A-Za-z][A-Za-z0-9]*", suffix_text):
+        for word in re.findall(r"[A-Za-z][A-Za-z0-9]*|(?<=[_-])\d{8}\b|(?<=[_-])\d{4}\b", suffix_text):
             normalized = word.lower()
-            if normalized not in _MODEL_HISTORY_VARIANT_WORDS:
+            if normalized not in _MODEL_HISTORY_VARIANT_WORDS and not normalized.isdigit():
                 break
             suffix_words.append(normalized)
             if len(suffix_words) >= 4:
                 break
         suffix_part = "-".join(suffix_words)
-        return f"model:{family}-{version}{('-' + suffix_part) if suffix_part else ''}"
-    return ""
+        topic = f"model:{family}-{version}{('-' + suffix_part) if suffix_part else ''}"
+        if not primary_topic:
+            primary_topic = topic
+        # A generic product label must not hide the dated revision in its title.
+        if any(word.isdigit() for word in suffix_words) and (
+            topic == primary_topic or topic.startswith(primary_topic + "-")
+        ):
+            return topic
+    return primary_topic
 
 
 def _history_event_key(item: AIUpdateItem) -> str:
@@ -1006,9 +1014,12 @@ def _has_explicit_model_release(item: AIUpdateItem) -> bool:
         generic_match = _GENERIC_MODEL_VERSION_RE.search(url_topic)
         if generic_match and generic_match.group("family").lower() not in _NON_MODEL_VERSION_FAMILIES:
             has_named_model_version = True
-    return has_named_model_version and _contains_any_marker(
-        release_evidence_blob,
-        _MODEL_RELEASE_ACTION_MARKERS,
+    has_model_upgrade = _contains_any_marker(
+        headline_fields, ("update", "updated", "upgrade", "upgraded", "更新", "升级"),
+    ) and not _contains_any_marker(headline_blob, _MODEL_LIFECYCLE_MARKERS)
+    return has_named_model_version and (
+        _contains_any_marker(release_evidence_blob, _MODEL_RELEASE_ACTION_MARKERS)
+        or has_model_upgrade
     )
 
 
@@ -1468,9 +1479,9 @@ def featured_ai_update(items: list[AIUpdateItem]) -> AIUpdateItem | None:
 
 
 def _interleave_by_vendor_for_same_day(items: list[AIUpdateItem], *, target_count: int) -> list[AIUpdateItem]:
-    by_day: OrderedDict[str, list[AIUpdateItem]] = OrderedDict()
+    by_day: OrderedDict[tuple[bool, str], list[AIUpdateItem]] = OrderedDict()
     for item in items:
-        by_day.setdefault(_published_day_key(item), []).append(item)
+        by_day.setdefault((_has_explicit_model_release(item), _published_day_key(item)), []).append(item)
 
     selected: list[AIUpdateItem] = []
     for _day, day_items in by_day.items():

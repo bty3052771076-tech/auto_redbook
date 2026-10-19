@@ -93,19 +93,22 @@ def load_post(post_id: str, base: Path = DATA_ROOT) -> Post:
     return Post.model_validate(data)
 
 
-def list_posts(base: Path = DATA_ROOT) -> Iterable[Post]:
+def iter_posts(base: Path = DATA_ROOT) -> Iterable[Post]:
     root = base / "posts"
     if not root.exists():
-        return []
-    posts: list[Post] = []
+        return
     for post_dir_path in root.iterdir():
         post_file = post_dir_path / "post.json"
         if post_file.exists():
             try:
-                posts.append(Post.model_validate(_read_json(post_file)))
+                post = Post.model_validate(_read_json(post_file))
             except Exception:
                 continue
-    return posts
+            yield post
+
+
+def list_posts(base: Path = DATA_ROOT) -> Iterable[Post]:
+    return list(iter_posts(base))
 
 
 def save_revision(revision: Revision, base: Path = DATA_ROOT) -> Path:

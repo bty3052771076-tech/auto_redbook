@@ -206,9 +206,9 @@ def test_rank_ai_updates_backfills_with_social_when_official_sources_are_too_few
         allow_social_backfill=True,
     )
 
-    assert len(ranked) == 5
+    assert len(ranked) == 10
     assert sum(1 for item in ranked if item.source_type == "official") == 3
-    assert sum(1 for item in ranked if item.source_type == "social") == 2
+    assert sum(1 for item in ranked if item.source_type == "social") == 7
 
 
 def test_rank_ai_updates_uses_official_then_aggregator_then_social_tiers():
@@ -286,6 +286,7 @@ def test_rank_ai_updates_uses_backfill_when_official_source_cap_cannot_reach_tar
         target_count=4,
         min_official_count=6,
         allow_social_backfill=True,
+        max_items_per_source=2,
     )
 
     assert len(ranked) == 4
@@ -344,7 +345,7 @@ def test_rank_ai_updates_never_selects_more_than_two_per_source():
         for index in range(3)
     ]
 
-    ranked = rank_ai_updates(items, target_count=10, min_official_count=99)
+    ranked = rank_ai_updates(items, target_count=10, min_official_count=99, max_items_per_source=2)
 
     counts = ai_digest_source_counts(ranked)
     assert len(ranked) == 4
@@ -1567,6 +1568,7 @@ def test_rank_ai_updates_limits_single_vendor_when_diverse_quota_safe_sources_ex
         now=now,
         min_domestic_model_count=3,
         min_foreign_ai_count=3,
+        max_items_per_source=2,
     )
     source_counts = Counter(item.source_name for item in ranked)
 
