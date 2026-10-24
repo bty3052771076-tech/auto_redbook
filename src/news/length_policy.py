@@ -29,12 +29,12 @@ def assess_news_length(content: str, comment: str, draft: dict[str, Any], picked
     limit = 300 if complex_event else 220
     content_chars, comment_chars = _count(content), _count(comment)
     issue = "content_too_long" if content_chars > limit else (
-        "comment_too_long" if comment_chars > 40 else ""
+        "comment_too_long" if comment_chars > 100 else ""
     )
     warnings = []
     if content_chars < 150:
         warnings.append("content_below_target")
-    if comment_chars < 20:
+    if comment_chars < 50:
         warnings.append("comment_below_target")
     return {
         "version": "concise-news-v1",
@@ -42,7 +42,7 @@ def assess_news_length(content: str, comment: str, draft: dict[str, Any], picked
         "complexity_reason": reason if complex_event else "",
         "complexity_evidence": verified if complex_event else [],
         "content_chars": content_chars, "content_limit": limit,
-        "comment_chars": comment_chars, "comment_limit": 40,
+        "comment_chars": comment_chars, "comment_limit": 100,
         "issue": issue, "status": "needs_resummary" if issue else "accepted",
         "warnings": warnings,
     }
@@ -54,7 +54,7 @@ def news_length_instruction() -> str:
         "普通新闻内容目标150–220字，优先写180–200字，硬上限220字；"
         "只有复杂事件在保留必要因果、各方关键动作与结果时可以延长，最多300字，"
         "不能仅因原文较长而延长。\n"
-        "评价目标20–40字，优先写25–30字，硬上限40字，限一个短句，最多一个逗号。"
+        "评价目标50–100字，优先写60–80字，硬上限100字，围绕同一判断写成一个完整句子。"
         "就本事件的具体受影响者、利益或责任表达一个判断，必要不确定性只作限定，不能只写等待后续；"
         "只说明一个要点，不并列意义、风险、条件和建议，"
         "不罗列多个待确认变量，不在评价里补述新闻事实或背景。\n"

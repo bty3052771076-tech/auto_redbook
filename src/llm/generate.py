@@ -10,6 +10,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
 
 from src.config import LLMConfig
+from src.llm.request_policy import MINIMAX_FLASH_MODELS, minimax_output_tokens, minimax_reasoning_options
 from src.news.length_policy import news_length_instruction
 from src.text_integrity import repair_utf8_as_gbk_mojibake
 
@@ -486,14 +487,17 @@ def _ensure_cfg_list(cfg: LLMConfig | list[LLMConfig]) -> list[LLMConfig]:
     return [cfg]
 
 
-def _effective_draft_max_tokens(*, prompt_text: str, max_body: int) -> int:
-    """Keep the global token ceiling without oversizing ordinary draft calls.
+def _effective_draft_max_tokens(*, prompt_text: str, max_body: int, model: str = "") -> int:
+    """Use a reasoning budget for Flash; bound other models to draft size.
 
     A long news prompt plus ``max_tokens=60000`` can exceed a provider's
     context-budget validation before generation starts.  Drafts are bounded
     to ``max_body`` characters, so a smaller request budget is sufficient and
-    leaves room for the input prompt and JSON envelope.
+    leaves room for the input prompt and JSON envelope. Flash instead reserves
+    its model-specific budget for hidden reasoning plus the concise final copy.
     """
+    if model.strip().lower().rsplit("/", 1)[-1] in MINIMAX_FLASH_MODELS:
+        return minimax_output_tokens(model, DEFAULT_LLM_MAX_TOKENS)
     raw = os.getenv("LLM_MAX_TOKENS", str(DEFAULT_LLM_MAX_TOKENS))
     try:
         configured = max(256, int(raw))
@@ -591,10 +595,15 @@ def generate_draft(
                             str(getattr(message, "content", "")) for message in messages
                         ),
                         max_body=max_body,
+                        model=llm_cfg.model,
                     ),
                     "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
                 }
                 model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.4))
+                model_kwargs.update(minimax_reasoning_options(
+                    llm_cfg.model,
+                    effort=(llm_cfg.platform_snapshot or {}).get("parameters", {}).get("reasoning_effort"),
+                ))
                 model = None if llm_cfg.platform_snapshot else init_chat_model(llm_cfg.model, **model_kwargs)
                 print(
                     f"[llm] provider={llm_cfg.provider} model={llm_cfg.model} base_url={llm_cfg.base_url}"
@@ -746,10 +755,14 @@ def generate_json(
                     "model_provider": "openai",
                     "base_url": llm_cfg.base_url,
                     "api_key": llm_cfg.api_key,
-                    "max_tokens": max(256, int(max_tokens)),
+                    "max_tokens": minimax_output_tokens(llm_cfg.model, max(256, int(max_tokens))),
                     "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
                 }
                 model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.1))
+                model_kwargs.update(minimax_reasoning_options(
+                    llm_cfg.model,
+                    effort=(llm_cfg.platform_snapshot or {}).get("parameters", {}).get("reasoning_effort"),
+                ))
                 model = None if llm_cfg.platform_snapshot else init_chat_model(llm_cfg.model, **model_kwargs)
                 print(
                     f"[llm-json] provider={llm_cfg.provider} model={llm_cfg.model} "

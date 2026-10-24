@@ -13,9 +13,10 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from src.config import LLMConfig
 from src.llm.generate import _temperature_kwargs
+from src.llm.request_policy import minimax_output_tokens, minimax_reasoning_options
 from src.text_integrity import simplify_common_chinese
 
-from .models import AIDigestBrief, AIUpdateItem
+from .models import AI_DIGEST_BODY_LIMIT, AIDigestBrief, AIUpdateItem
 from .rank import (
     AI_DIGEST_MAX_ITEMS_PER_SOURCE,
     ai_update_impact_score,
@@ -30,7 +31,6 @@ from .rank import (
 # their final answer, so a small ceiling may surface as an empty response.
 AI_DIGEST_LLM_MAX_TOKENS = 60000
 AI_DIGEST_LLM_TIMEOUT_SECONDS = 240
-AI_DIGEST_BODY_LIMIT = 1000
 _BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _GENERIC_AI_DIGEST_MARKERS = (
@@ -1489,6 +1489,9 @@ def build_ai_digest_prompt(
         "没有事件时间证据时不在摘要中添加时间。\n"
         + "如果候选信息是英文、日文或其他语言，必须翻译并改写为自然中文；公司名、模型名、产品名可保留原文。\n"
         + "请返回严格 JSON，字段为 title, subtitle, date, items, source_summary。\n"
+        + f"发布正文将由程序编排为最多{AI_DIGEST_BODY_LIMIT}字符的资讯索引，含日期、来源、标点和换行。"
+        "title 应简洁完整，保留主体、模型全名、版本和具体动作；不能截断名称或省略关键限定。"
+        "此上限不作用于结构化JSON和配图摘要，不得为缩短索引而删掉资讯事实。\n"
         + "items 每项只输出：title, summary, url, tags。url 必须从对应候选原样复制；每个 URL 只能出现一次，不得把同一事件改写成多个条目。\n"
         + "不得使用‘动态数字’、‘动态3’或‘动态5’作为标题、来源或占位文本。\n"
         + "具体事实写作协议：先在内部定位材料支持的主体、动作、对象、当前状态及关键细节，再改写，"
@@ -1681,10 +1684,15 @@ def evaluate_ai_digest_impact_with_llm(
                 "model_provider": "openai",
                 "base_url": cfg.base_url,
                 "api_key": cfg.api_key,
-                "max_tokens": min(AI_DIGEST_LLM_MAX_TOKENS, max(4000, len(items) * 180)),
+                "max_tokens": minimax_output_tokens(
+                    cfg.model, min(AI_DIGEST_LLM_MAX_TOKENS, max(4000, len(items) * 180)),
+                ),
                 "timeout": request_timeout,
             }
             model_kwargs.update(_temperature_kwargs(cfg.model, 0))
+            model_kwargs.update(minimax_reasoning_options(
+                cfg.model, effort=(getattr(cfg, "platform_snapshot", None) or {}).get("parameters", {}).get("reasoning_effort"),
+            ))
             if (cfg.provider or "").strip().lower() == "volcengine":
                 model_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             model = init_chat_model(cfg.model, **model_kwargs)
@@ -1757,6 +1765,138 @@ def parse_ai_digest_brief_json(text: str) -> AIDigestBrief:
     return _ensure_chinese_brief(AIDigestBrief.model_validate(data))
 
 
+def _ai_digest_repair_context(
+    brief: AIDigestBrief, source_items: list[AIUpdateItem],
+) -> tuple[dict[str, AIUpdateItem], dict[int, str]]:
+    """Bind repairs by exact source URL, never by position or fuzzy similarity."""
+    source_by_url = {item.url: item for item in source_items}
+    source_counts = Counter(item.url for item in source_items)
+    selected_urls = [item.url for item in brief.items]
+    if not selected_urls or len(set(selected_urls)) != len(selected_urls):
+        raise ValueError("AI digest repair requires nonempty, distinct selected source URLs")
+    issues = {}
+    for index, item in enumerate(brief.items):
+        if not item.url or source_counts[item.url] != 1:
+            raise ValueError(f"AI digest repair requires one original source for URL: {item.url}")
+        issue = _ai_digest_item_content_issue(item)
+        if issue:
+            issues[index] = issue
+    return source_by_url, issues
+
+
+def _build_ai_digest_repair_prompt(
+    brief: AIDigestBrief, source_by_url: dict[str, AIUpdateItem], issues: dict[int, str],
+) -> str:
+    rows = [
+        {
+            "index": index + 1,
+            "issue": issue,
+            "draft": {"title": brief.items[index].title, "summary": brief.items[index].summary},
+            "source": source_by_url[brief.items[index].url].model_dump(),
+        }
+        for index, issue in issues.items()
+    ]
+    return (
+        "仅修复以下失败条目，其他已通过条目已锁定，不要返回或改写。"
+        "返回严格JSON对象，items每项仅包含url、title、summary，url原样复制。"
+        "以source中的原始材料为唯一事实依据，draft是待纠正文案，不是证据。"
+        "修正issue指出的问题，用自然中文说明具名主体、具体动作、对象和原文细节；"
+        "不得使用‘披露相关变化’等空泛句，也不能以附加中文短语代替翻译。"
+        "不得新增数字、模型、能力、发布状态或使用条件；库新增模型支持不等于模型首发。"
+        "不能补造发布时间；材料不足以完成改写时返回空摘要，不能编造。"
+        f"正文索引上限为{AI_DIGEST_BODY_LIMIT}字符，标题须简洁完整，但不得截断产品名或事实。"
+        "\n" + json.dumps({"items": rows}, ensure_ascii=False)
+    )
+
+
+def _apply_ai_digest_repairs(
+    text: str, brief: AIDigestBrief, source_by_url: dict[str, AIUpdateItem],
+    issues: dict[int, str],
+) -> tuple[AIDigestBrief, dict[int, str]]:
+    # Parse the patch without fallback normalization: a failed patch must not
+    # silently turn into a different event or overwrite already accepted copy.
+    data = json.loads(_extract_json_object(text, required_key="items"))
+    rows = data.get("items")
+    if not isinstance(rows, list):
+        raise ValueError("AI digest repair items must be a list")
+    rows_by_url: dict[str, list[dict]] = {}
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("url"), str):
+            rows_by_url.setdefault(row["url"], []).append(row)
+    updated = list(brief.items)
+    remaining = {}
+    for index, previous_issue in issues.items():
+        item = brief.items[index]
+        matches = rows_by_url.get(item.url, [])
+        if len(matches) != 1:
+            remaining[index] = previous_issue + "；该URL必须恰好返回一次，不能缺失、替换或重复"
+            continue
+        row = matches[0]
+        if not all(isinstance(row.get(field), str) for field in ("title", "summary")):
+            remaining[index] = "修复的title和summary必须是文本"
+            continue
+        candidate = AIUpdateItem.model_validate({
+            **item.model_dump(),
+            "title": simplify_common_chinese(row["title"]),
+            "summary": simplify_common_chinese(row["summary"]),
+        })
+        issue = _ai_digest_item_content_issue(candidate)
+        if not issue and not _generated_item_is_grounded(candidate, source_by_url[item.url]):
+            issue = "标题或摘要含原始材料未支持的事实，请核对名称、版本、数字和使用条件"
+        if issue:
+            remaining[index] = issue
+        else:
+            updated[index] = candidate
+    return brief.model_copy(update={"items": updated}), remaining
+
+
+def retain_valid_ai_digest_items(
+    brief: AIDigestBrief, source_items: list[AIUpdateItem],
+) -> tuple[list[AIUpdateItem], list[dict[str, str]]]:
+    """Partition exhausted copy without changing facts or selecting new events.
+
+    The caller must recheck its count, topic, freshness and source constraints.
+    Missing or ambiguous evidence is an error, never permission to drop it.
+    """
+    source_by_url, issues = _ai_digest_repair_context(brief, source_items)
+    kept, dropped = [], []
+    for index, item in enumerate(brief.items):
+        issue = issues.get(index, "")
+        if not issue and not _generated_item_is_grounded(item, source_by_url[item.url]):
+            issue = "generated copy is not grounded in its original source"
+        if issue:
+            dropped.append({"url": item.url, "title": item.title, "reason": issue})
+        else:
+            kept.append(item)
+    return kept, dropped
+
+
+class AIDigestGenerationError(RuntimeError):
+    """Carry traceable partial copy to the workflow's bounded final repair."""
+
+    def __init__(self, message: str, *, partial_brief: AIDigestBrief | None = None):
+        super().__init__(message)
+        self.partial_brief = partial_brief.model_copy(deep=True) if partial_brief is not None else None
+
+
+def repair_ai_digest_brief_with_llm(
+    cfgs: list[LLMConfig], brief: AIDigestBrief, source_items: list[AIUpdateItem],
+) -> AIDigestBrief:
+    """Repair selected/fallback copy with at most two requests per config.
+
+    Pass the original collected sources, not the failed generated copy. Exact
+    URLs bind identity; only title/summary can change. Order, provenance and
+    timestamps (including missing ones) remain untouched. No collection or
+    persistence occurs here. Accepted copy is not re-reviewed; source factual
+    review and freshness/selection checks remain with the caller.
+    Exhaustion raises RuntimeError; a valid brief requires no model request.
+    """
+    return generate_ai_digest_brief_with_llm(
+        cfgs, source_items, target_count=len(brief.items), date=brief.date,
+        initial_brief=brief,
+    )
+
+
 def generate_ai_digest_brief_with_llm(
     cfgs: list[LLMConfig],
     items: list[AIUpdateItem],
@@ -1765,8 +1905,18 @@ def generate_ai_digest_brief_with_llm(
     min_domestic_model_count: int = 0,
     min_foreign_ai_count: int = 0,
     date: str = "",
+    initial_brief: AIDigestBrief | None = None,
 ) -> AIDigestBrief:
-    """Use the configured LLM to translate and summarize preselected AI digest items."""
+    """Generate copy, retaining accepted items during bounded repair retries."""
+    current_brief = initial_brief
+    source_by_url: dict[str, AIUpdateItem] = {}
+    repair_issues: dict[int, str] = {}
+    if current_brief is not None:
+        source_by_url, repair_issues = _ai_digest_repair_context(current_brief, items)
+        if not repair_issues:
+            validate_ai_digest_concrete_content(current_brief)
+            render_ai_digest_body(current_brief)
+            return current_brief
     if not cfgs:
         raise RuntimeError("LLM config missing for daily AI digest")
 
@@ -1804,10 +1954,13 @@ def generate_ai_digest_brief_with_llm(
                 "model_provider": "openai",
                 "base_url": cfg.base_url,
                 "api_key": cfg.api_key,
-                "max_tokens": AI_DIGEST_LLM_MAX_TOKENS,
+                "max_tokens": minimax_output_tokens(cfg.model, AI_DIGEST_LLM_MAX_TOKENS),
                 "timeout": request_timeout,
             }
             model_kwargs.update(_temperature_kwargs(cfg.model, 0.2))
+            model_kwargs.update(minimax_reasoning_options(
+                cfg.model, effort=(getattr(cfg, "platform_snapshot", None) or {}).get("parameters", {}).get("reasoning_effort"),
+            ))
             # Ark models can otherwise spend the whole output allowance on
             # hidden reasoning and return an empty final message.  The digest
             # is a constrained JSON transformation, so direct answering is
@@ -1825,16 +1978,28 @@ def generate_ai_digest_brief_with_llm(
             )
             for attempt in range(1, 3):
                 retry_instruction = ""
-                if attempt > 1:
+                if last_exc is not None:
                     retry_instruction = (
                         "\n\n上一次返回无法通过 JSON、条数或具体内容校验。"
                         f"本次必须只返回一个完整 JSON 对象，items 必须恰好 {target_count} 条。"
                         "逐条重新核对事实，标题与摘要必须明确说明主体、具体动作和对象，"
                         "不要使用‘披露相关内容’等泛化句；材料不足时仍使用空摘要，不要为满足条数编造。"
+                        f"\n具体错误：{last_exc}"
+                    )
+                request_prompt = user_prompt + retry_instruction
+                if current_brief is not None:
+                    request_prompt = _build_ai_digest_repair_prompt(current_brief, source_by_url, repair_issues)
+                    if last_exc is not None:
+                        request_prompt += f"\n上次校验或请求错误：{last_exc}"
+                    print(
+                        f"[ai-digest-llm] stage=repair pending={len(repair_issues)} "
+                        f"retained={len(current_brief.items) - len(repair_issues)} "
+                        f"indices={','.join(str(i + 1) for i in repair_issues)}",
+                        flush=True,
                     )
                 messages = prompt.format_messages(
-                    user_prompt=user_prompt + retry_instruction,
-                    date=date or _today_date(),
+                    user_prompt=request_prompt,
+                    date=current_brief.date if current_brief is not None else (date or _today_date()),
                 )
                 try:
                     print(
@@ -1843,24 +2008,35 @@ def generate_ai_digest_brief_with_llm(
                     )
                     resp = model.invoke(messages)
                     text = resp.content if hasattr(resp, "content") else str(resp)
-                    brief = parse_ai_digest_brief_json(text)
-                    if len(brief.items) != target_count:
-                        raise ValueError(
-                            f"expected exactly {target_count} items, got {len(brief.items)}"
+                    if current_brief is not None:
+                        current_brief, repair_issues = _apply_ai_digest_repairs(
+                            text, current_brief, source_by_url, repair_issues,
                         )
-                    brief = _restore_traceable_ai_digest_items(brief, items)
-                    if len(brief.items) != target_count:
+                    else:
+                        brief = parse_ai_digest_brief_json(text)
+                        if len(brief.items) != target_count:
+                            raise ValueError(
+                                f"expected exactly {target_count} items, got {len(brief.items)}"
+                            )
+                        brief = _restore_traceable_ai_digest_items(brief, items)
+                        if len(brief.items) != target_count:
+                            raise ValueError(
+                                f"traceable distinct events left {len(brief.items)} of {target_count} items"
+                            )
+                        if brief.date != (date or _today_date()):
+                            brief = brief.model_copy(update={"date": date or _today_date()})
+                        brief = _fill_missing_item_publish_times(brief, date=date)
+                        brief = _ensure_chinese_brief(brief)
+                        source_by_url, repair_issues = _ai_digest_repair_context(brief, items)
+                        current_brief = brief
+                    if repair_issues:
                         raise ValueError(
-                            f"traceable distinct events left {len(brief.items)} of {target_count} items"
+                            "AI digest item repair required: "
+                            + "；".join(f"第{i + 1}条：{issue}" for i, issue in repair_issues.items())
                         )
-                    if brief.date != (date or _today_date()):
-                        data = brief.model_dump()
-                        data["date"] = date or _today_date()
-                        brief = AIDigestBrief.model_validate(data)
-                    brief = _fill_missing_item_publish_times(brief, date=date)
-                    brief = _ensure_chinese_brief(brief)
-                    validate_ai_digest_concrete_content(brief)
-                    return brief
+                    validate_ai_digest_concrete_content(current_brief)
+                    render_ai_digest_body(current_brief)
+                    return current_brief
                 except Exception as exc:
                     last_exc = exc
                     if attempt < 2:
@@ -1872,7 +2048,9 @@ def generate_ai_digest_brief_with_llm(
             last_exc = exc
             continue
 
-    raise RuntimeError(f"daily ai digest LLM generation failed: {last_exc}")
+    raise AIDigestGenerationError(
+        f"daily ai digest LLM generation failed: {last_exc}", partial_brief=current_brief,
+    ) from last_exc
 
 
 def build_fallback_brief(
@@ -1967,6 +2145,7 @@ def _ai_digest_body_topic_lines(
     *,
     include_source: bool,
     title_limit: int | None = None,
+    include_published_at: bool = True,
 ) -> list[str]:
     lines = []
     for idx, item in enumerate(items, 1):
@@ -1975,7 +2154,7 @@ def _ai_digest_body_topic_lines(
             title = _shorten_ai_digest_body_title(title, max_chars=title_limit)
         prefix = f"{idx}. {_ai_digest_body_source(item)}：" if include_source else f"{idx}. "
         published_at = _format_ai_digest_body_published_at(item.published_at)
-        suffix = f"（发布时间：{published_at}）" if published_at else ""
+        suffix = f"（发布时间：{published_at}）" if published_at and include_published_at else ""
         lines.append(f"{prefix}{title}{suffix}")
     return lines
 
@@ -2021,19 +2200,9 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
     if len(body) <= AI_DIGEST_BODY_LIMIT:
         return body
 
-    # Compact only when the platform body limit requires it. Never slice a
-    # source name or title at an arbitrary character boundary, and keep the
-    # complete source list in the header when per-item labels are omitted.
-    variants = (
-        (True, None, False),
-        (True, 72, False),
-        (True, 48, False),
-        (False, None, False),
-        (False, 72, False),
-        (False, 48, False),
-        (False, 36, False),
-    )
-    for include_source, title_limit, include_selection in variants:
+    # Remove repeated presentation metadata before shortening the index.
+    # Complete titles, event times and sources remain on the unchanged cards.
+    for include_source, include_published_at in ((True, True), (False, True), (False, False)):
         compact_lines = [
             "每日AI讯息",
             f"发布时间：{brief.date}",
@@ -2041,12 +2210,27 @@ def render_ai_digest_body(brief: AIDigestBrief, *, selection_meta: dict | None =
             source_tier_line,
             "",
             "今日动态：",
-            *(_ai_digest_body_topic_lines(items, include_source=include_source, title_limit=title_limit)),
+            *(_ai_digest_body_topic_lines(items, include_source=include_source,
+                                         include_published_at=include_published_at)),
         ]
-        if include_selection and selection_line:
-            compact_lines.append(selection_line)
+        if not include_published_at:
+            compact_lines.append("各条发布时间与完整内容见配图。")
         body = "\n".join(compact_lines)
         if len(body) <= AI_DIGEST_BODY_LIMIT:
             return body
 
-    return body
+    header = ["每日AI讯息", f"发布时间：{brief.date}", f"本期共{len(items)}条AI动态", "", "重点索引："]
+    selected = []
+    fitted = ""
+    for line in _ai_digest_body_topic_lines(items, include_source=False, include_published_at=False):
+        remaining = len(items) - len(selected) - 1
+        footer = (f"其余{remaining}条及完整内容、信源、各条发布时间见配图。" if remaining
+                  else "完整内容、信源与各条发布时间见配图。")
+        candidate = "\n".join([*header, *selected, line, "", footer])
+        if len(candidate) > AI_DIGEST_BODY_LIMIT:
+            break
+        selected.append(line)
+        fitted = candidate
+    if fitted:
+        return fitted
+    raise ValueError(f"AI_DIGEST_BODY_LIMIT: no complete topic fits within {AI_DIGEST_BODY_LIMIT} characters")

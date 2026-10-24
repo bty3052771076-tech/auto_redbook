@@ -72,8 +72,20 @@ def test_comment_upper_bound_and_sparse_facts_do_not_require_padding():
     from src.news.length_policy import assess_news_length
 
     assert assess_news_length("机构宣布暂停服务。", "后续安排仍待确认。", {}, source())["issue"] == ""
-    assert assess_news_length(SHORT, "评" * 40 + "。", {}, source())["issue"] == "comment_too_long"
-    assert assess_news_length(SHORT, "评" * 39 + "。", {}, source())["issue"] == ""
+    assert assess_news_length(SHORT, "评" * 100 + "。", {}, source())["issue"] == "comment_too_long"
+    assert assess_news_length(SHORT, "评" * 99 + "。", {}, source())["issue"] == ""
+
+
+@pytest.mark.parametrize("size,below_target", [(49, True), (50, False), (75, False), (100, False)])
+def test_comment_target_range_uses_non_whitespace_characters(size, below_target):
+    from src.news.length_policy import assess_news_length
+
+    comment = " 评 " * (size - 1) + "。\n"
+    review = assess_news_length(SHORT, comment, {}, source())
+    assert review["issue"] == ""
+    assert review["comment_chars"] == size
+    assert review["comment_limit"] == 100
+    assert ("comment_below_target" in review["warnings"]) is below_target
 
 
 def test_normalization_retains_complete_overlong_single_sentence_for_resummary():
@@ -202,12 +214,25 @@ def test_second_overlong_copy_is_rejected_without_third_call_or_clipping(monkeyp
 
 
 def test_long_comment_is_rewritten_without_cutting_it(monkeypatch):
-    long_comment = "新增的夜间公交服务有利于乘客出行，但司机轮班、站点照明以及线路之间的衔接条件仍需要相关部门继续协商并依据试行数据评估。"
+    long_comment = ("新增的夜间公交服务有利于乘客出行，但司机轮班、站点照明以及线路之间的衔接条件仍需要相关部门继续协商并依据试行数据评估，"
+                    "班次增加不能以司机休息和乘客候车安全为代价，交通部门应把排班协商与站点照明作为试行评估的重要条件，"
+                    "确保便利和安全在同一套安排中落实。")
+    assert len(long_comment) > 100
     result, calls, _ = run_candidate(monkeypatch, [draft(SHORT, long_comment), draft(SHORT)])
     assert result.status == "success", (result.reason, result.draft)
     assert len(calls) == 2
     assert long_comment in calls[1]["prompt_hint"]
     assert w._daily_news_body_quality_fields(result.post.body)["评价"] == COMMENT
+
+
+def test_comment_in_new_target_range_does_not_trigger_a_rewrite(monkeypatch):
+    comment = "新增的夜间公交服务有利于乘客出行，但司机轮班、站点照明以及线路之间的衔接条件仍需要相关部门继续协商并依据试行数据评估。"
+    assert 50 <= len(comment) <= 100
+    result, calls, _ = run_candidate(monkeypatch, [draft(SHORT, comment)])
+    assert result.status == "success", (result.reason, result.draft)
+    assert len(calls) == 1
+    assert w._daily_news_body_quality_fields(result.post.body)["评价"] == comment
+    assert result.post.platform["news"]["length_review"]["rewrite_count"] == 0
 
 
 def test_complete_llm_body_is_kept_when_caller_requests_resummary(monkeypatch):
@@ -243,7 +268,8 @@ def test_legacy_date_metadata_is_not_counted_as_comment():
 def test_prompt_uses_new_targets_without_changing_daily_wow():
     prompt = w._daily_news_prompt(source(), "公交")
     assert "150–220" in prompt
-    assert "20–40" in prompt
+    assert "50–100" in prompt
+    assert "20–40字" not in prompt
     assert "220-350" not in prompt
     wow_prompt = w._daily_news_prompt(source(), "公交", column=w.DAILY_WOW_CONTENT_TYPE)
     assert "220-350" in wow_prompt
@@ -301,7 +327,7 @@ def test_initial_candidate_enables_concise_writer_before_first_request(monkeypat
     assert result.status == "success"
     assert calls[0].get("concise_news") is True
     assert "180–200字" in calls[0]["prompt_hint"]
-    assert "25–30字" in calls[0]["prompt_hint"]
+    assert "60–80字" in calls[0]["prompt_hint"]
 
 
 def test_daily_wow_does_not_enable_concise_news_writer(monkeypatch):
@@ -345,8 +371,8 @@ def test_single_post_enables_concise_writer_at_actual_request_boundary(monkeypat
     assert len(requests) == 1
     system, user = (str(message.content) for message in requests[0])
     for text in (system, user):
-        assert "180–200字" in text and "25–30字" in text
-        assert "150–220字" in text and "20–40字" in text
+        assert "180–200字" in text and "60–80字" in text
+        assert "150–220字" in text and "50–100字" in text
     assert "Body <= 1000" not in system
     assert "at least 200" not in system
     assert "expand it" not in system

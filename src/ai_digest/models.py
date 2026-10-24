@@ -9,6 +9,9 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
+AI_DIGEST_BODY_LIMIT = 800
+
+
 SourceType = Literal["official", "aggregator", "social", "search", "github"]
 VerificationStatus = Literal[
     "official_only",

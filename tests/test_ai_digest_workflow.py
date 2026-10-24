@@ -631,7 +631,7 @@ def test_final_ai_digest_policy_drops_stale_items_before_publication():
             summary="厂商正式发布模型版本并开放接口。",
             source_name="厂商A",
             url="https://example.com/today",
-            published_at=f"{today.isoformat()}T08:00:00+08:00",
+            published_at=f"{today.isoformat()}T00:00:00+08:00",
         ),
         AIUpdateItem(
             title="旧模型正式发布",

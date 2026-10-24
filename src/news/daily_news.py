@@ -947,6 +947,115 @@ def _dedupe_by_title(items: list[NewsItem], *, max_count: int) -> list[NewsItem]
     return picked
 
 
+@dataclass(frozen=True)
+class _PolicyStoryIdentity:
+    names: frozenset[str]
+    issuer: str
+    release: bool
+    seen: Optional[datetime]
+    cohort: Optional[tuple[str, str, str, str]]
+
+
+def _policy_release_issuer(text: str) -> str:
+    text = text.replace("中共中央办公厅", "中办").replace("国务院办公厅", "国办")
+    header = re.match(r"^([^《》:：，,。！？\n]{2,40})[:：]", text)
+    published = re.finditer(
+        r"(?:^|[。！？\n])\s*(?:近日|日前|今日|昨日)?"
+        r"([^《》:：，,。！？\n]{2,40}?)(?:联合)?(?:印发|发布|公布|出台)",
+        text,
+    )
+    for match in (header, *published):
+        if not match:
+            continue
+        issuer = re.sub(r"[\s、和及与]", "", match.group(1))
+        if re.fullmatch(r"(?:中办国办|国办中办)", issuer):
+            return "中办国办"
+        if re.fullmatch(r"[\u4e00-\u9fff]{2,30}(?:部|局|委|政府|厅|办公室|办)", issuer):
+            return issuer
+    return ""
+
+
+def _policy_story_identity(item: NewsItem) -> Optional[_PolicyStoryIdentity]:
+    text = "\n".join(part for part in (item.title, item.description, item.content) if part)
+    kinds = ("意见", "通知", "办法", "方案", "条例", "规定", "规划", "决定", "细则")
+    labels = {
+        re.sub(r"\s+", "", name)
+        for name in re.findall(r"《([^《》\n]{2,160})》", text)
+        if any(re.sub(r"\s+", "", name).endswith(kind) for kind in kinds)
+    }
+    if not labels:
+        return None
+    generic = {
+        *kinds, "指导意见", "实施意见", "若干意见", "管理办法",
+        "实施方案", "行动方案", "实施细则",
+    }
+    names = frozenset(labels - generic)
+    issuer = _policy_release_issuer(text)
+    headline = re.sub(r"《[^》]+》", "", item.title or "")
+    execution = re.search(r"已拨付|已经|首批|完成|签约|获批|拨付|开工|落地|启动实施|正式实施", headline)
+    clause = bool(re.search(r"》\s*(?:提出|明确|要求|指出|强调|部署|规定)", text))
+    published = bool(re.search(r"(?:印发|发布|公布|出台)[^。！？《\n]{0,20}《", text))
+    release = not execution and (clause or published)
+
+    # Anonymous clauses need a same-publisher, same-day, short publication burst.
+    # Undated reports and bare dates do not establish that evidence.
+    seen = None
+    raw_seen = str(item.seendate or "").strip()
+    if re.search(r"[ T]\d{2}:?\d{2}", raw_seen):
+        try:
+            seen = datetime.fromisoformat(raw_seen.replace("Z", "+00:00"))
+        except ValueError:
+            seen = _parse_seendate_utc(raw_seen)
+        if seen is not None:
+            china_tz = timezone(timedelta(hours=8))
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=china_tz)
+            seen = seen.astimezone(china_tz)
+    publisher = _canonical_domain(_domain_for_item(item))
+    technology = bool(re.search(r"科技|科研|研发|科学基金", text))
+    header_issuer = _policy_release_issuer(item.title or "")
+    anonymous = labels == {"意见"} and clause and header_issuer == issuer == "中办国办"
+    cohort = None
+    document_kinds = {kind for kind in kinds if any(label.endswith(kind) for label in labels)}
+    if release and issuer and seen and publisher and technology and len(document_kinds) == 1:
+        if names or anonymous:
+            cohort = (issuer, seen.date().isoformat(), publisher, next(iter(document_kinds)))
+    return _PolicyStoryIdentity(names, issuer, bool(release), seen, cohort)
+
+
+def _same_policy_story(
+    left: Optional[_PolicyStoryIdentity],
+    right: Optional[_PolicyStoryIdentity],
+    named_by_cohort: dict[tuple[str, str, str, str], set[str]],
+) -> Optional[bool]:
+    """None leaves non-policy pairs to the existing story heuristics."""
+    if left is None or right is None:
+        return None
+    # Explicit document/issuer conflicts outrank fuzzy headlines and ASCII names.
+    if left.names and right.names and left.names != right.names:
+        return False
+    if left.issuer and right.issuer and left.issuer != right.issuer:
+        return False
+    if not left.release or not right.release:
+        return False
+    if len(left.names) > 1 or len(right.names) > 1:
+        return False
+    if left.names and right.names:
+        return True
+    if left.cohort is None or left.cohort != right.cohort:
+        return False
+    if left.seen is None or right.seen is None or abs(left.seen - right.seen) > timedelta(minutes=30):
+        return False
+    known_names = named_by_cohort.get(left.cohort, set())
+    # Looking at the whole input prevents an anonymous clause from bridging
+    # two explicitly different documents, regardless of input order.
+    if len(known_names) > 1:
+        return False
+    if left.names or right.names:
+        return (left.names | right.names) == known_names
+    return True
+
+
 def _dedupe_by_story(items: list[NewsItem], *, max_count: int) -> list[NewsItem]:
     """
     More aggressive than title-only dedupe: also attempts to dedupe cross-language stories
@@ -960,20 +1069,34 @@ def _dedupe_by_story(items: list[NewsItem], *, max_count: int) -> list[NewsItem]
     picked_title_tokens: list[set[str]] = []
     picked_entity_tokens: list[set[str]] = []
     picked_cjk_signatures: list[tuple[set[str], set[str]]] = []
-    for item in items:
+    picked_policies: list[Optional[_PolicyStoryIdentity]] = []
+    policies = [_policy_story_identity(item) for item in items]
+    named_by_cohort: dict[tuple[str, str, str, str], set[str]] = {}
+    for policy in policies:
+        if policy is not None and policy.cohort is not None:
+            named_by_cohort.setdefault(policy.cohort, set()).update(policy.names)
+    for item, policy in zip(items, policies):
         title_tokens = _tokens(item.title)
         entity_tokens = _entity_tokens(f"{item.title} {item.description or ''}")
         cjk_signature = _cjk_story_event_signature(item)
+        policy_matches = [
+            _same_policy_story(policy, previous, named_by_cohort)
+            for previous in picked_policies
+        ]
+        if any(match is True for match in policy_matches):
+            continue
+        comparable = [index for index, match in enumerate(policy_matches) if match is None]
         if any(
-            _title_similar(title_tokens, t, threshold=NEWS_DEDUPE_SIM_THRESHOLD)
-            for t in picked_title_tokens
+            _title_similar(title_tokens, picked_title_tokens[index], threshold=NEWS_DEDUPE_SIM_THRESHOLD)
+            for index in comparable
         ):
             continue
         # Cross-language dedupe: only apply entity matching when title tokens overlap is low.
         # This avoids over-deduping highly-related-but-distinct stories like:
         # "Apple releases new Mac" vs "Apple releases new iPad".
         max_overlap = 0.0
-        for t in picked_title_tokens:
+        for index in comparable:
+            t = picked_title_tokens[index]
             if not title_tokens or not t:
                 continue
             denom = float(min(len(title_tokens), len(t)) or 1)
@@ -981,15 +1104,19 @@ def _dedupe_by_story(items: list[NewsItem], *, max_count: int) -> list[NewsItem]
         if (
             max_overlap < 0.6
             and entity_tokens
-            and any(_entity_similar(entity_tokens, e) for e in picked_entity_tokens)
+            and any(_entity_similar(entity_tokens, picked_entity_tokens[index]) for index in comparable)
         ):
             continue
-        if any(_same_cjk_story_event(cjk_signature, signature) for signature in picked_cjk_signatures):
+        if any(
+            _same_cjk_story_event(cjk_signature, picked_cjk_signatures[index])
+            for index in comparable
+        ):
             continue
         picked.append(item)
         picked_title_tokens.append(title_tokens)
         picked_entity_tokens.append(entity_tokens)
         picked_cjk_signatures.append(cjk_signature)
+        picked_policies.append(policy)
         if len(picked) >= max_count:
             break
     return picked

@@ -827,15 +827,15 @@ def test_collect_ai_digest_updates_uses_search_backfill_for_daily_digest_quotas(
             raw_excerpt="火山方舟更新豆包模型能力。",
         ),
         AIUpdateItem(
-            title="Anthropic Claude Code 工具更新",
-            summary="Anthropic 更新 Claude Code。",
+            title="Anthropic为Claude Code新增远程MCP认证",
+            summary="Claude Code新增远程MCP服务器的OAuth设备授权流程。",
             source_name="搜索",
             source_type="search",
             url="https://example.com/claude",
             published_at="2026-07-02T09:30:00Z",
             vendor="Anthropic",
             product="Claude Code",
-            raw_excerpt="Anthropic updates Claude Code.",
+            raw_excerpt="Claude Code adds OAuth device authorization for remote MCP servers.",
         ),
         AIUpdateItem(
             title="Google Gemini 推理更新",

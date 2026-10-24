@@ -1874,8 +1874,8 @@ def _agent_ai_digest_policy_defaults() -> dict[str, str]:
     """Keep impact settings, but do not restore obsolete source quotas."""
 
     return {
-        "AI_DIGEST_IMPACT_SUPERVISOR": os.getenv("AI_DIGEST_IMPACT_SUPERVISOR") or "0",
-        "AI_DIGEST_HIGH_IMPACT_SCORE": os.getenv("AI_DIGEST_HIGH_IMPACT_SCORE") or "0",
+        "AI_DIGEST_IMPACT_SUPERVISOR": os.getenv("AI_DIGEST_IMPACT_SUPERVISOR") or "1",
+        "AI_DIGEST_HIGH_IMPACT_SCORE": os.getenv("AI_DIGEST_HIGH_IMPACT_SCORE") or "75",
         "AI_DIGEST_MIN_OFFICIAL_ITEMS": "0",
         "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS": "0",
         "AI_DIGEST_MIN_FOREIGN_AI_ITEMS": "0",

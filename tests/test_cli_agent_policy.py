@@ -29,8 +29,8 @@ def test_agent_ai_digest_defaults_are_soft_without_overriding_explicit_values(mo
         monkeypatch.delenv(name, raising=False)
 
     assert _agent_ai_digest_policy_defaults() == {
-        "AI_DIGEST_IMPACT_SUPERVISOR": "0",
-        "AI_DIGEST_HIGH_IMPACT_SCORE": "0",
+        "AI_DIGEST_IMPACT_SUPERVISOR": "1",
+        "AI_DIGEST_HIGH_IMPACT_SCORE": "75",
         "AI_DIGEST_MIN_OFFICIAL_ITEMS": "0",
         "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS": "0",
         "AI_DIGEST_MIN_FOREIGN_AI_ITEMS": "0",

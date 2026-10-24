@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from src.llm.request_policy import minimax_output_tokens, minimax_reasoning_options
+
 from .security import PlatformError, file_lock, pinned_address, relative_path
 
 
@@ -35,15 +37,21 @@ def tool_call(identity, name, arguments):
 
 def encode(snapshot, messages, max_tokens, tools=None):
     adapter = snapshot['adapter']
-    params = snapshot.get('parameters') or {}
-    maximum = min(int(params.get('max_output_tokens', max_tokens)), int(max_tokens))
+    params = dict(snapshot.get('parameters') or {})
+    reasoning = minimax_reasoning_options(
+        snapshot['upstream_model_id'], effort=params.get('reasoning_effort'),
+    )
+    params.update(reasoning)
+    request_limit = minimax_output_tokens(snapshot['upstream_model_id'], int(max_tokens))
+    maximum = min(int(params.get('max_output_tokens', request_limit)), request_limit)
     body = {'model': snapshot['upstream_model_id']}
     for key in ('temperature', 'top_p', 'reasoning_effort'):
         if key in params and not (adapter == 'anthropic_messages' and key == 'reasoning_effort'):
             body[key] = params[key]
     if adapter == 'openai_chat':
         body.update(messages=[dict(m) for m in messages], stream=False)
-        body[params.get('token_parameter', 'max_tokens')] = maximum
+        token_parameter = 'max_completion_tokens' if reasoning else 'max_tokens'
+        body[params.get('token_parameter', token_parameter)] = maximum
         for message in body['messages']:
             if message.get('tool_calls'):
                 message['tool_calls'] = [{'id': t['id'], 'type': 'function', 'function': {
@@ -68,6 +76,8 @@ def encode(snapshot, messages, max_tokens, tools=None):
             body['tools'] = [{'type': 'function', **t} for t in tools]
         path = 'responses'
     elif adapter == 'anthropic_messages':
+        if reasoning:
+            body['output_config'] = {'effort': reasoning['reasoning_effort']}
         body.update(max_tokens=maximum, system='\n'.join(m['content'] for m in messages if m['role'] == 'system'))
         output = []
         for message in messages:

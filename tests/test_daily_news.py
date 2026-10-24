@@ -892,7 +892,7 @@ def test_daily_news_prompt_requires_chinese_translation_no_url_and_target_length
     assert "必须全部使用简体中文" in prompt
     assert "英文新闻" in prompt and "翻译" in prompt
     assert "150–220字" in prompt
-    assert "20–40字" in prompt
+    assert "50–100字" in prompt
     assert "最多300字" in prompt
     assert "建议220-350字" not in prompt
     assert "150字以内" not in prompt
@@ -1360,7 +1360,7 @@ def test_daily_news_prompt_prioritizes_complete_event_summary_over_commentary():
     assert "主体、时间、地点、核心行为、关键数据、原因或背景、当前结果" in prompt
     assert "事实叙述应占正文主要篇幅" in prompt
     assert "评价不得替代、压缩或重复事实叙述" in prompt
-    assert "评价目标20–40字" in prompt
+    assert "评价目标50–100字" in prompt
     assert "150–220字" in prompt
     assert "禁止按字符截断" in prompt
     assert "150字以内" not in prompt

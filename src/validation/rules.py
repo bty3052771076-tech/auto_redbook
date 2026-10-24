@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from src.ai_digest.models import AI_DIGEST_BODY_LIMIT
 from src.storage.models import Post, PostType
 from src.text_integrity import contains_recoverable_utf8_as_gbk_mojibake
 from src.workflow.content_evidence import text_integrity_issues
@@ -62,6 +63,9 @@ def validate_post(post: Post) -> ValidationResult:
         errors.append(f"title too long: {len(title)} > {max_title}")
 
     max_body = _limit_for_body(post.type)
+    digest = post.platform.get("ai_digest")
+    if post.type == PostType.image and isinstance(digest, dict) and digest.get("mode") == "daily_ai_digest":
+        max_body = AI_DIGEST_BODY_LIMIT
     if max_body is not None and len(body) > max_body:
         errors.append(f"body too long: {len(body)} > {max_body}")
 

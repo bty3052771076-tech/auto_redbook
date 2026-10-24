@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, List, Optional
 from src.config import load_llm_configs
 from src.ai_digest.collect import collect_ai_digest_updates
 from src.ai_digest.generate import (
+    AIDigestGenerationError,
     _concrete_action_in_text,
     build_fallback_brief,
     evaluate_ai_digest_impact_with_llm,
@@ -25,9 +26,11 @@ from src.ai_digest.generate import (
     is_vague_collective_title,
     is_ai_digest_source_label_title,
     render_ai_digest_body,
+    repair_ai_digest_brief_with_llm,
+    retain_valid_ai_digest_items,
     validate_ai_digest_concrete_content,
 )
-from src.ai_digest.models import AIDigestBrief, AIUpdateItem
+from src.ai_digest.models import AI_DIGEST_BODY_LIMIT, AIDigestBrief, AIUpdateItem
 from src.ai_digest.rank import (
     AI_DIGEST_MAX_ITEMS_PER_SOURCE,
     ai_digest_official_count,
@@ -3945,9 +3948,11 @@ def _fetch_daily_news_candidates_for_upload(
         windows, window_meta = _daily_news_lookback_window(
             lookback_days, env_names=("NEWS_LOOKBACK_DAYS", "CONTENT_LOOKBACK_DAYS"))
         target_count = max(1, int(count or 1))
-        preferred = _daily_news_candidate_fetch_limit(target_count)
+        # Replenishment retains a full-size pool without increasing the output goal.
+        pool_count = max(10, target_count) if exclude_story_keys else target_count
+        preferred = _daily_news_candidate_fetch_limit(pool_count)
         # The raw target is independent of the minimum generation threshold.
-        raw_target = max(target_count * 20, _daily_news_raw_candidate_fetch_limit(preferred))
+        raw_target = max(pool_count * 20, _daily_news_raw_candidate_fetch_limit(preferred))
         policy = performance_policy or PerformancePolicy.from_environment()
         history_signatures = []
         from src.news.daily_news import NewsItem
@@ -4086,7 +4091,7 @@ def _daily_news_evaluation_viewpoint_instruction(value: str | None) -> str:
         "文体教育看公平、参与机会和人格尊严；灾害健康看生命安全、救助可及性和公共责任。"
         "只选择与本事件事实直接相关的一个角度，不强行套用全部立场。"
         "评价是明确标注的分析，不是新增事实；不得编造因果、损失、民意、责任或确定的未来结果。"
-        "用一个20–40字完整短句说明谁的什么利益受到怎样影响或哪项责任不能回避；"
+        "用一个完整句子说明谁的什么利益受到怎样影响或哪项责任不能回避，篇幅遵守当前栏目的评价要求；"
         "不得留空，不复述标题，不写从某立场来看等标签，不用需要进一步查看、后续仍需观察之类等待句代替判断。"
         "必要的不确定性可以保留，但须同时说明本事件的具体利害，不为凑字数编造内容。\n"
     )
@@ -5538,6 +5543,10 @@ def _select_adaptive_ai_digest_items(
             and item.dedupe_key not in strict_keys
             and ai_update_is_high_impact(item, threshold=impact_threshold)
             and (
+                (impact_scores.get(item.dedupe_key) or {}).get("llm_score") is None
+                or ai_update_category(item) == "model_release"
+            )
+            and (
                 len(strict_available) < minimum
                 or ai_update_category(item) == "model_release"
                 or item.source_type in {"official", "github"}
@@ -5748,7 +5757,7 @@ def _fit_ai_digest_brief_to_body_limit(
     items = list(brief.items or [])
     while len(items) > max(1, min_items):
         fitted = _with_ai_digest_items(brief, items)
-        if len(render_ai_digest_body(fitted, selection_meta=selection_meta)) <= MAX_IMAGE_BODY:
+        if len(render_ai_digest_body(fitted, selection_meta=selection_meta)) <= AI_DIGEST_BODY_LIMIT:
             return fitted
         items = items[:-1]
     return _with_ai_digest_items(brief, items)
@@ -5849,18 +5858,18 @@ def _fit_ai_digest_items_to_body_capacity(
             continue
         preview = build_fallback_brief(selected, target_count=target)
         last_length = len(render_ai_digest_body(preview, selection_meta=selection_meta))
-        if last_length <= MAX_IMAGE_BODY:
+        if last_length <= AI_DIGEST_BODY_LIMIT:
             return selected, {
                 "requested_items": requested,
                 "selected_items": len(selected),
                 "dropped_items": max(0, requested - len(selected)),
                 "body_length": last_length,
-                "body_limit": MAX_IMAGE_BODY,
+                "body_limit": AI_DIGEST_BODY_LIMIT,
             }
     raise RuntimeError(
         "daily ai digest body capacity insufficient: "
         f"保留最少{minimum}条及全部来源链接后正文仍为{last_length}字，"
-        f"超过小红书上限{MAX_IMAGE_BODY}字"
+        f"超过每日AI讯息正文上限{AI_DIGEST_BODY_LIMIT}字"
     )
 
 
@@ -6353,6 +6362,8 @@ def create_daily_ai_digest_posts(
         if config_error and not impact_meta.get("error"):
             impact_meta["error"] = config_error
         impact_meta["enabled"] = supervisor_enabled
+        if not supervisor_enabled:
+            impact_meta.update(mode="disabled_deterministic", error="")
         impact_meta["threshold"] = impact_threshold
         impact_meta["candidate_limit"] = supervisor_limit
         if progress is not None:
@@ -6818,6 +6829,16 @@ def create_daily_ai_digest_posts(
     generation_mode = "llm"
     llm_error = ""
     llm_items = _prepare_ai_digest_llm_items(items, target_count=generation_target)
+    # Keep original evidence separate from generated/fallback copy. Topic
+    # recovery may select another collected URL, so retain that source too.
+    repair_sources_by_url: dict[str, AIUpdateItem] = {}
+    for source_item in [
+        *(auto_collection_items or []), *prompt_topic_candidates,
+        *raw_items_for_fallback, *llm_items,
+    ]:
+        if source_item.url and source_item.url not in repair_sources_by_url:
+            repair_sources_by_url[source_item.url] = source_item.model_copy(deep=True)
+    generation_cfgs = []
     source_meta["llm_input_items"] = len(llm_items)
     source_meta["llm_input_quota_counts"] = ai_digest_quota_counts(llm_items)
     if progress is not None:
@@ -6838,20 +6859,26 @@ def create_daily_ai_digest_posts(
     except Exception as exc:
         generation_mode = "fallback"
         llm_error = str(exc)
-        if progress is not None:
-            progress("llm_selection", f"failed error={llm_error}; using quota-safe fallback")
-        fallback_items = _select_ai_digest_fallback_pool(items, raw_items_for_fallback, target_count=generation_target)
-        if prompt_search_queries and len(fallback_items) >= generation_target:
-            brief = build_fallback_brief(fallback_items[:generation_target], target_count=generation_target)
+        if isinstance(exc, AIDigestGenerationError) and exc.partial_brief is not None:
+            brief = exc.partial_brief
+            generation_mode = "llm"
+            if progress is not None:
+                progress("llm_selection", f"partial error={llm_error}; retaining selected copy for item repair")
         else:
-            brief = _build_quota_safe_ai_digest_fallback(
-                fallback_items,
-                target_count=generation_target,
-                min_official_count=effective_min_official_count,
-                max_age_days=max_age_days,
-                min_domestic_model_count=effective_min_domestic_model_count,
-                min_foreign_ai_count=effective_min_foreign_ai_count,
-            )
+            if progress is not None:
+                progress("llm_selection", f"failed error={llm_error}; using quota-safe fallback")
+            fallback_items = _select_ai_digest_fallback_pool(items, raw_items_for_fallback, target_count=generation_target)
+            if prompt_search_queries and len(fallback_items) >= generation_target:
+                brief = build_fallback_brief(fallback_items[:generation_target], target_count=generation_target)
+            else:
+                brief = _build_quota_safe_ai_digest_fallback(
+                    fallback_items,
+                    target_count=generation_target,
+                    min_official_count=effective_min_official_count,
+                    max_age_days=max_age_days,
+                    min_domestic_model_count=effective_min_domestic_model_count,
+                    min_foreign_ai_count=effective_min_foreign_ai_count,
+                )
     brief = _finalize_ai_digest_brief(
         brief,
         generation_mode=generation_mode,
@@ -7011,12 +7038,54 @@ def create_daily_ai_digest_posts(
         body_fit_error = source_cap_error
     if body_fit_error:
         raise RuntimeError(body_fit_error)
+    body_fit_dropped = max(0, selected_before_body_fit - len(brief.items))
     try:
         validate_ai_digest_concrete_content(brief)
     except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
+        if progress is not None:
+            progress("content_repair", f"in_progress selected={len(brief.items)} reason={exc}")
+        try:
+            # One bounded repair pass covers both fallback paths and any
+            # untranslated topic inserted after generation, without recollecting.
+            repair_meta = {"status": "repaired", "reason": str(exc)}
+            try:
+                repaired = repair_ai_digest_brief_with_llm(
+                    generation_cfgs, brief, list(repair_sources_by_url.values()),
+                )
+            except AIDigestGenerationError as exhausted:
+                if not adaptive_mode or exhausted.partial_brief is None:
+                    raise
+                kept, dropped = retain_valid_ai_digest_items(
+                    exhausted.partial_brief, list(repair_sources_by_url.values()),
+                )
+                if not dropped or len(kept) < minimum_count:
+                    raise
+                repaired = _with_ai_digest_items(exhausted.partial_brief, kept)
+                generation_target = len(kept)
+                repair_meta.update(status="qualified_subset", dropped=dropped, retained=len(kept))
+            repaired, repaired_policy = _enforce_ai_digest_publish_policy(repaired)
+            repair_error = _ai_digest_selection_error(
+                repaired.items,
+                target_count=generation_target,
+                min_official_count=effective_min_official_count,
+                min_domestic_model_count=effective_min_domestic_model_count,
+                min_foreign_ai_count=effective_min_foreign_ai_count,
+                max_age_days=max_age_days,
+            ) or _ai_digest_source_cap_error(repaired.items, target_count=generation_target)
+            missing_topics = _missing_ai_digest_prompt_topics(repaired.items, prompt_search_queries)
+            if repair_error or missing_topics:
+                raise ValueError(repair_error or "AI digest repair lost requested topics: " + ", ".join(missing_topics))
+            validate_ai_digest_concrete_content(repaired)
+        except (ValueError, RuntimeError) as repair_exc:
+            raise RuntimeError(f"daily ai digest content repair failed: {repair_exc}") from repair_exc
+        brief = repaired
+        source_meta["strict_publish_policy"] = repaired_policy
+        source_meta["content_repair"] = repair_meta
+        if progress is not None:
+            progress("content_repair", f"success selected={len(brief.items)} "
+                     f"dropped={len(repair_meta.get('dropped', []))} mode={repair_meta['status']}")
     source_meta["selected_before_body_fit"] = selected_before_body_fit
-    source_meta["body_fit_dropped"] = max(0, selected_before_body_fit - len(brief.items))
+    source_meta["body_fit_dropped"] = body_fit_dropped
     source_meta["selected_quota_counts"] = ai_digest_quota_counts(list(brief.items or []))
     source_meta["source_distribution"] = ai_digest_source_counts(list(brief.items or []))
     source_meta["source_distribution_max"] = max(
@@ -7025,12 +7094,14 @@ def create_daily_ai_digest_posts(
     )
     source_meta["selected_official_count"] = ai_digest_official_count(list(brief.items or []))
     rendered_body = render_ai_digest_body(brief, selection_meta=source_meta)
-    if len(rendered_body) > MAX_IMAGE_BODY:
+    if len(rendered_body) > AI_DIGEST_BODY_LIMIT:
         raise RuntimeError(
-            "daily ai digest body too long: "
-            f"{len(rendered_body)} > {MAX_IMAGE_BODY}; "
-            "the brief body exceeds the Xiaohongshu body limit"
+            "AI_DIGEST_BODY_LIMIT: daily ai digest body too long: "
+            f"{len(rendered_body)} > {AI_DIGEST_BODY_LIMIT}; "
+            "the brief body exceeds the AI digest body limit"
         )
+    source_meta["body_limit"] = AI_DIGEST_BODY_LIMIT
+    source_meta["rendered_body_length"] = len(rendered_body)
     post = Post(
         type="image",
         status=PostStatus.draft,
@@ -7465,9 +7536,11 @@ def _supervise_daily_news_candidates(
     required_international_conflict_count: int = 0,
     progress_callback: DailyNewsProgressCallback | None,
     column: str = "daily_news",
+    accepted_items: list[Any] | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
-    """Use one optional LLM call to reorder the already validated candidate pool."""
+    """Rank validated candidates without reintroducing explicit rejections."""
     wow_column = column == DAILY_WOW_CONTENT_TYPE
+    review_target = max(2, target_count) if accepted_items else target_count
     if wow_column and not _daily_news_llm_supervisor_enabled(
         cfgs, target_count=target_count, column=column
     ):
@@ -7489,7 +7562,7 @@ def _supervise_daily_news_candidates(
             **strict_meta,
         }
     if not _daily_news_llm_supervisor_enabled(
-        cfgs, target_count=target_count, column=column
+        cfgs, target_count=review_target, column=column
     ):
         return candidates, {"enabled": False, "status": "not_requested"}
 
@@ -7536,11 +7609,12 @@ def _supervise_daily_news_candidates(
             "优先保留有具体主体、动作、时间或数据的新闻，排除泛泛评论、旧闻、重复报道和信息不足项。"
             "必须仅返回 JSON 对象，不得输出 Markdown 或解释文字。"
             "JSON 格式：{\"ranked_ids\":[正整数...],\"rejected_ids\":[正整数...],\"reason\":\"不超过80字\"}。"
-            "ranked_ids 必须是候选 id 的去重排序；未列出的 id 会保留在本地排序末尾。"
+            "ranked_ids 是合格候选的去重排序；rejected_ids 必须列出重复或不合格项，拒选项不会补回。"
+            "同一政策文件的不同条款应合为一个事件；不得选择已经入选事件的另一篇报道。"
         )
         system_prompt += (
-            f" Return at least {minimum_ranked_count} unique ranked_ids. "
-            "Do not return fewer ranked_ids when the candidate pool contains enough items. "
+            f" Aim for {minimum_ranked_count} unique eligible ranked_ids. "
+            "If fewer qualify, explicitly reject the others; never retain a duplicate to fill the count. "
             f"The final batch must include at least {required_international_conflict_count} "
             "international conflict or geopolitical stories when marked true; rank those "
             "traceable items before ordinary business stories."
@@ -7552,6 +7626,11 @@ def _supervise_daily_news_candidates(
                 "requested_drafts": target_count,
                 "minimum_china_mainland_items": required_china_count,
                 "minimum_international_conflict_items": required_international_conflict_count,
+                "already_selected": [
+                    {"title": str(item.title), "summary": _compact_daily_news_context(item, max_chars=240),
+                     "url": str(item.url)}
+                    for item in (accepted_items or [])
+                ],
                 "candidates": payload,
             },
             ensure_ascii=False,
@@ -7617,21 +7696,29 @@ def _supervise_daily_news_candidates(
                     continue
                 if 1 <= index <= len(pool) and index not in ranked_indices:
                     ranked_indices.append(index)
-        if not ranked_indices:
+        rejected_indices = {
+            int(value) for value in (result.get("rejected_ids") or [])
+            if str(value).isdigit() and 1 <= int(value) <= len(pool)
+        }
+        ranked_indices = [index for index in ranked_indices if index not in rejected_indices]
+        if not ranked_indices and not rejected_indices:
             raise RuntimeError("supervisor returned no usable ranked_ids")
-        if len(ranked_indices) < minimum_ranked_count:
+        if len(ranked_indices) < minimum_ranked_count and not rejected_indices:
             raise RuntimeError(
                 f"supervisor returned {len(ranked_indices)} ranked_ids; "
                 f"expected at least {minimum_ranked_count}"
             )
         chosen = [pool[index - 1] for index in ranked_indices]
         chosen_keys = {item.url or item.title for item in chosen}
-        chosen.extend(item for item in candidates if (item.url or item.title) not in chosen_keys)
+        rejected_keys = {pool[index - 1].url or pool[index - 1].title for index in rejected_indices}
+        chosen.extend(item for item in candidates
+                      if (item.url or item.title) not in chosen_keys | rejected_keys)
         meta = {
             "enabled": True,
             "status": "success",
             "reviewed_candidate_count": len(pool),
             "ranked_candidate_count": len(ranked_indices),
+            "rejected_candidate_count": len(rejected_indices),
             "reason": _clip_text(str(result.get("reason") or ""), limit=160),
         }
         _emit_daily_news_progress(
@@ -8327,6 +8414,22 @@ def _run_parallel_daily_news_candidates(
                     if not extra:
                         break
                     existing_keys = {news_key(item) for item in picks}
+                    extra = [item for item in extra if news_key(item) not in existing_keys]
+                    if not extra:
+                        break
+                    extra, refill_review = _supervise_daily_news_candidates(
+                        extra, cfgs=cfgs, prompt_hint=prompt_norm,
+                        target_count=max(1, target_count - len(posts)),
+                        required_china_count=max(0, required_china_count - accepted_china_count),
+                        required_international_conflict_count=max(
+                            0, required_international_conflict_count - accepted_conflict_count),
+                        progress_callback=progress_callback, column=column,
+                        accepted_items=accepted_items,
+                    )
+                    selection_meta = base_meta.setdefault("selection_pool", {})
+                    selection_meta.setdefault("refill_supervisor_reviews", []).append(refill_review)
+                    if not extra:
+                        continue
                     for item in extra:
                         if news_key(item) in existing_keys:
                             continue
@@ -8876,7 +8979,9 @@ def create_daily_news_posts(
         picks.sort(key=lambda item: _parse_seendate_utc(item.seendate).astimezone(_resolve_tz("Asia/Shanghai")).date(), reverse=True)
         main = feasible_news_batch(picks, target_count, china=required_china_count,
                                    conflict=required_international_conflict_count)
-        if not main:
+        if not main and (
+            wow_column or required_china_count or required_international_conflict_count
+        ):
             if wow_column:
                 raise RuntimeError(
                     "每日我去没有通过反差筛选的候选：本次候选都缺少可检查的真实反差，"

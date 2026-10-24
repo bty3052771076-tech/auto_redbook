@@ -136,3 +136,11 @@ AutoRedbookGUI*.exe
 /tools/opencodex/
 /tools/postgresql/
 /tools/*.local.json
+
+# Publish only the reviewed screenshots used by README.
+!docs/
+docs/*
+!docs/images/
+docs/images/*
+!docs/images/readme-workflow.png
+!docs/images/readme-sources.png

@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+from src.llm.request_policy import minimax_output_tokens
+
 from .presets import ADAPTERS, ROLE_PURPOSES
 from .security import CredentialStore, PlatformError, file_lock, relative_path, validate_address
 
@@ -174,7 +176,7 @@ class PlatformStore:
         identity = data.get('upstream_model_id')
         if not isinstance(identity, str) or not identity or len(identity) > 512 or any(ord(c) < 33 for c in identity):
             raise PlatformError('INVALID_MODEL', '请输入原生模型 ID，不能包含空白或控制字符')
-        params = self._parameters(data.get('parameters') or {})
+        params = self._parameters(data.get('parameters') or {}, model=identity)
         def add(state):
             self._find(state, 'connections', data['connection_id'])
             if any(row['connection_id'] == data['connection_id'] and row['upstream_model_id'] == identity for row in state['models']):
@@ -188,13 +190,14 @@ class PlatformStore:
         return self._mutate(revision, add)
 
     @staticmethod
-    def _parameters(params):
+    def _parameters(params, *, model=''):
         if not isinstance(params, dict) or set(params) - {'temperature', 'top_p', 'max_output_tokens', 'token_parameter', 'reasoning_effort'}:
             raise PlatformError('UNSUPPORTED_PARAMETER', '参数不受支持')
         if params.get('token_parameter', 'max_tokens') not in {'max_tokens', 'max_completion_tokens'}:
             raise PlatformError('UNSUPPORTED_PARAMETER', 'token 参数无效')
-        if 'max_output_tokens' in params and (type(params['max_output_tokens']) is not int or not 256 <= params['max_output_tokens'] <= 64000):
-            raise PlatformError('UNSUPPORTED_PARAMETER', '输出上限必须为256至64000')
+        maximum = minimax_output_tokens(model, 64000)
+        if 'max_output_tokens' in params and (type(params['max_output_tokens']) is not int or not 256 <= params['max_output_tokens'] <= maximum):
+            raise PlatformError('UNSUPPORTED_PARAMETER', f'输出上限必须为256至{maximum}')
         for key, upper in (('temperature', 2), ('top_p', 1)):
             if key in params and (type(params[key]) not in {int, float} or not 0 <= params[key] <= upper):
                 raise PlatformError('UNSUPPORTED_PARAMETER', '采样参数必须在所选范围内')
@@ -210,7 +213,7 @@ class PlatformStore:
             if any(key in data and type(data[key]) is not bool for key in ('enabled', 'favorite')):
                 raise PlatformError('INVALID_MODEL', '启用和收藏必须为布尔值')
             if 'parameters' in data:
-                data['parameters'] = self._parameters(data['parameters'])
+                data['parameters'] = self._parameters(data['parameters'], model=row['upstream_model_id'])
                 row['capabilities'] = {}
             if 'name' in data and (not isinstance(data['name'], str) or not data['name'].strip() or len(data['name']) > 120):
                 raise PlatformError('INVALID_MODEL', '展示名无效')
